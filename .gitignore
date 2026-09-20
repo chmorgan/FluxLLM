@@ -1,0 +1,12 @@
+# Build artifacts
+.build/
+# Xcode / SPM
+DerivedData/
+*.xcodeproj/
+# macOS
+.DS_Store
+# Editor (optional — remove this line if you want to share .vscode)
+.vscode/
+# Python caches
+__pycache__/
+*.py[cod]

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+     <key>CFBundleDevelopmentRegion</key>
+     <string>en</string>
+     <key>CFBundleExecutable</key>
+     <string>FluxLLMApp</string>
+     <key>CFBundleIdentifier</key>
+     <string>com.cmorgan.FluxLLM</string>
+     <key>CFBundleName</key>
+     <string>FluxLLM</string>
+     <key>CFBundleDisplayName</key>
+     <string>FluxLLM</string>
+     <key>CFBundleIconFile</key>
+     <string>FluxLLM.icns</string>
+     <key>CFBundlePackageType</key>
+     <string>APPL</string>
+     <key>CFBundleShortVersionString</key>
+     <string>0.1.0</string>
+     <key>CFBundleVersion</key>
+     <string>1</string>
+     <key>LSMinimumSystemVersion</key>
+     <string>15.0</string>
+     <!-- Start quietly in the menu bar. The dashboard switches to regular
+          activation while open, then restores accessory mode when closed. -->
+     <key>LSUIElement</key>
+     <true/>
+</dict>
+</plist>

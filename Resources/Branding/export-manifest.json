@@ -1,0 +1,325 @@
+{
+  "concept": "FluxLLM tall waveform",
+  "approval": "unoutlined status and header marks approved; original dimensions and blue/cyan gradients preserved",
+  "status_logical_points": [
+    24,
+    18
+  ],
+  "rendering": "original color; transparent status background",
+  "brand_logical_points": [
+    48,
+    36
+  ],
+  "app_mark_transform": "translate(108 208) scale(8)",
+  "status_visible_inner_edge_points": 0,
+  "status_edge_colors": {},
+  "brand_visible_inner_edge_points": 0,
+  "sources": [
+    {
+      "file": "Masters/status-mark.svg",
+      "sha256": "b07e8468215f20eb4e6464377fd5783ce1b32ca23ec795397e4e421a79f4b2a3"
+    }
+  ],
+  "exports": [
+    {
+      "file": "Masters/app-icon.svg",
+      "sha256": "d93d94c5ec900fea0b679e769435eb1698e165db62865a13b7748099a2cc15d0"
+    },
+    {
+      "file": "Masters/status-mark-light.svg",
+      "sha256": "b07e8468215f20eb4e6464377fd5783ce1b32ca23ec795397e4e421a79f4b2a3"
+    },
+    {
+      "file": "Masters/status-mark-dark.svg",
+      "sha256": "b07e8468215f20eb4e6464377fd5783ce1b32ca23ec795397e4e421a79f4b2a3"
+    },
+    {
+      "file": "Masters/brand-mark-light.svg",
+      "sha256": "543a14fa80d058e1a53138aa7aa57705c3ba01262111dd28972266b4cca9b51e"
+    },
+    {
+      "file": "Masters/brand-mark-dark.svg",
+      "sha256": "543a14fa80d058e1a53138aa7aa57705c3ba01262111dd28972266b4cca9b51e"
+    },
+    {
+      "file": "AppIcon/FluxLLM-1024.png",
+      "sha256": "51dabac01240da1453d51d9b7b873bb77cb9c4da0585be06196c547d80e59821",
+      "pixels": [
+        1024,
+        1024
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_128x128.png",
+      "sha256": "02860793d11ec537e94a5a3d69c93d48349cea2608e7ea394e980b4da901a2fe",
+      "pixels": [
+        128,
+        128
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_128x128@2x.png",
+      "sha256": "20b90560c5fb6aa7271def086193fd34344f4cec7f4ff837baf79961b22cab20",
+      "pixels": [
+        256,
+        256
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_16x16.png",
+      "sha256": "3fbed255752c442a3874626a89b792ae47d28e5cae70244a9dcb0e805214e7ed",
+      "pixels": [
+        16,
+        16
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_16x16@2x.png",
+      "sha256": "970c249f2117d54e4c3ccd28f015e3ec4ae150d3349f1569849ebc8ce924bd53",
+      "pixels": [
+        32,
+        32
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_256x256.png",
+      "sha256": "68ed9ea1b3f26aaee0639f58bb08ae9c9be5f20711535e1a1e3edccb6c43c7af",
+      "pixels": [
+        256,
+        256
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_256x256@2x.png",
+      "sha256": "5851464cc9f4c107bd01e7b7483209d8687bc614b38dd0c43e3ca3ebdd4013d1",
+      "pixels": [
+        512,
+        512
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_32x32.png",
+      "sha256": "0f6b1254494cf287632b77c61f98286e1bfcd7765e6e703fe15a8c6aae1f3910",
+      "pixels": [
+        32,
+        32
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_32x32@2x.png",
+      "sha256": "68ab4ce6094041cc2f3e167e7174f4a1b2c4070bb73ef5ea92187c64395f91d3",
+      "pixels": [
+        64,
+        64
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_512x512.png",
+      "sha256": "5a47aae97ecf0d3ae67670eab1bb347d1f68de40721d0ebd83c209b7c84f6cbc",
+      "pixels": [
+        512,
+        512
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.iconset/icon_512x512@2x.png",
+      "sha256": "e7053e6cc699407842782b82b647ba3c4fa71484482d122bb01891563edf66de",
+      "pixels": [
+        1024,
+        1024
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "BrandMark/FluxLLMBrandDark.png",
+      "sha256": "42ffc726ec6baae76b163c56e2867f712914046145407fb7f83a7eb633d55c7e",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "BrandMark/FluxLLMBrandDark@2x.png",
+      "sha256": "70c9afe9847440467ecdc3fe9dd259d5430fd35ce6114a26addebb1e408a5d1c",
+      "pixels": [
+        96,
+        72
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "BrandMark/FluxLLMBrandLight.png",
+      "sha256": "42ffc726ec6baae76b163c56e2867f712914046145407fb7f83a7eb633d55c7e",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "BrandMark/FluxLLMBrandLight@2x.png",
+      "sha256": "70c9afe9847440467ecdc3fe9dd259d5430fd35ce6114a26addebb1e408a5d1c",
+      "pixels": [
+        96,
+        72
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "StatusBar/FluxLLMStatus.png",
+      "sha256": "e01dedf2fdb39a03e39d133f33e6e4210870503d07615476da0d1c9ee6d863bc",
+      "pixels": [
+        24,
+        18
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "StatusBar/FluxLLMStatus@2x.png",
+      "sha256": "977d46cb5f47a30d14503d17eb69b48e800fdaf9faf9e82e1a0b0f15e0815256",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "StatusBar/FluxLLMStatusDark.png",
+      "sha256": "e01dedf2fdb39a03e39d133f33e6e4210870503d07615476da0d1c9ee6d863bc",
+      "pixels": [
+        24,
+        18
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "StatusBar/FluxLLMStatusDark@2x.png",
+      "sha256": "977d46cb5f47a30d14503d17eb69b48e800fdaf9faf9e82e1a0b0f15e0815256",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "StatusBar/FluxLLMStatusLight.png",
+      "sha256": "e01dedf2fdb39a03e39d133f33e6e4210870503d07615476da0d1c9ee6d863bc",
+      "pixels": [
+        24,
+        18
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "StatusBar/FluxLLMStatusLight@2x.png",
+      "sha256": "977d46cb5f47a30d14503d17eb69b48e800fdaf9faf9e82e1a0b0f15e0815256",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "AppIcon/FluxLLM.icns",
+      "sha256": "f8dd81b00f565e75328fba959de3e849a23ae011cb72d414ae79fe11b9940e86"
+    }
+  ],
+  "runtime_exports": [
+    {
+      "file": "FluxLLMStatusLight.png",
+      "sha256": "e01dedf2fdb39a03e39d133f33e6e4210870503d07615476da0d1c9ee6d863bc",
+      "pixels": [
+        24,
+        18
+      ],
+      "mode": "RGBA",
+      "source": "StatusBar/FluxLLMStatusLight.png"
+    },
+    {
+      "file": "FluxLLMStatusLight@2x.png",
+      "sha256": "977d46cb5f47a30d14503d17eb69b48e800fdaf9faf9e82e1a0b0f15e0815256",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA",
+      "source": "StatusBar/FluxLLMStatusLight@2x.png"
+    },
+    {
+      "file": "FluxLLMStatusDark.png",
+      "sha256": "e01dedf2fdb39a03e39d133f33e6e4210870503d07615476da0d1c9ee6d863bc",
+      "pixels": [
+        24,
+        18
+      ],
+      "mode": "RGBA",
+      "source": "StatusBar/FluxLLMStatusDark.png"
+    },
+    {
+      "file": "FluxLLMStatusDark@2x.png",
+      "sha256": "977d46cb5f47a30d14503d17eb69b48e800fdaf9faf9e82e1a0b0f15e0815256",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA",
+      "source": "StatusBar/FluxLLMStatusDark@2x.png"
+    },
+    {
+      "file": "FluxLLMBrandLight.png",
+      "sha256": "42ffc726ec6baae76b163c56e2867f712914046145407fb7f83a7eb633d55c7e",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA",
+      "source": "BrandMark/FluxLLMBrandLight.png"
+    },
+    {
+      "file": "FluxLLMBrandLight@2x.png",
+      "sha256": "70c9afe9847440467ecdc3fe9dd259d5430fd35ce6114a26addebb1e408a5d1c",
+      "pixels": [
+        96,
+        72
+      ],
+      "mode": "RGBA",
+      "source": "BrandMark/FluxLLMBrandLight@2x.png"
+    },
+    {
+      "file": "FluxLLMBrandDark.png",
+      "sha256": "42ffc726ec6baae76b163c56e2867f712914046145407fb7f83a7eb633d55c7e",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA",
+      "source": "BrandMark/FluxLLMBrandDark.png"
+    },
+    {
+      "file": "FluxLLMBrandDark@2x.png",
+      "sha256": "70c9afe9847440467ecdc3fe9dd259d5430fd35ce6114a26addebb1e408a5d1c",
+      "pixels": [
+        96,
+        72
+      ],
+      "mode": "RGBA",
+      "source": "BrandMark/FluxLLMBrandDark@2x.png"
+    },
+    {
+      "file": "FluxLLM.icns",
+      "sha256": "f8dd81b00f565e75328fba959de3e849a23ae011cb72d414ae79fe11b9940e86",
+      "source": "AppIcon/FluxLLM.icns"
+    }
+  ]
+}
