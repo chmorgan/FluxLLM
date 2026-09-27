@@ -35,8 +35,11 @@ jobs:
           swift --version
           python3 --version
 
-      - name: Test release packaging
-        run: bash Tests/Scripts/package-release-tests.sh
+      - name: Test release scripts
+        run: |
+          for suite in Tests/Scripts/*-tests.sh; do
+            bash "$suite" || exit
+          done
 
       - name: Run Swift tests with coverage
         run: swift test --enable-code-coverage
