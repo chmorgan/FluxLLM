@@ -8,6 +8,7 @@ public final class MenuBarController: NSObject {
     private let metricsStore: MetricsStore
     private let coordinator: MonitoringCoordinator
     private let settings: AppSettings
+    private let launchAtLogin: LaunchAtLoginController
     private let menuActions = MenuActions()
     private let popover = NSPopover()
     private var dashboardWindow: DashboardWindow?
@@ -20,11 +21,13 @@ public final class MenuBarController: NSObject {
     public static let appTitle = "FluxLLM"
 
     public init(
-        metricsStore: MetricsStore, coordinator: MonitoringCoordinator, settings: AppSettings
+        metricsStore: MetricsStore, coordinator: MonitoringCoordinator, settings: AppSettings,
+        launchAtLogin: LaunchAtLoginController? = nil
     ) {
         self.metricsStore = metricsStore
         self.coordinator = coordinator
         self.settings = settings
+        self.launchAtLogin = launchAtLogin ?? LaunchAtLoginController()
         super.init()
         wireActions()
 
@@ -182,10 +185,11 @@ public final class MenuBarController: NSObject {
 
     private func showSettings() {
         guard isStarted else { return }
+        launchAtLogin.refresh()
         popover.performClose(nil)
         if settingsWindow == nil {
             settingsWindow = Self.makeSettingsWindow(
-                settings: settings, store: metricsStore,
+                settings: settings, store: metricsStore, launchAtLogin: launchAtLogin,
                 onApply: { [weak self] in
                     guard let self else { throw CancellationError() }
                     try await self.applyConfiguration()
@@ -203,6 +207,7 @@ public final class MenuBarController: NSObject {
     /// content can recursively resize it during safe-area/constraint updates.
     static func makeSettingsWindow(
         settings: AppSettings, store: MetricsStore? = nil,
+        launchAtLogin: LaunchAtLoginController? = nil,
         onApply: @escaping () async throws -> Void,
         onRescan: @escaping () async -> Void = {}
     ) -> NSWindow {
@@ -215,7 +220,8 @@ public final class MenuBarController: NSObject {
         window.isReleasedWhenClosed = false
         let hosting = NSHostingController(
             rootView: SettingsView(
-                settings: settings, store: store, onApply: onApply, onRescan: onRescan))
+                settings: settings, store: store, launchAtLogin: launchAtLogin,
+                onApply: onApply, onRescan: onRescan))
         hosting.sizingOptions = []
         window.contentViewController = hosting
         window.setContentSize(contentSize)

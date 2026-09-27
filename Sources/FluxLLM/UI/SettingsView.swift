@@ -1,8 +1,10 @@
+import ServiceManagement
 import SwiftUI
 
 /// Connection drafts take effect together when saved; edits never interrupt monitoring.
 public struct SettingsView: View {
     @ObservedObject private var settings: AppSettings
+    @ObservedObject private var launchAtLogin: LaunchAtLoginController
     private let store: MetricsStore?
     private let onApply: () async throws -> Void
     private let onRescan: () async -> Void
@@ -19,10 +21,12 @@ public struct SettingsView: View {
 
     public init(
         settings: AppSettings, store: MetricsStore? = nil,
+        launchAtLogin: LaunchAtLoginController? = nil,
         onApply: @escaping () async throws -> Void = {},
         onRescan: @escaping () async -> Void = {}
     ) {
         self.settings = settings
+        self.launchAtLogin = launchAtLogin ?? LaunchAtLoginController()
         self.store = store
         self.onApply = onApply
         self.onRescan = onRescan
@@ -38,100 +42,12 @@ public struct SettingsView: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Menu bar").font(.headline)
-                        Toggle("Show tokens per second", isOn: $settings.showMenuBarTokensPerSecond)
-                        Toggle("Show FluxLLM logo", isOn: $settings.showMenuBarLogo)
-                    }
+                    generalSection
                     Divider()
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("LLM system").font(.headline)
-                        Picker("System", selection: $selection) {
-                            ForEach(BackendSelection.allCases) { choice in
-                                Text(choice.title).tag(choice)
-                            }
-                        }
-                        if selection == .automatic {
-                            Text(
-                                "FluxLLM selects a detected system and remembers it while it remains available. Choose a system when several are detected."
-                            )
-                            .font(.caption).foregroundStyle(.secondary)
-                        }
-                        if let warning = BackendPresentation.selectionWarning(
-                            selection: selection, detected: store?.detectedBackends ?? [])
-                        {
-                            Label(warning, systemImage: "exclamationmark.triangle")
-                                .font(.caption).foregroundStyle(.orange)
-                        }
-                        if let notice = store?.selectionNotice {
-                            Text(notice).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-
-                    detectionSection
-                    Divider()
-
-                    if selection == .ollama {
-                        ollamaConfiguration
-                    } else if let kind = selection.kind {
-                        nativeConfiguration(kind)
-                    } else {
-                        if store?.backendKind == .ollama { ollamaConfiguration }
-                        DisclosureGroup("Discovery addresses") {
-                            VStack(alignment: .leading, spacing: 16) {
-                                if store?.backendKind != .ollama { ollamaConfiguration }
-                                ForEach(BackendKind.allCases.filter { $0 != .ollama }) { kind in
-                                    nativeConfiguration(kind)
-                                }
-                            }.padding(.top, 12)
-                        }
-                    }
-
-                    if let store {
-                        DisclosureGroup("Connection details") {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(
-                                    store.connectionMessage
-                                        ?? "Connection state: \(store.connectionState.rawValue)")
-                                if store.backendKind == .ollama {
-                                    Text("Proxy: \(store.proxyState.rawValue)")
-                                    Text("Client endpoint: \(store.proxyEndpoint)")
-                                    Text("Ollama upstream: \(store.upstreamEndpoint)")
-                                    if let error = store.proxyError {
-                                        Text(error).foregroundStyle(.red)
-                                    }
-                                    if let error = store.generationError {
-                                        Text(error).foregroundStyle(.red)
-                                    }
-                                }
-                            }
-                            .font(.caption).foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, 8)
-                        }
-                    }
-
-                    Divider()
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("System GPU").font(.headline)
-                        if let store, let sample = store.backendGPUActivity,
-                            store.systemGPUUtilizationPercent != nil
-                        {
-                            Text("Source: \(sample.source)")
-                        } else {
-                            Text(
-                                store?.gpuAvailabilityMessage
-                                    ?? "System GPU telemetry is unavailable on this Mac.")
-                        }
-                        Text(GPUActivityPresentation.explanation)
-                    }
-                    .font(.caption).foregroundStyle(.secondary)
+                    connectionSections
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .disabled(isApplying)
             }
 
             Divider()
@@ -158,6 +74,136 @@ public struct SettingsView: View {
             applyError = nil
             didApply = false
         }
+    }
+
+    private var generalSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("General").font(.headline)
+            HStack {
+                Toggle(
+                    "Launch at login",
+                    isOn: Binding(
+                        get: { launchAtLogin.isRequested },
+                        set: { enabled in
+                            Task { @MainActor in
+                                await launchAtLogin.setEnabled(enabled)
+                            }
+                        })
+                )
+                .disabled(launchAtLogin.isUpdating)
+                if launchAtLogin.isUpdating { ProgressView().controlSize(.small) }
+            }
+            Text("Changes to launch at login take effect immediately.")
+                .font(.caption).foregroundStyle(.secondary)
+            if launchAtLogin.status == .requiresApproval {
+                Text("FluxLLM won’t launch at login until you allow it in System Settings.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Open Login Items Settings") {
+                    launchAtLogin.openSystemSettings()
+                }
+            }
+            if let error = launchAtLogin.errorMessage {
+                Text(error).font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var connectionSections: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Menu bar").font(.headline)
+                Toggle("Show tokens per second", isOn: $settings.showMenuBarTokensPerSecond)
+                Toggle("Show FluxLLM logo", isOn: $settings.showMenuBarLogo)
+            }
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("LLM system").font(.headline)
+                Picker("System", selection: $selection) {
+                    ForEach(BackendSelection.allCases) { choice in
+                        Text(choice.title).tag(choice)
+                    }
+                }
+                if selection == .automatic {
+                    Text(
+                        "FluxLLM selects a detected system and remembers it while it remains available. Choose a system when several are detected."
+                    )
+                    .font(.caption).foregroundStyle(.secondary)
+                }
+                if let warning = BackendPresentation.selectionWarning(
+                    selection: selection, detected: store?.detectedBackends ?? [])
+                {
+                    Label(warning, systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                if let notice = store?.selectionNotice {
+                    Text(notice).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            detectionSection
+            Divider()
+
+            if selection == .ollama {
+                ollamaConfiguration
+            } else if let kind = selection.kind {
+                nativeConfiguration(kind)
+            } else {
+                if store?.backendKind == .ollama { ollamaConfiguration }
+                DisclosureGroup("Discovery addresses") {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if store?.backendKind != .ollama { ollamaConfiguration }
+                        ForEach(BackendKind.allCases.filter { $0 != .ollama }) { kind in
+                            nativeConfiguration(kind)
+                        }
+                    }.padding(.top, 12)
+                }
+            }
+
+            if let store {
+                DisclosureGroup("Connection details") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(
+                            store.connectionMessage
+                                ?? "Connection state: \(store.connectionState.rawValue)")
+                        if store.backendKind == .ollama {
+                            Text("Proxy: \(store.proxyState.rawValue)")
+                            Text("Client endpoint: \(store.proxyEndpoint)")
+                            Text("Ollama upstream: \(store.upstreamEndpoint)")
+                            if let error = store.proxyError {
+                                Text(error).foregroundStyle(.red)
+                            }
+                            if let error = store.generationError {
+                                Text(error).foregroundStyle(.red)
+                            }
+                        }
+                    }
+                    .font(.caption).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 8)
+                }
+            }
+
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                Text("System GPU").font(.headline)
+                if let store, let sample = store.backendGPUActivity,
+                    store.systemGPUUtilizationPercent != nil
+                {
+                    Text("Source: \(sample.source)")
+                } else {
+                    Text(
+                        store?.gpuAvailabilityMessage
+                            ?? "System GPU telemetry is unavailable on this Mac.")
+                }
+                Text(GPUActivityPresentation.explanation)
+            }
+            .font(.caption).foregroundStyle(.secondary)
+        }
+        .disabled(isApplying)
     }
 
     private var detectionSection: some View {

@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 import XCTest
 
@@ -73,6 +74,53 @@ final class SettingsWindowTests: XCTestCase {
         }
     }
 
+    func testLaunchAtLoginUpdatesKeepWindowSizeAndDoNotApplyInvalidConnectionDraft() async throws {
+        _ = NSApplication.shared
+        let suite = "com.cmorgan.FluxLLM.login-settings-window-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.backendSelection = .ollama
+        settings.proxyPort = 0
+        XCTAssertNotNil(settings.configurationError)
+        let service = SettingsLoginService()
+        let launchAtLogin = LaunchAtLoginController(service: service)
+        var applyCount = 0
+        let window = MenuBarController.makeSettingsWindow(
+            settings: settings, launchAtLogin: launchAtLogin,
+            onApply: { applyCount += 1 })
+        defer { window.close() }
+
+        // External changes, pending approval, and a not-found status all
+        // invalidate the same hosted view without changing its fixed size.
+        for status in [
+            SMAppService.Status.enabled, .requiresApproval, .notFound, .notRegistered,
+        ] {
+            service.status = status
+            launchAtLogin.refresh()
+            try assertStableLayout(window)
+        }
+
+        service.registrationError = NSError(
+            domain: "SettingsWindowTests", code: 1,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "The login setting could not be changed. Reopen FluxLLM and try again."
+            ])
+        await launchAtLogin.setEnabled(true)
+        XCTAssertNotNil(launchAtLogin.errorMessage)
+        try assertStableLayout(window)
+
+        service.registrationError = nil
+        await launchAtLogin.setEnabled(true)
+        try assertStableLayout(window)
+        await launchAtLogin.setEnabled(false)
+        try assertStableLayout(window)
+        XCTAssertEqual(settings.backendSelection, .ollama)
+        XCTAssertEqual(settings.proxyPort, 0)
+        XCTAssertEqual(applyCount, 0)
+    }
+
     func testNativeBackendValidationDoesNotDependOnUnusedOllamaFields() {
         XCTAssertNil(
             SettingsView.validationError(
@@ -112,4 +160,21 @@ final class SettingsWindowTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         try operation(AppSettings(defaults: defaults))
     }
+}
+
+@MainActor
+private final class SettingsLoginService: LaunchAtLoginService {
+    var status: SMAppService.Status = .notRegistered
+    var registrationError: Error?
+
+    func register() throws {
+        if let registrationError { throw registrationError }
+        status = .requiresApproval
+    }
+
+    func unregister() async throws {
+        status = .notRegistered
+    }
+
+    func openSystemSettings() {}
 }

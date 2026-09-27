@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settings: AppSettings
     private let metricsStore: MetricsStore
     private let coordinator: MonitoringCoordinator
+    private let launchAtLogin: LaunchAtLoginController
     private let menuBarController: MenuBarController
     private var startupTask: Task<Void, Never>?
     private var terminationTask: Task<Void, Never>?
@@ -31,11 +32,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let store = MetricsStore(historyDirectory: historyDirectory)
         let settings = AppSettings()
         let coordinator = MonitoringCoordinator(settings: settings, store: store)
+        let launchAtLogin = LaunchAtLoginController()
         self.settings = settings
         self.metricsStore = store
         self.coordinator = coordinator
+        self.launchAtLogin = launchAtLogin
         self.menuBarController = MenuBarController(
-            metricsStore: store, coordinator: coordinator, settings: settings)
+            metricsStore: store, coordinator: coordinator, settings: settings,
+            launchAtLogin: launchAtLogin)
         super.init()
     }
 
@@ -48,6 +52,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             metricsStore.startSampling()
             await coordinator.start()
         }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        launchAtLogin.refresh()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

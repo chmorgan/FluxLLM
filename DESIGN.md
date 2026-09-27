@@ -6,8 +6,8 @@ diagnostics.
 
 ## Ownership and data flow
 
-The executable creates one `AppSettings`, `MetricsStore`, `MonitoringCoordinator`, and AppKit
-`MenuBarController`. SwiftUI renders their state; it does not own listeners.
+The executable creates one `AppSettings`, `MetricsStore`, `MonitoringCoordinator`,
+`LaunchAtLoginController`, and AppKit `MenuBarController`. SwiftUI renders their state; it does not own listeners.
 
 ```text
 Native backend HTTP metrics ── BackendSample ───────────┐
@@ -20,6 +20,12 @@ The coordinator owns one selected backend session and its collectors. Applying s
 session; epoch checks reject delayed results. Observable state changes run on the main actor. Ordered proxy
 events pass through a coalescing inbox: cumulative progress may replace older pending progress, while lifecycle
 transitions and tool events retain order. Forwarded response bytes are independent of telemetry delivery.
+
+Launch at login is opt-in and uses `SMAppService.mainApp`. macOS owns its state; no separate preference is
+persisted. The General toggle applies immediately, independently of connection drafts and Save. Pending
+approval remains requested but is clearly identified as unable to launch until allowed in System Settings.
+Status refreshes whenever Settings opens or the app becomes active. Login launches reuse the normal quiet
+menu-bar startup path. Registration changes are serialized, and failures show the actual system status.
 
 ## Backends and selection
 
@@ -155,6 +161,7 @@ Ordinary tests use memory-only stores; persistence tests use isolated temporary 
 - [Backends](Sources/FluxLLM/Backends), [OllamaProxy](Sources/FluxLLM/OllamaProxy),
   [GPU](Sources/FluxLLM/GPU): acquisition and lifecycle.
 - [Telemetry](Sources/FluxLLM/Telemetry): contracts, settings, state, retention.
+- [System](Sources/FluxLLM/System): macOS login-item registration and status.
 - [UI](Sources/FluxLLM/UI): AppKit hosting, charts, rails, inspection, Settings.
 - [Tests](Tests/FluxLLMTests) and [scripts](scripts): regression tests and local fixtures.
 - [Branding](Resources/Branding/README.md): artwork sources and reproduction.

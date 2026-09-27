@@ -17,6 +17,11 @@ Choose a backend in Settings. For Ollama, point clients using `/api/chat` or
 `localhost:11434`. Other backends are monitored directly through their metrics
 or status endpoints.
 
+Enable **Settings → General → Launch at login** to start FluxLLM automatically
+when you sign in. The change takes effect immediately, without pressing Save.
+If macOS requires approval, use **Open Login Items Settings** to allow FluxLLM.
+You can turn the option off again without quitting the app.
+
 The dashboard's **Usage** row shows Ollama input/output tokens, tool calls, and
 requests. Choose **Since launch**, **Selected period**, or **Today**; totals are
 kept separately from the chart. `~` marks estimated output and `+` marks a known
