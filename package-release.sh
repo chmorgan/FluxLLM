@@ -187,7 +187,7 @@ release_commit="$(git -C "$repo_dir" rev-parse --verify "${tag_ref}^{commit}")" 
 if ! git -C "$repo_dir" show "$release_commit:package-release.sh" | cmp -s "$script_path" -; then
     fail "package-release.sh must match the copy committed in tag $release_tag. Commit the release tooling before tagging, or use the script from that tag."
 fi
-for source_file in build-dev.sh Package.resolved Resources/Info.plist LICENSE verify-release.sh generate-release-notes.sh; do
+for source_file in build-dev.sh Package.resolved Resources/Info.plist LICENSE verify-release.sh generate-release-notes.sh generate-release-casks.sh; do
     git -C "$repo_dir" cat-file -e "$release_commit:$source_file" || fail "Tag $release_tag is missing $source_file."
 done
 [[ "$(git -C "$repo_dir" rev-parse --is-shallow-repository)" == false ]] || fail "Release notes require full Git history. Fetch the complete history and release tags before packaging."
@@ -333,9 +333,10 @@ ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "$final_zip"
 )
 mv "$final_zip" "$temp_dir/SHA256SUMS" "$output_dir/"
 # Use the helper versions committed in the release, just like the build script.
-# Verification extracts the final ZIP, so it checks exactly what users download.
-bash "$worktree_dir/verify-release.sh" "$release_tag" --release-dir "$output_dir"
+# Cask generation verifies a snapshot of the final ZIP before using its checksum.
+bash "$worktree_dir/generate-release-casks.sh" "$release_tag" --release-dir "$output_dir"
 bash "$worktree_dir/generate-release-notes.sh" "$release_tag" --output "$output_dir/release-notes.md"
 printf 'Release ready: %s/%s\n' "$output_dir" "$archive_name"
 printf 'Checksum and source provenance: %s\n' "$output_dir"
-printf 'Edit release notes before publishing: %s/release-notes.md\n' "$output_dir"
+printf 'Generated Homebrew casks: %s/Casks\n' "$output_dir"
+printf 'Optional release-note edits: %s/release-notes.md\n' "$output_dir"

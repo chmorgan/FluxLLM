@@ -21,7 +21,7 @@ import zipfile
 
 SOURCE_ROOT = Path(sys.argv.pop(1))
 RELEASE_SCRIPT = SOURCE_ROOT / "package-release.sh"
-RELEASE_HELPERS = ("verify-release.sh", "generate-release-notes.sh")
+RELEASE_HELPERS = ("verify-release.sh", "generate-release-notes.sh", "generate-release-casks.sh")
 VERSION = "1.2.3"
 IDENTITY = "Developer ID Application: Release Test (TESTTEAM01)"
 PROFILE = "release-test-profile"
@@ -435,6 +435,14 @@ class ReleaseScriptTests(unittest.TestCase):
         self.assertTrue(notes.is_file(), self.last_output)
         self.assertIn(f"FluxLLM {VERSION}", notes.read_text())
         self.assertIn("Release fixture", notes.read_text())
+        checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+        for token in ("fluxllm", f"fluxllm@{VERSION}"):
+            cask = (output / "Casks" / f"{token}.rb").read_text()
+            self.assertIn(f'cask "{token}" do', cask)
+            self.assertIn(f'version "{VERSION}"', cask)
+            self.assertIn(f'sha256 "{checksum}"', cask)
+            self.assertIn(f'https://github.com/chmorgan/fluxllm/releases/download/{VERSION}/FluxLLM-{VERSION}.zip', cask)
+        self.assertFalse((self.repo / "Casks").exists())
 
     def assert_final_archive_verified(self):
         verifies = [call for call in self.calls("codesign") if "--verify" in call["args"]]
@@ -692,6 +700,20 @@ class ReleaseScriptTests(unittest.TestCase):
         self.assertIn("Fixture archive verification failed", result.stdout)
         self.assertNotIn("Release ready:", result.stdout)
         self.assertFalse((self.output / "release-notes.md").exists())
+        self.assertFalse((self.output / "Casks").exists())
+        self.assert_worktree_cleaned()
+
+    def test_cask_generation_failure_blocks_release_ready(self):
+        (self.repo / "generate-release-casks.sh").write_text(
+            "#!/bin/bash\necho 'Fixture cask generation failed' >&2\nexit 97\n"
+        )
+        self.retag_fixture()
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Fixture cask generation failed", result.stdout)
+        self.assertNotIn("Release ready:", result.stdout)
+        self.assertFalse((self.output / "release-notes.md").exists())
+        self.assertFalse((self.output / "Casks").exists())
         self.assert_worktree_cleaned()
 
     def test_note_generation_failure_blocks_release_ready(self):
