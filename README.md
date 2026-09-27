@@ -36,6 +36,41 @@ their server-reported token totals.
 
 See [DESIGN.md](DESIGN.md) for architecture, measurement semantics, and limitations.
 
+## Continuous integration
+
+The [CI workflow](.github/workflows/ci.yml) runs on pull requests and pushes with
+two independent jobs. Both use Python 3.12:
+
+- **macOS:** `macos-15` on Apple Silicon with Xcode 26.3 runs the Swift tests
+  with coverage, compiles the release app, and tests the packaging scripts.
+- **Python:** `ubuntu-26.04` runs the mock server tests.
+
+Run the same checks locally from the repository root. The Swift checks require
+a supported Mac with Xcode installed:
+
+```sh
+swift test --enable-code-coverage
+swift build -c release --product FluxLLMApp
+bash Tests/Scripts/package-release-tests.sh
+python3 -m unittest discover -s scripts -p 'test_mock*.py' -v
+```
+
+These checks need no downloaded models, external inference servers, or signing
+secrets. Backend integration tests use local mock servers; packaging tests mock
+builds, signing, and notarization.
+
+Three hardware tests are skipped by default. On a supported Mac, set the
+corresponding environment variable when running `swift test` to opt in:
+
+| Environment variable | Hardware check |
+| --- | --- |
+| `FLUXLLM_GPU_PROBE=1` | Enumerate GPU accelerators and clients through IOKit. |
+| `FLUXLLM_GPU_LIVE=1` | Read GPU activity from an already-running local Ollama worker. |
+| `FLUXLLM_SYSTEM_GPU_LIVE=1` | Read total system GPU utilization. |
+
+The live Ollama test does not start inference; start the required worker activity
+before running it. Regular GPU tests use fixtures and run in CI.
+
 ## Releases
 
 [package-release.sh](package-release.sh) builds a tagged version, signs and
