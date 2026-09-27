@@ -86,6 +86,15 @@ if args and args[0] == "api":
     if len(endpoints) != 1:
         sys.exit("Unexpected API invocation: " + repr(args))
     endpoint = endpoints[0]
+    if endpoint == "repos/chmorgan/fluxllm":
+        fail("visibility")
+        state["visibility_reads"] = state.get("visibility_reads", 0) + 1
+        result = state.get("repository", {"private": False})
+        if state.get("private_after_read") and state["visibility_reads"] > state["private_after_read"]:
+            result = {"private": True}
+        save()
+        print(json.dumps(result))
+        sys.exit(0)
     prefix = "repos/chmorgan/fluxllm/"
     if not endpoint.startswith(prefix):
         sys.exit("Unexpected repository: " + endpoint)
@@ -229,6 +238,64 @@ with Path(args[2]).open("x") as file:
 NOTES
 '''
 
+MOCK_CASKS = r'''#!/bin/bash
+set -euo pipefail
+python3 - "$@" <<'CASKS'
+import json
+import os
+from pathlib import Path
+import sys
+args = sys.argv[1:]
+with open(os.environ["PUBLISH_TEST_LOG"], "a") as log:
+    log.write(json.dumps({"tool": "casks", "args": args}) + "\n")
+if len(args) != 5 or args[:2] != ["1.2.3", "--release-dir"] or args[3] != "--output-dir":
+    sys.exit("Unexpected cask generation invocation: " + repr(args))
+if os.environ.get("PUBLISH_TEST_FAIL") == "casks":
+    sys.exit("Mock cask generation failure")
+source = Path(args[2])
+for name in ("FluxLLM-1.2.3.zip", "SHA256SUMS", "release-info.txt"):
+    if not (source / name).is_file():
+        sys.exit("Missing verified artifact for cask generation")
+state_path = Path(os.environ["PUBLISH_TEST_STATE"])
+state = json.loads(state_path.read_text())
+if state.get("change_after_casks"):
+    state["release"].update(state["change_after_casks"])
+if state.get("change_tag_after_casks"):
+    state["remote_commit"] = "f" * 40
+state_path.write_text(json.dumps(state))
+output = Path(args[4])
+output.mkdir()
+for name in ("fluxllm.rb", "fluxllm@1.2.3.rb"):
+    (output / name).write_text("generated fixture: " + name + "\n")
+CASKS
+'''
+
+MOCK_TAP = r'''import json
+import os
+from pathlib import Path
+
+def update_tap(source_repo, tag, cask_dir, stable):
+    with open(os.environ["PUBLISH_TEST_LOG"], "a") as log:
+        log.write(json.dumps({"tool": "tap", "repo": str(source_repo), "tag": tag,
+                              "casks": str(cask_dir), "stable": stable}) + "\n")
+    if tag != "1.2.3" or type(stable) is not bool:
+        raise RuntimeError("Unexpected tap invocation")
+    for name in ("fluxllm.rb", "fluxllm@1.2.3.rb"):
+        if (Path(cask_dir) / name).read_text() != "generated fixture: " + name + "\n":
+            raise RuntimeError("Expected generated cask bytes")
+    if os.environ.get("PUBLISH_TEST_FAIL") == "tap":
+        raise RuntimeError("Mock tap push failure")
+    state_path = Path(os.environ["PUBLISH_TEST_STATE"])
+    state = json.loads(state_path.read_text())
+    desired = {"tag": tag, "stable": stable}
+    updated = state.get("tap") != desired
+    if updated:
+        state["tap"] = desired
+        state["tap_commits"] = state.get("tap_commits", 0) + 1
+        state_path.write_text(json.dumps(state))
+    return {"updated": updated, "commit": "a" * 40 if updated else None}
+'''
+
 
 class PublishReleaseTests(unittest.TestCase):
     def setUp(self):
@@ -250,9 +317,12 @@ class PublishReleaseTests(unittest.TestCase):
             "PUBLISH_TEST_REMOTE_ASSETS": str(self.remote_assets),
         })
         shutil.copyfile(SOURCE_ROOT / "publish-release.sh", self.repo / "publish-release.sh")
-        for name, content in (("verify-release.sh", MOCK_VERIFY), ("generate-release-notes.sh", MOCK_NOTES)):
+        for name, content in (("verify-release.sh", MOCK_VERIFY), ("generate-release-notes.sh", MOCK_NOTES),
+                              ("generate-release-casks.sh", MOCK_CASKS)):
             (self.repo / name).write_text(content)
             (self.repo / name).chmod(0o755)
+        (self.repo / "scripts").mkdir()
+        (self.repo / "scripts/release_cask_tap.py").write_text(MOCK_TAP)
         (self.mockbin / "gh").write_text(MOCK_GH)
         (self.mockbin / "gh").chmod(0o755)
         (self.repo / ".gitignore").write_text(".build/\n")
@@ -344,6 +414,8 @@ class PublishReleaseTests(unittest.TestCase):
         self.assertIn(item["html_url"], result.stdout)
         self.assertTrue(self.calls("verify"))
         self.assertFalse(self.calls("notes"))
+        self.assertFalse(self.calls("casks"))
+        self.assertFalse(self.calls("tap"))
         self.assertEqual(sorted(path.name for path in self.remote_assets.iterdir()), sorted(ASSETS))
         self.assertTrue(any(call["args"][:2] == ["release", "download"] for call in self.calls("gh")))
         first_mutation = self.calls().index(self.mutations()[0])
@@ -370,6 +442,135 @@ class PublishReleaseTests(unittest.TestCase):
         self.run_script(VERSION, "--stable", "--publish")
         self.assertFalse(self.state()["release"]["draft"])
         self.assertFalse(self.state()["release"]["prerelease"])
+        self.assertEqual(len(self.calls("tap")), 1)
+        self.assertTrue(self.calls("tap")[0]["stable"])
+
+    def test_published_prerelease_updates_only_exact_cask_after_verification(self):
+        self.run_script(VERSION, "--publish")
+        self.assertEqual(len(self.calls("casks")), 1)
+        self.assertEqual(len(self.calls("tap")), 1)
+        self.assertFalse(self.calls("tap")[0]["stable"])
+        calls = self.calls()
+        published = next(index for index, item in enumerate(calls) if "--draft=false" in item.get("args", []))
+        last_verify = max(index for index, item in enumerate(calls) if item["tool"] == "verify")
+        casks = next(index for index, item in enumerate(calls) if item["tool"] == "casks")
+        tap = next(index for index, item in enumerate(calls) if item["tool"] == "tap")
+        self.assertLess(published, last_verify)
+        self.assertLess(last_verify, casks)
+        self.assertLess(casks, tap)
+        self.assertEqual(Path(self.calls("verify")[-1]["args"][2]), Path(self.calls("casks")[0]["args"][2]))
+        self.assertFalse((self.repo / "scripts/__pycache__").exists())
+
+    def test_published_retry_finishes_tap_without_another_release_mutation(self):
+        self.existing_published(prerelease=False)
+        shutil.rmtree(self.release_dir)
+        self.run_script(VERSION, "--publish")
+        self.run_script(VERSION, "--publish")
+        self.assertFalse(self.mutations())
+        self.assertEqual(self.state()["tap_commits"], 1)
+        self.assertEqual(len(self.calls("tap")), 2)
+        self.assertTrue(all(item["stable"] for item in self.calls("tap")))
+
+    def test_private_repository_blocks_draft_and_publication_mutations(self):
+        self.update_state(repository={"private": True})
+        for flags in ((), ("--publish",)):
+            with self.subTest(flags=flags):
+                result = self.run_script(VERSION, *flags, success=False)
+                self.assertIn("public chmorgan/fluxllm repository", result.stderr)
+        self.assertFalse(self.mutations())
+        self.assertFalse(self.calls("casks"))
+        self.assertFalse(self.calls("tap"))
+
+    def test_malformed_repository_visibility_blocks_mutations(self):
+        for repository in ({}, {"private": 0}, {"private": "false"}, []):
+            with self.subTest(repository=repository):
+                self.update_state(repository=repository)
+                self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.mutations())
+        self.assertFalse(self.calls("tap"))
+
+    def test_visibility_api_failure_blocks_mutations(self):
+        self.env["PUBLISH_TEST_FAIL"] = "visibility"
+        self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.mutations())
+
+    def test_private_published_release_reports_pending_tap(self):
+        self.existing_published()
+        self.update_state(repository={"private": True})
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("is published, but the Homebrew tap update is pending", result.stderr)
+        self.assertIn("./publish-release.sh " + VERSION + " --publish", result.stderr)
+        self.assertFalse(self.calls("casks"))
+        self.assertFalse(self.calls("tap"))
+        self.assertFalse(self.mutations())
+
+    def test_visibility_rechecked_before_updating_tap_after_publication(self):
+        self.update_state(private_after_read=1)
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.state()["release"]["draft"])
+        self.assertIn("Homebrew tap update is pending", result.stderr)
+        self.assertFalse(self.calls("casks"))
+        self.assertFalse(self.calls("tap"))
+
+    def test_visibility_changed_during_cask_generation_never_updates_tap(self):
+        self.existing_published()
+        self.update_state(private_after_read=1)
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("Homebrew tap update is pending", result.stderr)
+        self.assertTrue(self.calls("casks"))
+        self.assertFalse(self.calls("tap"))
+        self.assertFalse(self.mutations())
+
+    def test_cask_generation_failure_preserves_published_release_and_can_resume(self):
+        self.env["PUBLISH_TEST_FAIL"] = "casks"
+        result = self.run_script(VERSION, "--publish", success=False)
+        release = self.state()["release"]
+        self.assertFalse(release["draft"])
+        self.assertIn("Homebrew tap update is pending", result.stderr)
+        self.assertFalse(self.calls("tap"))
+        mutation_count = len(self.mutations())
+        del self.env["PUBLISH_TEST_FAIL"]
+        self.run_script(VERSION, "--publish")
+        self.assertEqual(self.state()["release"], release)
+        self.assertEqual(len(self.mutations()), mutation_count)
+        self.assertEqual(self.state()["tap_commits"], 1)
+
+    def test_tap_failure_preserves_release_and_quotes_complete_retry_command(self):
+        self.existing_published()
+        custom = self.root / "release output's $(touch unexpected)"
+        shutil.move(str(self.release_dir), str(custom))
+        self.env["PUBLISH_TEST_FAIL"] = "tap"
+        result = self.run_script(VERSION, "--publish", "--release-dir", str(custom), success=False)
+        self.assertIn("Homebrew tap update is pending", result.stderr)
+        retry = next(line.removeprefix("Retry: ") for line in result.stderr.splitlines() if line.startswith("Retry: "))
+        self.assertEqual(shlex.split(retry), ["./publish-release.sh", VERSION, "--publish", "--release-dir", str(custom)])
+        self.assertFalse(self.mutations())
+        self.assertNotIn("tap_commits", self.state())
+
+    def test_missing_tap_helper_reports_pending_tap(self):
+        self.existing_published()
+        (self.repo / "scripts/release_cask_tap.py").unlink()
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("Homebrew tap update is pending", result.stderr)
+        self.assertFalse(self.calls("tap"))
+        self.assertFalse(self.mutations())
+
+    def test_release_changed_during_cask_generation_never_updates_tap(self):
+        self.existing_published()
+        self.update_state(change_after_casks={"prerelease": False})
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("changed during cask generation", result.stderr)
+        self.assertIn("Homebrew tap update is pending", result.stderr)
+        self.assertFalse(self.calls("tap"))
+        self.assertFalse(self.mutations())
+
+    def test_tag_changed_during_cask_generation_never_updates_tap(self):
+        self.existing_published()
+        self.update_state(change_tag_after_casks=True)
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("Homebrew tap update is pending", result.stderr)
+        self.assertFalse(self.calls("tap"))
+        self.assertFalse(self.mutations())
 
     def test_existing_draft_updates_assets_and_notes(self):
         self.existing_draft()
@@ -405,12 +606,15 @@ class PublishReleaseTests(unittest.TestCase):
         self.run_script(VERSION)
         self.assertFalse(self.mutations())
         self.assertEqual(len(self.calls("verify")), 1)
+        self.assertFalse(self.calls("casks"))
+        self.assertFalse(self.calls("tap"))
 
     def test_published_prerelease_preserved_with_stable_flag(self):
         self.existing_published()
         result = self.run_script(VERSION, "--publish", "--stable")
         self.assertIn("Published prerelease verified", result.stdout)
         self.assertTrue(self.state()["release"]["prerelease"])
+        self.assertFalse(self.calls("tap")[0]["stable"])
         self.assertFalse(self.mutations())
 
     def test_published_retry_does_not_require_or_modify_notes(self):
@@ -501,7 +705,10 @@ class PublishReleaseTests(unittest.TestCase):
     def test_published_retry_verifier_failure_is_not_success(self):
         self.existing_published()
         self.env["PUBLISH_TEST_FAIL"] = "verify"
-        self.run_script(VERSION, "--publish", success=False)
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("Homebrew tap update is pending", result.stderr)
+        self.assertIn("Retry: ./publish-release.sh " + VERSION + " --publish", result.stderr)
+        self.assertFalse(self.calls("tap"))
         self.assertFalse(self.mutations())
 
     def test_published_retry_download_failure_is_not_success(self):
@@ -516,6 +723,8 @@ class PublishReleaseTests(unittest.TestCase):
         self.assertFalse(self.state()["release"]["draft"])
         self.assertIn("release was published, but final verification failed", result.stderr)
         self.assertIn("Rerun the same command", result.stderr)
+        self.assertIn("Homebrew tap update is pending", result.stderr)
+        self.assertFalse(self.calls("tap"))
 
     def test_published_retry_rechecks_remote_tag(self):
         self.existing_published()

@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 exec python3 - "$SCRIPT_DIR" "$@" <<'PY'
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -65,6 +66,13 @@ def check_tag(tag, commit):
                            "Push the correct tag; never move an existing release tag.")
 
 
+def require_public_repository():
+    repository = gh_json("api", API)
+    if not isinstance(repository, dict) or repository.get("private") is not False:
+        raise ReleaseError("Public Homebrew downloads require a public chmorgan/fluxllm repository. "
+                           "Authenticated private-repository downloads are not configured.")
+
+
 def find_release(tag):
     pages = gh_json("api", "--paginate", "--slurp", f"{API}/releases")
     if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
@@ -78,7 +86,7 @@ def find_release(tag):
 def require_draft(release, tag, assets):
     if not release or release.get("tag_name") != tag or release.get("draft") is not True:
         raise ReleaseError("Refusing to modify a published release. Use a new version for changes.")
-    if type(release.get("id")) is not int:
+    if type(release.get("id")) is not int or release["id"] <= 0:
         raise ReleaseError("GitHub returned an invalid release ID.")
     names = [asset["name"] for asset in release.get("assets", [])]
     if len(names) != len(set(names)) or set(names) - set(assets):
@@ -160,10 +168,35 @@ def verify_published_release(repo_dir, tag, commit, release, assets, downloaded,
     return final
 
 
+def pending_tap_error(tag, error):
+    retry = shlex.join(["./publish-release.sh", *sys.argv[1:]])
+    return ReleaseError(f"FluxLLM {tag} is published, but the Homebrew tap update is pending.\n"
+                        f"{error}\nRetry: {retry}")
+
+
 def after_published_verification(repo_dir, tag, commit, snapshot, release):
-    # Shared completion point for publication and a verified published retry.
-    # Any follow-up must use snapshot and release["prerelease"], not CLI defaults.
-    pass
+    # Keep publication and tap updates separate: a failed Git push must never
+    # replace, retract, or otherwise change an already verified release.
+    try:
+        require_public_repository()
+        assets = [f"FluxLLM-{tag}.zip", "SHA256SUMS", "release-info.txt"]
+        before = published_fingerprint(release, tag, assets)
+        casks = snapshot.parent / "Casks"
+        run("bash", repo_dir / "generate-release-casks.sh", tag,
+            "--release-dir", snapshot, "--output-dir", casks, capture=False)
+        check_tag(tag, commit)
+        final = gh_json("api", f"{API}/releases/{release['id']}")
+        if published_fingerprint(final, tag, assets) != before:
+            raise ReleaseError("Published release changed during cask generation; investigate before retrying.")
+        require_public_repository()
+        # Load our sibling helper without creating __pycache__ in the checkout.
+        sys.dont_write_bytecode = True
+        spec = importlib.util.spec_from_file_location("release_cask_tap", repo_dir / "scripts/release_cask_tap.py")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        helper.update_tap(repo_dir, tag, casks, stable=not final["prerelease"])
+    except Exception as error:
+        raise pending_tap_error(tag, error) from error
 
 
 def regular_file(path):
@@ -197,11 +230,14 @@ def main():
                "  - Never modifies published releases.\n"
                "  - Reruns verify published assets without requiring local files or notes.\n"
                "  - Existing local files must match; partial release directories are rejected.\n"
+               "  - --publish also commits and pushes casks to main; reruns finish pending updates.\n"
+               "  - Newer stable releases advance the current cask; prereleases add only the exact version.\n"
+               "  - Public GitHub downloads are required; drafts never update the tap.\n"
                "  - Requires authenticated gh, Python 3.9+, and macOS verification tools.")
     parser.add_argument("tag", metavar="TAG", help="existing plain MAJOR.MINOR.PATCH tag, without v")
     parser.add_argument("--release-dir", metavar="DIR", help="existing local artifacts to compare or upload (default: .build/releases/TAG)")
     parser.add_argument("--publish", action="store_true", help="publish a verified draft; safely resume an existing publication")
-    parser.add_argument("--stable", action="store_true", help="stage/publish drafts as stable; existing published status is preserved")
+    parser.add_argument("--stable", action="store_true", help="use stable for drafts (default: prerelease); preserve published status")
     args = parser.parse_args()
     tag = args.tag
     if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
@@ -246,7 +282,12 @@ def main():
         release = find_release(tag)
         if release is not None and release.get("draft") is False:
             downloaded = Path(temporary) / "published"
-            release = verify_published_release(repo_dir, tag, commit, release, assets, downloaded, local)
+            try:
+                release = verify_published_release(repo_dir, tag, commit, release, assets, downloaded, local)
+            except Exception as error:
+                if args.publish:
+                    raise pending_tap_error(tag, error) from error
+                raise
             if args.publish:
                 after_published_verification(repo_dir, tag, commit, downloaded, release)
             kind = "prerelease" if release["prerelease"] else "stable release"
@@ -254,6 +295,7 @@ def main():
             return
         if local is None:
             missing_release_directory()
+        require_public_repository()
         print(f"Verifying FluxLLM {tag} before upload…", flush=True)
         run("bash", repo_dir / "verify-release.sh", tag, "--release-dir", snapshot, capture=False)
         if not notes.exists() and not notes.is_symlink():
@@ -302,9 +344,9 @@ def main():
                 release = verify_published_release(
                     repo_dir, tag, commit, published, assets, Path(temporary) / "published", snapshot)
             except (ReleaseError, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-                raise ReleaseError("The release was published, but final verification failed. "
-                                   "Rerun the same command to verify it without replacing assets. "
-                                   f"{error}") from error
+                raise pending_tap_error(
+                    tag, "The release was published, but final verification failed. "
+                    "Rerun the same command to verify it without replacing assets. " + str(error)) from error
             after_published_verification(repo_dir, tag, commit, Path(temporary) / "published", release)
         info = gh_json("release", "view", tag, "--repo", REPO, "--json", "url")
         print(("Published" if args.publish else "Draft ready") + f": {info['url']}")
