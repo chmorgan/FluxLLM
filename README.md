@@ -42,7 +42,7 @@ The [CI workflow](.github/workflows/ci.yml) runs on pull requests and pushes wit
 two independent jobs. Both use Python 3.12:
 
 - **macOS:** `macos-15` on Apple Silicon with Xcode 26.3 runs the Swift tests
-  with coverage, compiles the release app, and tests the packaging scripts.
+  with coverage, compiles the release app, and tests all release scripts.
 - **Python:** `ubuntu-26.04` runs the mock server tests.
 
 Run the same checks locally from the repository root. The Swift checks require
@@ -51,13 +51,17 @@ a supported Mac with Xcode installed:
 ```sh
 swift test --enable-code-coverage
 swift build -c release --product FluxLLMApp
-bash Tests/Scripts/package-release-tests.sh
+(
+  for test_script in Tests/Scripts/*-tests.sh; do
+    bash "$test_script" || exit
+  done
+)
 python3 -m unittest discover -s scripts -p 'test_mock*.py' -v
 ```
 
 These checks need no downloaded models, external inference servers, or signing
-secrets. Backend integration tests use local mock servers; packaging tests mock
-builds, signing, and notarization.
+secrets. Backend integration tests use local mock servers; release-script tests
+use fixtures and mock builds, signing, notarization, and GitHub operations.
 
 Three hardware tests are skipped by default. On a supported Mac, set the
 corresponding environment variable when running `swift test` to opt in:
@@ -74,10 +78,10 @@ before running it. Regular GPU tests use fixtures and run in CI.
 ## Releases
 
 [package-release.sh](package-release.sh) builds a tagged version, signs and
-notarizes it, verifies the final ZIP, and generates release notes for Apple
-Silicon on macOS 15+. Run packaging on an Apple Silicon Mac with Xcode tools,
-Python 3.9+, and a full clone with its tags. Publishing uses the GitHub CLI
-(`gh`), authenticated for `chmorgan/fluxllm`.
+notarizes it, verifies the final ZIP, and generates release notes and Homebrew
+casks for Apple Silicon on macOS 15+. Run packaging on an Apple Silicon Mac
+with Xcode tools, Python 3.9+, and a full clone with its tags. Publishing uses
+the GitHub CLI (`gh`), authenticated for `chmorgan/fluxllm`.
 
 ### One-time setup
 
@@ -93,7 +97,16 @@ To create a password, sign in at [account.apple.com](https://account.apple.com)
 and select **Sign-In and Security → App-Specific Passwords → Generate an
 app-specific password**.
 
+For publishing, configure your Git commit name and email and authenticate `gh`
+with permission to publish releases and push cask updates to `main`. Branch
+protection still applies; the script reports a rejected push without bypassing
+the repository's rules.
+
 ### 1. Tag and package
+
+Before preparing release changes on `main`, run `git pull --ff-only origin main`
+to include prior automated cask commits. If your branch has diverged, integrate
+the remote changes through your normal Git workflow first.
 
 Review and commit all release changes, including tooling, dependency pins, and
 `LICENSE`. From that commit on `main`, run these commands in the same terminal,
@@ -112,6 +125,9 @@ The script must match its copy in the tag. It builds that commit in isolation
 and derives the app version and archive name from the tag. Before reporting
 `Release ready`, it verifies the archive checksum, contents, version, commit,
 architecture, signature, stapled notarization, and Gatekeeper acceptance.
+It also writes `Casks/fluxllm.rb` and `Casks/fluxllm@<tag>.rb` beneath the release
+output directory, using the verified ZIP's checksum. These generated files are
+local release artifacts; publishing updates the repository's tap automatically.
 Existing output directories are never overwritten; retry with `--output-dir`
 pointing to a new directory under `.build/` or outside the repository, and update
 `release_dir` accordingly.
@@ -150,10 +166,10 @@ too.
 
 ### 3. Stage and publish
 
-Create or update a draft test release:
+Create or update a draft stable release:
 
 ```sh
-./publish-release.sh "$release_tag"
+./publish-release.sh "$release_tag" --stable
 ```
 
 The script verifies the archive and remote tag, uploads the ZIP, checksum, and
@@ -161,13 +177,29 @@ release metadata, then downloads the assets to verify their contents. Review
 the draft's notes and files, then publish:
 
 ```sh
-./publish-release.sh "$release_tag" --publish
+./publish-release.sh "$release_tag" --stable --publish
 ```
 
-Both commands default to a prerelease. Add `--stable` to both for a stable
-release. If packaging used a custom output directory, add
-`--release-dir "$release_dir"` to both commands. Published releases cannot be
-modified by this script; use a new version for subsequent changes.
+After publication and download verification, the script commits and pushes
+`Casks/fluxllm@<tag>.rb` to `main`. A newer stable release also updates
+`Casks/fluxllm.rb`. The cask commit follows the release tag; older versioned
+casks are preserved. This push leaves your local checkout unchanged. Drafts
+leave the tap untouched.
+
+For a prerelease, omit `--stable` from both commands. Prereleases get only their
+version-specific cask. For custom packaging output, add
+`--release-dir "$release_dir"` to both commands.
+
+If publication or the cask push fails, rerun the same publishing command. For
+an already published release, the script downloads and verifies its assets,
+then finishes any missing tap update. A missing default release directory is
+fine; if custom output is gone, omit `--release-dir` when retrying. Any existing
+local release directory must contain complete artifacts.
+
+A completed update creates no extra commit, and rerunning an older release
+never downgrades `fluxllm.rb`. Conflicting existing casks cause an error.
+Published assets, notes, and release status are preserved; use a new version
+for subsequent changes, and keep historical assets available for older casks.
 
 To rerun archive verification independently:
 
@@ -201,5 +233,30 @@ prints the setup command.
 
 </details>
 
-Homebrew installation instructions will be added once the first release and
-cask are available and verified.
+## Install with Homebrew
+
+Once a stable release and its cask have been published, install the current
+release with:
+
+```sh
+brew tap chmorgan/fluxllm https://github.com/chmorgan/fluxllm.git
+brew install --cask chmorgan/fluxllm/fluxllm
+```
+
+The existing repository serves as the public tap; no separate `homebrew-`
+repository or download credentials are needed. Use `brew upgrade --cask
+chmorgan/fluxllm/fluxllm` to update to the current stable release.
+
+To select an exact published version, including a prerelease, use its versioned
+cask. Only one FluxLLM cask can be installed at a time, so uninstall the current
+cask before switching:
+
+```sh
+brew uninstall --cask chmorgan/fluxllm/fluxllm
+brew install --cask chmorgan/fluxllm/fluxllm@0.1.1
+```
+
+Replace `0.1.1` with the published version you want. If switching from another
+exact version, use that cask's name in the uninstall command. Versioned casks
+stay on their selected release; their GitHub release assets must remain
+available.
