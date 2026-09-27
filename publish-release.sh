@@ -87,7 +87,83 @@ def require_draft(release, tag, assets):
 
 
 def refresh_draft(release, tag, assets):
-    return require_draft(gh_json("api", f"{API}/releases/{release['id']}"), tag, assets)
+    refreshed = require_draft(gh_json("api", f"{API}/releases/{release['id']}"), tag, assets)
+    if refreshed["id"] != release["id"]:
+        raise ReleaseError("GitHub release identity changed; retry after investigating.")
+    return refreshed
+
+
+def published_fingerprint(release, tag, assets):
+    if (not isinstance(release, dict) or release.get("tag_name") != tag or
+            release.get("draft") is not False or type(release.get("prerelease")) is not bool):
+        raise ReleaseError("Expected the published GitHub release and its actual release status.")
+    if type(release.get("id")) is not int or release["id"] <= 0:
+        raise ReleaseError("GitHub returned an invalid release ID.")
+    items = release.get("assets")
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ReleaseError("GitHub returned invalid published asset metadata.")
+    names = [item.get("name") for item in items]
+    if any(not isinstance(name, str) for name in names) or sorted(names) != sorted(assets):
+        raise ReleaseError("Published release must contain exactly the ZIP, SHA256SUMS, and release-info.txt.")
+    identities = []
+    for item in items:
+        if (type(item.get("id")) is not int or item["id"] <= 0 or
+                type(item.get("size")) is not int or item["size"] < 0 or
+                item.get("state") != "uploaded"):
+            raise ReleaseError("GitHub returned invalid published asset identity, size, or upload state.")
+        checksum = item.get("digest")
+        if checksum is not None and not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", str(checksum)):
+            raise ReleaseError("GitHub returned an invalid published asset digest.")
+        identities.append((item["name"], item["id"], item["size"], checksum, item.get("updated_at")))
+    if len({item[1] for item in identities}) != len(identities):
+        raise ReleaseError("GitHub returned duplicate published asset IDs.")
+    return release["id"], release["prerelease"], sorted(identities)
+
+
+def download_asset(asset, destination):
+    # Address the checked asset ID, not the mutable release tag or asset name.
+    env = dict(os.environ, GH_HOST="github.com", GH_PROMPT_DISABLED="1")
+    with destination.open("xb") as output:
+        result = subprocess.run(
+            ["gh", "api", f"{API}/releases/assets/{asset['id']}",
+             "--header", "Accept: application/octet-stream"],
+            cwd=SCRIPT_DIR, env=env, stdout=output, stderr=subprocess.PIPE)
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(f"GitHub asset download failed: {asset['name']}" +
+                           (f": {detail}" if detail else "."))
+    if destination.stat().st_size != asset["size"]:
+        raise ReleaseError(f"Downloaded asset size differs from GitHub metadata: {asset['name']}")
+    if asset.get("digest") and digest(destination).hex() != asset["digest"].split(":", 1)[1].lower():
+        raise ReleaseError(f"Downloaded asset checksum differs from GitHub metadata: {asset['name']}")
+
+
+def verify_published_release(repo_dir, tag, commit, release, assets, downloaded, local=None):
+    before = published_fingerprint(release, tag, assets)
+    refreshed = gh_json("api", f"{API}/releases/{release['id']}")
+    if published_fingerprint(refreshed, tag, assets) != before:
+        raise ReleaseError("Published release changed before verification; retry after investigating.")
+    downloaded.mkdir()
+    print(f"Verifying published FluxLLM {tag}…", flush=True)
+    for asset in refreshed["assets"]:
+        download_asset(asset, downloaded / asset["name"])
+    run("bash", repo_dir / "verify-release.sh", tag, "--release-dir", downloaded, capture=False)
+    if local is not None:
+        for name in assets:
+            if digest(downloaded / name) != digest(local / name):
+                raise ReleaseError(f"Published asset differs from the supplied local file: {name}. "
+                                   "Published releases are never overwritten.")
+    check_tag(tag, commit)
+    final = gh_json("api", f"{API}/releases/{release['id']}")
+    if published_fingerprint(final, tag, assets) != before:
+        raise ReleaseError("Published release changed during verification; retry after investigating.")
+    return final
+
+
+def after_published_verification(repo_dir, tag, commit, snapshot, release):
+    # Shared completion point for publication and a verified published retry.
+    # Any follow-up must use snapshot and release["prerelease"], not CLI defaults.
+    pass
 
 
 def regular_file(path):
@@ -111,7 +187,7 @@ def digest(path):
 def main():
     parser = argparse.ArgumentParser(
         prog="./publish-release.sh",
-        description="Create or update a verified draft prerelease for chmorgan/fluxllm.",
+        description="Stage, publish, or verify a FluxLLM release on GitHub.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Notes:\n"
                "  - Reads RELEASE_DIR/release-notes.md; generates it if missing.\n"
@@ -119,19 +195,26 @@ def main():
                "  - Uploads only the ZIP, SHA256SUMS, and release-info.txt.\n"
                "  - Verifies uploaded files before publishing.\n"
                "  - Never modifies published releases.\n"
+               "  - Reruns verify published assets without requiring local files or notes.\n"
+               "  - Existing local files must match; partial release directories are rejected.\n"
                "  - Requires authenticated gh, Python 3.9+, and macOS verification tools.")
     parser.add_argument("tag", metavar="TAG", help="existing plain MAJOR.MINOR.PATCH tag, without v")
-    parser.add_argument("--release-dir", metavar="DIR", help="default: .build/releases/TAG")
-    parser.add_argument("--publish", action="store_true", help="publish after staging and verifying the draft")
-    parser.add_argument("--stable", action="store_true", help="mark as stable (default: prerelease)")
+    parser.add_argument("--release-dir", metavar="DIR", help="existing local artifacts to compare or upload (default: .build/releases/TAG)")
+    parser.add_argument("--publish", action="store_true", help="publish a verified draft; safely resume an existing publication")
+    parser.add_argument("--stable", action="store_true", help="stage/publish drafts as stable; existing published status is preserved")
     args = parser.parse_args()
     tag = args.tag
     if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
         raise ReleaseError("Tag must be plain MAJOR.MINOR.PATCH, without a v prefix or suffix.")
     repo_dir = Path(run("git", "rev-parse", "--show-toplevel").strip())
     commit = run("git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}").strip()
-    release_dir = Path(args.release_dir).resolve() if args.release_dir else repo_dir / ".build/releases" / tag
-    if not release_dir.exists():
+    release_dir = Path(args.release_dir).expanduser().absolute() if args.release_dir else repo_dir / ".build/releases" / tag
+    if release_dir.is_symlink():
+        raise ReleaseError(f"Release directory must not be a symlink: {release_dir}")
+    release_dir = release_dir.resolve()
+    assets = [f"FluxLLM-{tag}.zip", "SHA256SUMS", "release-info.txt"]
+
+    def missing_release_directory():
         package_command = ["./package-release.sh", tag]
         if args.release_dir:
             package_command += ["--output-dir", str(release_dir)]
@@ -140,9 +223,13 @@ def main():
             f"Package the release first. From {repo_dir}, run:\n"
             f"  {shlex.join(package_command)}\n"
             "Retry publishing after packaging reports Release ready.")
-    if not release_dir.is_dir():
+    if release_dir.exists() and not release_dir.is_dir():
         raise ReleaseError(f"Release path is not a directory: {release_dir}")
-    assets = [f"FluxLLM-{tag}.zip", "SHA256SUMS", "release-info.txt"]
+    if args.release_dir and not release_dir.exists():
+        missing_release_directory()
+    if release_dir.exists():
+        for name in assets:
+            regular_file(release_dir / name)
     notes = release_dir / "release-notes.md"
     prerelease = "--prerelease=" + ("false" if args.stable else "true")
 
@@ -150,9 +237,23 @@ def main():
     with tempfile.TemporaryDirectory(prefix="fluxllm-publish-") as temporary:
         snapshot = Path(temporary) / "verified"
         snapshot.mkdir()
-        for name in assets:
-            regular_file(release_dir / name)
-            shutil.copyfile(release_dir / name, snapshot / name)
+        local = None
+        if release_dir.exists():
+            for name in assets:
+                shutil.copyfile(release_dir / name, snapshot / name)
+            local = snapshot
+        check_tag(tag, commit)
+        release = find_release(tag)
+        if release is not None and release.get("draft") is False:
+            downloaded = Path(temporary) / "published"
+            release = verify_published_release(repo_dir, tag, commit, release, assets, downloaded, local)
+            if args.publish:
+                after_published_verification(repo_dir, tag, commit, downloaded, release)
+            kind = "prerelease" if release["prerelease"] else "stable release"
+            print(f"Published {kind} verified: https://github.com/{REPO}/releases/tag/{tag}")
+            return
+        if local is None:
+            missing_release_directory()
         print(f"Verifying FluxLLM {tag} before upload…", flush=True)
         run("bash", repo_dir / "verify-release.sh", tag, "--release-dir", snapshot, capture=False)
         if not notes.exists() and not notes.is_symlink():
@@ -163,7 +264,6 @@ def main():
         shutil.copyfile(notes, snapshot / notes.name)
 
         check_tag(tag, commit)
-        release = find_release(tag)
         metadata = ["--repo", REPO, "--title", f"FluxLLM {tag}", prerelease,
                     "--notes-file", str(snapshot / notes.name)]
         if release is None:
@@ -195,6 +295,17 @@ def main():
         refresh_draft(release, tag, assets)
         if args.publish:
             run("gh", "release", "edit", tag, "--repo", REPO, "--draft=false", "--verify-tag", prerelease)
+            try:
+                published = gh_json("api", f"{API}/releases/{release['id']}")
+                if published.get("id") != release["id"]:
+                    raise ReleaseError("Published release identity changed.")
+                release = verify_published_release(
+                    repo_dir, tag, commit, published, assets, Path(temporary) / "published", snapshot)
+            except (ReleaseError, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+                raise ReleaseError("The release was published, but final verification failed. "
+                                   "Rerun the same command to verify it without replacing assets. "
+                                   f"{error}") from error
+            after_published_verification(repo_dir, tag, commit, Path(temporary) / "published", release)
         info = gh_json("release", "view", tag, "--repo", REPO, "--json", "url")
         print(("Published" if args.publish else "Draft ready") + f": {info['url']}")
         if not args.publish:

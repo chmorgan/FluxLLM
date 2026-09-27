@@ -22,6 +22,7 @@ REPOSITORY = "chmorgan/fluxllm"
 ASSETS = (f"FluxLLM-{VERSION}.zip", "SHA256SUMS", "release-info.txt")
 
 MOCK_GH = r'''#!/usr/bin/env python3
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -75,7 +76,10 @@ def capture_assets():
         path = Path(arg)
         if path.name in state["assets"] and path.is_file():
             shutil.copyfile(path, asset_dir / path.name)
-    state["release"]["assets"] = [{"name": path.name} for path in asset_dir.iterdir()]
+    state["release"]["assets"] = [
+        {"name": path.name, "id": 1000 + index, "size": path.stat().st_size,
+         "state": "uploaded", "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()}
+        for index, path in enumerate(sorted(asset_dir.iterdir()))]
 
 if args and args[0] == "api":
     endpoints = [arg for arg in args[1:] if arg.startswith("repos/")]
@@ -105,6 +109,16 @@ if args and args[0] == "api":
         print(json.dumps(result))
     elif endpoint == "git/tags/" + "a" * 40 and state.get("annotated"):
         print(json.dumps({"object": {"type": "commit", "sha": state["remote_commit"]}}))
+    elif endpoint.startswith("releases/assets/"):
+        fail("download-published")
+        if option("--header") != "Accept: application/octet-stream":
+            sys.exit("Expected binary asset Accept header")
+        asset_id = int(endpoint.rsplit("/", 1)[1])
+        asset = next(item for item in release()["assets"] if item["id"] == asset_id)
+        data = (Path(os.environ["PUBLISH_TEST_REMOTE_ASSETS"]) / asset["name"]).read_bytes()
+        if os.environ.get("PUBLISH_TEST_CORRUPT_PUBLISHED"):
+            data = b"x" * len(data)
+        sys.stdout.buffer.write(data)
     elif endpoint.startswith("releases/"):
         fail("refresh")
         item = release()
@@ -114,6 +128,9 @@ if args and args[0] == "api":
         changed = state.get("publish_after_read")
         if changed and state["draft_reads"] >= changed:
             item["draft"] = False
+        changes = state.get("release_changes_after_read")
+        if changes and state["draft_reads"] >= changes[0]:
+            item.update(changes[1])
         save()
         print(json.dumps(item))
     else:
@@ -303,6 +320,20 @@ class PublishReleaseTests(unittest.TestCase):
         for name in ASSETS:
             (self.remote_assets / name).write_text("previous asset content")
 
+    def existing_published(self, **changes):
+        import hashlib
+        self.existing_draft(draft=False)
+        for name in ASSETS:
+            shutil.copyfile(self.release_dir / name, self.remote_assets / name)
+        item = self.state()["release"]
+        item["assets"] = [
+            {"name": name, "id": 1000 + index, "state": "uploaded",
+             "size": (self.remote_assets / name).stat().st_size,
+             "digest": "sha256:" + hashlib.sha256((self.remote_assets / name).read_bytes()).hexdigest()}
+            for index, name in enumerate(ASSETS)]
+        item.update(changes)
+        self.update_state(release=item)
+
     def test_default_creates_verified_draft_prerelease(self):
         result = self.run_script(VERSION)
         item = self.state()["release"]
@@ -350,8 +381,159 @@ class PublishReleaseTests(unittest.TestCase):
             self.assertEqual((self.remote_assets / name).read_bytes(), (self.release_dir / name).read_bytes())
 
     def test_existing_published_release_is_immutable(self):
-        self.existing_draft(draft=False)
+        self.existing_published()
+        before = self.state()["release"]
+        result = self.run_script(VERSION, "--publish")
+        self.assertIn("Published prerelease verified", result.stdout)
+        self.assertEqual(self.state()["release"], before)
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_recovers_without_local_artifacts_or_notes(self):
+        self.existing_published(prerelease=False)
+        shutil.rmtree(self.release_dir)
+        result = self.run_script(VERSION, "--publish")
+        self.assertIn("Published stable release verified", result.stdout)
+        self.assertFalse(self.release_dir.exists())
+        self.assertFalse(self.calls("notes"))
+        self.assertEqual(len(self.calls("verify")), 1)
+        self.assertFalse(self.mutations())
+        verified = Path(self.calls("verify")[0]["args"][2])
+        self.assertFalse(verified.exists())
+
+    def test_published_verification_without_publish_is_read_only(self):
+        self.existing_published()
+        self.run_script(VERSION)
+        self.assertFalse(self.mutations())
+        self.assertEqual(len(self.calls("verify")), 1)
+
+    def test_published_prerelease_preserved_with_stable_flag(self):
+        self.existing_published()
+        result = self.run_script(VERSION, "--publish", "--stable")
+        self.assertIn("Published prerelease verified", result.stdout)
+        self.assertTrue(self.state()["release"]["prerelease"])
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_does_not_require_or_modify_notes(self):
+        self.existing_published()
+        self.notes.unlink()
+        self.run_script(VERSION, "--publish")
+        self.assertFalse(self.notes.exists())
+        self.assertFalse(self.calls("notes"))
+
+    def test_published_retry_rejects_different_local_artifacts(self):
+        self.existing_published()
+        (self.release_dir / ASSETS[0]).write_bytes(b"different local archive")
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("differs from the supplied local file", result.stderr)
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_rejects_partial_local_directory(self):
+        self.existing_published()
+        (self.release_dir / ASSETS[0]).unlink()
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("Required file is missing", result.stderr)
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_rejects_explicit_missing_directory(self):
+        self.existing_published()
+        result = self.run_script(VERSION, "--publish", "--release-dir", str(self.root / "missing"), success=False)
+        self.assertIn("Release directory does not exist", result.stderr)
+        self.assertFalse(self.calls())
+
+    def test_published_retry_rejects_dangling_default_directory_symlink(self):
+        self.existing_published()
+        shutil.rmtree(self.release_dir)
+        self.release_dir.symlink_to(self.root / "missing")
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("must not be a symlink", result.stderr)
+        self.assertFalse(self.calls())
+
+    def test_published_retry_rejects_missing_or_extra_assets(self):
+        self.existing_published()
+        assets = self.state()["release"]["assets"]
+        for changed in (assets[:-1], assets + [dict(assets[0], name="unexpected.zip")]):
+            with self.subTest(assets=changed):
+                item = self.state()["release"]
+                item["assets"] = changed
+                self.update_state(release=item)
+                self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_rejects_invalid_release_metadata(self):
+        self.existing_published()
+        initial = self.state()["release"]
+        for changes in ({"id": True}, {"id": -1}, {"prerelease": None}, {"assets": None}):
+            with self.subTest(changes=changes):
+                self.update_state(release=dict(initial, **changes))
+                self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_rejects_invalid_asset_metadata(self):
+        self.existing_published()
+        initial = self.state()["release"]
+        for changes in ({"id": True}, {"id": -1}, {"id": 1001}, {"size": "10"},
+                        {"state": "new"}, {"digest": "invalid"}):
+            with self.subTest(changes=changes):
+                item = json.loads(json.dumps(initial))
+                item["assets"][0].update(changes)
+                self.update_state(release=item)
+                self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_rejects_corrupted_download(self):
+        self.existing_published()
+        self.env["PUBLISH_TEST_CORRUPT_PUBLISHED"] = "1"
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertIn("checksum differs from GitHub metadata", result.stderr)
+        self.assertFalse(self.calls("verify"))
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_accepts_legacy_assets_without_github_digest(self):
+        self.existing_published()
+        item = self.state()["release"]
+        for asset in item["assets"]:
+            asset.pop("digest")
+        self.update_state(release=item)
+        self.run_script(VERSION, "--publish")
+        self.assertTrue(self.calls("verify"))
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_verifier_failure_is_not_success(self):
+        self.existing_published()
+        self.env["PUBLISH_TEST_FAIL"] = "verify"
         self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_download_failure_is_not_success(self):
+        self.existing_published()
+        self.env["PUBLISH_TEST_FAIL"] = "download-published"
+        self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.mutations())
+
+    def test_failure_after_publication_explains_safe_retry(self):
+        self.env["PUBLISH_TEST_FAIL"] = "download-published"
+        result = self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.state()["release"]["draft"])
+        self.assertIn("release was published, but final verification failed", result.stderr)
+        self.assertIn("Rerun the same command", result.stderr)
+
+    def test_published_retry_rechecks_remote_tag(self):
+        self.existing_published()
+        self.update_state(change_tag_after=1)
+        self.run_script(VERSION, "--publish", success=False)
+        self.assertFalse(self.mutations())
+
+    def test_published_retry_rejects_release_changed_during_verification(self):
+        self.existing_published()
+        initial = self.state()["release"]
+        changed_assets = json.loads(json.dumps(initial["assets"]))
+        changed_assets[0]["id"] += 10
+        for changes in ({"id": 456}, {"prerelease": False}, {"draft": True},
+                        {"assets": changed_assets}):
+            with self.subTest(changes=changes):
+                self.update_state(release=initial, draft_reads=0, release_changes_after_read=[2, changes])
+                result = self.run_script(VERSION, "--publish", success=False)
+                self.assertNotIn("Published prerelease verified", result.stdout)
         self.assertFalse(self.mutations())
 
     def test_unexpected_draft_assets_are_not_overwritten_or_published(self):
@@ -426,7 +608,7 @@ class PublishReleaseTests(unittest.TestCase):
         self.assertIn("./package-release.sh " + VERSION, result.stderr)
         self.assertIn("Release ready", result.stderr)
         self.assertFalse(self.release_dir.exists())
-        self.assertFalse(self.calls())
+        self.assertFalse(self.mutations())
 
     def test_missing_custom_release_directory_suggests_shell_quoted_packaging_command(self):
         custom = self.root / "release output's $(touch unexpected); [draft]"
