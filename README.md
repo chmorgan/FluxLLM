@@ -1,5 +1,13 @@
 # FluxLLM
 
+## Origin
+
+I wanted to see what ollama was going on my MacBook and couldn't find a status bar app that I liked. Here is the product of lots of AI prompts to tweak the look and feel and operation to what I thought would be a neat looking tool. I hope you enjoy it as much as I do.
+
+If there is something you'd like tweaked or fixed feel free to open issues or PRs.
+
+## Features
+
 A macOS 15+ menu bar app for monitoring LLM inference with Ollama, vLLM,
 Rapid-MLX, and llama.cpp. Shows token throughput, activity history, and this
 Mac’s total GPU utilization.
