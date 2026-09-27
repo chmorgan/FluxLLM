@@ -1,0 +1,83 @@
+{
+  "design": "OllamaFlux concept 3D",
+  "status": "Visual reference handoff; no production artwork or app integration is included.",
+  "source": "concept-3d-board.png",
+  "source_pixels": [
+    1448,
+    1086
+  ],
+  "source_sha256": "58be00e60d9c9c7bcd2b022ba13685bd721930df5f8ecd7160fdcaf2e4423aaa",
+  "crop_format": "[left, top, right, bottom] in source pixels, right/bottom exclusive",
+  "reference_images": [
+    {
+      "file": "main-logo-reference.png",
+      "crop": [
+        135,
+        170,
+        1315,
+        561
+      ],
+      "pixels": [
+        1180,
+        391
+      ],
+      "processing": "Crop only; no resizing, background removal, tracing, or redrawing."
+    },
+    {
+      "file": "llama-mark-reference.png",
+      "crop": [
+        140,
+        175,
+        495,
+        559
+      ],
+      "pixels": [
+        355,
+        384
+      ],
+      "processing": "Crop only; no resizing, background removal, tracing, or redrawing."
+    },
+    {
+      "file": "app-icon-reference.png",
+      "crop": [
+        140,
+        654,
+        409,
+        911
+      ],
+      "pixels": [
+        269,
+        257
+      ],
+      "processing": "Crop only; no resizing, background removal, tracing, or redrawing."
+    },
+    {
+      "file": "status-bar-reference.png",
+      "crop": [
+        643,
+        718,
+        790,
+        856
+      ],
+      "pixels": [
+        147,
+        138
+      ],
+      "processing": "Crop only; no resizing, background removal, tracing, or redrawing."
+    },
+    {
+      "file": "status-wave-reference.png",
+      "crop": [
+        669,
+        749,
+        770,
+        825
+      ],
+      "pixels": [
+        101,
+        76
+      ],
+      "processing": "Crop only; no resizing, background removal, tracing, or redrawing."
+    }
+  ]
+}

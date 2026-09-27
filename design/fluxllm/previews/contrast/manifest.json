@@ -1,0 +1,80 @@
+{
+  "status": "historical comparison; inner-edge revision superseded by the unoutlined status mark",
+  "visible_inner_edge_points": 0.5,
+  "edge_colors": {
+    "light": "#0B1F3B",
+    "dark": "#EAF0F9"
+  },
+  "source": {
+    "file": "Masters/status-mark.svg",
+    "sha256": "b07e8468215f20eb4e6464377fd5783ce1b32ca23ec795397e4e421a79f4b2a3"
+  },
+  "files": [
+    {
+      "file": "status-original.svg",
+      "sha256": "b07e8468215f20eb4e6464377fd5783ce1b32ca23ec795397e4e421a79f4b2a3"
+    },
+    {
+      "file": "status-original.png",
+      "sha256": "e01dedf2fdb39a03e39d133f33e6e4210870503d07615476da0d1c9ee6d863bc",
+      "pixels": [
+        24,
+        18
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "status-original@2x.png",
+      "sha256": "977d46cb5f47a30d14503d17eb69b48e800fdaf9faf9e82e1a0b0f15e0815256",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "status-light.svg",
+      "sha256": "b094026a8e470955d547ad55b24a0f36541847d4d7ffc866dde2e8e7dbf783bc"
+    },
+    {
+      "file": "status-light.png",
+      "sha256": "dec5b5f367ce2fb3bda6b4ae693cbb93b283fe7b38ba4332635384c6adebe17e",
+      "pixels": [
+        24,
+        18
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "status-light@2x.png",
+      "sha256": "19b8915c5f7c1bfd3915207513a844e7a51ce4ac7af95cf8ca7553dbaf6b9ce9",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "status-dark.svg",
+      "sha256": "0e745a6341ce9eed26bf8385310f46fce22791662c0588842536a4a7edade559"
+    },
+    {
+      "file": "status-dark.png",
+      "sha256": "8e492e1ca7f50de70b26d555711cd9a1f4e2893064ed3dc13b129e61c527de75",
+      "pixels": [
+        24,
+        18
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "file": "status-dark@2x.png",
+      "sha256": "b7cd04e81619483f0d5a5da51b361556bb8cf739ddd0702f3aaa550b627b977d",
+      "pixels": [
+        48,
+        36
+      ],
+      "mode": "RGBA"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="18" viewBox="0 0 101 76" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">FluxLLM — concept 3D status mark</title>
+  <desc id="desc">A detached blue/cyan dot beside a tall asymmetric waveform. Editable reconstruction from the approved reference; no background tile or shadow.</desc>
+  <defs>
+    <linearGradient id="wave-blue" x1="49" y1="4" x2="43" y2="71" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00B1F4"/>
+      <stop offset="0.40" stop-color="#009CFF"/>
+      <stop offset="0.76" stop-color="#075DFE"/>
+      <stop offset="1" stop-color="#0836F4"/>
+    </linearGradient>
+    <linearGradient id="wave-cyan" x1="57" y1="33" x2="94" y2="39" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#04D3DC" stop-opacity="0"/>
+      <stop offset="0.62" stop-color="#04C9E5" stop-opacity="0.86"/>
+      <stop offset="1" stop-color="#06D6C9"/>
+    </linearGradient>
+    <linearGradient id="dot-blue" x1="8" y1="31" x2="18" y2="49" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00C5F3"/>
+      <stop offset="0.5" stop-color="#008FFF"/>
+      <stop offset="1" stop-color="#075BF4"/>
+    </linearGradient>
+    <path id="wave-contour" d="M 26.0 39.0
+      C 30.9 38.8 33.5 43.1 36.0 50.4
+      C 37.5 54.6 39.5 58.4 41.8 48.2
+      C 46.0 30.1 50.3 4.5 62.0 4.5
+      C 74.8 3.7 76.8 37.8 82.0 43.1
+      C 85.2 46.5 88.7 37.0 97.6 38.0
+      C 94.9 41.7 93.0 50.9 88.7 56.0
+      C 83.9 62.0 79.3 59.8 75.0 51.6
+      C 69.7 41.9 68.8 22.2 63.6 21.9
+      C 59.2 21.6 57.4 36.1 53.3 48.0
+      C 48.8 62.1 45.1 72.2 39.5 72.1
+      C 32.3 72.3 28.5 60.1 26.4 50.2
+      C 25.3 45.4 24.8 41.0 26.0 39.0 Z"/>
+  </defs>
+  <circle id="separate-dot" cx="13.2" cy="39.65" r="8.7" fill="url(#dot-blue)"/>
+  <use href="#wave-contour" fill="url(#wave-blue)"/>
+  <use href="#wave-contour" fill="url(#wave-cyan)"/>
+</svg>
