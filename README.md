@@ -6,6 +6,31 @@ I wanted to see what ollama was going on my MacBook and couldn't find a status b
 
 If there is something you'd like tweaked or fixed feel free to open issues or PRs.
 
+## Preview
+
+Captured from the running FluxLLM app (version 0.1.0) during real local Ollama inference.
+
+Live request activity and token throughput:
+
+<img src="docs/media/live-monitoring.gif" width="865" alt="Animated FluxLLM dashboard showing live Ollama request activity, token throughput, and system GPU utilization">
+
+Track throughput, this Mac’s total GPU utilization, request timelines, and usage totals:
+
+<img src="docs/media/dashboard.png" width="865" alt="FluxLLM dashboard with token throughput and system GPU charts, colored request timelines, tool activity, and usage totals">
+
+<details>
+<summary>More screenshots</summary>
+
+Review 30 minutes of inference activity and request history:
+
+<img src="docs/media/history.png" width="865" alt="FluxLLM dashboard showing a 30-minute history of inference throughput, GPU utilization, and requests">
+
+Configure backend connections and menu-bar preferences:
+
+<img src="docs/media/settings.png" width="560" alt="FluxLLM Settings with backend selection, connection configuration, and menu-bar preferences">
+
+</details>
+
 ## Features
 
 A macOS 15+ menu bar app for monitoring LLM inference with Ollama, vLLM,
