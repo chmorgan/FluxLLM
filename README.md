@@ -31,6 +31,34 @@ Configure backend connections and menu-bar preferences:
 
 </details>
 
+## Install with Homebrew
+
+Once a stable release and its cask have been published, install the current
+release with:
+
+```sh
+brew tap chmorgan/fluxllm https://github.com/chmorgan/fluxllm.git
+brew install --cask chmorgan/fluxllm/fluxllm
+```
+
+The existing repository serves as the public tap; no separate `homebrew-`
+repository or download credentials are needed. Use `brew upgrade --cask
+chmorgan/fluxllm/fluxllm` to update to the current stable release.
+
+To select an exact published version, including a prerelease, use its versioned
+cask. Only one FluxLLM cask can be installed at a time, so uninstall the current
+cask before switching:
+
+```sh
+brew uninstall --cask chmorgan/fluxllm/fluxllm
+brew install --cask chmorgan/fluxllm/fluxllm@0.1.1
+```
+
+Replace `0.1.1` with the published version you want. If switching from another
+exact version, use that cask's name in the uninstall command. Versioned casks
+stay on their selected release; their GitHub release assets must remain
+available.
+
 ## Features
 
 A macOS 15+ menu bar app for monitoring LLM inference with Ollama, vLLM,
@@ -262,31 +290,3 @@ A missing profile without an interactive terminal stops before building and
 prints the setup command.
 
 </details>
-
-## Install with Homebrew
-
-Once a stable release and its cask have been published, install the current
-release with:
-
-```sh
-brew tap chmorgan/fluxllm https://github.com/chmorgan/fluxllm.git
-brew install --cask chmorgan/fluxllm/fluxllm
-```
-
-The existing repository serves as the public tap; no separate `homebrew-`
-repository or download credentials are needed. Use `brew upgrade --cask
-chmorgan/fluxllm/fluxllm` to update to the current stable release.
-
-To select an exact published version, including a prerelease, use its versioned
-cask. Only one FluxLLM cask can be installed at a time, so uninstall the current
-cask before switching:
-
-```sh
-brew uninstall --cask chmorgan/fluxllm/fluxllm
-brew install --cask chmorgan/fluxllm/fluxllm@0.1.1
-```
-
-Replace `0.1.1` with the published version you want. If switching from another
-exact version, use that cask's name in the uninstall command. Versioned casks
-stay on their selected release; their GitHub release assets must remain
-available.
