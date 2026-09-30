@@ -175,26 +175,27 @@ final class SystemGPUMonitorTests: XCTestCase {
 
     func testRegistryParserReadsOnlyDeviceUtilizationNumber() {
         for value in [0.0, 23.5, 100.0] {
-            let properties: NSDictionary = [
-                "PerformanceStatistics": [
-                    "Device Utilization %": NSNumber(value: value),
-                    "Renderer Utilization %": NSNumber(value: 99),
-                    "Tiler Utilization %": NSNumber(value: 98),
-                ]
+            let statistics: NSDictionary = [
+                "Device Utilization %": NSNumber(value: value),
+                "Renderer Utilization %": NSNumber(value: 99),
+                "Tiler Utilization %": NSNumber(value: 98),
             ]
-            XCTAssertEqual(IOKitSystemGPURegistry.utilizationPercent(properties: properties), value)
+            XCTAssertEqual(IOKitSystemGPURegistry.utilizationPercent(statistics: statistics), value)
         }
 
-        let rendererOnly: NSDictionary = [
-            "PerformanceStatistics": ["Renderer Utilization %": NSNumber(value: 25)]
+        let rendererOnly: NSDictionary = ["Renderer Utilization %": NSNumber(value: 25)]
+        XCTAssertNil(IOKitSystemGPURegistry.utilizationPercent(statistics: rendererOnly))
+    }
+
+    func testRegistryParserRejectsMissingOrUnexpectedStatisticsPropertyShape() {
+        let malformed: [Any?] = [
+            nil, NSNull(), "25", NSNumber(value: 25), NSDictionary(),
+            [["Device Utilization %": NSNumber(value: 25)]],
+            ["PerformanceStatistics": ["Device Utilization %": NSNumber(value: 25)]],
         ]
-        XCTAssertNil(IOKitSystemGPURegistry.utilizationPercent(properties: rendererOnly))
-        XCTAssertNil(
-            IOKitSystemGPURegistry.utilizationPercent(
-                properties: ["Device Utilization %": NSNumber(value: 25)]))
-        XCTAssertNil(IOKitSystemGPURegistry.utilizationPercent(properties: [:]))
-        XCTAssertNil(
-            IOKitSystemGPURegistry.utilizationPercent(properties: ["PerformanceStatistics": "25"]))
+        for property in malformed {
+            XCTAssertNil(IOKitSystemGPURegistry.utilizationPercent(statistics: property))
+        }
     }
 
     func testRegistryParserRejectsBooleanStringsAndInvalidPercentages() {
@@ -206,9 +207,24 @@ final class SystemGPUMonitorTests: XCTestCase {
         for value in malformed {
             XCTAssertNil(
                 IOKitSystemGPURegistry.utilizationPercent(
-                    properties: ["PerformanceStatistics": ["Device Utilization %": value]]),
+                    statistics: ["Device Utilization %": value]),
                 "Unexpected utilization from \(value)")
         }
+    }
+
+    func testMissingStatisticsPropertyKeepsMultipleGPUSampleUnavailable() async {
+        let properties: [Any?] = [
+            ["Device Utilization %": NSNumber(value: 80)], nil,
+        ]
+        let devices = properties.enumerated().map { index, property in
+            SystemGPURegistryDevice(
+                registryID: UInt64(index + 1),
+                utilizationPercent: IOKitSystemGPURegistry.utilizationPercent(statistics: property))
+        }
+
+        let result = await sample(devices: devices)
+
+        assertUnavailable(result)
     }
 
     func testLiveSystemGPUWhenExplicitlyEnabled() async throws {

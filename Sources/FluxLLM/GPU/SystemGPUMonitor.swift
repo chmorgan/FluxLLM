@@ -82,7 +82,6 @@ struct SystemGPURegistrySnapshot: Sendable {
 
 enum SystemGPURegistryReadError: Error {
     case enumerationFailed
-    case propertiesUnavailable
 }
 
 enum IOKitSystemGPURegistry {
@@ -110,18 +109,15 @@ enum IOKitSystemGPURegistry {
                 throw SystemGPURegistryReadError.enumerationFailed
             }
             guard seenRegistryIDs.insert(registryID).inserted else { continue }
-            var properties: Unmanaged<CFMutableDictionary>?
-            let propertyResult = IORegistryEntryCreateCFProperties(
-                accelerator, &properties, kCFAllocatorDefault, 0)
-            guard propertyResult == KERN_SUCCESS, let properties else {
-                if let properties { _ = properties.takeRetainedValue() }
-                throw SystemGPURegistryReadError.propertiesUnavailable
-            }
-            let dictionary = properties.takeRetainedValue() as NSDictionary
+            // Only this property is consumed; avoid copying every driver property
+            // on each sample. A missing or unreadable value stays unavailable.
+            let statistics = IORegistryEntryCreateCFProperty(
+                accelerator, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0
+            )?.takeRetainedValue()
             devices.append(
                 SystemGPURegistryDevice(
                     registryID: registryID,
-                    utilizationPercent: utilizationPercent(properties: dictionary)))
+                    utilizationPercent: utilizationPercent(statistics: statistics)))
         }
         guard IOIteratorIsValid(accelerators) != 0 else {
             throw SystemGPURegistryReadError.enumerationFailed
@@ -129,8 +125,8 @@ enum IOKitSystemGPURegistry {
         return SystemGPURegistrySnapshot(devices: devices)
     }
 
-    static func utilizationPercent(properties: NSDictionary) -> Double? {
-        guard let statistics = properties["PerformanceStatistics"] as? NSDictionary,
+    static func utilizationPercent(statistics: Any?) -> Double? {
+        guard let statistics = statistics as? NSDictionary,
             let number = statistics["Device Utilization %"] as? NSNumber,
             CFGetTypeID(number) != CFBooleanGetTypeID()
         else { return nil }
