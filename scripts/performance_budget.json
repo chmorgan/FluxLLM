@@ -1,0 +1,38 @@
+{
+  "schema_version": 2,
+  "workload_version": 1,
+  "performance_deadline_seconds": 300,
+  "limits": {
+    "cpu_rolling_1s_percent": 5.0,
+    "lifetime_footprint_bytes": 64000000,
+    "physical_write_bytes_logging_off": 0,
+    "logical_write_bytes_logging_off": 0,
+    "gpu_percent": 1.0
+  },
+  "requirements": {
+    "complete_filesystem_write_coverage": true,
+    "gpu_counter_required": true
+  },
+  "cases": [
+    {"name": "populated-closed", "history": "populated", "ui": "closed", "stages": [
+      {"activity": "ordinary", "seconds": 35},
+      {"activity": "high-rate", "seconds": 35},
+      {"activity": "idle", "seconds": 5}
+    ]},
+    {"name": "populated-visible", "history": "populated", "ui": "visible", "stages": [
+      {"activity": "ordinary", "seconds": 15},
+      {"activity": "high-rate", "seconds": 15},
+      {"activity": "idle", "seconds": 15, "open_close_cycles": 3}
+    ]},
+    {"name": "fresh-never-opened", "history": "fresh", "ui": "never-opened", "stages": [
+      {"activity": "idle", "seconds": 10},
+      {"activity": "ordinary", "seconds": 10},
+      {"activity": "high-rate", "seconds": 10}
+    ]},
+    {"name": "logging-transitions", "history": "fresh", "ui": "never-opened", "stages": [
+      {"activity": "ordinary", "seconds": 10, "logging_enabled": false},
+      {"activity": "ordinary", "seconds": 10, "logging_enabled": true},
+      {"activity": "ordinary", "seconds": 10, "logging_enabled": false}
+    ]}
+  ]
+}

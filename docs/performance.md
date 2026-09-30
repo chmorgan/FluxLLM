@@ -1,225 +1,140 @@
-# Synthetic resource regression checks
+# Automated performance regression checks
 
-These checks reproduce monitoring overhead before any optimization. They exercise
-production FluxLLM components without loading a real model. Baseline collection is
-**not a passing performance test**. Resource limits must be reviewed and frozen
-after demonstrating the current problem, before changing production code.
+Run the actual Release application through a fixed synthetic workload:
 
-## What runs
+```sh
+python3 scripts/run_performance_checks.py check
+```
 
-`ResourceUsageRegressionTests.testSyntheticAppResourceUsage` creates a production
-proxy, HTTP backend client, monitoring coordinator, metrics store, menu-bar
-controller, and retained SwiftUI hosts. It uses a unique defaults suite, ephemeral
-loopback ports, and a temporary history directory. Discovery is restricted to the
-fixture endpoint; the test does not reconfigure or send requests to an installed
-Ollama or FluxLLM instance.
+The command builds the application, collector, and optimized tests; calibrates
+measurement; launches an isolated backend and fresh application processes;
+operates the native windows; applies HTTP streaming load; checks correctness;
+and writes JSON/JUnit results. It requires no manual window interaction or trace
+inspection. Build time is reported separately. The performance stage has a hard
+300-second deadline, including calibration, fixture preparation, app startup and
+shutdown, workload, and chart checks. Exceeding the deadline cannot pass.
 
-The external Python fixture is both the mock upstream and the streaming client.
-Its CPU and memory are outside the measured test-host process. It verifies every
-forwarded record, final counts, and progressive delivery at 25%, 50%, and 75% of
-the stream. A first fragment followed by a buffered response cannot pass. The
-Swift host also checks live token/TPS progress, overlapping requests, call/result
-events, retained history sizes, and durable totals after reloading the files.
+## Fixed workload
 
-The matrix contains 18 cases:
+| Fresh application process | Real-time sequence | Duration |
+| --- | --- | ---: |
+| Populated history, closed dashboard | Open/close dashboard; 35 s ordinary streaming; 35 s high-rate streaming; 5 s settled | 75 s |
+| Populated history, visible dashboard | 15 s ordinary; 15 s high-rate; 15 s idle with three close/reopen cycles | 45 s |
+| Fresh history, never opened | 10 s idle; 10 s ordinary; 10 s high-rate | 30 s |
+| Logging transitions | Continuous ordinary streaming: 10 s off, 10 s on, 10 s off | 30 s |
 
-| Dimension | Values |
-| --- | --- |
-| UI | `never-opened`, `visible`, `closed` |
-| History | `fresh`, `populated` |
-| Activity | `idle`, `ordinary`, `high-rate` |
+The total real-time workload is 180 seconds. The remaining allowance covers
+calibration, setup/ingestion, lifecycle acknowledgments, chart preparation, and
+cleanup. This replaces the previous combinatorial matrix. Short deterministic
+unit tests cover additional lifecycle, retention, correction, and failure cases;
+the default performance gate does not require a long soak.
 
-`closed` opens and closes both the popover and dashboard before every cycle,
-retaining the actual production hosts. `visible` exercises the popover and leaves
-the dashboard visible. Visibility is checked throughout measurement; covering or
-minimizing the dashboard invalidates a visible run. These cases require a logged-in
-desktop. The test host runs the native AppKit application event loop and waits for
-popover animation completion during setup. The native actions are invoked through
-their existing Objective-C selectors; a renamed action or missing retained host
-fails the fixture.
+The external synthetic Ollama server reports a loaded model and implements the
+monitoring endpoints. Two independent HTTP clients send chat requests through
+FluxLLM's production proxy. Ordinary streams emit 40 fragments per second per
+request; high-rate streams emit 200. No real model download or inference is
+required. The fixture verifies exact forwarded content, progressive delivery,
+tool calls/results, duplicate suppression, and final token corrections. The
+runner verifies that the requested load was delivered; generator delays cannot
+silently make the workload easier.
 
-Ordinary and high-rate workloads contain two overlapping chat requests at 40 and
-200 fragments/second **per request**, respectively. Each request includes one
-submitted tool result, one response tool call, and a repeated terminal tool call
-that must deduplicate. Final output tokens are `2 * floor(duration * rate) + 17`
-per request; input tokens are 23. They deliberately differ from live estimates.
+The populated fixture retains approximately 19,000 historical requests, 38,000
+tool events, 7,201 raw samples per series, four older archive hours, and 256 recent
+request lanes. Its identities, relative timestamps, and expected totals are
+fixed. Generating fixture data is external preparation; loading or ingesting it
+inside FluxLLM remains part of the app's measured lifetime. The baseline retains
+existing production persistence until the production history implementation is
+changed. Test setup must not disable the behavior being reproduced.
 
-Populated history contains 19,000 completed requests and 38,000 tool events across
-seven days, four older archive hours, and 7,201 raw half-second samples for each
-series. The raw hour includes another 256 completed requests and 512 tool events.
-The test verifies initial totals before measurement so losing history cannot
-produce an apparently better performance result. Setup, restoration, UI
-transitions, and forced final persistence are outside measured phases.
-
-Each cycle has a workload phase (65 seconds by default) and a settled phase (10
-seconds). Production 500 ms sampling, one-second backend/GPU polling, and normal
-persistence timers run throughout. The 65-second phase crosses two archive-write
-deadlines; the test does not force writes to imitate their timers. Three cycles
-are the default and the minimum for the retained-growth gate. The full matrix is
-at least 67.5 minutes plus setup; start with the reported closed-window case.
-After all measured phases, files are reloaded **before** shutdown or a forced
-flush. Completed request totals and tool results must already be durable after
-the settled period. Idle cases do not require an unchanged usage file to be
-rewritten. Each archived series must include measured samples newer than setup
-and no older than the 30-second write cadence plus one 60-second bucket and five
-seconds of scheduling slack. Seeded archive data cannot satisfy this check.
-Final shutdown durability is checked separately after the explicit flush; these
-reloads and their extra memory stay outside every measured phase.
-Phases delayed more than five seconds past their requested duration are invalid.
-This prevents a late final sample from diluting CPU or GPU cost with extra idle
-time after the fixed workload has finished.
+Native AppKit actions open, close, and restore the real windows at fixed sizes.
+The runner verifies visibility and ongoing telemetry/rendering rather than
+assuming that an action acknowledgment proves the complete UI workload ran.
+A covered or missing visible window invalidates that scenario.
 
 ## Measurements and limits
 
-| Measurement | Source and interpretation |
+The checked-in policy is `scripts/performance_budget.json`.
+
+| Measurement | Source and limit |
 | --- | --- |
-| CPU | Process user + system CPU seconds; gate the worst workload or settled phase as a percentage of wall time. Multicore use may exceed 100%. |
-| Physical memory | `proc_pid_rusage` physical footprint, sampled about once per second; phase endpoints and sampled peak, augmented by any new kernel lifetime high-water mark. |
-| Retained growth | Maximum increase from an earlier settled-phase minimum across repeated cycles. Absolute peak also has its own limit. |
-| GPU | Process-owned IOKit GPU execution counters, restricted to the test host PID and birth identity. Execution seconds divided by wall time can exceed 100% across concurrent queues. |
-| Writes/wakeups | Kernel cumulative physical/logical write and wakeup counters, reported as diagnostics. These are not counts of JSON saves or write syscalls. |
+| CPU | Kernel cumulative user + system CPU time, sampled approximately every 250 ms. Every evaluated rolling one-second window must be at most **5% of one CPU core**. |
+| Memory | Physical footprint plus the kernel lifetime high-water mark, strictly **less than 64,000,000 bytes**. Startup, history ingestion, and first dashboard opening count. |
+| GPU | Calibrated process-owned GPU execution seconds / elapsed seconds, at most **1%**. This is not whole-device utilization or Activity Monitor Energy Impact. |
+| Disk writes | Physical and logical write counters plus attributed filesystem traces. **Zero while logging is disabled**; enabled logging may write only its configured destination. |
+| Chart preparation | Every measured fresh 256-lane full-hour publication must use at most **15 ms CPU**. Full-hour preparation must stay within **2×** equivalent aligned-minute preparation. |
+| Hidden presentation | No new chart preparation or Canvas drawing while the corresponding surface is hidden. Monitoring and streaming continue. |
 
-GPU execution time is **not** whole-device utilization, GPU occupancy, or energy.
-The existing application System GPU chart cannot attribute cost to FluxLLM.
-The probe uses driver-specific counters and must be validated against a process
-trace on the target Mac/OS before a GPU budget can be accepted. Missing or unstable
-counters remain unavailable. A required GPU gate fails if any measured phase is
-unavailable; there is no zero or whole-system fallback. Rendering charged to
-WindowServer is outside this process metric. Cross-check overall rendering and
-energy with [Apple's Metal profiling tools](https://developer.apple.com/metal/tools/).
+The collector starts observation before resuming the app and verifies PID plus
+process birth identity. It preserves raw samples and obtains final process
+accounting before reaping the child. CPU time units are calibrated against
+`getrusage`; no processor-count division or observer-cost subtraction is used.
+Missing samples, invalid intervals, changed identities, and incomplete final
+accounting prevent a complete pass.
 
-The observer runs inside the test host and contributes CPU/memory. Reports expose
-its cumulative read-window CPU and elapsed time. Those windows also contain
-concurrent app work, so their CPU must **not** be subtracted. Validate observer
-overhead and compare matched runs using the same probe. The test host also has
-XCTest/runtime overhead; this is a stable synthetic comparison, not an exact
-measurement of the shipping application. Corroborate improvements in the app.
+GPU calibration runs a controlled Metal helper with idle, active, and unrelated
+process phases. The provider must respond to real GPU work and correctly support
+explicit zero readings. Native self-task counters, when supported and validated,
+are emitted over a dedicated pipe; that small read cost remains charged to the
+app. An independently calibrated IOKit provider may be used where supported.
+An absent process, field, or driver client is not an assumed zero. Provider and
+coverage information are included in the report, including any final sample gap.
+WindowServer activity is separate from process-owned GPU accounting.
 
-Sampled memory can miss a brief peak below the process's setup high-water mark.
-The report preserves the kernel lifetime peak, which includes setup, separately.
-Use an allocation/VM trace when investigating transient spikes. Retained caches
-may be legitimate; freeze tolerances from repeated measurements instead of
-requiring memory to return immediately to its launch value.
+Filesystem tracing uses noninteractive privileged `fs_usage` and an observed
+proof write to establish readiness. It checks direct app writes and matching
+isolated preference paths, including delegated writes. Unknown formats, dropped
+records, ambiguous attribution, or unavailable authorization invalidate complete
+write coverage. FluxLLM itself runs without elevated privileges. Logging
+boundaries use acknowledged enable/disable transactions and the writer's drain
+barrier; they do not grant a general exemption for unrelated writes.
 
-## Build and run
+## Baselines and comparison artifacts
 
-Build and run the Swift tests with the normal project workflow, then prepare a
-release `.xctest` bundle for resource measurements. Pass its absolute path to the
-runner, which does not build anything. Ordinary Swift test runs execute the small
-chart correctness checks and skip both long performance entry points unless their
-environment flags are set.
-
-Prepare the optimized test bundle with testable imports enabled:
+Record the same workload before changing production behavior:
 
 ```sh
-swift build -c release --build-tests -Xswiftc -enable-testing
+python3 scripts/run_performance_checks.py baseline
 ```
 
-After a release test bundle is available, start with the primary reproduction:
+Reports default to unique timestamped directories under `.performance-results/`,
+which is ignored by Git. Existing directories are never overwritten. Each run
+preserves raw measurements, operation and fixture logs, correctness outcomes,
+binary hashes, workload identity, machine/display configuration, and measurement
+provider details. Keep both the failing baseline and subsequent checks.
+
+Only compatible workload/environment/provider records should be compared.
+Production binary hashes are expected to differ across optimizations. A baseline
+is evidence, not a performance pass; neither recording nor comparing one changes
+the checked-in limits. Report status distinguishes resource regressions from
+invalid or incomplete measurements.
+
+The original XCTest-host reproduction remains available through the legacy
+`--command` runner interface for investigating prior results. Its CPU/memory
+include XCTest overhead and its old phases exclude setup; it must not be compared
+as if it measured the complete actual-app lifetime. Earlier reports are preserved
+locally under `.performance-results/legacy-baseline-2026-09-29/` when available.
+
+## Environment and CI
+
+The full suite requires macOS, the Swift/Xcode toolchain, Python 3, and a usable
+logged-in graphical session. It automatically checks GPU support and
+noninteractive filesystem-tracing authorization. Missing capabilities return a
+nonzero incomplete result while retaining the measurements that were available.
+Do not run other build or benchmark workloads on the same machine concurrently.
+
+`.github/workflows/performance.yml` invokes the same command on a GitHub-hosted
+macOS runner and preserves artifacts even when limits or capabilities fail.
+Manual dispatch can select an available Apple Silicon XLarge runner to evaluate
+GPU support. A hosted runner is accepted only after the automated calibration and
+UI/tracing checks succeed; hardware acceleration alone does not prove counter
+availability. The workflow's job timeout also allows for the separate build.
+
+Normal Swift, Python, and release-script checks remain independent of the
+five-minute performance stage. The fast Python harness checks run with:
 
 ```sh
-python3 scripts/run_performance_checks.py baseline \
-  --case closed/populated/ordinary --repetitions 3 \
-  --output-dir /tmp/fluxllm-performance-before \
-  --command xcrun xctest \
-  -XCTest FluxLLMTests.ResourceUsageRegressionTests/testSyntheticAppResourceUsage \
-  /absolute/path/to/FluxLLMPackageTests.xctest
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*performance*.py'
 ```
 
-Use an absolute test-bundle path: the test command runs in its isolated artifact
-directory. The output directory must be new/empty and outside the repository.
-Omit `--case` to run all 18 cases; repeat it to select several. `--cycles` defaults
-to 3; `--duration` supports 65–600 seconds; `--settle` supports 5–120 seconds.
-Longer runs, more cycles (up to 20), and repetitions can investigate slow growth.
-A one-cycle baseline is allowed for diagnostics but cannot establish a memory
-growth pass. Do not run other test suites concurrently with these measurements.
-
-Use the same Mac, OS, display resolution/scaling/refresh, and release configuration
-for comparisons. Keep other GPU-heavy applications quiet and the visible dashboard
-unobscured. The runner preserves `report.json`, per-run `result.json`, scenarios,
-fixture logs, and test logs. It terminates both process groups on completion,
-failure, timeout, or interruption. The default timeout includes 120 seconds for
-setup; raise `--timeout` if initial fixture preparation needs more time.
-
-## Freeze a failing budget before optimization
-
-1. Inspect baseline correctness and repeated measurements. Confirm the synthetic
-   profile reproduces the costly production paths. A failed setup or unavailable
-   counter is not proof of the energy issue.
-2. Choose explicit limits for CPU percentage, absolute peak footprint, retained
-   growth, and GPU execution percentage. Demonstrate the relevant current metrics
-   exceed those limits. Record the GPU attribution trace/evidence.
-3. Save the reviewed budget. Copy the exact `environment` and `scenario` objects
-   from the report. The runner includes a SHA256 of the workload/measurement
-   sources in the environment; changing those files invalidates a frozen budget.
-   Production source is deliberately excluded so optimizations can be compared.
-4. Run `check` with that budget on the unchanged implementation to establish the
-   failing resource test, then use the same budget and workload after fixes.
-
-Budget structure (placeholders are intentionally not executable limits):
-
-```text
-{
-  "schema_version": 1,
-  "environment": <exact environment object from the release baseline report>,
-  "gpu_attribution": {
-    "method": <same value as environment.gpu_method>,
-    "evidence": <description/path of reviewed process attribution trace>
-  },
-  "cases": {
-    "closed/populated/ordinary": {
-      "scenario": <exact scenario object from the report>,
-      "limits": {
-        "cpu_percent": <reviewed numeric limit>,
-        "peak_footprint_bytes": <reviewed integer limit>,
-        "retained_growth_bytes": <reviewed integer limit>,
-        "gpu_percent": <reviewed numeric limit>
-      }
-    }
-  }
-}
-```
-
-Then replace `baseline` with `check --budget /absolute/path/to/budget.json` in the
-run command and choose a different artifact directory. Check mode rejects missing
-budgets, debug configurations, incompatible environments/workloads, insufficient
-cycles, incomplete correctness manifests, and unavailable required metrics. Each
-repetition must pass; results are not averaged to hide a failed run. Baseline mode
-never creates limits automatically and never reports a regression pass.
-
-The workload fingerprint describes the source files supplied to the runner. Build
-the tests again after changing them; it cannot prove a stale bundle includes those
-sources. The report records the test bundle path and a diagnostic launcher hash
-(often `xcrun`), not a claimed identity of the linked production binary.
-
-## Focused chart reproduction
-
-`ChartPreparationPerformanceTests` includes ordinary correctness tests for fresh
-publications, cache reuse, missing observations, and whole-bucket boundaries.
-Its opt-in benchmark prepares 30 fresh publications for 1, 33, and 256 request
-lanes, comparing full-hour raw history against equivalent visible-minute input.
-The shorter input includes complete left-edge bucket contributors (121–125
-points), preventing different output from being mistaken for an optimization.
-
-```sh
-FLUXLLM_PERF_CHART=1 FLUXLLM_PERF_CHART_RESULT=/tmp/fluxllm-chart-before.json \
-  xcrun xctest \
-  -XCTest FluxLLMTests.ChartPreparationPerformanceTests/testFreshChartPublicationsReportCPUAndWallCost \
-  /absolute/path/to/FluxLLMPackageTests.xctest
-```
-
-The JSON includes per-publication CPU/wall time, actual input counts, output
-checksums, and correctness results. It is explicitly unbudgeted characterization,
-used to explain resource failures; the whole-app resource runner is the gate.
-
-Python harness checks (no Swift build):
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_performance_*.py'
-```
-
-These tests verify the fixture, progressive forwarding checks, budget validation,
-and runner isolation/cleanup. CI includes them in its Python test job. Passing
-them does not establish a FluxLLM resource baseline. Keep production optimization
-blocked until the Swift reproducer has run and the current failure has been
-demonstrated.
+A short successful run establishes coverage of the fixed regression workload. It
+does not establish absence of leaks that require hours to develop.

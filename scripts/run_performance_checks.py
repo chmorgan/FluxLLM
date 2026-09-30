@@ -256,11 +256,15 @@ def stop_process_group(process, grace=2):
             os.killpg(process.pid, signum)
         except ProcessLookupError:
             pass
-        except PermissionError:
+        except PermissionError as error:
             # macOS sandboxing can report EPERM, rather than ESRCH, after
-            # an exited process group disappears. Reap before interpreting it.
+            # an exiting process group disappears. Allow the short kernel
+            # transition to a reapable child before interpreting it as denial.
             if process.poll() is None:
-                raise
+                try:
+                    process.wait(timeout=0.05)
+                except subprocess.TimeoutExpired:
+                    raise error from None
 
     if os.name == "posix":
         signal_group(signal.SIGTERM)
@@ -394,7 +398,7 @@ def arguments(argv=None):
     return args
 
 
-def main(argv=None):
+def legacy_main(argv=None):
     args = arguments(argv)
     report = None
     output = None
@@ -474,6 +478,14 @@ def main(argv=None):
 
 def interrupted(_signal, _frame):
     raise KeyboardInterrupt
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if "--command" in argv:
+        return legacy_main(argv)
+    from app_performance import run
+    return run(argv)
 
 
 if __name__ == "__main__":
