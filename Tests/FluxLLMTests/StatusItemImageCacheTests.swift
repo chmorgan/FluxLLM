@@ -26,9 +26,98 @@ final class StatusItemImageCacheTests: XCTestCase {
         XCTAssertTrue(described.highlighted === initial.highlighted)
         XCTAssertEqual(described.normal.accessibilityDescription, "New model and request state")
         XCTAssertEqual(cache.renderCount, 1)
+        XCTAssertEqual(cache.layoutCount, 1)
         for image in [described.normal, described.highlighted] {
             XCTAssertEqual(image.representations.count, 2)
         }
+    }
+
+    func testTextAndMeterChangesReuseLayout() throws {
+        var cache = StatusItemImageCache()
+        let appearance = try XCTUnwrap(NSAppearance(named: .aqua))
+        let initial = cache.images(
+            snapshot: makeSnapshot(), availableHeight: 22, appearance: appearance,
+            numberCharacters: 3, visibility: StatusItemVisibility())
+        var previous = initial
+        for snapshot in [
+            makeSnapshot(number: "51"), makeSnapshot(number: "999"),
+            makeSnapshot(tps: 51), makeSnapshot(gpu: 43),
+        ] {
+            let next = cache.images(
+                snapshot: snapshot, availableHeight: 22, appearance: appearance,
+                numberCharacters: 3, visibility: StatusItemVisibility())
+            XCTAssertFalse(next.normal === previous.normal)
+            XCTAssertFalse(next.highlighted === previous.highlighted)
+            XCTAssertEqual(next.itemWidth, initial.itemWidth)
+            XCTAssertEqual(next.normal.size, initial.normal.size)
+            XCTAssertEqual(cache.layoutCount, 1)
+            previous = next
+        }
+        XCTAssertEqual(cache.renderCount, 5)
+    }
+
+    func testGeometryChangesInvalidateLayout() throws {
+        let appearance = try XCTUnwrap(NSAppearance(named: .aqua))
+        for (snapshot, height, width, visibility) in [
+            (makeSnapshot(), 19.0, 3, StatusItemVisibility()),
+            (makeSnapshot(), 22.0, 4, StatusItemVisibility()),
+            (makeSnapshot(number: "9999"), 22.0, 3, StatusItemVisibility()),
+            (makeSnapshot(), 22.0, 3, StatusItemVisibility(showLogo: false)),
+            (makeSnapshot(), 22.0, 3, StatusItemVisibility(showTokensPerSecond: false)),
+        ] {
+            var cache = StatusItemImageCache()
+            _ = cache.images(
+                snapshot: makeSnapshot(), availableHeight: 22, appearance: appearance,
+                numberCharacters: 3, visibility: StatusItemVisibility())
+            let next = cache.images(
+                snapshot: snapshot, availableHeight: height, appearance: appearance,
+                numberCharacters: width, visibility: visibility)
+            let expected = StatusItemPresentation.layout(
+                numberCharacters: max(width, snapshot.number.count), availableHeight: height,
+                visibility: visibility)
+            XCTAssertEqual(cache.layoutCount, 2)
+            XCTAssertEqual(next.itemWidth, expected.itemWidth)
+            XCTAssertEqual(next.normal.size, expected.imageSize)
+            let repeated = cache.images(
+                snapshot: snapshot, availableHeight: height, appearance: appearance,
+                numberCharacters: width, visibility: visibility)
+            XCTAssertEqual(cache.layoutCount, 2)
+            XCTAssertTrue(next.normal === repeated.normal)
+        }
+    }
+
+    func testAppearanceChangesReuseLayoutAndIdenticalDarkArtwork() throws {
+        var cache = StatusItemImageCache()
+        let light = try XCTUnwrap(NSAppearance(named: .aqua))
+        let dark = try XCTUnwrap(NSAppearance(named: .darkAqua))
+        let lightImages = cache.images(
+            snapshot: makeSnapshot(), availableHeight: 22, appearance: light,
+            numberCharacters: 3, visibility: StatusItemVisibility())
+        XCTAssertFalse(lightImages.normal === lightImages.highlighted)
+        let darkImages = cache.images(
+            snapshot: makeSnapshot(), availableHeight: 22, appearance: dark,
+            numberCharacters: 3, visibility: StatusItemVisibility())
+        XCTAssertTrue(darkImages.normal === darkImages.highlighted)
+        XCTAssertFalse(darkImages.normal === lightImages.normal)
+        XCTAssertEqual(darkImages.normal.representations.count, 2)
+        XCTAssertEqual(cache.layoutCount, 1)
+        XCTAssertEqual(cache.renderCount, 2)
+
+        let described = cache.images(
+            snapshot: makeSnapshot(summary: "Updated dark reading"), availableHeight: 22,
+            appearance: dark, numberCharacters: 3, visibility: StatusItemVisibility())
+        XCTAssertTrue(described.normal === darkImages.normal)
+        XCTAssertTrue(described.normal === described.highlighted)
+        XCTAssertEqual(described.highlighted.accessibilityDescription, "Updated dark reading")
+        XCTAssertEqual(cache.renderCount, 2)
+
+        let restored = cache.images(
+            snapshot: makeSnapshot(), availableHeight: 22, appearance: light,
+            numberCharacters: 3, visibility: StatusItemVisibility())
+        XCTAssertFalse(restored.normal === restored.highlighted)
+        XCTAssertEqual(restored.itemWidth, lightImages.itemWidth)
+        XCTAssertEqual(cache.layoutCount, 1)
+        XCTAssertEqual(cache.renderCount, 3)
     }
 
     func testEveryDrawnInputInvalidatesImages() throws {
@@ -70,6 +159,7 @@ final class StatusItemImageCacheTests: XCTestCase {
         XCTAssertTrue(initial.normal === next.normal)
         XCTAssertEqual(initial.itemWidth, next.itemWidth)
         XCTAssertEqual(cache.renderCount, 1)
+        XCTAssertEqual(cache.layoutCount, 1)
     }
 
     func testScalarMeterPeakKeepsUnavailableDistinctFromZero() {
