@@ -15,11 +15,62 @@ struct GPUResourceReading: Codable, Sendable {
     let gpu_interval_execution_seconds: Double?
 }
 
+// Preserve the field names in the performance JSON protocol.
+// swift-format-ignore: AlwaysUseLowerCamelCase
 struct GPUCapabilityReport: Codable, Sendable {
+    /// Kept as the live-counter capability for existing measurement consumers.
+    /// Passing a full-lifetime budget also requires full_lifetime_coverage.
     let available: Bool
+    let live_counter_available: Bool
+    let full_lifetime_coverage: Bool
+    let full_lifetime_unavailable_code: String
+    let full_lifetime_unavailable_reason: String
     let provider: String
     let reason: String?
     let calibration: GPUCalibrationEvidence?
+
+    init(available: Bool, provider: String, reason: String?, calibration: GPUCalibrationEvidence?) {
+        self.available = available
+        live_counter_available = available
+        // Neither current provider establishes that all work submitted by the
+        // process has completed or been cancelled when its terminal value is
+        // read. A final self sample precedes framework teardown; retained AGX
+        // registry properties have no validated finalization signal.
+        full_lifetime_coverage = false
+        full_lifetime_unavailable_code = "finalized_terminal_accounting_unsupported"
+        full_lifetime_unavailable_reason =
+            "Current GPU providers have no validated finalized terminal accounting. "
+            + "Live counters do not establish coverage through process exit and outstanding GPU work."
+        self.provider = provider
+        self.reason = reason
+        self.calibration = calibration
+    }
+
+    /// Deterministic protocol coverage: successful live calibration must not
+    /// silently turn into a full-lifetime capability, nor hide calibration
+    /// failures behind the independent terminal-accounting limitation.
+    static func verifyCoverageReporting() throws {
+        for liveAvailable in [false, true] {
+            let report = GPUCapabilityReport(
+                available: liveAvailable, provider: "self-test",
+                reason: liveAvailable ? nil : "Live calibration unavailable", calibration: nil)
+            let encoded = try JSONEncoder().encode(report)
+            let decoded = try JSONDecoder().decode(GPUCapabilityReport.self, from: encoded)
+            guard let fields = try JSONSerialization.jsonObject(with: encoded) as? [String: Any],
+                fields["available"] as? Bool == liveAvailable,
+                fields["live_counter_available"] as? Bool == liveAvailable,
+                fields["full_lifetime_coverage"] as? Bool == false,
+                fields["full_lifetime_unavailable_code"] as? String
+                    == "finalized_terminal_accounting_unsupported",
+                decoded.available == liveAvailable, decoded.live_counter_available == liveAvailable,
+                !decoded.full_lifetime_coverage, !decoded.full_lifetime_unavailable_reason.isEmpty,
+                decoded.reason == report.reason
+            else {
+                throw GPUCalibrationError.invalid(
+                    "GPU live/full-lifetime capability reporting self-test failed.")
+            }
+        }
+    }
 }
 
 // Preserve the field names in the performance JSON protocol.
@@ -62,7 +113,7 @@ actor GPUResourceProvider {
     /// must reject every missing interval rather than carrying the last value
     /// forward or treating this as an uninterrupted kernel lifetime counter.
     func sample() async -> GPUResourceReading {
-        guard let capability, capability.available,
+        guard let capability, capability.live_counter_available,
             capability.provider == Self.provider, capability.calibration != nil
         else {
             return unavailable(

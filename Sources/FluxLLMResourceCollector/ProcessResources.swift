@@ -4,12 +4,27 @@ import Foundation
 
 enum CollectorFailure: Error, CustomStringConvertible {
     case message(String)
+    case processLookup(pid: Int32, operation: ProcessLookupOperation, errorCode: Int32)
 
     var description: String {
         switch self {
         case .message(let value): value
+        case .processLookup(let pid, .birthTime, let errorCode):
+            "Cannot verify PID \(pid) and process birth time (errno \(errorCode))"
+        case .processLookup(let pid, .resourceUsage, let errorCode):
+            "proc_pid_rusage(\(pid), RUSAGE_INFO_V4) failed (errno \(errorCode))"
         }
     }
+}
+
+enum ProcessLookupOperation { case birthTime, resourceUsage }
+
+/// Injectable only to exercise exit-observation ordering without timing stress.
+/// Recovery still confirms the real owned child's exit before reading rusage.
+struct ExitTransitionObservation {
+    var clock: () -> Double = ProcessResources.monotonicSeconds
+    var pause: (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }
+    var hasExited: (ControlledProcess) throws -> Bool = { try $0.hasExited() }
 }
 
 /// Values returned by proc_pid_rusage are cumulative Mach ticks, not nanoseconds.
@@ -48,13 +63,96 @@ struct ProcessResources {
         (Double(userTicks) + Double(systemTicks)) * Double(numer) / Double(denom) / 1_000_000_000
     }
 
+    /// PID reuse is impossible while this collector still owns the unreaped
+    /// child. A completed exit can remove BSD birth metadata before a periodic
+    /// or buffered control-event sample runs; final rusage remains authoritative.
+    func snapshot(
+        phase: String, ownedChild child: ControlledProcess, permitZombie: Bool = false,
+        recoveryDeadline: Double = .infinity
+    ) throws -> [String: Any] {
+        guard child.pid == processID, !child.reaped else {
+            throw CollectorFailure.message(
+                "Resource sampling requires the original owned, unreaped child")
+        }
+        if permitZombie {
+            guard try child.hasExited() else {
+                throw CollectorFailure.message(
+                    "Final resource sampling requires a confirmed owned-child exit")
+            }
+            return try snapshot(phase: phase, permitZombie: true)
+        }
+        do {
+            return try snapshot(phase: phase)
+        } catch {
+            return try recoverSnapshotAfterExit(
+                error, phase: phase, ownedChild: child,
+                deadline: recoveryDeadline)
+        }
+    }
+
+    func recoverSnapshotAfterExit(
+        _ error: Error, phase: String, ownedChild child: ControlledProcess,
+        deadline: Double = .infinity,
+        observation: ExitTransitionObservation = ExitTransitionObservation()
+    ) throws -> [String: Any] {
+        guard let failure = error as? CollectorFailure,
+            case .processLookup(let failedPID, _, let errorCode) = failure,
+            errorCode == ESRCH, failedPID == processID,
+            child.pid == processID, !child.reaped
+        else {
+            throw error
+        }
+        let started = observation.clock()
+        guard started.isFinite, !deadline.isNaN, started < deadline else { throw error }
+        let end = min(deadline, started + 0.1)
+        var previous = started
+        var observations = 0
+        while true {
+            let now = observation.clock()
+            guard now.isFinite, now >= previous, now < end,
+                child.pid == processID, !child.reaped
+            else { throw error }
+            observations += 1
+            if try observation.hasExited(child) {
+                // Even a scripted test observation cannot authorize a live or
+                // reaped process. WNOWAIT keeps the original PID unreusable.
+                guard child.pid == processID, !child.reaped, try child.hasExited() else {
+                    throw error
+                }
+                let confirmedAt = observation.clock()
+                guard confirmedAt.isFinite, confirmedAt >= now, confirmedAt < end else {
+                    throw error
+                }
+                // Fresh kernel counters and the saved Mach start counter remain
+                // authoritative; no cached counters or missing-identity waiver.
+                var result = try snapshot(phase: phase, permitZombie: true)
+                result["exit_identity_recovery"] =
+                    [
+                        "errno": errorCode, "observations": observations,
+                        "wait_seconds": confirmedAt - started,
+                    ] as [String: Any]
+                return result
+            }
+            let after = observation.clock()
+            guard after.isFinite, after >= now, after < end else { throw error }
+            previous = after
+            observation.pause(min(0.001, end - after))
+        }
+    }
+
     func snapshot(phase: String, permitZombie: Bool = false) throws -> [String: Any] {
         let started = Self.monotonicSeconds()
         if !permitZombie, try Self.birthTime(of: processID) != birthTimeMicroseconds {
             throw CollectorFailure.message("The measured process identity changed")
         }
         let usage = try Self.readUsage(processID)
-        let timestamp = Self.monotonicSeconds()
+        // Instruments uses Mach absolute time; CLOCK_MONOTONIC has a different
+        // origin. Pair them on every sample instead of inferring an offset from
+        // wall-clock time or a rounded trace start date.
+        let clockBefore = Self.monotonicSeconds()
+        let absoluteTicks = mach_absolute_time()
+        let clockAfter = Self.monotonicSeconds()
+        let timestamp = (clockBefore + clockAfter) / 2
         guard usage.ri_proc_start_abstime == startAbsoluteTime else {
             throw CollectorFailure.message("The measured process start counter changed")
         }
@@ -66,6 +164,10 @@ struct ProcessResources {
             "type": "sample", "phase": phase,
             "process_id": processID, "birth_time_us": birthTimeMicroseconds,
             "monotonic_seconds": timestamp,
+            "mach_absolute_ticks": absoluteTicks,
+            "mach_absolute_seconds": Double(absoluteTicks) * Double(timebase.numer)
+                / Double(timebase.denom) / 1_000_000_000,
+            "clock_read_uncertainty_seconds": clockAfter - clockBefore,
             "counter_read_seconds": timestamp - started,
             "cpu_seconds": Self.cpuSeconds(
                 userTicks: usage.ri_user_time, systemTicks: usage.ri_system_time,
@@ -86,12 +188,14 @@ struct ProcessResources {
     static func birthTime(of pid: Int32) throws -> UInt64 {
         var info = proc_bsdinfo()
         let count = Int32(MemoryLayout<proc_bsdinfo>.size)
-        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, count) == count,
-            info.pbi_pid == UInt32(bitPattern: pid), info.pbi_start_tvsec > 0,
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, count) == count else {
+            throw CollectorFailure.processLookup(pid: pid, operation: .birthTime, errorCode: errno)
+        }
+        guard info.pbi_pid == UInt32(bitPattern: pid), info.pbi_start_tvsec > 0,
             info.pbi_start_tvsec <= UInt64.max / 1_000_000, info.pbi_start_tvusec < 1_000_000
         else {
             throw CollectorFailure.message(
-                "Cannot verify PID \(pid) and process birth time (errno \(errno))")
+                "Kernel process birth identity is invalid for PID \(pid)")
         }
         return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
     }
@@ -104,8 +208,8 @@ struct ProcessResources {
             }
         }
         guard status == 0 else {
-            throw CollectorFailure.message(
-                "proc_pid_rusage(\(pid), RUSAGE_INFO_V4) failed (errno \(errno))")
+            throw CollectorFailure.processLookup(
+                pid: pid, operation: .resourceUsage, errorCode: errno)
         }
         return usage
     }

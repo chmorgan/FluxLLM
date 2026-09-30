@@ -5,6 +5,16 @@ import Foundation
 
 nonisolated(unsafe) private var collectorInterrupted: sig_atomic_t = 0
 
+/// The runner owns one Instruments recording spanning calibration and every
+/// application lifetime. GPU capability remains deferred until it exports and
+/// validates that recording. Filesystem tracing is validated independently.
+private enum ExternalTrace {
+    static let enabled =
+        ProcessInfo.processInfo.environment["FLUXLLM_PERFORMANCE_EXTERNAL_TRACE"] == "1"
+    static let provider = "Instruments Metal System Trace (external session)"
+    static let reason = "Awaiting validation of the runner-owned Instruments recording"
+}
+
 @main
 struct FluxLLMResourceCollector {
     @MainActor
@@ -18,6 +28,9 @@ struct FluxLLMResourceCollector {
         }
         if arguments == ["--gpu-protocol-self-test-worker"] {
             exit(GPUResourceProvider.runProtocolSelfTestWorker())
+        }
+        if arguments == ["--resource-exit-self-test-worker"] {
+            exit(runResourceExitSelfTestWorker())
         }
         do {
             if arguments == ["--preflight"] {
@@ -89,13 +102,29 @@ struct FluxLLMResourceCollector {
         try emit(["type": "preflight_progress", "stage": "cpu_calibration"])
         let cpu = try ProcessResources.calibrateCPU()
         let usage = try ProcessResources.readUsage(getpid())
-        try emit(["type": "preflight_progress", "stage": "gpu_calibration"])
-        let gpu = await GPUResourceProvider.preflight(deadlineSeconds: 12)
+        let gpu: [String: Any]
+        let gpuMethod: String
+        if ExternalTrace.enabled {
+            gpuMethod = ExternalTrace.provider
+            gpu = [
+                "available": false, "live_counter_available": false,
+                "full_lifetime_coverage": false, "external_trace": true,
+                "provider": gpuMethod, "reason": ExternalTrace.reason,
+                "full_lifetime_unavailable_code": "external_trace_pending",
+                "full_lifetime_unavailable_reason": ExternalTrace.reason,
+            ]
+        } else {
+            try emit(["type": "preflight_progress", "stage": "gpu_calibration"])
+            let capability = await GPUResourceProvider.preflight(deadlineSeconds: 12)
+            gpu = try object(capability)
+            gpuMethod = capability.provider
+        }
         try emit(["type": "preflight_progress", "stage": "filesystem_trace"])
         let tracer = FileIOTracer(targetPID: nil, runID: nil, storageRoot: nil)
-        let trace = await tracer.start()
+        _ = await tracer.start()
         await tracer.stop()
-        let environment = collectorEnvironment(gpuMethod: gpu.provider)
+        let trace = tracer.capability
+        let environment = collectorEnvironment(gpuMethod: gpuMethod)
         let displayAvailable = environment["display_available"] == "true"
         let physical: [String: Any] = [
             "available": usage.ri_phys_footprint > 0,
@@ -107,7 +136,8 @@ struct FluxLLMResourceCollector {
             "cpu": cpu, "physical_footprint": physical,
             "physical_writes": ["available": true, "reason": NSNull()],
             "logical_writes": ["available": true, "reason": NSNull()],
-            "gpu": try object(gpu), "trace_coverage": try object(trace),
+            "gpu": gpu, "trace_coverage": try object(trace),
+            "external_trace": ExternalTrace.enabled,
             "display": [
                 "available": displayAvailable,
                 "reason": displayAvailable
@@ -117,9 +147,10 @@ struct FluxLLMResourceCollector {
             "elapsed_seconds": ProcessResources.monotonicSeconds() - started,
         ]
         try emit(result)
-        try emit(["type": "calibration", "cpu": cpu, "gpu": try object(gpu)])
+        try emit(["type": "calibration", "cpu": cpu, "gpu": gpu])
     }
 
+    @MainActor
     private static func selfTest() throws {
         let fractional = ProcessResources.cpuSeconds(
             userTicks: 24_000_000, systemTicks: 24_000_000,
@@ -137,7 +168,18 @@ struct FluxLLMResourceCollector {
         guard calibration["available"] as? Bool == true else {
             throw CollectorFailure.message("CPU self-calibration failed")
         }
+        let clockSample = try ProcessResources(processID: getpid()).snapshot(phase: "self_test")
+        guard let ticks = clockSample["mach_absolute_ticks"] as? UInt64, ticks > 0,
+            let seconds = clockSample["mach_absolute_seconds"] as? Double, seconds > 0,
+            let uncertainty = clockSample["clock_read_uncertainty_seconds"] as? Double,
+            uncertainty >= 0, uncertainty < 0.01
+        else {
+            throw CollectorFailure.message("Mach/monotonic clock pairing self-test failed")
+        }
         try GPUResourceProvider.verifyControlPipe()
+        try GPUCapabilityReport.verifyCoverageReporting()
+        try FileIOTracer.verifyClosingProofValidation()
+        try verifyOwnedExitSampling()
         let finalEvent: [String: Any] = [
             "type": "gpu_sample", "final": true, "process_id": 42,
             "birth_time_us": 123, "monotonic_seconds": 5.0,
@@ -157,8 +199,199 @@ struct FluxLLMResourceCollector {
         }
         try emit([
             "type": "self_test", "passed": true, "cpu": calibration, "short_line_pipe": true,
-            "raw_gpu_final_receipt": true,
+            "raw_gpu_final_receipt": true, "gpu_lifetime_capability_reporting": true,
+            "paired_mach_monotonic_clocks": true, "closing_filesystem_proof": true,
+            "owned_exit_resource_sampling": true, "bounded_exit_transition_recovery": true,
         ])
+    }
+
+    private static func runResourceExitSelfTestWorker() -> Int32 {
+        let count = 8 * 1_024 * 1_024
+        guard let allocation = malloc(count) else { return 2 }
+        defer { free(allocation) }
+        // An observable libc call prevents Release dead-store elimination of
+        // the temporary allocation used to exercise lifetime peak accounting.
+        arc4random_buf(allocation, count)
+        do {
+            let probe = try ProcessResources(processID: getpid())
+            let usage = try ProcessResources.readUsage(getpid())
+            try writeAll(
+                jsonLine([
+                    "type": "stopped", "command_id": "exit-race", "status": "ok",
+                    "process_id": getpid(), "birth_time_us": probe.birthTimeMicroseconds,
+                    "observed_peak_bytes": usage.ri_lifetime_max_phys_footprint,
+                ]), to: 4)
+            return 0
+        } catch { return 2 }
+    }
+
+    /// Exercise the real kernel/zombie state and a buffered authenticated pipe,
+    /// rather than relying on timing-sensitive repetitions of a fast shutdown.
+    private static func verifyOwnedExitSampling() throws {
+        let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
+        let child = try ControlledProcess(
+            executable: executable, environment: ProcessInfo.processInfo.environment,
+            arguments: ["--resource-exit-self-test-worker"])
+        defer { child.terminate() }
+        let probe = try ProcessResources(processID: child.pid)
+        let missing = CollectorFailure.processLookup(
+            pid: child.pid, operation: .birthTime, errorCode: ESRCH)
+        func requireRejection(
+            _ error: CollectorFailure, phase: String, deadline: Double = .infinity,
+            observation: ExitTransitionObservation = ExitTransitionObservation()
+        ) throws {
+            do {
+                _ = try probe.recoverSnapshotAfterExit(
+                    error, phase: "control_boundary", ownedChild: child,
+                    deadline: deadline, observation: observation)
+            } catch let actual {
+                guard String(describing: actual) == String(describing: error) else {
+                    throw CollectorFailure.message(
+                        "Exit-race recovery replaced an unrelated process failure during \(phase)")
+                }
+                return
+            }
+            throw CollectorFailure.message(
+                "Exit-race recovery accepted an unrelated process failure during \(phase)")
+        }
+        func requireImmediateRejection(_ error: CollectorFailure, phase: String) throws {
+            var callbacks = 0
+            let observation = ExitTransitionObservation(
+                clock: {
+                    callbacks += 1
+                    return 0
+                },
+                pause: { _ in callbacks += 1 },
+                hasExited: { _ in
+                    callbacks += 1
+                    return true
+                })
+            try requireRejection(error, phase: phase, deadline: 0, observation: observation)
+            guard callbacks == 0 else {
+                throw CollectorFailure.message(
+                    "Ineligible exit recovery invoked observation callbacks during \(phase)")
+            }
+        }
+        // Fake time makes the uncovered ordering and all timeout edges
+        // deterministic. The real owned child remains suspended throughout.
+        for (phase, deadline, reportsExit, expectedWait) in [
+            ("persistent not-exited", Double.infinity, false, 0.1),
+            ("clipped collector deadline", 0.0025, false, 0.0025),
+            ("expired collector deadline", 0.0, false, 0.0),
+            ("false exit observation for live child", Double.infinity, true, 0.0),
+        ] {
+            var clock = 0.0
+            var waits: [Double] = []
+            var observations = 0
+            let scripted = ExitTransitionObservation(
+                clock: { clock },
+                pause: { interval in
+                    waits.append(interval)
+                    clock += interval
+                },
+                hasExited: { _ in
+                    observations += 1
+                    return reportsExit
+                })
+            try requireRejection(missing, phase: phase, deadline: deadline, observation: scripted)
+            guard abs(clock - expectedWait) < 0.000_000_001,
+                waits.allSatisfy({ $0 > 0 && $0 <= 0.001 }),
+                expectedWait > 0 ? !waits.isEmpty : waits.isEmpty,
+                deadline > 0 ? observations > 0 : observations == 0
+            else {
+                throw CollectorFailure.message(
+                    "Exit-transition recovery violated its fixed polling bound during \(phase)")
+            }
+        }
+        let observationFailure = CollectorFailure.message("scripted exit observation failure")
+        do {
+            _ = try probe.recoverSnapshotAfterExit(
+                missing, phase: "control_boundary", ownedChild: child,
+                observation: ExitTransitionObservation(
+                    clock: { 0 }, pause: { _ in },
+                    hasExited: { _ in throw observationFailure }))
+            throw CollectorFailure.message("Exit recovery swallowed an observation error")
+        } catch {
+            guard String(describing: error) == String(describing: observationFailure) else {
+                throw error
+            }
+        }
+        try child.resume()
+        let deadline = ProcessResources.monotonicSeconds() + 3
+        while !(try child.hasExited()), ProcessResources.monotonicSeconds() < deadline {
+            usleep(1_000)
+        }
+        guard try child.hasExited() else {
+            throw CollectorFailure.message("Exit-race worker did not exit within its deadline")
+        }
+
+        let buffered = try readAvailable(child.eventDescriptor)
+        guard buffered.last == 10,
+            let event = try JSONSerialization.jsonObject(with: Data(buffered.dropLast()))
+                as? [String: Any],
+            event["type"] as? String == "stopped", event["command_id"] as? String == "exit-race",
+            (event["process_id"] as? NSNumber)?.int32Value == child.pid,
+            (event["birth_time_us"] as? NSNumber)?.uint64Value == probe.birthTimeMicroseconds,
+            let observedPeak = (event["observed_peak_bytes"] as? NSNumber)?.uint64Value,
+            observedPeak >= 8 * 1_024 * 1_024
+        else {
+            throw CollectorFailure.message(
+                "Exit-race worker did not preserve its authenticated buffered stop event: \(String(decoding: buffered.prefix(1_024), as: UTF8.self))"
+            )
+        }
+        let boundary = try probe.snapshot(phase: "control_boundary", ownedChild: child)
+        let recovered = try probe.recoverSnapshotAfterExit(
+            missing, phase: "periodic", ownedChild: child)
+        var transitionClock = 0.0
+        var transitionObservations = 0
+        var transitionWaits: [Double] = []
+        let transitioned = try probe.recoverSnapshotAfterExit(
+            missing, phase: "control_boundary", ownedChild: child,
+            deadline: 1,
+            observation: ExitTransitionObservation(
+                clock: { transitionClock },
+                pause: { interval in
+                    transitionWaits.append(interval)
+                    transitionClock += interval
+                },
+                hasExited: { _ in
+                    transitionObservations += 1
+                    return transitionObservations == 3
+                }))
+        guard transitionObservations == 3, transitionWaits == [0.001, 0.001],
+            let recovery = transitioned["exit_identity_recovery"] as? [String: Any],
+            recovery["observations"] as? Int == 3,
+            recovery["wait_seconds"] as? Double == 0.002
+        else {
+            throw CollectorFailure.message(
+                "Scripted not-exited/not-exited/exited recovery did not preserve its ordering")
+        }
+        let final = try probe.snapshot(phase: "final", ownedChild: child, permitZombie: true)
+        let kernel = try ProcessResources.readUsage(child.pid)
+        for sample in [boundary, recovered, transitioned, final] {
+            guard (sample["birth_time_us"] as? UInt64) == probe.birthTimeMicroseconds,
+                (sample["lifetime_peak_footprint_bytes"] as? UInt64)
+                    == kernel.ri_lifetime_max_phys_footprint,
+                (sample["user_cpu_ticks"] as? UInt64) == kernel.ri_user_time,
+                (sample["system_cpu_ticks"] as? UInt64) == kernel.ri_system_time,
+                kernel.ri_lifetime_max_phys_footprint >= observedPeak
+            else {
+                throw CollectorFailure.message(
+                    "Exit-race sampling did not retain genuine final kernel counters")
+            }
+        }
+        try requireImmediateRejection(
+            .processLookup(pid: child.pid, operation: .birthTime, errorCode: EPERM),
+            phase: "permission error")
+        try requireImmediateRejection(
+            .processLookup(pid: getpid(), operation: .birthTime, errorCode: ESRCH),
+            phase: "unrelated PID")
+        try requireImmediateRejection(
+            .message("The measured process identity changed"), phase: "identity mismatch")
+        guard try child.reap().status == 0 else {
+            throw CollectorFailure.message("Exit-race worker failed")
+        }
+        try requireImmediateRejection(missing, phase: "reaped child")
     }
 }
 
@@ -166,6 +399,7 @@ struct FluxLLMResourceCollector {
 private final class ApplicationMeasurement {
     private let executable: String
     private let deadlineSeconds: Double
+    private var samplingDeadline = -Double.infinity
     private var child: ControlledProcess?
     private var probe: ProcessResources?
     private var tracer: FileIOTracer?
@@ -181,6 +415,10 @@ private final class ApplicationMeasurement {
     private var lastGPUReported = -Double.infinity
     private var commandBuffer = Data()
     private var eventBuffer = Data()
+    private var traceCapability: TraceCapability {
+        tracer?.capability
+            ?? TraceCapability(available: false, reason: "Filesystem tracing has not started")
+    }
 
     init(executable: String, deadlineSeconds: Double) {
         self.executable = executable
@@ -189,6 +427,7 @@ private final class ApplicationMeasurement {
 
     func execute() async throws {
         let deadline = ProcessResources.monotonicSeconds() + deadlineSeconds
+        samplingDeadline = deadline
         var environment = ProcessInfo.processInfo.environment
         guard let configuration = environment["FLUXLLM_PERFORMANCE_CONFIGURATION"],
             let configBytes = configuration.data(using: .utf8), configBytes.count <= 65_536,
@@ -216,12 +455,13 @@ private final class ApplicationMeasurement {
             .flatMap { $0.data(using: .utf8) }
             .flatMap { try? JSONDecoder().decode(GPUCapabilityReport.self, from: $0) }
         nativeGPUEnabled =
-            capability?.available == true
+            !ExternalTrace.enabled && capability?.live_counter_available == true
             && capability?.provider == GPUResourceProvider.kernelProvider
             && capability?.calibration != nil
-        gpu = GPUResourceProvider(target: probe.gpuIdentity, capability: capability)
-        let tracer = FileIOTracer(targetPID: process.pid, runID: runID, storageRoot: storageRoot)
-        self.tracer = tracer
+        if !ExternalTrace.enabled {
+            gpu = GPUResourceProvider(target: probe.gpuIdentity, capability: capability)
+        }
+        tracer = FileIOTracer(targetPID: process.pid, runID: runID, storageRoot: storageRoot)
         do {
             // Publish the owned PID before any capability wait so the runner can
             // clean it up even if this observer is forcibly terminated at startup.
@@ -229,10 +469,13 @@ private final class ApplicationMeasurement {
                 "type": "launched", "pid": process.pid,
                 "birth_time_us": probe.birthTimeMicroseconds,
                 "run_id": runID, "storage_root": storageRoot,
+                "external_trace": ExternalTrace.enabled,
                 "environment": collectorEnvironment(
-                    gpuMethod: capability?.provider ?? GPUResourceProvider.provider),
+                    gpuMethod: ExternalTrace.enabled
+                        ? ExternalTrace.provider
+                        : capability?.provider ?? GPUResourceProvider.provider),
             ])
-            _ = await tracer.start()
+            _ = await tracer?.start()
             let stdinFlags = fcntl(STDIN_FILENO, F_GETFL)
             guard stdinFlags >= 0, fcntl(STDIN_FILENO, F_SETFL, stdinFlags | O_NONBLOCK) == 0 else {
                 throw CollectorFailure.message("Cannot configure runner command input")
@@ -272,7 +515,7 @@ private final class ApplicationMeasurement {
                         try drainTrace()
                         try await Task.sleep(for: .milliseconds(100))
                     }
-                    await tracer.stop()
+                    await tracer?.stop()
                     try drainTrace()
                     try emit([
                         "type": "exited", "status": result.status,
@@ -285,11 +528,12 @@ private final class ApplicationMeasurement {
                         "gpu_exit_gap_seconds": lastGPURead.isFinite
                             ? max(0, exitedAt - lastGPURead) as Any : NSNull(),
                         "gpu_exit_tail_measured": false,
-                        "trace_coverage": tracer.capability.available,
-                        "trace_timestamp_attribution": tracer.capability.timestamp_attribution,
-                        "trace_timestamp_unavailable_reason": tracer.capability
+                        "external_trace": ExternalTrace.enabled,
+                        "trace_coverage": traceCapability.available,
+                        "trace_timestamp_attribution": traceCapability.timestamp_attribution,
+                        "trace_timestamp_unavailable_reason": traceCapability
                             .timestamp_unavailable_reason as Any? ?? NSNull(),
-                        "trace_unavailable_reason": tracer.capability.reason as Any? ?? NSNull(),
+                        "trace_unavailable_reason": traceCapability.reason as Any? ?? NSNull(),
                     ])
                     return
                 }
@@ -310,7 +554,7 @@ private final class ApplicationMeasurement {
             }
         } catch {
             process.terminate()
-            await tracer.stop()
+            await tracer?.stop()
             throw error
         }
     }
@@ -319,7 +563,9 @@ private final class ApplicationMeasurement {
     private func sample(phase: String, commandID: Any? = nil, permitZombie: Bool = false)
         async throws -> [String: Any]
     {
-        guard let probe else { throw CollectorFailure.message("Process probe is not initialized") }
+        guard let probe, let child else {
+            throw CollectorFailure.message("Process probe is not initialized")
+        }
         let now = ProcessResources.monotonicSeconds()
         var gpuSampled = false
         if nativeGPUEnabled, phase == "baseline" {
@@ -341,7 +587,9 @@ private final class ApplicationMeasurement {
             lastGPURead = ProcessResources.monotonicSeconds()
             gpuSampled = true
         }
-        var result = try probe.snapshot(phase: phase, permitZombie: permitZombie)
+        var result = try probe.snapshot(
+            phase: phase, ownedChild: child, permitZombie: permitZombie,
+            recoveryDeadline: samplingDeadline)
         if let latestGPU {
             result.merge(try object(latestGPU)) { _, new in new }
         }
@@ -352,9 +600,13 @@ private final class ApplicationMeasurement {
         if result["gpu_seconds"] == nil { result["gpu_seconds"] = NSNull() }
         if result["gpu_unavailable_reason"] == nil {
             result["gpu_unavailable_reason"] =
-                latestGPU?.gpu_seconds == nil
-                ? "GPU counters have not produced a valid interval" : NSNull() as Any
+                ExternalTrace.enabled
+                ? ExternalTrace.reason
+                : latestGPU?.gpu_seconds == nil
+                    ? "GPU counters have not produced a valid interval" : NSNull() as Any
         }
+        result["external_trace"] = ExternalTrace.enabled
+        if ExternalTrace.enabled { result["gpu_provider"] = ExternalTrace.provider }
         result["gpu_sampled"] = gpuSampled
         result["gpu_sample_monotonic_seconds"] =
             lastGPURead.isFinite ? lastGPURead as Any : NSNull()
@@ -364,11 +616,11 @@ private final class ApplicationMeasurement {
             result["gpu_coverage_end_monotonic_seconds"] = lastGPURead
         }
         lastGPUReported = lastGPURead
-        result["trace_coverage"] = tracer?.capability.available ?? false
-        result["trace_unavailable_reason"] = tracer?.capability.reason as Any? ?? NSNull()
-        result["trace_timestamp_attribution"] = tracer?.capability.timestamp_attribution ?? false
+        result["trace_coverage"] = traceCapability.available
+        result["trace_unavailable_reason"] = traceCapability.reason as Any? ?? NSNull()
+        result["trace_timestamp_attribution"] = traceCapability.timestamp_attribution
         result["trace_timestamp_unavailable_reason"] =
-            tracer?.capability.timestamp_unavailable_reason as Any? ?? NSNull()
+            traceCapability.timestamp_unavailable_reason as Any? ?? NSNull()
         if let commandID { result["command_id"] = commandID }
         try emit(result)
         return result

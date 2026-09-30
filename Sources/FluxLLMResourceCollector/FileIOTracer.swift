@@ -36,17 +36,20 @@ final class FileIOTracer {
     private let targetName: String?
     private let namespaces: [String]
     private let proofName = "flx-proof-" + UUID().uuidString.prefix(12)
+    private let closingProofName = "flx-close-" + UUID().uuidString.prefix(12)
     private var process: Process?
     private var output: FileHandle?
     private var errors: FileHandle?
     private var pending = Data()
     private var events: [[String: Any]] = []
     private var proofObserved = false
+    private var closingProofObserved = false
     private var failure: String?
     private var stopping = false
     private var descriptors: [String: [String: String]] = [:]
     private var clockOrigin: ClockOrigin?
     private var proofWriteBrackets: [ClosedRange<Double>] = []
+    private var closingProofWriteBrackets: [ClosedRange<Double>] = []
     private var timestampFailure: String?
 
     init(targetPID: Int32?, runID: String?, storageRoot: String?) {
@@ -147,8 +150,29 @@ final class FileIOTracer {
 
     func stop() async {
         guard let child = process, !stopping else { return }
-        stopping = true
         readOutput()
+        stopping = true
+        // A fresh destination and a post-drain write bracket prevent buffered
+        // startup proof events from standing in for end-of-lifecycle coverage.
+        if capability.available, child.isRunning {
+            do {
+                let deadline = ProcessInfo.processInfo.systemUptime + 2
+                while ProcessInfo.processInfo.systemUptime < deadline,
+                    failure == nil, !closingProofObserved, child.isRunning
+                {
+                    try makeProofWrite(closing: true)
+                    try await Task.sleep(for: .milliseconds(50))
+                    readOutput()
+                }
+                if !closingProofObserved, failure == nil {
+                    invalidate(
+                        "Filesystem tracing did not observe its distinct closing proof within two seconds; final coverage is incomplete."
+                    )
+                }
+            } catch {
+                invalidate("Filesystem closing proof failed: \(error.localizedDescription)")
+            }
+        }
         if child.isRunning { child.interrupt() }
         for _ in 0..<10 {
             readOutput()
@@ -175,6 +199,7 @@ final class FileIOTracer {
         output = nil
         errors = nil
         try? FileManager.default.removeItem(atPath: "/private/tmp/\(proofName)")
+        try? FileManager.default.removeItem(atPath: "/private/tmp/\(closingProofName)")
     }
 
     private func invalidate(_ reason: String) {
@@ -201,8 +226,7 @@ final class FileIOTracer {
             if !diagnostics.isEmpty {
                 // Do not copy privileged diagnostic output or unrelated paths
                 // into reports. A stderr stream invalidates coverage.
-                invalidate(
-                    "fs_usage reported an error, missing privileges, or unsupported tracing.")
+                invalidate(Self.diagnosticReason(String(decoding: diagnostics, as: UTF8.self)))
             }
             pending.append(try readAvailable(output.fileDescriptor))
             guard pending.count <= 1_048_576 else {
@@ -268,7 +292,10 @@ final class FileIOTracer {
         if normalized == "close" || normalized == "guarded_close_np", let descriptor {
             descriptors[name]?[descriptor] = nil
         }
-        let proof = detail.contains(proofName) || resolvedPath?.contains(proofName) == true
+        let openingProof = detail.contains(proofName) || resolvedPath?.contains(proofName) == true
+        let closingProof =
+            detail.contains(closingProofName) || resolvedPath?.contains(closingProofName) == true
+        let proof = openingProof || closingProof
         let isApp = targetName == name
         let isDelegated = targetPID != nil && name == "cfprefsd"
         guard proof || isApp || isDelegated else { return }
@@ -276,17 +303,19 @@ final class FileIOTracer {
         let classification = Self.classify(normalized, detail: detail)
         if proof, normalized == "write" {
             guard let timing = convertedTimestamp(sourceTimestamp),
-                proofWriteBrackets.contains(where: {
-                    timing.monotonicSeconds >= $0.lowerBound - timing.uncertaintySeconds
-                        && timing.monotonicSeconds <= $0.upperBound + timing.uncertaintySeconds
-                })
+                Self.matchesProof(
+                    timing, brackets: closingProof ? closingProofWriteBrackets : proofWriteBrackets)
             else {
                 invalidateTimestamp(
                     "The filesystem proof-write timestamp did not match its actual monotonic write bracket; timezone or timestamp semantics are unverified."
                 )
                 return
             }
-            proofObserved = timestampFailure == nil
+            if closingProof {
+                closingProofObserved = timestampFailure == nil
+            } else {
+                proofObserved = timestampFailure == nil
+            }
             return
         }
         guard !proof else { return }
@@ -356,8 +385,8 @@ final class FileIOTracer {
         return timing
     }
 
-    private func makeProofWrite() throws {
-        let location = "/private/tmp/\(proofName)"
+    private func makeProofWrite(closing: Bool = false) throws {
+        let location = "/private/tmp/\(closing ? closingProofName : proofName)"
         let descriptor = open(location, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else {
             throw CollectorFailure.message("Cannot create filesystem trace proof")
@@ -370,7 +399,11 @@ final class FileIOTracer {
         guard finished >= started else {
             throw CollectorFailure.message("The filesystem proof monotonic clock moved backwards")
         }
-        proofWriteBrackets.append(started...finished)
+        if closing {
+            closingProofWriteBrackets.append(started...finished)
+        } else {
+            proofWriteBrackets.append(started...finished)
+        }
         guard written == 1, fsync(descriptor) == 0 else {
             throw CollectorFailure.message("Cannot write filesystem trace proof")
         }
@@ -379,6 +412,63 @@ final class FileIOTracer {
     private struct EventTiming {
         let monotonicSeconds: Double
         let uncertaintySeconds: Double
+    }
+
+    private static func matchesProof(_ timing: EventTiming, brackets: [ClosedRange<Double>]) -> Bool
+    {
+        timing.monotonicSeconds.isFinite && timing.uncertaintySeconds.isFinite
+            && timing.uncertaintySeconds >= 0
+            && brackets.contains {
+                timing.monotonicSeconds >= $0.lowerBound - timing.uncertaintySeconds
+                    && timing.monotonicSeconds <= $0.upperBound + timing.uncertaintySeconds
+            }
+    }
+
+    private static let authorizationReason =
+        "Filesystem write verification needs noninteractive administrator authorization for /usr/bin/fs_usage in this benchmark session. Authorization is unavailable; write coverage is unverified and this run cannot pass."
+    private static let unsupportedTraceReason =
+        "fs_usage reported an error, missing privileges, or unsupported tracing."
+
+    private static func diagnosticReason(_ diagnostic: String) -> String {
+        let lower = diagnostic.lowercased()
+        let authorizationTokens = [
+            "a password is required", "a terminal is required", "not allowed", "no tty present",
+        ]
+        return authorizationTokens.contains(where: lower.contains)
+            ? authorizationReason : unsupportedTraceReason
+    }
+
+    static func verifyClosingProofValidation() throws {
+        let startup = EventTiming(monotonicSeconds: 10, uncertaintySeconds: 0.001)
+        let closing = EventTiming(monotonicSeconds: 300, uncertaintySeconds: 0.001)
+        guard matchesProof(startup, brackets: [9.999...10.001]),
+            !matchesProof(startup, brackets: [299.999...300.001]),
+            !matchesProof(closing, brackets: []),
+            matchesProof(closing, brackets: [299.999...300.001]),
+            !matchesProof(
+                EventTiming(monotonicSeconds: .nan, uncertaintySeconds: 0), brackets: [0...1])
+        else {
+            throw CollectorFailure.message(
+                "Filesystem closing proof accepted stale or invalid evidence")
+        }
+        for diagnostic in [
+            "sudo: a password is required",
+            "sudo: a terminal is required to read the password",
+            "sudo: a private account is not allowed to execute a private path",
+            "sudo: no tty present and no askpass program specified",
+        ] {
+            guard diagnosticReason(diagnostic) == authorizationReason else {
+                throw CollectorFailure.message(
+                    "Filesystem authorization diagnostic was not classified safely")
+            }
+        }
+        guard
+            diagnosticReason("fs_usage: unsupported tracing diagnostic containing a private path")
+                == unsupportedTraceReason
+        else {
+            throw CollectorFailure.message(
+                "Filesystem diagnostic included unclassified privileged output")
+        }
     }
 
     /// All externally reported timestamps share the app/collector/runner's

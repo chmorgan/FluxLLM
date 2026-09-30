@@ -11,7 +11,10 @@ final class ControlledProcess {
     let stderrDescriptor: Int32
     private(set) var reaped = false
 
-    init(executable: String, environment: [String: String]) throws {
+    init(
+        executable: String, environment: [String: String],
+        arguments commandArguments: [String] = ["--performance-control"]
+    ) throws {
         var owned: [Int32] = []
         func pipePair() throws -> (Int32, Int32) {
             var pair: [Int32] = [0, 0]
@@ -62,7 +65,7 @@ final class ControlledProcess {
             posix_spawnattr_setflags(
                 &attributes, Int16(POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_SETPGROUP))
             posix_spawnattr_setpgroup(&attributes, 0)
-            let argumentStrings: [String] = [executable, "--performance-control"]
+            let argumentStrings: [String] = [executable] + commandArguments
             let arguments: [UnsafeMutablePointer<CChar>?] =
                 argumentStrings.map { strdup($0) } + [nil]
             let entries: [UnsafeMutablePointer<CChar>?] =
@@ -113,7 +116,11 @@ final class ControlledProcess {
             throw CollectorFailure.message(
                 "Cannot observe process exit without reaping (errno \(errno))")
         }
-        return info.si_pid == pid
+        // Darwin can return CLD_STOPPED for a newly suspended spawn even with
+        // WEXITED requested. A matching PID alone does not establish an exit.
+        return info.si_pid == pid && info.si_signo == SIGCHLD
+            && (info.si_code == CLD_EXITED || info.si_code == CLD_KILLED
+                || info.si_code == CLD_DUMPED)
     }
 
     func reap() throws -> (status: Int32, cpuSeconds: Double) {
