@@ -27,6 +27,7 @@ final class DashboardLifecycleTests: XCTestCase {
                 presentedSnapshots.append(store.chartPresentation.publicationID)
                 let controller = NSHostingController(
                     rootView: DashboardView(presentation: state).environment(store))
+                controller.sizingOptions = []
                 host = controller
                 return controller
             },
@@ -36,20 +37,24 @@ final class DashboardLifecycleTests: XCTestCase {
             })
 
         XCTAssertEqual(creations, 0, "Construction must not initialize the chart renderer")
-        window.present()
-        window.simulatedVisible = true
-        window.synchronizePresentationVisibility()
+        autoreleasepool {
+            window.present()
+            window.simulatedVisible = true
+            window.synchronizePresentationVisibility()
+            XCTAssertNotNil(host)
+        }
         XCTAssertEqual(creations, 1)
-        XCTAssertNotNil(host)
 
         let end = Date(timeIntervalSince1970: 2_000_000_000)
         state.navigation.select(
             DateInterval(start: end.addingTimeInterval(-120), end: end), now: end)
         let selected = state.navigation
         let beforeHide = store.chartPresentation.publicationID
-        window.simulatedVisible = false
-        window.synchronizePresentationVisibility()
-        drainNativeUpdates()
+        autoreleasepool {
+            window.simulatedVisible = false
+            window.synchronizePresentationVisibility()
+            drainNativeUpdates()
+        }
         XCTAssertNil(host, "An occluded dashboard must not keep its SwiftUI host alive")
         XCTAssertFalse(window.isPresentationContentActive)
         let hiddenPublication = store.chartPresentation.publicationID
@@ -62,18 +67,22 @@ final class DashboardLifecycleTests: XCTestCase {
         window.synchronizePresentationVisibility()
         XCTAssertEqual(creations, 1, "Hidden telemetry must not recreate a chart host")
 
-        window.simulatedVisible = true
-        window.synchronizePresentationVisibility()
+        autoreleasepool {
+            window.simulatedVisible = true
+            window.synchronizePresentationVisibility()
+        }
         XCTAssertEqual(creations, 2)
         XCTAssertNotEqual(presentedSnapshots.last, beforeHide)
         XCTAssertEqual(store.chartPresentation.timestamp, sampledAt)
         XCTAssertEqual(state.navigation, selected)
 
-        window.windowDidMiniaturize(
-            Notification(name: NSWindow.didMiniaturizeNotification, object: window))
-        drainNativeUpdates()
+        autoreleasepool {
+            window.simulatedVisible = false
+            window.windowDidMiniaturize(
+                Notification(name: NSWindow.didMiniaturizeNotification, object: window))
+            drainNativeUpdates()
+        }
         XCTAssertNil(host)
-        window.simulatedVisible = false
         window.close()
         XCTAssertFalse(window.isDashboardOpen)
         XCTAssertFalse(window.isPresentationContentActive)
@@ -100,15 +109,26 @@ final class DashboardLifecycleTests: XCTestCase {
                 host = controller
                 return controller
             }, visibilityChanged: { changes.append($0) })
-        for _ in 0..<4 {
-            window.present()
-            window.simulatedVisible = true
-            window.synchronizePresentationVisibility()
-            XCTAssertNotNil(host)
-            window.close()
-            drainNativeUpdates()
+        for cycle in 0..<4 {
+            let selectedSize = cycle.isMultiple(of: 2) ? size : NSSize(width: 900, height: 900)
+            window.setContentSize(selectedSize)
+            let selectedFrame = window.frame
+            autoreleasepool {
+                window.present()
+                window.simulatedVisible = true
+                window.synchronizePresentationVisibility()
+                XCTAssertNotNil(host)
+                XCTAssertEqual(
+                    window.frame, selectedFrame,
+                    "Attaching an unsized view must preserve the window")
+                window.close()
+                drainNativeUpdates()
+            }
             XCTAssertNil(host)
-            XCTAssertEqual(window.contentLayoutRect.size, size)
+            XCTAssertEqual(window.contentLayoutRect.size, selectedSize)
+            XCTAssertEqual(
+                window.frame, selectedFrame,
+                "Detaching content must also preserve position and size")
         }
         XCTAssertEqual(creations, 4)
         XCTAssertEqual(changes, [true, false, true, false, true, false, true, false])
@@ -152,4 +172,13 @@ private final class LifecycleDashboardWindow: DashboardWindow {
     var simulatedVisible = false
     override var presentationIsVisible: Bool { isDashboardOpen && simulatedVisible }
     override func makeKeyAndOrderFront(_ sender: Any?) {}
+    override func close() {
+        // This mock never orders a native window in, so AppKit does not reset
+        // its internal closed state on present(). Deliver the matching close
+        // event for each simulated presentation; the production callback is
+        // idempotent when super.close also delivers it on the first cycle.
+        simulatedVisible = false
+        windowWillClose(Notification(name: NSWindow.willCloseNotification, object: self))
+        super.close()
+    }
 }

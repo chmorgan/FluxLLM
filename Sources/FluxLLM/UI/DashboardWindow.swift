@@ -40,7 +40,7 @@ class DashboardWindow: NSWindow, NSWindowDelegate {
         makePresentationContent = makeContent
         presentationVisibilityChanged = visibilityChanged
         placeholder.view = NSView(frame: NSRect(origin: .zero, size: contentLayoutRect.size))
-        contentViewController = placeholder
+        replacePresentationContent(with: placeholder)
     }
 
     /// Kept separate from content attachment so lifecycle tests can exercise the
@@ -86,12 +86,23 @@ class DashboardWindow: NSWindow, NSWindowDelegate {
         isPresentationContentActive = active
         presentationVisibilityChanged?(active)
         if active {
-            contentViewController = makePresentationContent?()
+            if let controller = makePresentationContent?() {
+                replacePresentationContent(with: controller)
+            }
         } else {
-            let size = contentLayoutRect.size
-            placeholder.view.frame = NSRect(origin: .zero, size: size)
-            contentViewController = placeholder
+            replacePresentationContent(with: placeholder)
         }
+    }
+
+    private func replacePresentationContent(with controller: NSViewController) {
+        // AppKit sizes a window to the incoming controller's view. Lazy hosts
+        // and the reusable placeholder must adopt the user's current geometry,
+        // rather than feeding their initial/fitting size back into the window.
+        let preservedFrame = frame
+        let contentSize = contentRect(forFrameRect: preservedFrame).size
+        controller.view.setFrameSize(contentSize)
+        contentViewController = controller
+        if frame != preservedFrame { setFrame(preservedFrame, display: false) }
     }
 
     override func setContentSize(_ size: NSSize) {

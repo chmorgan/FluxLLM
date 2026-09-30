@@ -230,7 +230,19 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     }
 
     public var performanceVisibility: (dashboard: Bool, popover: Bool) {
-        (dashboardWindow?.isVisible == true, popover.isShown)
+        let dashboardVisible =
+            dashboardWindow.map {
+                $0.presentationIsVisible && $0.isPresentationContentActive
+            } ?? false
+        let popoverWindowVisible =
+            popover.contentViewController?.view.window.map {
+                $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)
+            } ?? false
+        return (
+            dashboardVisible,
+            popover.isShown && !isPopoverClosing && popoverPresentation.isActive
+                && popoverWindowVisible
+        )
     }
 
     /// AppKit owns resize limits; SwiftUI gives the chart the remaining height.
