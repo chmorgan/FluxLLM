@@ -1,9 +1,13 @@
 {
   "schema_version": 2,
   "workload_version": 1,
+  "fixture_schema_version": 2,
+  "cpu_policy": "authenticated-ready-startup-v1",
   "performance_deadline_seconds": 300,
   "limits": {
     "cpu_rolling_1s_percent": 5.0,
+    "cpu_startup_rolling_1s_percent": 50.0,
+    "cpu_startup_short_allowance_seconds": 0.5,
     "lifetime_footprint_bytes": 64000000,
     "physical_write_bytes_logging_off": 0,
     "logical_write_bytes_logging_off": 0,

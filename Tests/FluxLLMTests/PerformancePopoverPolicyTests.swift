@@ -44,6 +44,7 @@ final class PerformancePopoverPolicyTests: XCTestCase {
         XCTAssertTrue(readiness().isReady)
         for state in [
             readiness(controllerStarted: false), readiness(appActive: false),
+            readiness(popoverIsClosing: true),
             readiness(anchorExists: false), readiness(anchorWindowExists: false),
             readiness(anchorWindowVisible: false), readiness(anchorScreenPresent: false),
             readiness(anchorHidden: true), readiness(width: 0), readiness(height: -1),
@@ -96,11 +97,88 @@ final class PerformancePopoverPolicyTests: XCTestCase {
         XCTAssertFalse(expired.ready)
     }
 
+    func testReadinessWaitsForCloseCompletionWhenShownAndWindowStateLag() async {
+        let start = ContinuousClock.now
+        var now = start
+        var pauses = 0
+        let result = await MenuBarController.waitForPerformancePopoverReadiness(
+            until: start.advanced(by: .seconds(4)),
+            read: {
+                // The window disappears before isShown clears, and didClose
+                // follows both. Neither earlier state permits the next show.
+                self.readiness(popoverIsShown: pauses == 0, popoverIsClosing: pauses < 2)
+            }, now: { now },
+            pause: {
+                pauses += 1
+                now = now.advanced(by: .seconds(1))
+            })
+        XCTAssertTrue(result.ready)
+        XCTAssertEqual(pauses, 2)
+        XCTAssertFalse(result.readiness.popoverIsShown)
+        XCTAssertFalse(result.readiness.popoverIsClosing)
+        XCTAssertEqual(result.readiness.diagnostics["popover_is_closing"] as? Bool, false)
+        // An already visible, stable popover remains an idempotent show target.
+        XCTAssertTrue(readiness(popoverIsShown: true, popoverWindowVisible: true).isReady)
+    }
+
+    func testCloseCompletionCannotExtendTheSharedFourSecondDeadline() async {
+        let start = ContinuousClock.now
+        var now = start
+        var pauses = 0
+        let result = await MenuBarController.waitForPerformancePopoverReadiness(
+            until: start.advanced(by: .seconds(4)),
+            read: { self.readiness(popoverIsClosing: pauses < 4) }, now: { now },
+            pause: {
+                pauses += 1
+                now = now.advanced(by: .seconds(1))
+            })
+        XCTAssertEqual(pauses, 4)
+        XCTAssertFalse(result.ready)
+        XCTAssertFalse(result.readiness.popoverIsClosing)
+    }
+
+    func testOnlyNativeDidCloseClearsTheMeasurementClosingLatch() throws {
+        _ = NSApplication.shared
+        let suite = "FluxLLM.Performance.CloseReadinessTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        let store = MetricsStore()
+        let coordinator = MonitoringCoordinator(settings: settings, store: store)
+        let controller = MenuBarController(
+            metricsStore: store, coordinator: coordinator, settings: settings,
+            launchAtLogin: LaunchAtLoginController(service: PopoverTestLoginService()))
+        defer { controller.stop() }
+        controller.start()
+        controller.performanceSetPopoverVisible(false)
+        XCTAssertFalse(controller.performancePopoverReadiness.popoverIsClosing)
+        controller.popoverWillClose(Notification(name: NSPopover.willCloseNotification))
+        let closing = controller.performancePopoverReadiness
+        XCTAssertFalse(closing.popoverIsShown)
+        XCTAssertFalse(closing.popoverWindowVisible)
+        XCTAssertTrue(closing.popoverIsClosing)
+        // A repeated close command cannot treat hidden/isShown=false as didClose.
+        controller.performanceSetPopoverVisible(false)
+        XCTAssertTrue(controller.performancePopoverReadiness.popoverIsClosing)
+        controller.popoverDidClose(Notification(name: NSPopover.didCloseNotification))
+        XCTAssertFalse(controller.performancePopoverReadiness.popoverIsClosing)
+        let diagnostics = controller.performancePopoverReadiness.diagnostics
+        for key in [
+            "dashboard_window_exists", "dashboard_native_visible",
+            "dashboard_occlusion_visible", "dashboard_is_minimized",
+            "dashboard_is_open", "dashboard_host_active",
+        ] {
+            XCTAssertEqual(diagnostics[key] as? Bool, false, key)
+        }
+    }
+
     private func readiness(
         controllerStarted: Bool = true, appActive: Bool = true,
         anchorExists: Bool = true, anchorWindowExists: Bool = true,
         anchorWindowVisible: Bool = true, anchorScreenPresent: Bool = true,
-        anchorHidden: Bool = false, width: Double = 100, height: Double = 24
+        anchorHidden: Bool = false, width: Double = 100, height: Double = 24,
+        popoverIsShown: Bool = false, popoverWindowVisible: Bool = false,
+        popoverIsClosing: Bool = false
     ) -> PerformancePopoverReadiness {
         PerformancePopoverReadiness(
             controllerStarted: controllerStarted, appActive: appActive,
@@ -108,7 +186,11 @@ final class PerformancePopoverPolicyTests: XCTestCase {
             anchorExists: anchorExists, anchorWindowExists: anchorWindowExists,
             anchorWindowVisible: anchorWindowVisible, anchorScreenPresent: anchorScreenPresent,
             anchorHidden: anchorHidden, anchorBoundsWidth: width, anchorBoundsHeight: height,
-            popoverIsShown: false, popoverWindowVisible: false)
+            popoverIsShown: popoverIsShown, popoverWindowVisible: popoverWindowVisible,
+            popoverIsClosing: popoverIsClosing,
+            dashboardWindowExists: false, dashboardNativeVisible: false,
+            dashboardOcclusionVisible: false, dashboardMiniaturized: false,
+            dashboardOpen: false, dashboardHostActive: false)
     }
 
     func testOnlyExplicitPerformanceControlChangesNativeDismissalPolicy() throws {

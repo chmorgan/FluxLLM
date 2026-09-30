@@ -11,6 +11,9 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     private let launchAtLogin: LaunchAtLoginController
     private let menuActions = MenuActions()
     private let popover = MenuBarController.makePopover()
+    // Measurement readiness tracks the complete native close lifecycle rather
+    // than inferring its completion from the window disappearing or isShown.
+    private var performancePopoverClosePending = false
     private let popoverPresentation = DashboardPresentationState()
     private var popoverVisibilityObserver: DashboardWindowVisibilityObserver?
     private var isPopoverClosing = false
@@ -129,6 +132,7 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
 
     private func closePopover() {
         Self.performanceUICheckpoint?("popover.native_close.begin")
+        if popover.isShown { performancePopoverClosePending = true }
         popover.performClose(nil)
         Self.performanceUICheckpoint?("popover.native_close.end")
     }
@@ -181,11 +185,13 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     }
 
     public func popoverWillClose(_ notification: Notification) {
+        performancePopoverClosePending = true
         isPopoverClosing = true
         setPopoverPresentationActive(false)
     }
 
     public func popoverDidClose(_ notification: Notification) {
+        performancePopoverClosePending = false
         guard !popover.isShown else { return }
         releasePopoverContent()
     }
@@ -296,11 +302,19 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
             anchorBoundsWidth: Double(button?.bounds.width ?? 0),
             anchorBoundsHeight: Double(button?.bounds.height ?? 0),
             popoverIsShown: popover.isShown,
-            popoverWindowVisible: popover.contentViewController?.view.window?.isVisible == true)
+            popoverWindowVisible: popover.contentViewController?.view.window?.isVisible == true,
+            popoverIsClosing: performancePopoverClosePending,
+            dashboardWindowExists: dashboardWindow != nil,
+            dashboardNativeVisible: dashboardWindow?.isVisible == true,
+            dashboardOcclusionVisible: dashboardWindow?.occlusionState.contains(.visible) == true,
+            dashboardMiniaturized: dashboardWindow?.isMiniaturized == true,
+            dashboardOpen: dashboardWindow?.isDashboardOpen == true,
+            dashboardHostActive: dashboardWindow?.isPresentationContentActive == true)
     }
 
-    /// Wait for native activation and an attached status anchor before the one
-    /// controlled show attempt. This never opens, retries, or fabricates a view.
+    /// Wait for native activation, an attached status anchor and completion of
+    /// any prior close before the one controlled show attempt. This never opens,
+    /// retries, or fabricates a view, and shares the caller's absolute deadline.
     public func performancePreparePopover(until deadline: ContinuousClock.Instant) async
         -> (readiness: PerformancePopoverReadiness, ready: Bool)
     {
@@ -511,9 +525,16 @@ public struct PerformancePopoverReadiness: Equatable {
     let anchorBoundsHeight: Double
     let popoverIsShown: Bool
     let popoverWindowVisible: Bool
+    let popoverIsClosing: Bool
+    let dashboardWindowExists: Bool
+    let dashboardNativeVisible: Bool
+    let dashboardOcclusionVisible: Bool
+    let dashboardMiniaturized: Bool
+    let dashboardOpen: Bool
+    let dashboardHostActive: Bool
 
     public var isReady: Bool {
-        controllerStarted && appActive && anchorExists && anchorWindowExists
+        controllerStarted && appActive && !popoverIsClosing && anchorExists && anchorWindowExists
             && anchorWindowVisible && anchorScreenPresent && !anchorHidden
             && anchorBoundsWidth.isFinite && anchorBoundsWidth > 0
             && anchorBoundsHeight.isFinite && anchorBoundsHeight > 0
@@ -531,6 +552,13 @@ public struct PerformancePopoverReadiness: Equatable {
             "anchor_bounds_height": anchorBoundsHeight.isFinite
                 ? anchorBoundsHeight as Any : NSNull(),
             "popover_is_shown": popoverIsShown, "popover_window_visible": popoverWindowVisible,
+            "popover_is_closing": popoverIsClosing,
+            "dashboard_window_exists": dashboardWindowExists,
+            "dashboard_native_visible": dashboardNativeVisible,
+            "dashboard_occlusion_visible": dashboardOcclusionVisible,
+            "dashboard_is_minimized": dashboardMiniaturized,
+            "dashboard_is_open": dashboardOpen,
+            "dashboard_host_active": dashboardHostActive,
             "ready": isReady,
         ]
     }

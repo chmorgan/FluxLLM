@@ -17,6 +17,13 @@ on:
         options:
           - check
           - baseline
+      gpu_provider:
+        description: Coarse GPU capability probe or explicit detailed diagnostic
+        type: choice
+        default: powermetrics
+        options:
+          - powermetrics
+          - instruments
   pull_request:
     paths:
       - 'Sources/**'
@@ -41,6 +48,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       PERFORMANCE_MODE: ${{ inputs.mode || 'check' }}
+      GPU_PROVIDER: ${{ inputs.gpu_provider || 'powermetrics' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -49,7 +57,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Build, calibrate, and run the fixed performance workload
-        run: python3 scripts/run_performance_checks.py "$PERFORMANCE_MODE"
+        # No interactive authentication in CI. Missing/uncalibrated GPU support
+        # remains incomplete; independent CPU, memory and I/O evidence survives.
+        run: python3 scripts/run_performance_checks.py "$PERFORMANCE_MODE" --gpu-provider "$GPU_PROVIDER"
       - name: Preserve measurements even when a limit or capability fails
         if: always()
         uses: actions/upload-artifact@v7
