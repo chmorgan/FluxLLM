@@ -26,6 +26,7 @@ import xml.etree.ElementTree as ET
 import uuid
 
 from run_performance_checks import InvalidResult, launch_fixture, load_json, number, require, stop_process_group, write_json
+from performance_fixture import TIMING_POLICY
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -251,14 +252,73 @@ def validate_fixture_start(stage, acknowledgement):
                        ("expected_output_tokens", "output_tokens"), ("expected_prompt_tokens", "prompt_tokens")):
         require(type(acknowledgement.get(field)) is int and acknowledgement[field] == expected[key],
                 f"Fixture acknowledgement {field} differs from the fixed workload")
+    indices = acknowledgement.get("expected_request_indices")
+    require(isinstance(indices, list) and len(indices) == expected["requests"]
+            and all(type(index) is int and index >= 0 for index in indices) and len(set(indices)) == len(indices),
+            "Fixture acknowledgement does not identify every concurrent stream")
 
 
-def validate_workload(stage, status, before, after):
+def validate_fixture_timing(stage, status, acknowledgement):
+    require(isinstance(acknowledgement, dict) and status.get("run_id") == acknowledgement.get("run_id")
+            and isinstance(status.get("run_id"), str) and status["run_id"], "Fixture timing belongs to a different workload")
+    timing = status.get("timing")
+    require(isinstance(timing, dict) and all(timing.get(key) == value and type(timing.get(key)) is type(value)
+                                           for key, value in TIMING_POLICY.items()), "Fixture timing policy is missing or changed")
+    streams = timing.get("streams")
+    indices = acknowledgement.get("expected_request_indices")
+    require(isinstance(streams, list) and len(streams) == 2 and isinstance(indices, list) and len(indices) == 2
+            and all(type(index) is int and index >= 0 for index in indices) and len(set(indices)) == 2,
+            "Timing evidence for both concurrent source streams is required")
+    actual_indices = [item.get("request_index") if isinstance(item, dict) else None for item in streams]
+    require(all(type(index) is int for index in actual_indices) and len(set(actual_indices)) == 2
+            and sorted(actual_indices) == sorted(indices), "Fixture timing stream identities differ from the acknowledged workload")
+    rate = 40 if stage["activity"] == "ordinary" else 200
+    chunks = math.floor(stage["seconds"] * rate)
+    lateness = TIMING_POLICY["maximum_lateness_seconds"]
+    epsilon = TIMING_POLICY["early_epsilon_seconds"]
+    first_flushes = []
+    for stream in streams:
+        require(type(stream.get("rate_hz")) in (int, float) and stream["rate_hz"] == rate
+                and type(stream.get("duration_seconds")) in (int, float) and stream["duration_seconds"] == stage["seconds"],
+                "Fixture timing rate or duration differs from the fixed workload")
+        for field, expected in (("expected_content_fragments", chunks), ("records_observed", chunks + 1)):
+            require(type(stream.get(field)) is int and stream[field] == expected, f"Fixture timing {field} is incomplete")
+        fields = ("source_started_monotonic_seconds", "first_write_started_monotonic_seconds",
+                  "first_flush_finished_monotonic_seconds", "terminal_write_started_monotonic_seconds",
+                  "terminal_flush_finished_monotonic_seconds", "maximum_start_lateness_seconds",
+                  "maximum_finish_lateness_seconds", "maximum_earliness_seconds", "maximum_flush_seconds")
+        values = {field: number(stream.get(field), f"Fixture timing {field}") for field in fields}
+        origin, first_start, first_finish, terminal_start, terminal_finish = [values[field] for field in fields[:5]]
+        require(origin - epsilon <= first_start <= first_finish <= terminal_start <= terminal_finish,
+                "Fixture timing timestamps are out of order")
+        require(values["maximum_start_lateness_seconds"] <= values["maximum_finish_lateness_seconds"] <= lateness + 1e-9,
+                "A source fragment write or flush exceeded its absolute deadline by more than 50 ms")
+        require(values["maximum_earliness_seconds"] <= epsilon, "A source fragment was emitted before its planned deadline")
+        require(values["maximum_flush_seconds"] <= lateness + epsilon,
+                "A source fragment flush blocked beyond the timing policy")
+        for due, started, finished in ((origin, first_start, first_finish),
+                                       (origin + stage["seconds"], terminal_start, terminal_finish)):
+            require(started - due <= values["maximum_start_lateness_seconds"] + 1e-9
+                    and finished - due <= values["maximum_finish_lateness_seconds"] + 1e-9
+                    and due - started <= values["maximum_earliness_seconds"] + 1e-9
+                    and finished - started <= values["maximum_flush_seconds"] + 1e-9,
+                    "Fixture timing extrema disagree with observed endpoint timestamps")
+        require(abs(terminal_finish - first_finish - stage["seconds"]) <= lateness + 1e-9,
+                "Observed source stream duration differs by more than 50 ms")
+        require(type(stream.get("violation_count")) is int and stream["violation_count"] == 0
+                and stream.get("violations") == [], "Source stream timing recorded a violation")
+        first_flushes.append(first_finish)
+    require(max(first_flushes) - min(first_flushes) <= TIMING_POLICY["maximum_stream_skew_seconds"] + 1e-9,
+            "Concurrent source streams started more than 50 ms apart")
+
+
+def validate_workload(stage, status, before, after, acknowledgement=None):
     expected = expected_work(stage)
     require(isinstance(before, dict) and isinstance(after, dict), "App snapshots are required")
     if stage["activity"] != "idle":
         require(status.get("running") is False and status.get("error") is None, "Synthetic network workload did not complete cleanly")
         require(status.get("forwarding_verified") is True, "Exact incremental forwarding was not verified")
+        validate_fixture_timing(stage, status, acknowledgement)
         for field, expected_field in (("completed_requests", "requests"), ("received_chunks", "chunks"),
                                       ("tool_calls", "tool_calls"), ("tool_results", "tool_results")):
             require(type(status.get(field)) is int and status[field] == expected[expected_field], f"Fixture {field} differs from expected work")
@@ -576,7 +636,7 @@ def run_continuous_logging(collector, specification, case, proxy_url, upstream, 
             status = completed_status(collector, upstream, deadline)
             after = collector.snapshot()
             stage_result.update(after=after, fixture_status=status)
-            stage_result["validated_work"] = validate_workload(whole, status, initial, after)
+            stage_result["validated_work"] = validate_workload(whole, status, initial, after, acknowledgement)
         failures, invalid = presentation_checks(before, after, specification, stage)
         case["failures"].extend(failures)
         case["invalid"].extend(invalid)
@@ -622,6 +682,7 @@ def run_case(specification, collector_path, app_path, upstream, gpu_capability, 
             case["stages"].append(stage_result)
             started = time.monotonic()
             stage_end = started + stage["seconds"]
+            acknowledgement = None
             if stage["activity"] != "idle":
                 acknowledgement = fixture_request(upstream, "/control/start", deadline, {
                     "proxy_url": proxy_url, "duration_seconds": stage["seconds"],
@@ -647,7 +708,7 @@ def run_case(specification, collector_path, app_path, upstream, gpu_capability, 
                 status = completed_status(collector, upstream, deadline)
             after = collector.snapshot()
             stage_result.update(after=after, fixture_status=status, elapsed_seconds=time.monotonic() - started)
-            stage_result["validated_work"] = validate_workload(stage, status, before, after)
+            stage_result["validated_work"] = validate_workload(stage, status, before, after, acknowledgement)
             failures, invalid = presentation_checks(before, after, specification, stage)
             case["failures"].extend(failures)
             case["invalid"].extend(invalid)
@@ -805,10 +866,18 @@ def preflight(collector, directory, deadline, timeout=25):
         capabilities = {"type": "capabilities", "environment": {},
                         **{field: {"available": False, "reason": reason}
                            for field in ("cpu", "physical_footprint", "physical_writes", "logical_writes", "trace_coverage")},
-                        "gpu": {"available": False, "provider": "uncalibrated", "reason": reason, "calibration": None}}
+                        "gpu": {"available": False, "live_counter_available": False,
+                                "full_lifetime_coverage": False, "full_lifetime_unavailable_code": "preflight_incomplete",
+                                "full_lifetime_unavailable_reason": reason,
+                                "provider": "uncalibrated", "reason": reason, "calibration": None}}
         if proof.get("cpu", {}).get("available") is True:
             capabilities["cpu"] = proof["cpu"]
     result["capabilities"] = capabilities
+    gpu = capabilities.get("gpu", {})
+    if gpu.get("full_lifetime_coverage") is not True:
+        errors.append("GPU full-lifetime coverage is unavailable: "
+                      + str(gpu.get("full_lifetime_unavailable_reason") or "Finalized terminal GPU accounting was not demonstrated")
+                      + f" (code: {gpu.get('full_lifetime_unavailable_code', 'missing_coverage_evidence')})")
     write_json(directory / "preflight.json", result)
     return result
 
@@ -844,7 +913,8 @@ def comparison_key(report):
     if (not isinstance(environment, dict) or environment.get("display_available") == "false"
             or any(not environment.get(field) for field in ("os", "hardware", "display", "build_configuration"))):
         return None
-    provider_fields = ("provider", "method", "counter", "counter_key", "api", "schema_version", "available", "validated")
+    provider_fields = ("provider", "method", "counter", "counter_key", "api", "schema_version", "available", "validated",
+                       "live_counter_available", "full_lifetime_coverage", "full_lifetime_unavailable_code")
     providers = {kind: {field: capability[field] for field in provider_fields if field in capability}
                  for kind, capability in capabilities.items() if isinstance(capability, dict) and kind != "environment"}
     return {"measurement_sha256": report["measurement_identity"]["sha256"], "environment": environment,

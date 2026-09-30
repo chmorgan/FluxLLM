@@ -35,8 +35,15 @@ FluxLLM's production proxy. Ordinary streams emit 40 fragments per second per
 request; high-rate streams emit 200. No real model download or inference is
 required. The fixture verifies exact forwarded content, progressive delivery,
 tool calls/results, duplicate suppression, and final token corrections. The
-runner verifies that the requested load was delivered; generator delays cannot
-silently make the workload easier.
+runner also verifies source timing for both concurrent streams. Every fragment,
+including the terminal record, must begin writing and finish flushing no more
+than 50 ms after its absolute deadline; emissions more than 1 microsecond early
+are invalid. First-flush times across streams and first-to-terminal durations
+must agree with the schedule within 50 ms. This fixed allowance covers bounded
+scheduler jitter and catch-up within two ordinary-rate or ten high-rate slots;
+larger delays, stretches, or bursts invalidate the workload. The fixture retains
+per-stream timing extrema, endpoint timestamps, counts, and bounded violation
+details. The policy is versioned and does not adapt to a slow machine.
 
 The populated fixture retains approximately 19,000 historical requests, 38,000
 tool events, 7,201 raw samples per series, four older archive hours, and 256 recent
@@ -83,6 +90,15 @@ An absent process, field, or driver client is not an assumed zero. Provider and
 coverage information are included in the report, including any final sample gap.
 WindowServer activity is separate from process-owned GPU accounting.
 
+GPU preflight reports live-counter calibration separately from full-lifetime
+coverage. A calibrated live counter remains useful for diagnostics, but neither
+current provider exposes validated finalized accounting for process exit and
+outstanding GPU work. Therefore `full_lifetime_coverage` is false with code
+`finalized_terminal_accounting_unsupported`, and the automated run cannot achieve
+a complete pass. A final app self-sample or retained IOKit client is not treated
+as proof of terminal coverage. Missing coverage is reported as incomplete; it is
+never replaced with zero or an adjusted threshold.
+
 Filesystem tracing uses noninteractive privileged `fs_usage` and an observed
 proof write to establish readiness. It checks direct app writes and matching
 isolated preference paths, including delegated writes. Unknown formats, dropped
@@ -128,9 +144,10 @@ Do not run other build or benchmark workloads on the same machine concurrently.
 `.github/workflows/performance.yml` invokes the same command on a GitHub-hosted
 macOS runner and preserves artifacts even when limits or capabilities fail.
 Manual dispatch can select an available Apple Silicon XLarge runner to evaluate
-GPU support. A hosted runner is accepted only after the automated calibration and
-UI/tracing checks succeed; hardware acceleration alone does not prove counter
-availability. The workflow's job timeout also allows for the separate build.
+GPU support. Automated calibration and UI/tracing checks remain required;
+hardware acceleration alone does not prove counter availability or resolve the
+current terminal GPU coverage limitation. The workflow's job timeout also allows
+for the separate build.
 
 Normal Swift, Python, and release-script checks remain independent of the
 five-minute performance stage. The fast Python harness checks run with:

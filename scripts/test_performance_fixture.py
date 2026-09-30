@@ -11,8 +11,12 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 
-from performance_fixture import MAX_BODY_BYTES, MODEL, create_server, encoded, proxy_address, record
+from performance_fixture import (MAX_BODY_BYTES, MAX_TIMING_VIOLATIONS, MODEL,
+                                 FixtureHandler, SourceProgress, StreamTiming,
+                                 create_server, encoded, proxy_address, record)
 
 
 @contextmanager
@@ -85,6 +89,11 @@ class PerformanceFixtureTests(unittest.TestCase):
                 self.assertEqual(result["expected_prompt_tokens"], 46)
                 self.assertEqual(result["tool_calls"], 2)
                 self.assertEqual(result["tool_results"], 2)
+                self.assertEqual(len(result["timing"]["streams"]), 2)
+                for timing in result["timing"]["streams"]:
+                    self.assertEqual(timing["records_observed"], chunks + 1)
+                    self.assertEqual(timing["violation_count"], 0)
+                    self.assertLessEqual(timing["maximum_finish_lateness_seconds"], 0.05)
             self.assertEqual(len(run_ids), 2)
 
     def test_record_has_repeated_identified_tool_and_authoritative_counts(self):
@@ -252,6 +261,78 @@ class PerformanceFixtureTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.communicate()
+
+
+class SourceTimingTests(unittest.TestCase):
+    def timing(self, rate=200, duration=1, delay=lambda index: 0, flush=lambda index: 0):
+        chunks = round(rate * duration)
+        timing = StreamTiming(7, chunks, rate, duration, 100)
+        for index in range(chunks + 1):
+            due = 100 + (duration if index == chunks else index / rate)
+            started = due + delay(index)
+            timing.observed(index, started, started + flush(index))
+        return timing.snapshot()
+
+    def test_bounded_scheduler_jitter_and_small_catchup_remain_valid(self):
+        for rate in (40, 200):
+            result = self.timing(rate=rate, delay=lambda index: 0.004 if index % 2 else 0)
+            self.assertEqual(result["violation_count"], 0)
+            self.assertAlmostEqual(result["maximum_finish_lateness_seconds"], 0.004)
+
+    def test_exact_50ms_terminal_boundary_and_reversed_clock(self):
+        self.assertEqual(self.timing(delay=lambda index: 0.05 if index == 200 else 0)["violation_count"], 0)
+        timing = StreamTiming(1, 40, 40, 1, 100)
+        timing.observed(0, 100, 100.04)
+        timing.observed(1, 100.025, 100.025)
+        self.assertGreater(timing.snapshot()["violation_count"], 0)
+
+    def test_late_write_and_blocked_flush_are_independently_invalid(self):
+        for options in ({"delay": lambda index: 0.051 if index == 50 else 0},
+                        {"flush": lambda index: 0.051 if index == 50 else 0}):
+            with self.subTest(options=options):
+                result = self.timing(**options)
+                self.assertGreater(result["violation_count"], 0)
+                self.assertGreater(result["maximum_finish_lateness_seconds"], 0.05)
+
+    def test_whole_stream_stretch_early_fragment_and_terminal_fail(self):
+        for delay in (lambda index: index * 0.001,
+                      lambda index: -0.001 if index == 20 else 0,
+                      lambda index: -0.01 if index == 200 else 0,
+                      lambda index: 0.051 if index == 200 else 0):
+            with self.subTest(delay=delay):
+                self.assertGreater(self.timing(delay=delay)["violation_count"], 0)
+
+    def test_violation_evidence_has_constant_space(self):
+        result = self.timing(delay=lambda _: 0.1)
+        self.assertGreater(result["violation_count"], MAX_TIMING_VIOLATIONS)
+        self.assertEqual(len(result["violations"]), MAX_TIMING_VIOLATIONS)
+
+    def test_sender_records_real_write_delay_before_http_eof(self):
+        clock = [100.0]
+        progress = SourceProgress()
+        def wait(seconds):
+            clock[0] += seconds
+            return False
+        writes = [0]
+        def write(payload):
+            if payload == b"0\r\n\r\n":
+                self.assertIsNotNone(progress.timing_snapshot())
+                return
+            writes[0] += 1
+            if writes[0] == 3:
+                clock[0] += 0.075
+        handler = SimpleNamespace(
+            send_response=mock.Mock(), send_header=mock.Mock(), end_headers=mock.Mock(),
+            server=SimpleNamespace(lock=threading.Lock(), stopping=SimpleNamespace(wait=wait),
+                                   source_completions={("run", 7): progress}),
+            wfile=SimpleNamespace(write=write, flush=lambda: None))
+        with mock.patch("performance_fixture.time.monotonic", side_effect=lambda: clock[0]):
+            FixtureHandler.send_stream(handler, 7, 40, 200, 0.2, "run")
+        result = progress.timing_snapshot()
+        self.assertEqual(result["records_observed"], 41)
+        self.assertGreater(result["violation_count"], 0)
+        self.assertAlmostEqual(result["maximum_flush_seconds"], 0.075)
+        self.assertAlmostEqual(result["maximum_finish_lateness_seconds"], 0.075)
 
 
 if __name__ == "__main__":

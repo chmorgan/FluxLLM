@@ -1,6 +1,7 @@
 """Fast checks for the actual-app performance runner; no builds or app launch."""
 
 import contextlib
+import copy
 import io
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ from unittest import mock
 import xml.etree.ElementTree as ET
 
 import app_performance as app
+from performance_fixture import StreamTiming, TIMING_POLICY
 
 
 def samples():
@@ -28,6 +30,26 @@ def samples():
 
 def budget():
     return app.load_json(app.BUDGET_PATH)
+
+
+def fixture_evidence(stage):
+    expected = app.expected_work(stage)
+    acknowledgement = {"run_id": "test-run", "running": True, "expected_requests": 2,
+                       "expected_request_indices": [32, 33], "expected_chunks": expected["chunks"],
+                       "expected_output_tokens": expected["output_tokens"], "expected_prompt_tokens": expected["prompt_tokens"]}
+    streams = []
+    rate = 40 if stage["activity"] == "ordinary" else 200
+    chunks = expected["chunks"] // 2
+    for index in acknowledgement["expected_request_indices"]:
+        timing = StreamTiming(index, chunks, rate, stage["seconds"], 100)
+        for chunk in range(chunks + 1):
+            due = 100 + (stage["seconds"] if chunk == chunks else chunk / rate)
+            timing.observed(chunk, due, due)
+        streams.append(timing.snapshot())
+    status = {"run_id": acknowledgement["run_id"], "running": False, "error": None, "forwarding_verified": True,
+              "completed_requests": 2, "received_chunks": expected["chunks"], "tool_calls": 2, "tool_results": 2,
+              "timing": dict(TIMING_POLICY, streams=streams)}
+    return acknowledgement, status
 
 
 class ResourceGateTests(unittest.TestCase):
@@ -248,17 +270,79 @@ class ProtocolTests(unittest.TestCase):
         expected = app.expected_work(stage)
         before = {field: 0 for field in expected}
         after = dict(expected)
-        status = {"running": False, "error": None, "forwarding_verified": True,
-                  "completed_requests": 2, "received_chunks": expected["chunks"], "tool_calls": 2, "tool_results": 2}
-        self.assertEqual(app.validate_workload(stage, status, before, after), expected)
+        acknowledgement, status = fixture_evidence(stage)
+        self.assertEqual(app.validate_workload(stage, status, before, after, acknowledgement), expected)
         for field in ("requests", "output_tokens", "prompt_tokens", "tool_calls", "tool_results"):
             with self.subTest(field=field), self.assertRaises(app.InvalidResult):
                 changed = dict(after)
                 changed[field] -= 1
-                app.validate_workload(stage, status, before, changed)
+                app.validate_workload(stage, status, before, changed, acknowledgement)
         status["received_chunks"] -= 1
         with self.assertRaises(app.InvalidResult):
-            app.validate_workload(stage, status, before, after)
+            app.validate_workload(stage, status, before, after, acknowledgement)
+
+    def test_timing_requires_current_workload_complete_streams_and_fixed_policy(self):
+        stage = {"activity": "high-rate", "seconds": 1}
+        changes = (
+            lambda value: value.update(run_id="previous-run"),
+            lambda value: value.pop("timing"),
+            lambda value: value["timing"].update(maximum_lateness_seconds=0.5),
+            lambda value: value["timing"]["streams"].pop(),
+            lambda value: value["timing"]["streams"][1].update(request_index=32),
+            lambda value: value["timing"]["streams"][0].update(records_observed=200),
+            lambda value: value["timing"]["streams"][0].update(rate_hz=40),
+            lambda value: value["timing"]["streams"][0].update(duration_seconds=0.9))
+        acknowledgement, original = fixture_evidence(stage)
+        app.validate_fixture_timing(stage, original, acknowledgement)
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(app.InvalidResult):
+                status = copy.deepcopy(original)
+                change(status)
+                app.validate_fixture_timing(stage, status, acknowledgement)
+
+    def test_timing_recomputes_bad_maxima_and_rejects_invalid_numbers(self):
+        stage = {"activity": "ordinary", "seconds": 1}
+        for field, value in (("maximum_start_lateness_seconds", 0.051),
+                             ("maximum_finish_lateness_seconds", 0.051),
+                             ("maximum_earliness_seconds", 0.001),
+                             ("maximum_flush_seconds", 0.06),
+                             ("terminal_flush_finished_monotonic_seconds", None),
+                             ("maximum_finish_lateness_seconds", float("nan")),
+                             ("maximum_finish_lateness_seconds", float("inf")),
+                             ("maximum_finish_lateness_seconds", True),
+                             ("maximum_finish_lateness_seconds", -1)):
+            with self.subTest(field=field, value=value), self.assertRaises(app.InvalidResult):
+                acknowledgement, status = fixture_evidence(stage)
+                status["timing"]["streams"][0].update({field: value, "timing_passed": True})
+                app.validate_fixture_timing(stage, status, acknowledgement)
+
+    def test_timing_recomputes_endpoint_duration_and_concurrent_skew(self):
+        stage = {"activity": "ordinary", "seconds": 1}
+        for change in ("early-terminal", "stretched-terminal", "skew", "reversed"):
+            with self.subTest(change=change), self.assertRaises(app.InvalidResult):
+                acknowledgement, status = fixture_evidence(stage)
+                stream = status["timing"]["streams"][0]
+                if change == "skew":
+                    for field in tuple(stream):
+                        if field.endswith("monotonic_seconds"):
+                            stream[field] += 0.051
+                elif change == "reversed":
+                    stream["first_write_started_monotonic_seconds"] = 101
+                else:
+                    offset = -0.01 if change == "early-terminal" else 0.051
+                    stream["terminal_write_started_monotonic_seconds"] += offset
+                    stream["terminal_flush_finished_monotonic_seconds"] += offset
+                app.validate_fixture_timing(stage, status, acknowledgement)
+
+    def test_timing_accepts_exact_policy_boundaries(self):
+        stage = {"activity": "high-rate", "seconds": 1}
+        acknowledgement, status = fixture_evidence(stage)
+        stream = status["timing"]["streams"][0]
+        stream["terminal_write_started_monotonic_seconds"] += 0.05
+        stream["terminal_flush_finished_monotonic_seconds"] += 0.05
+        stream["maximum_start_lateness_seconds"] = 0.05
+        stream["maximum_finish_lateness_seconds"] = 0.05
+        app.validate_fixture_timing(stage, status, acknowledgement)
 
     def test_completed_but_buffered_stream_is_invalid(self):
         stage = {"activity": "ordinary", "seconds": 10}
@@ -277,9 +361,7 @@ class ProtocolTests(unittest.TestCase):
     def test_fixture_start_manifest_cannot_reduce_the_workload(self):
         stage = {"activity": "ordinary", "seconds": 30}
         expected = app.expected_work(stage)
-        acknowledgement = {"run_id": "test", "running": True, "expected_requests": 2,
-                           "expected_chunks": expected["chunks"], "expected_output_tokens": expected["output_tokens"],
-                           "expected_prompt_tokens": expected["prompt_tokens"]}
+        acknowledgement, _ = fixture_evidence(stage)
         app.validate_fixture_start(stage, acknowledgement)
         acknowledgement["expected_requests"] = 1
         with self.assertRaises(app.InvalidResult):
@@ -368,8 +450,28 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(any("timed out" in reason for reason in result["invalid"]))
             self.assertTrue(result["capabilities"]["cpu"]["available"])
             self.assertFalse(result["capabilities"]["gpu"]["available"])
+            self.assertFalse(result["capabilities"]["gpu"]["live_counter_available"])
+            self.assertFalse(result["capabilities"]["gpu"]["full_lifetime_coverage"])
+            self.assertTrue(any("GPU full-lifetime coverage" in reason for reason in result["invalid"]))
             self.assertTrue((directory / "preflight-execution.json").exists())
             self.assertTrue((directory / "preflight.json").exists())
+
+    def test_live_gpu_calibration_without_terminal_coverage_is_incomplete_at_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capabilities = {"type": "capabilities", "gpu": {
+                "available": True, "live_counter_available": True, "full_lifetime_coverage": False,
+                "full_lifetime_unavailable_code": "finalized_terminal_accounting_unsupported",
+                "full_lifetime_unavailable_reason": "No validated finalized process-exit accounting"}}
+            def launch(command, **options):
+                options["stdout"].write(json.dumps(capabilities).encode() + b"\n")
+                process = mock.Mock()
+                process.wait.return_value = 0
+                return process
+            with mock.patch.object(app.subprocess, "Popen", side_effect=launch), mock.patch.object(app, "stop_process_group"):
+                result = app.preflight(Path("/collector"), Path(temporary), app.Deadline(5))
+            self.assertTrue(result["capabilities"]["gpu"]["live_counter_available"])
+            self.assertTrue(any("finalized_terminal_accounting_unsupported" in reason for reason in result["invalid"]))
+            self.assertTrue(any("process-exit accounting" in reason for reason in result["invalid"]))
 
 
 class CleanupTests(unittest.TestCase):

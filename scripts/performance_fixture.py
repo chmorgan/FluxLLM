@@ -24,6 +24,14 @@ CREATED_AT = "2026-01-01T00:00:00Z"
 MAX_BODY_BYTES = 65536
 MAX_RECORD_BYTES = 16384
 MAX_CHUNKS = 1_000_000
+TIMING_POLICY = {
+    "schema_version": 1,
+    "policy": "absolute-deadlines-50ms-v1",
+    "maximum_lateness_seconds": 0.05,
+    "maximum_stream_skew_seconds": 0.05,
+    "early_epsilon_seconds": 0.000001,
+}
+MAX_TIMING_VIOLATIONS = 8
 
 
 def encoded(value):
@@ -116,7 +124,72 @@ def idle_status():
         "expected_prompt_tokens": 0, "tool_calls": 0, "tool_results": 0,
         "received_chunks": 0, "expected_chunks": 0,
         "forwarding_verified": False, "error": None,
+        "timing": dict(TIMING_POLICY, streams=[]),
     }
+
+
+class StreamTiming:
+    """Inspect every actual send while retaining bounded evidence per stream."""
+
+    def __init__(self, index, chunks, rate, duration, started):
+        self.last_flush_finished = started
+        self.value = {
+            "request_index": index, "rate_hz": rate, "duration_seconds": duration,
+            "expected_content_fragments": chunks, "records_observed": 0,
+            "source_started_monotonic_seconds": started,
+            "first_write_started_monotonic_seconds": None,
+            "first_flush_finished_monotonic_seconds": None,
+            "terminal_write_started_monotonic_seconds": None,
+            "terminal_flush_finished_monotonic_seconds": None,
+            "maximum_start_lateness_seconds": 0.0,
+            "maximum_finish_lateness_seconds": 0.0,
+            "maximum_earliness_seconds": 0.0,
+            "maximum_flush_seconds": 0.0,
+            "violation_count": 0, "violations": [],
+        }
+
+    def violation(self, index, message, write_started, flush_finished, due):
+        self.value["violation_count"] += 1
+        if len(self.value["violations"]) < MAX_TIMING_VIOLATIONS:
+            self.value["violations"].append({
+                "record_index": index, "reason": message,
+                "planned_monotonic_seconds": due,
+                "write_started_monotonic_seconds": write_started,
+                "flush_finished_monotonic_seconds": flush_finished,
+            })
+
+    def observed(self, index, write_started, flush_finished):
+        value = self.value
+        terminal = index == value["expected_content_fragments"]
+        due = value["source_started_monotonic_seconds"] + (
+            value["duration_seconds"] if terminal else index / value["rate_hz"])
+        if (index != value["records_observed"] or flush_finished < write_started
+                or write_started < self.last_flush_finished):
+            self.violation(index, "Record sequence or write clock moved backwards", write_started, flush_finished, due)
+        self.last_flush_finished = flush_finished
+        value["records_observed"] += 1
+        if index == 0:
+            value["first_write_started_monotonic_seconds"] = write_started
+            value["first_flush_finished_monotonic_seconds"] = flush_finished
+        if terminal:
+            value["terminal_write_started_monotonic_seconds"] = write_started
+            value["terminal_flush_finished_monotonic_seconds"] = flush_finished
+        value["maximum_start_lateness_seconds"] = max(value["maximum_start_lateness_seconds"], write_started - due)
+        value["maximum_finish_lateness_seconds"] = max(value["maximum_finish_lateness_seconds"], flush_finished - due)
+        value["maximum_earliness_seconds"] = max(value["maximum_earliness_seconds"], due - write_started, due - flush_finished)
+        value["maximum_flush_seconds"] = max(value["maximum_flush_seconds"], flush_finished - write_started)
+        if (write_started - due > TIMING_POLICY["maximum_lateness_seconds"] + 1e-9
+                or flush_finished - due > TIMING_POLICY["maximum_lateness_seconds"] + 1e-9):
+            self.violation(index, "Fragment exceeded its absolute deadline by more than 50 ms", write_started, flush_finished, due)
+        if min(write_started, flush_finished) < due - TIMING_POLICY["early_epsilon_seconds"]:
+            self.violation(index, "Fragment was emitted before its planned deadline", write_started, flush_finished, due)
+        if terminal and value["first_flush_finished_monotonic_seconds"] is not None:
+            elapsed = flush_finished - value["first_flush_finished_monotonic_seconds"]
+            if abs(elapsed - value["duration_seconds"]) > TIMING_POLICY["maximum_lateness_seconds"] + 1e-9:
+                self.violation(index, "Observed stream duration differs by more than 50 ms", write_started, flush_finished, due)
+
+    def snapshot(self):
+        return self.value | {"violations": list(self.value["violations"])}
 
 
 class SourceProgress:
@@ -125,6 +198,7 @@ class SourceProgress:
     def __init__(self):
         self.lock = threading.Lock()
         self.latest = -1
+        self.timing = None
 
     def emitted(self, index):
         with self.lock:
@@ -133,6 +207,14 @@ class SourceProgress:
     def snapshot(self):
         with self.lock:
             return self.latest
+
+    def finished(self, timing):
+        with self.lock:
+            self.timing = timing
+
+    def timing_snapshot(self):
+        with self.lock:
+            return self.timing
 
 
 class FixtureServer(ThreadingHTTPServer):
@@ -167,6 +249,7 @@ class FixtureServer(ThreadingHTTPServer):
                 "expected_output_tokens": (2 * workload.chunks + 17) * workload.concurrency,
                 "expected_prompt_tokens": 23 * workload.concurrency,
                 "expected_chunks": workload.chunks * workload.concurrency,
+                "expected_request_indices": [workload.cycle * 32 + ordinal for ordinal in range(workload.concurrency)],
             }
             self.source_completions = {}
             self.workers = []
@@ -256,9 +339,19 @@ class FixtureServer(ThreadingHTTPServer):
                     self.status["tool_results"] += 1
                 if error and self.status["error"] is None:
                     self.status["error"] = error
+                timing = source_progress.timing_snapshot()
+                if timing is not None:
+                    self.status["timing"]["streams"].append(timing)
+                if succeeded and (timing is None or timing["records_observed"] != workload.chunks + 1
+                                  or timing["violation_count"]):
+                    self.status["error"] = self.status["error"] or f"request {index}: source emission timing is incomplete or outside the fixed 50 ms policy"
                 self.source_completions.pop((run_id, index), None)
                 if not self.source_completions:
                     self.status["running"] = False
+                    starts = [item["first_flush_finished_monotonic_seconds"] for item in self.status["timing"]["streams"]]
+                    if len(starts) == workload.concurrency and all(item is not None for item in starts):
+                        if max(starts) - min(starts) > TIMING_POLICY["maximum_stream_skew_seconds"] + 1e-9:
+                            self.status["error"] = self.status["error"] or "Concurrent source streams started more than 50 ms apart"
                     self.status["forwarding_verified"] = (
                         self.status["error"] is None
                         and self.status["completed_requests"] == workload.concurrency
@@ -358,6 +451,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         started = time.monotonic()
+        timing = StreamTiming(index, chunks, rate, duration, started)
         with self.server.lock:
             progress = self.server.source_completions.get((run_id, index))
         try:
@@ -368,8 +462,14 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 if progress is not None:
                     progress.emitted(chunk_index)
                 payload = encoded(record(index, chunk_index, chunks, duration)) + b"\n"
+                write_started = time.monotonic()
                 self.wfile.write(f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n")
                 self.wfile.flush()
+                timing.observed(chunk_index, write_started, time.monotonic())
+            # Publish before the HTTP terminator: drive() cannot finish its
+            # final read until the complete timing evidence is available.
+            if progress is not None:
+                progress.finished(timing.snapshot())
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
