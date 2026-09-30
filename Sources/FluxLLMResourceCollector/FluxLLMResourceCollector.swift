@@ -138,7 +138,27 @@ struct FluxLLMResourceCollector {
             throw CollectorFailure.message("CPU self-calibration failed")
         }
         try GPUResourceProvider.verifyControlPipe()
-        try emit(["type": "self_test", "passed": true, "cpu": calibration, "short_line_pipe": true])
+        let finalEvent: [String: Any] = [
+            "type": "gpu_sample", "final": true, "process_id": 42,
+            "birth_time_us": 123, "monotonic_seconds": 5.0,
+            "kernel_gpu_counter": 0,
+        ]
+        guard
+            validatedNativeGPUFinalTimestamp(finalEvent, processID: 42, birthTime: 123, now: 5.1)
+                == 5,
+            validatedNativeGPUFinalTimestamp(finalEvent, processID: 43, birthTime: 123, now: 5.1)
+                == nil,
+            validatedNativeGPUFinalTimestamp(finalEvent, processID: 42, birthTime: 124, now: 5.1)
+                == nil,
+            validatedNativeGPUFinalTimestamp(finalEvent, processID: 42, birthTime: 123, now: 4)
+                == nil
+        else {
+            throw CollectorFailure.message("Final GPU receipt identity/timestamp self-test failed")
+        }
+        try emit([
+            "type": "self_test", "passed": true, "cpu": calibration, "short_line_pipe": true,
+            "raw_gpu_final_receipt": true,
+        ])
     }
 }
 
@@ -156,6 +176,8 @@ private final class ApplicationMeasurement {
     private var nativeGPUCounter: UInt64 = 0
     private var nativeGPUFailure: String?
     private var nativeGPUFinal = false
+    /// Receipt is a protocol fact. It does not establish a usable GPU counter.
+    private var nativeGPUFinalReceivedAt: Double?
     private var lastGPUReported = -Double.infinity
     private var commandBuffer = Data()
     private var eventBuffer = Data()
@@ -256,7 +278,10 @@ private final class ApplicationMeasurement {
                         "type": "exited", "status": result.status,
                         "wait4_cpu_seconds": result.cpuSeconds,
                         "final_sample": final,
-                        "gpu_final_self_sample_received": nativeGPUFinal,
+                        "gpu_final_self_sample_received": nativeGPUFinalReceivedAt != nil,
+                        "gpu_final_self_sample_monotonic_seconds": nativeGPUFinalReceivedAt as Any?
+                            ?? NSNull(),
+                        "gpu_final_self_sample_calibrated": nativeGPUFinal,
                         "gpu_exit_gap_seconds": lastGPURead.isFinite
                             ? max(0, exitedAt - lastGPURead) as Any : NSNull(),
                         "gpu_exit_tail_measured": false,
@@ -396,7 +421,16 @@ private final class ApplicationMeasurement {
     }
 
     private func ingestNativeGPU(_ event: [String: Any]) {
-        guard nativeGPUEnabled, let probe else { return }
+        guard let probe else { return }
+        if let timestamp = validatedNativeGPUFinalTimestamp(
+            event, processID: probe.processID, birthTime: probe.birthTimeMicroseconds,
+            now: ProcessResources.monotonicSeconds())
+        {
+            nativeGPUFinalReceivedAt = timestamp
+        }
+        // An unsupported provider may still deliver its final raw event. Record
+        // that receipt above while keeping every measured GPU value unavailable.
+        guard nativeGPUEnabled else { return }
         if let reason = event["gpu_unavailable_reason"] as? String {
             nativeGPUFailure = reason
             return
@@ -450,6 +484,20 @@ private final class ApplicationMeasurement {
     private func drainTrace() throws {
         for event in tracer?.drain() ?? [] { try emit(event) }
     }
+}
+
+private func validatedNativeGPUFinalTimestamp(
+    _ event: [String: Any], processID: Int32, birthTime: UInt64, now: Double
+) -> Double? {
+    guard event["type"] as? String == "gpu_sample", event["final"] as? Bool == true,
+        let pid = event["process_id"] as? NSNumber, CFGetTypeID(pid) != CFBooleanGetTypeID(),
+        pid.int64Value == Int64(processID),
+        let birth = event["birth_time_us"] as? NSNumber, CFGetTypeID(birth) != CFBooleanGetTypeID(),
+        birth.uint64Value == birthTime,
+        let timestamp = event["monotonic_seconds"] as? Double, timestamp.isFinite,
+        timestamp >= 0, timestamp <= now + 0.01
+    else { return nil }
+    return timestamp
 }
 
 func object<T: Encodable>(_ value: T) throws -> [String: Any] {
