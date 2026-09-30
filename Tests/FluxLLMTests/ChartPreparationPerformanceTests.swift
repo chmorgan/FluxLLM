@@ -129,6 +129,18 @@ final class ChartPreparationPerformanceTests: XCTestCase {
             equivalentOutputs = equivalentOutputs && equal
             XCTAssertTrue(
                 equal, "Visible output changed with retained history for \(laneCount) lanes")
+            #if !DEBUG
+                if laneCount == 256 {
+                    let hour = try XCTUnwrap(paired.first { $0.retention == "hour" })
+                    let minute = try XCTUnwrap(paired.first { $0.retention == "minute-aligned" })
+                    XCTAssertLessThanOrEqual(
+                        hour.maximumCPUSecondsPerPublication, 0.015,
+                        "Every full-hour publication must stay within the 15 ms CPU budget")
+                    XCTAssertLessThanOrEqual(
+                        hour.totalCPUSeconds, minute.totalCPUSeconds * 2,
+                        "Retained offscreen history must not double preparation CPU cost")
+                }
+            #endif
             cases.append(contentsOf: paired)
         }
         #if DEBUG
@@ -373,11 +385,14 @@ private struct ChartPerformanceCase: Encodable {
 
     var totalCPUSeconds: Double { measurements.reduce(0) { $0 + $1.cpuSeconds } }
     var totalWallSeconds: Double { measurements.reduce(0) { $0 + $1.wallSeconds } }
+    var maximumCPUSecondsPerPublication: Double { measurements.map(\.cpuSeconds).max() ?? 0 }
+    var maximumWallSecondsPerPublication: Double { measurements.map(\.wallSeconds).max() ?? 0 }
 
     enum CodingKeys: String, CodingKey {
         case retention, laneCount, measurements, outputChecksums
         case freshPreparations, cacheReuse, completeOutputs
         case totalCPUSeconds, totalWallSeconds, cpuSecondsPerPublication, wallSecondsPerPublication
+        case maximumCPUSecondsPerPublication, maximumWallSecondsPerPublication
     }
 
     init(
@@ -408,11 +423,15 @@ private struct ChartPerformanceCase: Encodable {
             totalCPUSeconds / Double(measurements.count), forKey: .cpuSecondsPerPublication)
         try container.encode(
             totalWallSeconds / Double(measurements.count), forKey: .wallSecondsPerPublication)
+        try container.encode(
+            maximumCPUSecondsPerPublication, forKey: .maximumCPUSecondsPerPublication)
+        try container.encode(
+            maximumWallSecondsPerPublication, forKey: .maximumWallSecondsPerPublication)
     }
 }
 
 private struct ChartPerformanceReport: Encodable {
-    let schemaVersion = 1
+    let schemaVersion = 2
     let kind = "chart-preparation"
     let fixtureVersion = ChartPerformanceFixture.version
     let cpuClock = "getrusage(RUSAGE_SELF): user + system"
@@ -420,8 +439,17 @@ private struct ChartPerformanceReport: Encodable {
     let visibleDurationSeconds = ChartPerformanceFixture.visibleDuration
     let publicationCount = ChartPerformanceFixture.publicationCount
     let timingIncludesFixtureConstruction = false
-    let budgetStatus = "unbudgeted-characterization"
+    let maximum256LaneCPUSecondsPerPublication = 0.015
+    let maximum256LaneRetainedHistoryCPURatio = 2.0
+    let budgetStatus: String
     let configuration: String
     let equivalentOutputs: Bool
     let cases: [ChartPerformanceCase]
+
+    init(configuration: String, equivalentOutputs: Bool, cases: [ChartPerformanceCase]) {
+        self.configuration = configuration
+        self.equivalentOutputs = equivalentOutputs
+        self.cases = cases
+        budgetStatus = configuration == "release" ? "enforced" : "requires-release-build"
+    }
 }

@@ -58,24 +58,15 @@ struct ChartDisplayHistory {
         samples: [TimeSeriesPoint], now: Date, duration: TimeInterval,
         maximumGap: TimeInterval = 5, archivedSegments: [[ArchivedChartBucket]] = []
     ) {
-        let validDuration = duration.isFinite && duration > 0
-        let cutoff = validDuration ? now.addingTimeInterval(-duration) : now
-        let usesArchive = archivedSegments.contains { segment in
-            segment.contains { $0.isValid && $0.end >= cutoff && $0.end <= now }
-        }
-        // Minute means cannot be expanded into pretend high-resolution samples.
-        let interval =
-            validDuration
-            ? (usesArchive ? max(60, (duration / 3_600).rounded(.up) * 60) : max(3, duration / 60))
-            : 3
+        let window = ChartObservationWindow(
+            samples: samples, now: now, duration: duration, maximumGap: maximumGap,
+            archivedSegments: archivedSegments)
+        let interval = window.interval
+        let cutoff = window.cutoff
         self.interval = interval
         self.now = now
         self.cutoff = cutoff
-        hasValidWindow =
-            validDuration && now.timeIntervalSince1970.isFinite
-            && cutoff.timeIntervalSince1970.isFinite
-            && maximumGap.isFinite && maximumGap >= 0
-
+        hasValidWindow = window.isValid
         guard hasValidWindow else {
             runs = []
             segments = []
@@ -84,67 +75,10 @@ struct ChartDisplayHistory {
             current = nil
             return
         }
-
-        // Repeated timestamps follow the store's replacement rule. Preserve input order
-        // for ties, then let the last observation at that timestamp win.
-        let sorted = samples.enumerated().filter {
-            $0.element.timestamp.timeIntervalSince1970.isFinite && $0.element.timestamp <= now
-        }.sorted {
-            if $0.element.timestamp == $1.element.timestamp { return $0.offset < $1.offset }
-            return $0.element.timestamp < $1.element.timestamp
-        }
-        var observations: [TimeSeriesPoint] = []
-        for entry in sorted {
-            if observations.last?.timestamp == entry.element.timestamp {
-                observations.removeLast()
-            }
-            observations.append(entry.element)
-        }
-
-        // At the source history's retention boundary, an incomplete leading bin
-        // cannot be reconstructed. Omit that bin rather than change its old mean
-        // as contributors disappear. Startup bins near Now remain visible.
-        var omittedLeadingKey: Double?
-        let archive = archivedSegments.compactMap { segment -> [ArchivedChartBucket]? in
-            let retained = segment.filter { sample in
-                sample.isValid && sample.end <= now
-                    && (observations.first.map { sample.end < $0.timestamp } ?? true)
-            }
-            return retained.isEmpty ? nil : retained
-        }
-        let earliest = ([observations.first?.timestamp] + archive.map { $0.first?.start })
-            .compactMap { $0 }.min()
-        if let earliest {
-            let key = Self.bucketKey(earliest, interval: interval)
-            let start = key * interval
-            let leftEdge = cutoff.timeIntervalSince1970
-            if earliest.timeIntervalSince1970 > start,
-                start <= leftEdge, leftEdge < start + interval
-            {
-                omittedLeadingKey = key
-            }
-        }
-
-        var rawRuns: [[TimeSeriesPoint]] = []
-        var rawRun: [TimeSeriesPoint] = []
-        for sample in observations {
-            guard Self.isValid(sample) else {
-                if !rawRun.isEmpty { rawRuns.append(rawRun) }
-                rawRun = []
-                continue
-            }
-            if let previous = rawRun.last,
-                sample.timestamp.timeIntervalSince(previous.timestamp) > maximumGap
-            {
-                rawRuns.append(rawRun)
-                rawRun = []
-            }
-            rawRun.append(sample)
-        }
-        if !rawRun.isEmpty { rawRuns.append(rawRun) }
+        let omittedLeadingKey = window.omittedLeadingKey
 
         var displayRuns: [DisplayRun] = []
-        for rawRun in rawRuns {
+        for rawRun in window.rawRuns {
             // Aggregate whole epoch-aligned bins first. Trimming individual samples at
             // the moving left edge would change previously completed averages.
             let visibleBuckets = Self.aggregate(rawRun, interval: interval).filter {
@@ -157,8 +91,12 @@ struct ChartDisplayHistory {
                 )
             }
         }
-        for segment in archive {
-            let visibleBuckets = Self.aggregate(segment, interval: interval).filter {
+        for segment in window.archive {
+            let firstVisibleKey = Self.bucketKey(cutoff, interval: interval)
+            let candidates = segment.filter {
+                Self.bucketKey($0.end, interval: interval) >= firstVisibleKey
+            }
+            let visibleBuckets = Self.aggregate(candidates, interval: interval).filter {
                 $0.timestamp >= cutoff && $0.timestamp <= now
                     && Self.bucketKey($0.timestamp, interval: interval) != omittedLeadingKey
             }
@@ -173,7 +111,7 @@ struct ChartDisplayHistory {
         buckets = segments.flatMap { $0 }
         peak = buckets.map(\.value).max()
 
-        if let latest = observations.last, Self.isValid(latest), latest.timestamp >= cutoff,
+        if let latest = window.latest, Self.isValid(latest), latest.timestamp >= cutoff,
             now.timeIntervalSince(latest.timestamp) <= 5
         {
             current = buckets.last

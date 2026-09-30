@@ -54,23 +54,23 @@ struct ToolActivityHistory {
         duration: TimeInterval, maximumGap: TimeInterval = 5,
         archivedSegments: [[ArchivedChartBucket]] = []
     ) {
-        let validDuration = duration.isFinite && duration > 0
-        let cutoff = validDuration ? now.addingTimeInterval(-duration) : now
-        let usesArchive = archivedSegments.contains { segment in
-            segment.contains { $0.isValid && $0.end >= cutoff && $0.end <= now }
-        }
-        let interval =
-            validDuration
-            ? (usesArchive ? max(60, (duration / 3_600).rounded(.up) * 60) : max(3, duration / 60))
-            : 3
+        self.init(
+            preparedEvents: Self.normalizedEvents(events, through: now),
+            observation: ToolActivityObservation(
+                observations: observations, now: now, duration: duration,
+                maximumGap: maximumGap, archivedSegments: archivedSegments))
+    }
+
+    /// Events have already been merged, deduplicated, and ordered for this
+    /// publication. Grouping them by request preserves that ordering.
+    init(preparedEvents events: [ToolActivityEvent], observation: ToolActivityObservation) {
+        let interval = observation.interval
+        let now = observation.now
+        let cutoff = observation.cutoff
         self.interval = interval
         self.now = now
         self.cutoff = cutoff
-        hasValidWindow =
-            validDuration && now.timeIntervalSince1970.isFinite
-            && cutoff.timeIntervalSince1970.isFinite
-            && maximumGap.isFinite && maximumGap >= 0
-
+        hasValidWindow = observation.isValid
         guard hasValidWindow else {
             segments = []
             buckets = []
@@ -80,118 +80,44 @@ struct ToolActivityHistory {
             return
         }
 
-        // Match replacement semantics of the underlying time-series store.
-        let sortedObservations = observations.enumerated().filter {
-            $0.element.timestamp.timeIntervalSince1970.isFinite && $0.element.timestamp <= now
-        }.sorted {
-            if $0.element.timestamp == $1.element.timestamp { return $0.offset < $1.offset }
-            return $0.element.timestamp < $1.element.timestamp
-        }
-        var samples: [TimeSeriesPoint] = []
-        for observation in sortedObservations {
-            if samples.last?.timestamp == observation.element.timestamp { samples.removeLast() }
-            samples.append(observation.element)
-        }
-
-        var seenIDs: Set<UUID> = []
-        let validEvents = events.filter {
-            $0.timestamp.timeIntervalSince1970.isFinite && $0.timestamp <= now
-                && seenIDs.insert($0.id).inserted
-        }.enumerated().sorted {
-            if $0.element.timestamp == $1.element.timestamp { return $0.offset < $1.offset }
-            return $0.element.timestamp < $1.element.timestamp
-        }.map(\.element)
-        let calls = validEvents.filter { $0.kind == .call }
-        resultMarkers = validEvents.filter {
+        let calls = events.filter { $0.kind == .call }
+        resultMarkers = events.filter {
             $0.kind == .resultSubmission && $0.timestamp >= cutoff
         }
-
-        // An incomplete retention bin has lost both its exposure time and events.
-        // Omit it instead of allowing old completed rates to drift as data expires.
-        var omittedLeadingKey: Double?
-        let archive = archivedSegments.compactMap { segment -> [ArchivedChartBucket]? in
-            let retained = segment.filter { sample in
-                sample.isValid && sample.end <= now
-                    && (samples.first.map { sample.end < $0.timestamp } ?? true)
-            }
-            return retained.isEmpty ? nil : retained
-        }
-        let earliest = ([samples.first?.timestamp] + archive.map { $0.first?.start })
-            .compactMap { $0 }.min()
-        if let earliest {
-            let key = Self.bucketKey(earliest, interval: interval)
-            let start = key * interval
-            let leftEdge = cutoff.timeIntervalSince1970
-            if earliest.timeIntervalSince1970 > start,
-                start <= leftEdge, leftEdge < start + interval
-            {
-                omittedLeadingKey = key
-            }
-        }
-
-        var rawRuns: [[TimeSeriesPoint]] = []
-        var rawRun: [TimeSeriesPoint] = []
-        for sample in samples {
-            guard Self.isValid(sample) else {
-                if !rawRun.isEmpty { rawRuns.append(rawRun) }
-                rawRun = []
-                continue
-            }
-            if let previous = rawRun.last,
-                sample.timestamp.timeIntervalSince(previous.timestamp) > maximumGap
-            {
-                rawRuns.append(rawRun)
-                rawRun = []
-            }
-            rawRun.append(sample)
-        }
-        if !rawRun.isEmpty { rawRuns.append(rawRun) }
-
-        // Archived segments retain exact collection spans even though the rate
-        // samples within them have been reduced to minute means. Their endpoints
-        // provide exposure time; gaps between segments remain unobserved.
-        var coverageRuns = rawRuns.compactMap { run -> (start: Date, end: Date)? in
-            guard let first = run.first, let last = run.last else { return nil }
-            return (first.timestamp, last.timestamp)
-        }
-        coverageRuns += archive.compactMap { run -> (start: Date, end: Date)? in
-            guard let first = run.first, let last = run.last else { return nil }
-            return (first.start, last.end)
-        }
-        coverageRuns.sort { $0.start < $1.start }
-
+        let omittedLeadingKey = observation.omittedLeadingKey
         var displaySegments: [[ToolActivityBucket]] = []
         var assignedIDs: Set<UUID> = []
         var callIndex = 0
-        for run in coverageRuns {
+        for run in observation.runs {
             while callIndex < calls.count && calls[callIndex].timestamp < run.start {
                 callIndex += 1
             }
             let firstCallIndex = callIndex
             while callIndex < calls.count && calls[callIndex].timestamp <= run.end {
+                assignedIDs.insert(calls[callIndex].id)
                 callIndex += 1
             }
-            let runCalls = Array(calls[firstCallIndex..<callIndex])
-            assignedIDs.formUnion(runCalls.map(\.id))
-            let firstKey = Self.bucketKey(max(run.start, cutoff), interval: interval)
-            let lastKey = Self.bucketKey(run.end, interval: interval)
-            var key = firstKey
+            var bucketCallIndex = firstCallIndex
             var segment: [ToolActivityBucket] = []
-            while key <= lastKey {
-                if key != omittedLeadingKey {
-                    let start = max(
-                        run.start, Date(timeIntervalSince1970: key * interval))
-                    let end = min(
-                        run.end, Date(timeIntervalSince1970: (key + 1) * interval))
-                    let bucketCalls = runCalls.filter {
-                        Self.bucketKey($0.timestamp, interval: interval) == key
-                    }
-                    if end >= cutoff, start <= end {
-                        segment.append(Self.bucket(start: start, end: end, calls: bucketCalls))
-                    }
+            segment.reserveCapacity(run.buckets.count)
+            for bucket in run.buckets {
+                while bucketCallIndex < callIndex
+                    && Self.bucketKey(calls[bucketCallIndex].timestamp, interval: interval)
+                        < bucket.key
+                {
+                    bucketCallIndex += 1
                 }
-                guard key + 1 > key else { break }
-                key += 1
+                let firstBucketCallIndex = bucketCallIndex
+                while bucketCallIndex < callIndex
+                    && Self.bucketKey(calls[bucketCallIndex].timestamp, interval: interval)
+                        == bucket.key
+                {
+                    bucketCallIndex += 1
+                }
+                segment.append(
+                    Self.bucket(
+                        start: bucket.start, end: bucket.end,
+                        calls: calls[firstBucketCallIndex..<bucketCallIndex]))
             }
             if !segment.isEmpty { displaySegments.append(segment) }
         }
@@ -223,14 +149,13 @@ struct ToolActivityHistory {
         buckets = displaySegments.flatMap { $0 }
         peak = buckets.filter { $0.observedDuration > 0 }.map(\.callsPerMinute).max()
 
-        if let latest = samples.last, Self.isValid(latest), latest.timestamp >= cutoff,
-            now.timeIntervalSince(latest.timestamp) <= maximumGap,
-            !pendingCalls.contains(where: { $0.timestamp > latest.timestamp }),
+        if let latest = observation.currentTimestamp,
+            !pendingCalls.contains(where: { $0.timestamp > latest }),
             !buckets.contains(where: {
-                $0.end == latest.timestamp && $0.observedDuration == 0 && $0.callCount > 0
+                $0.end == latest && $0.observedDuration == 0 && $0.callCount > 0
             }),
             let candidate = buckets.last(where: {
-                $0.end == latest.timestamp && $0.observedDuration > 0
+                $0.end == latest && $0.observedDuration > 0
             })
         {
             current = candidate
@@ -251,9 +176,9 @@ struct ToolActivityHistory {
         }
     }
 
-    private static func bucket(
-        start: Date, end: Date, calls: [ToolActivityEvent]
-    ) -> ToolActivityBucket {
+    private static func bucket<Calls: Collection>(
+        start: Date, end: Date, calls: Calls
+    ) -> ToolActivityBucket where Calls.Element == ToolActivityEvent {
         let duration = end.timeIntervalSince(start)
         let rate = duration > 0 ? Double(calls.count) * 60 / duration : 0
         return ToolActivityBucket(
@@ -262,8 +187,17 @@ struct ToolActivityHistory {
             toolNames: Array(Set(calls.compactMap(\.name))).sorted())
     }
 
-    private static func isValid(_ sample: TimeSeriesPoint) -> Bool {
-        sample.isAvailable && sample.value.isFinite && sample.value >= 0
+    static func normalizedEvents(
+        _ events: [ToolActivityEvent], through now: Date
+    ) -> [ToolActivityEvent] {
+        var seenIDs: Set<UUID> = []
+        return events.filter {
+            $0.timestamp.timeIntervalSince1970.isFinite && $0.timestamp <= now
+                && seenIDs.insert($0.id).inserted
+        }.enumerated().sorted {
+            if $0.element.timestamp == $1.element.timestamp { return $0.offset < $1.offset }
+            return $0.element.timestamp < $1.element.timestamp
+        }.map(\.element)
     }
 
     private static func bucketKey(_ timestamp: Date, interval: TimeInterval) -> Double {
