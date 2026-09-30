@@ -20,7 +20,7 @@ final class GenerationEventInboxTests: XCTestCase {
             var wakeups = 0
             for await _ in inbox.notifications {
                 wakeups += 1
-                for event in inbox.drain() {
+                for event in inbox.drainReadyEvents() {
                     deliveries += 1
                     store.apply(event, epoch: epoch)
                 }

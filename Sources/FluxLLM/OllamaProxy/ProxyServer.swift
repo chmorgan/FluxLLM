@@ -16,6 +16,7 @@ public final class ProxyManager: ObservableObject {
     private var ollamaHost: String
     private var ollamaPort: Int
     private weak var metricsStore: MetricsStore?
+    private let eventEpoch: UUID?
 
     private var serverChannel: Channel?
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
@@ -42,12 +43,13 @@ public final class ProxyManager: ObservableObject {
         self.ollamaHost = ollamaHost
         self.ollamaPort = ollamaPort
         self.metricsStore = metricsStore
+        self.eventEpoch = eventEpoch
         let inbox = GenerationEventInbox()
         eventInbox = inbox
         eventConsumer = Task { @MainActor [weak metricsStore] in
             for await _ in inbox.notifications {
                 guard !Task.isCancelled else { return }
-                for event in inbox.drain() {
+                for event in inbox.drainReadyEvents() {
                     metricsStore?.apply(event, epoch: eventEpoch)
                 }
             }
@@ -56,7 +58,7 @@ public final class ProxyManager: ObservableObject {
     }
 
     deinit {
-        eventInbox.finish()
+        eventInbox.finish(deliveringPendingEvents: false)
         eventConsumer?.cancel()
     }
 
@@ -244,6 +246,12 @@ public final class ProxyManager: ObservableObject {
                 lastError = "Error stopping proxy: \(error.localizedDescription)"
                 metricsStore?.proxyError = lastError
             }
+        }
+        // Channel shutdown emits cancellation and its latest cumulative usage.
+        // Apply those events before stop/restart returns, even if a live batch
+        // was waiting for its 50 ms delivery deadline.
+        for event in eventInbox.drain() {
+            metricsStore?.apply(event, epoch: eventEpoch)
         }
         serverChannel = nil
         eventLoopGroup = nil
