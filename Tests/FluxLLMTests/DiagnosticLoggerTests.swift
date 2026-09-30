@@ -89,6 +89,32 @@ final class DiagnosticLoggerTests: XCTestCase {
         try await logger.setEnabled(false)
     }
 
+    func testDisableWaitsForCloseBarrierAndSurfacesItsFailure() async throws {
+        let entered = expectation(description: "Close barrier entered")
+        let output = DiagnosticTestOutput(
+            blockClose: true, failClose: true, closeEntered: entered)
+        defer { output.releaseClose() }
+        let logger = DiagnosticLogger(configuration: .init()) { _ in output }
+        try await logger.setEnabled(true, directory: temporaryDirectory())
+        logger.record(.sample, count: 1)
+        let disable = Task { @MainActor in try await logger.setEnabled(false) }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertFalse(logger.isEnabled)
+        XCTAssertTrue(logger.isUpdating, "Disable must await buffered-output completion")
+        XCTAssertEqual(try records(output.snapshot.writes).count, 1)
+        logger.record(.sample, count: 2)
+        output.releaseClose()
+        do {
+            try await disable.value
+            XCTFail("The disable caller must receive a close-barrier failure")
+        } catch {}
+        XCTAssertFalse(logger.isUpdating)
+        XCTAssertNotNil(logger.errorMessage)
+        XCTAssertEqual(output.snapshot.closeCalls, 1)
+        XCTAssertEqual(try records(output.snapshot.writes).count, 1)
+        try await logger.setEnabled(false)
+    }
+
     func testOpenFailureLeavesLoggingDisabledAndClosesOutput() async throws {
         let output = DiagnosticTestOutput(failOpen: true)
         let logger = DiagnosticLogger(configuration: .init()) { _ in output }
@@ -250,18 +276,25 @@ private final class DiagnosticTestOutput: DiagnosticLogOutput, @unchecked Sendab
     private let condition = NSCondition()
     private var state = Snapshot()
     private var blockWrites: Bool
+    private var blockClose: Bool
     private let failWrites: Bool
     private let failOpen: Bool
+    private let failClose: Bool
     private var entered: XCTestExpectation?
+    private var closeEntered: XCTestExpectation?
 
     init(
         blockWrites: Bool = false, failWrites: Bool = false, failOpen: Bool = false,
-        entered: XCTestExpectation? = nil
+        entered: XCTestExpectation? = nil, blockClose: Bool = false, failClose: Bool = false,
+        closeEntered: XCTestExpectation? = nil
     ) {
         self.blockWrites = blockWrites
+        self.blockClose = blockClose
         self.failWrites = failWrites
         self.failOpen = failOpen
+        self.failClose = failClose
         self.entered = entered
+        self.closeEntered = closeEntered
     }
 
     var snapshot: Snapshot {
@@ -295,13 +328,24 @@ private final class DiagnosticTestOutput: DiagnosticLogOutput, @unchecked Sendab
 
     func close() throws {
         condition.lock()
+        defer { condition.unlock() }
         state.closeCalls += 1
-        condition.unlock()
+        closeEntered?.fulfill()
+        closeEntered = nil
+        while blockClose { condition.wait() }
+        if failClose { throw TestError.outputFailure }
     }
 
     func releaseWrites() {
         condition.lock()
         blockWrites = false
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func releaseClose() {
+        condition.lock()
+        blockClose = false
         condition.broadcast()
         condition.unlock()
     }

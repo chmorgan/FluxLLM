@@ -153,6 +153,7 @@ public final class DiagnosticLogger {
 }
 
 /// Implementations are accessed exclusively on the writer's serial queue.
+/// Closing must finish buffered output before returning or reporting a failure.
 protocol DiagnosticLogOutput: AnyObject, Sendable {
     func open(directory: URL) throws
     func write(_ data: Data) throws
@@ -315,9 +316,20 @@ private final class DiagnosticFileOutput: DiagnosticLogOutput, @unchecked Sendab
     }
 
     func close() throws {
-        let closing = handle
+        guard let closing = handle else { return }
         handle = nil
-        try closing?.close()
+        // Disable and rotation use this same serial barrier. Closing alone can
+        // leave buffered file data to be written after logging is acknowledged off.
+        var synchronizationError: Error?
+        do {
+            try closing.synchronize()
+        } catch {
+            synchronizationError = error
+        }
+        // Always release the file, including after synchronization fails. A
+        // close failure is surfaced directly instead of being hidden by cleanup.
+        try closing.close()
+        if let synchronizationError { throw synchronizationError }
     }
 
     private func path(_ index: Int) throws -> URL {
