@@ -68,10 +68,12 @@ Mac’s total GPU utilization.
 Choose a backend in Settings. For Ollama, point clients using `/api/chat` or
 `/api/generate` at `http://127.0.0.1:11435`; the default upstream is
 `localhost:11434`. Other backends are monitored directly through their metrics
-or status endpoints.
+or status endpoints. Backend and menu-bar preference changes apply for the
+current launch and are not saved. Previously saved preferences are read at startup.
 
 Enable **Settings → General → Launch at login** to start FluxLLM automatically
-when you sign in. The change takes effect immediately, without pressing Save.
+when you sign in. The change takes effect immediately, separately from other
+settings.
 If macOS requires approval, use **Open Login Items Settings** to allow FluxLLM.
 You can turn the option off again without quitting the app.
 
@@ -85,12 +87,19 @@ Drag across the chart to zoom, use the arrow buttons to move through history,
 and select **Live** to follow new activity again. Double-click a request rail
 or use its **Fit request** context menu to frame that request.
 
-FluxLLM saves 24 hours of chart history and up to 30 days of bounded request
-usage locally. Recent charts retain detailed samples; older history uses
-minute averages. Saved usage contains counts, timing, model names, and tool
-names—not prompt text, response text, tool arguments, or result contents.
-History is separated by backend endpoint. Other backends continue to show
-their server-reported token totals.
+History stays in memory for the current launch and resets when FluxLLM exits.
+A long-running session retains up to 24 hours of chart history and 30 days of
+bounded request usage. Recent charts retain detailed samples; older history
+uses minute averages. Usage contains counts, timing, model names, and tool
+names, with no prompt text, response text, tool arguments, or result contents.
+History is separated by backend endpoint. Existing history files from earlier
+versions are ignored and left untouched. Other backends continue to show their
+server-reported token totals.
+
+Optional diagnostic logging is off by default. When enabled, it writes bounded,
+rotating logs containing event metadata, identifiers, timing, and counts.
+Diagnostic logs do not save or restore dashboard history. Logging starts disabled
+again on the next launch.
 
 See [DESIGN.md](DESIGN.md) for architecture, measurement semantics, and limitations.
 

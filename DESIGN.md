@@ -22,7 +22,7 @@ events pass through a coalescing inbox: cumulative progress may replace older pe
 transitions and tool events retain order. Forwarded response bytes are independent of telemetry delivery.
 
 Launch at login is opt-in and uses `SMAppService.mainApp`. macOS owns its state; no separate preference is
-persisted. The General toggle applies immediately, independently of connection drafts and Save. Pending
+persisted. The General toggle applies immediately, independently of connection preferences. Pending
 approval remains requested but is clearly identified as unable to launch until allowed in System Settings.
 Status refreshes whenever Settings opens or the app becomes active. Login launches reuse the normal quiet
 menu-bar startup path. Registration changes are serialized, and failures show the actual system status.
@@ -40,10 +40,15 @@ Native collectors observe direct client traffic without a proxy or Prometheus in
 scrapes; resets, changed series, or gaps reset the baseline. llama.cpp requires `--metrics`; router mode
 requires a model selection and uses `autoload=false`. Native token totals are server totals.
 
-Discovery probes saved endpoints and these loopback defaults using bounded, read-only requests. Backend-specific
-responses establish identity; a port or generic OpenAI-compatible model list does not. Automatic selection
+Discovery probes configured endpoints and these loopback defaults using bounded, read-only requests.
+Backend-specific responses establish identity; a port or generic OpenAI-compatible model list does not. Automatic selection
 retains its previous detected choice or selects a sole detection; unresolved choices go to Settings. Manual
-selection persists. Scan Again does not restart collection.
+selection remains in effect for the current launch. Scan Again does not restart collection.
+
+App settings read existing saved preferences at startup for compatibility. Changes to backend selection,
+endpoints, menu-bar preferences, and automatic-selection memory apply only to the current launch. They do not
+write preferences or migrate a legacy preferences domain. Diagnostic logging starts disabled each launch.
+The macOS-owned launch-at-login registration remains independent of these session preferences.
 
 Ollama clients must target the loopback proxy, normally `http://127.0.0.1:11435`. Only routed native generation
 traffic is measured. The proxy starts whenever Ollama is selected; persisted `autoStartProxy` is legacy state.
@@ -59,10 +64,10 @@ request's count; its completed-request average is `eval_count × 1,000,000,000 /
 usage appears at completion. Final averages are not live activity.
 
 Backend and GPU polling normally occur every second; failed backend polls back off to 30 seconds, and unresolved
-discovery retries every five seconds. History samples every half-second. Numeric throughput and coherent chart
-snapshots publish once per second, with immediate clearing/reset transitions. Ollama's numeric estimate waits
-for one second of output: healthy loading and warmup display zero while raw post-output history can already
-contain estimates. Help and metadata preserve measurement basis despite plain numeric labels.
+discovery retries every five seconds. History samples every half-second. Numeric throughput publishes once
+per second; coherent chart snapshots publish once per second while a chart surface is visible, with immediate
+clearing/reset transitions. Ollama's numeric estimate waits for one second of output: healthy loading and
+warmup display zero while raw post-output history can already contain estimates. Help and metadata preserve measurement basis despite plain numeric labels.
 
 Health, request output, native activity counts, and GPU readings have separate freshness evidence, generally
 expiring after five seconds. Successful health polling cannot refresh stale output rates. Outstanding observed
@@ -85,9 +90,9 @@ loading and waiting time, unlike Ollama's evaluation-only completed-request rate
 The dashboard Usage row aggregates independently of the chart, scoped to the selected endpoint. Since launch
 includes all monitored requests in this process, including active estimates, and survives collection restarts.
 Selected period attributes a request's full usage to its completion time; adjacent intervals are half-open
-so boundary completions cannot count twice. Today uses the local calendar day, including saved completions and
-active requests started today. Tool calls use their event timestamps for both period scopes. Missing input
-usage remains unknown; a known subtotal carries `+` when other requests have unknown input. Estimated output
+so boundary completions cannot count twice. Today uses the local calendar day and includes completions observed
+in this launch and active requests started today. Tool calls use their event timestamps for both period scopes.
+Missing input usage remains unknown; a known subtotal carries `+` when other requests have unknown input. Estimated output
 carries `~`. Duplicate request and tool events are deduplicated; final usage replaces estimates rather than
 being added to them. Server-native counters retain their separate server-total labels and semantics.
 
@@ -136,9 +141,11 @@ publication time and ended requests use their finish time, independently of curs
 replaces stream estimates, and estimated counts and averages carry a `~` prefix. Decorative lifecycle effects
 use a separate clock, pause when hidden, and respect accessibility settings; they do not alter measurements.
 
-Raw histories retain one hour with at most 7,201 samples each. An independent archive keeps 24 hours of minute
-means weighted by sample count, with explicit collection gaps and source boundaries. Archived means cannot
-be expanded into finer samples when zooming. Whole archived buckets overlapping the raw buffer are omitted
+Raw histories use bounded rings retaining one hour with at most 7,201 samples each. Insertion, expiry, and
+same-timestamp replacement do not shift the retained hour or copy the last presentation snapshot. An
+independent in-memory archive keeps 24 hours of minute means weighted by sample count, with explicit collection
+gaps and source boundaries. Its bounded rings retain segment flags and expire old prefixes without rebuilding
+all retained buckets. Archived means cannot be expanded into finer samples when zooming. Whole archived buckets overlapping the raw buffer are omitted
 to avoid double counting, leaving at most a minute of missing coverage at the boundary. Tool observations
 retain their actual continuous spans for exposure-based rates. Archived means never imply a fresh live rate.
 
@@ -149,12 +156,47 @@ the newest completed requests up to 256 displayed records, with an omitted-count
 Per-request tool charts are prepared only for rendered requests. Live lifecycle state continues updating while
 the viewport is pinned; historical views suppress animation.
 
-The app restores history from Application Support/FluxLLM/History and writes atomic snapshots off the main
-actor (usage at most once per second; chart archive every 30 seconds), flushing on orderly shutdown. Source
-keys include backend kind, endpoint without credentials/query, and configured model. Corrupt or unsupported
-files remain untouched and expose a storage status; collection continues in memory. Request history stores
-counts, timing, model/tool names, and identifiers, with no prompt, response, argument, or result contents.
-Ordinary tests use memory-only stores; persistence tests use isolated temporary directories.
+All history belongs to the current application session. A new launch starts empty; there are no history
+readers, writers, save timers, migrations, or shutdown flushes. Existing files under
+Application Support/FluxLLM/History are ignored and left untouched, including corrupt or unsupported files.
+Source keys include backend kind, endpoint without credentials/query, and configured model. Request history
+holds counts, timing, model/tool names, and identifiers, with no prompt, response, argument, or result contents.
+
+The usage ledger shares metadata through reference-counted interned slots, releasing names when retained
+records expire. Exact since-launch totals are updated incrementally. Complete-hour aggregates accelerate
+period queries; exact completion and tool-event timestamps handle interval edges, preserving half-open
+boundaries and later authoritative corrections. Retained timestamp indices are rebuilt only when membership
+changes. Existing record and event caps remain explicit: selected-period queries mark missing detail as partial
+while since-launch counters survive eviction.
+
+Native dashboard and popover hosts request chart presentation only while visible. Closing, minimizing, or
+occluding a surface releases its host and prepared charts while collection continues. The last consumer
+closing releases the store's presentation arrays; reopening immediately prepares the latest retained data.
+Navigation and request identities survive this suspension. The status meter queries an inclusive recent peak
+directly from the raw ring; it does not materialize the retained hour to calculate that scalar.
+
+Tests compare optimized accounting and archives with reference histories, exercise wraparound and retention,
+and verify that new sessions start empty and legacy paths are untouched. The synthetic resource fixture uses
+the same in-memory ingestion paths and validates that optimization does not discard its required history.
+
+## Diagnostic logging and resource limits
+
+Diagnostic logging is separate from usage and chart history and is disabled by default. Disabled logging does
+not construct records, encode data, create directories, or schedule file work. Opt-in logs contain fixed event
+categories, backend kind, request identifiers, timing, and numeric counts; they exclude prompt and response
+text, tool arguments, and result contents. They are never loaded to restore dashboard history.
+
+One serial writer has a 128 KiB queue limit including its in-flight batch, writes batches no larger than
+16 KiB, and rotates at most three files of 1 MiB each. Overflow drops diagnostic records and increments an
+in-memory dropped count instead of blocking telemetry or growing the queue. File errors are surfaced in
+Settings. Logging preference changes are session-only, so the next launch starts with logging disabled.
+
+The resource regression acceptance limits are CPU at most 5% of one core, lifetime physical footprint strictly
+below 64,000,000 bytes, process GPU execution time at most 1% of elapsed time, and zero app-attributed disk writes
+with diagnostic logging disabled. Chart preparation has a 15 ms limit per publication. These are acceptance
+limits, not a claim that every build meets them. The process GPU check is separate from the dashboard's
+whole-Mac utilization reading. See [performance checks](docs/performance.md) for the workload, measurement
+coverage, and validation protocol.
 
 ## Source map
 
