@@ -10,3 +10,5 @@ DerivedData/
 # Python caches
 __pycache__/
 *.py[cod]
+# Local performance baselines, measurements, and comparison reports
+.performance-results/

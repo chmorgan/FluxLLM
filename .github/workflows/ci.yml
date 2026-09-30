@@ -62,5 +62,5 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run mock server tests
-        run: python3 -m unittest discover -s scripts -p 'test_mock*.py' -v
+      - name: Run Python tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
