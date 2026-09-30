@@ -5,6 +5,11 @@ import AppKit
 @MainActor
 class DashboardWindow: NSWindow, NSWindowDelegate {
     private(set) var isDashboardOpen = false
+    private(set) var isPresentationContentActive = false
+    private var makePresentationContent: (() -> NSViewController)?
+    private var presentationVisibilityChanged: ((Bool) -> Void)?
+    private var visibilityGeneration = 0
+    private let placeholder = NSViewController()
     var setActivationPolicy: @MainActor (NSApplication.ActivationPolicy) -> Void = {
         _ = NSApp.setActivationPolicy($0)
     }
@@ -16,12 +21,77 @@ class DashboardWindow: NSWindow, NSWindowDelegate {
         }
         if isMiniaturized { deminiaturize(nil) }
         makeKeyAndOrderFront(nil)
+        schedulePresentationUpdate()
     }
 
     func windowWillClose(_ notification: Notification) {
+        setPresentationContentActive(false)
         guard isDashboardOpen else { return }
         isDashboardOpen = false
         setActivationPolicy(.accessory)
+    }
+
+    /// A closed window preserves its frame and native sizing behavior, without
+    /// retaining an observing SwiftUI host. The factory owns only light state.
+    func configurePresentation(
+        makeContent: @escaping () -> NSViewController,
+        visibilityChanged: @escaping (Bool) -> Void
+    ) {
+        makePresentationContent = makeContent
+        presentationVisibilityChanged = visibilityChanged
+        placeholder.view = NSView(frame: NSRect(origin: .zero, size: contentLayoutRect.size))
+        contentViewController = placeholder
+    }
+
+    /// Kept separate from content attachment so lifecycle tests can exercise the
+    /// native event sequence without depending on another app's window stacking.
+    var presentationIsVisible: Bool {
+        isDashboardOpen && isVisible && !isMiniaturized && occlusionState.contains(.visible)
+    }
+
+    func synchronizePresentationVisibility() {
+        setPresentationContentActive(presentationIsVisible)
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        schedulePresentationUpdate()
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        setPresentationContentActive(false)
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        schedulePresentationUpdate()
+    }
+
+    override func orderOut(_ sender: Any?) {
+        super.orderOut(sender)
+        setPresentationContentActive(false)
+    }
+
+    private func schedulePresentationUpdate() {
+        visibilityGeneration &+= 1
+        let expected = visibilityGeneration
+        // AppKit can notify during SwiftUI layout. Change host ownership only
+        // after that layout pass and ignore superseded native notifications.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.visibilityGeneration == expected else { return }
+            self.synchronizePresentationVisibility()
+        }
+    }
+
+    private func setPresentationContentActive(_ active: Bool) {
+        guard makePresentationContent != nil, active != isPresentationContentActive else { return }
+        isPresentationContentActive = active
+        presentationVisibilityChanged?(active)
+        if active {
+            contentViewController = makePresentationContent?()
+        } else {
+            let size = contentLayoutRect.size
+            placeholder.view.frame = NSRect(origin: .zero, size: size)
+            contentViewController = placeholder
+        }
     }
 
     override func setContentSize(_ size: NSSize) {

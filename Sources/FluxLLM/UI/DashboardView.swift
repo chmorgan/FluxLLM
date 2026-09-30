@@ -14,17 +14,20 @@ enum DashboardFrameAnchors: PreferenceKey {
 struct DashboardView: View {
     @Environment(MetricsStore.self) private var store
     @Environment(\.colorScheme) private var colorScheme
-    @State private var chartPreparation = DashboardChartPreparation()
-    @State private var navigation = HistoryNavigation()
+    @State private var presentation: DashboardPresentationState
     let actions: MenuActions
     let isCompact: Bool
 
     static let compactWidth: CGFloat = 360
     static let preferredWindowSize = DashboardSizingPolicy.preferredWindowSize
 
-    init(actions: MenuActions = MenuActions(), isCompact: Bool = false) {
+    init(
+        actions: MenuActions = MenuActions(), isCompact: Bool = false,
+        presentation: DashboardPresentationState = DashboardPresentationState()
+    ) {
         self.actions = actions
         self.isCompact = isCompact
+        _presentation = State(initialValue: presentation)
     }
 
     var body: some View {
@@ -48,7 +51,7 @@ struct DashboardView: View {
         }
         .background(TelemetryPanelBackground())
         .onChange(of: store.monitoringEpoch) { _, _ in
-            navigation = HistoryNavigation(preset: store.historyRange)
+            presentation.synchronize(with: store)
         }
     }
 
@@ -477,7 +480,7 @@ struct DashboardView: View {
     }
 
     private var currentNavigation: HistoryNavigation {
-        var value = navigation
+        var value = presentation.navigation
         if value.preset != store.historyRange {
             value.selectPreset(
                 store.historyRange, now: store.chartPresentation.timestamp,
@@ -489,7 +492,7 @@ struct DashboardView: View {
         Binding(
             get: { currentNavigation },
             set: {
-                navigation = $0
+                presentation.navigation = $0
                 store.historyRange = $0.preset
             })
     }
@@ -527,7 +530,7 @@ struct DashboardView: View {
     private var throughputColor: Color { TelemetryPalette.throughput(colorScheme) }
     private var gpuColor: Color { TelemetryPalette.gpu(colorScheme) }
     private var preparedCharts: PreparedDashboardCharts {
-        chartPreparation.histories(
+        presentation.chartPreparation.histories(
             snapshot: store.chartPresentation, duration: chartDuration,
             epoch: store.monitoringEpoch,
             windowEnd: chartInterval.end, isLive: isCompact || currentNavigation.isLive

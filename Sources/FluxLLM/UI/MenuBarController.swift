@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Owns one native status item, a transient dashboard, and reusable windows.
 @MainActor
-public final class MenuBarController: NSObject {
+public final class MenuBarController: NSObject, NSPopoverDelegate {
     private var statusItem: NSStatusItem?
     private let metricsStore: MetricsStore
     private let coordinator: MonitoringCoordinator
@@ -11,11 +11,16 @@ public final class MenuBarController: NSObject {
     private let launchAtLogin: LaunchAtLoginController
     private let menuActions = MenuActions()
     private let popover = NSPopover()
+    private let popoverPresentation = DashboardPresentationState()
+    private var popoverVisibilityObserver: DashboardWindowVisibilityObserver?
+    private var isPopoverClosing = false
     private var dashboardWindow: DashboardWindow?
     private var settingsWindow: NSWindow?
     private var iconTimer: Timer?
     private var settingsActionTask: Task<Void, Error>?
     private var statusWidthBudget = StatusItemWidthBudget()
+    private var statusImageCache = StatusItemImageCache()
+    private var statusAccessibilitySummary: String?
     private var isStarted = false
 
     public static let appTitle = "FluxLLM"
@@ -33,18 +38,14 @@ public final class MenuBarController: NSObject {
 
         popover.behavior = .transient
         popover.animates = true
-        let hosting = NSHostingController(
-            rootView: MenuBarExtraView(actions: menuActions)
-                .environment(metricsStore)
-                .frame(width: 360)
-                .onExitCommand { [weak self] in self?.popover.performClose(nil) })
-        hosting.sizingOptions = [.preferredContentSize]
-        popover.contentViewController = hosting
+        popover.delegate = self
     }
 
     public func start() {
         guard !isStarted else { return }
         isStarted = true
+        metricsStore.setChartPresentationDemand(false, consumer: .popover)
+        metricsStore.setChartPresentationDemand(false, consumer: .dashboard)
         if let appIcon = BrandingAssets.appIcon {
             NSApp.applicationIconImage = appIcon
         }
@@ -82,10 +83,13 @@ public final class MenuBarController: NSObject {
         iconTimer?.invalidate()
         iconTimer = nil
         popover.performClose(nil)
+        releasePopoverContent()
         dashboardWindow?.close()
         settingsWindow?.close()
         if let item = statusItem { NSStatusBar.system.removeStatusItem(item) }
         statusItem = nil
+        statusImageCache = StatusItemImageCache()
+        statusAccessibilitySummary = nil
     }
 
     /// Drain the cancelled settings operation before final monitoring teardown.
@@ -108,10 +112,61 @@ public final class MenuBarController: NSObject {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            preparePopoverContent()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    private func preparePopoverContent() {
+        isPopoverClosing = false
+        setPopoverPresentationActive(true)
+        guard popover.contentViewController == nil else { return }
+        let hosting = NSHostingController(
+            rootView: DashboardPopoverContent(
+                store: metricsStore, actions: menuActions, presentation: popoverPresentation
+            )
+            .frame(width: DashboardView.compactWidth)
+            .onExitCommand { [weak self] in self?.popover.performClose(nil) })
+        hosting.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = hosting
+    }
+
+    public func popoverDidShow(_ notification: Notification) {
+        popoverVisibilityObserver?.stop()
+        guard let window = popover.contentViewController?.view.window else { return }
+        popoverVisibilityObserver = DashboardWindowVisibilityObserver(window: window) {
+            [weak self] visible in
+            guard let self else { return }
+            self.setPopoverPresentationActive(
+                visible && self.popover.isShown && !self.isPopoverClosing && self.isStarted)
+        }
+    }
+
+    public func popoverWillClose(_ notification: Notification) {
+        isPopoverClosing = true
+        setPopoverPresentationActive(false)
+    }
+
+    public func popoverDidClose(_ notification: Notification) {
+        guard !popover.isShown else { return }
+        releasePopoverContent()
+    }
+
+    private func setPopoverPresentationActive(_ active: Bool) {
+        if !active, let size = popover.contentViewController?.view.bounds.size {
+            popoverPresentation.placeholderSize = size
+        }
+        metricsStore.setChartPresentationDemand(active, consumer: .popover)
+        popoverPresentation.setActive(active, store: metricsStore)
+    }
+
+    private func releasePopoverContent() {
+        popoverVisibilityObserver?.stop()
+        popoverVisibilityObserver = nil
+        setPopoverPresentationActive(false)
+        popover.contentViewController = nil
     }
 
     private func buildCommandMenu() -> NSMenu {
@@ -189,10 +244,19 @@ public final class MenuBarController: NSObject {
         window.title = "FluxLLM Dashboard"
         window.isReleasedWhenClosed = false
         window.delegate = window
-        let hosting = NSHostingController(
-            rootView: DashboardView(actions: actions).environment(store))
-        hosting.sizingOptions = []
-        window.contentViewController = hosting
+        let presentation = DashboardPresentationState()
+        window.configurePresentation(
+            makeContent: {
+                let hosting = NSHostingController(
+                    rootView: DashboardView(actions: actions, presentation: presentation)
+                        .environment(store))
+                hosting.sizingOptions = []
+                return hosting
+            },
+            visibilityChanged: { visible in
+                store.setChartPresentationDemand(visible, consumer: .dashboard)
+                presentation.setActive(visible, store: store)
+            })
         window.setContentSize(DashboardView.preferredWindowSize)
         window.center()
         return window
@@ -291,23 +355,23 @@ public final class MenuBarController: NSObject {
             ? button.bounds.height : NSStatusBar.system.thickness
         statusWidthBudget.observe(publishedTPS: metricsStore.displayTPS)
         let visibility = statusVisibility
-        let layout = StatusItemPresentation.layout(
-            numberCharacters: statusWidthBudget.numberCharacters, availableHeight: availableHeight,
-            visibility: visibility)
-        if statusItem.length != layout.itemWidth {
-            statusItem.length = layout.itemWidth
-        }
-        button.image = StatusItemPresentation.image(
-            store: metricsStore, availableHeight: availableHeight,
+        let snapshot = StatusItemPresentation.snapshot(store: metricsStore)
+        let images = statusImageCache.images(
+            snapshot: snapshot, availableHeight: availableHeight,
             appearance: button.effectiveAppearance,
             numberCharacters: statusWidthBudget.numberCharacters, visibility: visibility)
-        button.alternateImage = StatusItemPresentation.image(
-            store: metricsStore, availableHeight: availableHeight,
-            appearance: button.effectiveAppearance, isHighlighted: true,
-            numberCharacters: statusWidthBudget.numberCharacters, visibility: visibility)
-        let summary = StatusItemPresentation.accessibilitySummary(store: metricsStore)
-        button.toolTip = summary
-        button.setAccessibilityValue(summary)
+        if statusItem.length != images.itemWidth {
+            statusItem.length = images.itemWidth
+        }
+        if button.image !== images.normal { button.image = images.normal }
+        if button.alternateImage !== images.highlighted {
+            button.alternateImage = images.highlighted
+        }
+        if statusAccessibilitySummary != snapshot.accessibilitySummary {
+            statusAccessibilitySummary = snapshot.accessibilitySummary
+            button.toolTip = snapshot.accessibilitySummary
+            button.setAccessibilityValue(snapshot.accessibilitySummary)
+        }
     }
 
     private enum CommandError: LocalizedError {

@@ -14,21 +14,27 @@ struct StatusMeterReading: Equatable {
     static func recentPeak(
         currentValue: Double?, samples: [TimeSeriesPoint], now: Date
     ) -> Self {
-        func valid(_ value: Double?) -> Double? {
-            guard let value, value.isFinite, value >= 0 else { return nil }
-            return value
-        }
-
-        let current = valid(currentValue)
         let cutoff = now.addingTimeInterval(-60)
-        var peak = current
+        var peak: Double?
         for sample in samples {
             guard sample.isAvailable, sample.timestamp >= cutoff, sample.timestamp <= now,
                 let value = valid(sample.value)
             else { continue }
             peak = max(peak ?? 0, value)
         }
+        return recentPeak(currentValue: currentValue, sampledPeak: peak)
+    }
+
+    static func recentPeak(currentValue: Double?, sampledPeak: Double?) -> Self {
+        let current = valid(currentValue)
+        let history = valid(sampledPeak)
+        let peak = history.map { max($0, current ?? 0) } ?? current
         return Self(currentValue: current, scaleMaximum: peak)
+    }
+
+    private static func valid(_ value: Double?) -> Double? {
+        guard let value, value.isFinite, value >= 0 else { return nil }
+        return value
     }
 
     static func percentage(_ value: Double?) -> Self {
@@ -73,6 +79,22 @@ struct StatusItemLayout {
 
 /// Formatting and layout are independent of the status item's lifetime.
 enum StatusItemPresentation {
+    struct Snapshot: Equatable {
+        let number: String
+        let throughput: StatusMeterReading
+        let gpu: StatusMeterReading
+        let accessibilitySummary: String
+    }
+
+    @MainActor
+    static func snapshot(store: MetricsStore) -> Snapshot {
+        let meters = meterReadings(store: store)
+        return Snapshot(
+            number: store.displayTPS.flatMap(formattedNumber) ?? "—",
+            throughput: meters.throughput, gpu: meters.gpu,
+            accessibilitySummary: accessibilitySummary(store: store, meters: meters))
+    }
+
     static func formattedNumber(_ rate: Double) -> String? {
         guard rate.isFinite, rate >= 0 else { return nil }
         let rounded = rate.rounded()
@@ -152,6 +174,13 @@ enum StatusItemPresentation {
 
     @MainActor
     static func accessibilitySummary(store: MetricsStore) -> String {
+        accessibilitySummary(store: store, meters: meterReadings(store: store))
+    }
+
+    @MainActor
+    private static func accessibilitySummary(
+        store: MetricsStore, meters: (throughput: StatusMeterReading, gpu: StatusMeterReading)
+    ) -> String {
         let status = MenuBarExtraView.statusLine(store: store)
         let backend = store.backendKind?.title ?? "LLM monitor"
         let throughput: String
@@ -165,7 +194,6 @@ enum StatusItemPresentation {
             throughput = "Throughput unavailable"
         }
         let model = store.currentModel.map { ". \($0)" } ?? ""
-        let meters = meterReadings(store: store)
         let throughputMeter = throughputMeterSummary(meters.throughput)
         let gpuMeter =
             meters.gpu.currentValue.map { String(format: "%.1f percent", $0) }
@@ -182,9 +210,11 @@ enum StatusItemPresentation {
     static func meterReadings(store: MetricsStore) -> (
         throughput: StatusMeterReading, gpu: StatusMeterReading
     ) {
+        let now = store.displayUpdatedAt ?? store.sampleDate
         let throughput = StatusMeterReading.recentPeak(
             currentValue: store.displayTPS,
-            samples: store.tpsHistory, now: store.displayUpdatedAt ?? store.sampleDate)
+            sampledPeak: store.peakThroughput(
+                in: DateInterval(start: now.addingTimeInterval(-60), end: now)))
         let gpu = StatusMeterReading.percentage(store.systemGPUUtilizationPercent)
         return (throughput, gpu)
     }
@@ -205,15 +235,22 @@ enum StatusItemPresentation {
         numberCharacters: Int = 3,
         visibility: StatusItemVisibility = StatusItemVisibility()
     ) -> NSImage {
-        let number = store.displayTPS.flatMap(formattedNumber) ?? "—"
+        let snapshot = snapshot(store: store)
         let layout = layout(
-            numberCharacters: max(numberCharacters, number.count), availableHeight: availableHeight,
+            numberCharacters: max(numberCharacters, snapshot.number.count),
+            availableHeight: availableHeight,
             visibility: visibility)
-        let size = layout.imageSize
-        let image = NSImage(size: size)
         let style = StatusMarkAppearance.resolve(
             appearance: appearance, isHighlighted: isHighlighted)
-        let meters = meterReadings(store: store)
+        return image(snapshot: snapshot, layout: layout, style: style)
+    }
+
+    @MainActor
+    static func image(snapshot: Snapshot, layout: StatusItemLayout, style: StatusMarkAppearance)
+        -> NSImage
+    {
+        let size = layout.imageSize
+        let image = NSImage(size: size)
 
         // Explicit representations keep the text, meters, and approved artwork
         // sharp on both display scales, regardless of the current main screen.
@@ -238,7 +275,7 @@ enum StatusItemPresentation {
             context.cgContext.scaleBy(x: CGFloat(scale), y: CGFloat(scale))
             context.cgContext.clear(CGRect(origin: .zero, size: size))
             drawContents(
-                number: number, throughput: meters.throughput, gpu: meters.gpu,
+                number: snapshot.number, throughput: snapshot.throughput, gpu: snapshot.gpu,
                 layout: layout, style: style)
             NSGraphicsContext.restoreGraphicsState()
 
@@ -246,7 +283,7 @@ enum StatusItemPresentation {
             image.addRepresentation(representation)
         }
         image.isTemplate = false
-        image.accessibilityDescription = accessibilitySummary(store: store)
+        image.accessibilityDescription = snapshot.accessibilitySummary
         return image
     }
 
