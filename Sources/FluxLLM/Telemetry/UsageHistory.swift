@@ -30,27 +30,37 @@ public struct UsageSummary: Sendable, Equatable {
 }
 
 /// Request usage is independent of the chart's viewport and sample retention.
-/// Only counts, model names, and tool names/timestamps are persisted, never
-/// prompts, responses, arguments, or tool-result contents.
+/// Session-only counts and metadata. No request or tool payload is retained.
+/// Exact event timestamps preserve half-open selected-period accounting.
 @MainActor
 public final class UsageHistory {
     public private(set) var persistenceError: String?
     public static let retentionInterval: TimeInterval = 30 * 24 * 60 * 60
 
-    private let launchID = UUID()
-    private let directory: URL?
+    private let metadata = UsageMetadata()
+    private var sourceIDs: [String: Int] = [:]
     private let calendar: Calendar
     private let recordLimit: Int
     private let toolEventLimit: Int
     private var records: [RequestKey: UsageRequestRecord] = [:]
     private var tools: [ToolKey: UsageToolRecord] = [:]
-    private var launchTotals: [String: UsageTotals] = [:]
-    private var requestTruncatedThrough: [String: Date] = [:]
-    private var toolTruncatedThrough: [String: Date] = [:]
-    private var incompleteLaunchSources: Set<String> = []
-    private var persistenceIsDisabled = false
-    private var scheduledWrite: Task<Void, Never>?
-    private var pendingWrite: Task<Void, Never>?
+    private var launchTotals: [Int: UsageTotals] = [:]
+    private var requestTruncatedThrough: [Int: Date] = [:]
+    private var toolTruncatedThrough: [Int: Date] = [:]
+    private var incompleteLaunchSources: Set<Int> = []
+    // Queries reuse ordering until an insertion/removal changes it. Live token
+    // updates do not invalidate order, and completed history is never sorted at 1 Hz.
+    private var activeRequests: Set<RequestKey> = []
+    private var completedOrder: [RequestKey] = []
+    private var completedOrderIsDirty = true
+    private var completedTotals: [AccountingBucket: UsageTotals] = [:]
+    private var toolCallTotals: [AccountingBucket: Int] = [:]
+    private var requestOrder: [RequestKey] = []
+    private var requestOrderIsDirty = true
+    private var toolOrder: [ToolKey] = []
+    private var toolOrderIsDirty = true
+    private var revision: UInt64 = 0
+    private var cachedSummary: (SummaryKey, UsageSummary)?
     private var latestDate: Date
     private var lastPrunedAt: Date?
 
@@ -58,21 +68,18 @@ public final class UsageHistory {
         directory: URL? = nil, now: Date = Date(), calendar: Calendar = .current,
         recordLimit: Int = 20_000, toolEventLimit: Int = 50_000
     ) {
-        self.directory = directory
+        // Kept for source compatibility; old files are intentionally untouched.
+        _ = directory
         self.calendar = calendar
         self.recordLimit = max(1, recordLimit)
         self.toolEventLimit = max(1, toolEventLimit)
         latestDate = now
-        load(at: now)
-    }
-
-    deinit {
-        scheduledWrite?.cancel()
     }
 
     public func apply(_ event: GenerationEvent, source: String, at date: Date) {
         guard date.timeIntervalSinceReferenceDate.isFinite else { return }
         latestDate = max(latestDate, date)
+        let source = sourceID(for: source)
         switch event {
         case .began(let request):
             guard request.startedAt.timeIntervalSinceReferenceDate.isFinite else { return }
@@ -87,11 +94,12 @@ public final class UsageHistory {
                 return
             }
             let record = UsageRequestRecord(
-                id: request.id, source: source, launchID: launchID,
                 startedAt: request.startedAt, lastUpdatedAt: request.startedAt,
-                model: request.model)
+                modelID: metadata.retain(request.model))
             records[key] = record
-            updateLaunchTotals(removing: nil, adding: record)
+            requestOrderIsDirty = true
+            activeRequests.insert(key)
+            updateLaunchTotals(source: source, removing: nil, adding: record)
         case .updated(let id, let snapshot):
             let key = RequestKey(source: source, id: id)
             guard snapshot.timestamp.timeIntervalSinceReferenceDate.isFinite,
@@ -105,7 +113,10 @@ public final class UsageHistory {
             }
             var record = old
             record.lastUpdatedAt = snapshot.timestamp
-            record.model = snapshot.model ?? record.model
+            if let model = snapshot.model, model != metadata[record.modelID] {
+                metadata.release(record.modelID)
+                record.modelID = metadata.retain(model)
+            }
             record.outputTokens = max(0, snapshot.outputTokens)
             record.outputIsEstimated = snapshot.isEstimated
             if let input = snapshot.promptTokens { record.inputTokens = max(0, input) }
@@ -114,9 +125,11 @@ public final class UsageHistory {
             }
             if terminal && record.endedAt == nil {
                 record.endedAt = max(record.startedAt, snapshot.timestamp)
+                activeRequests.remove(key)
+                completedOrderIsDirty = true
             }
             records[key] = record
-            updateLaunchTotals(removing: old, adding: record)
+            updateLaunchTotals(source: source, removing: old, adding: record)
         case .failed(let id, _), .cancelled(let id):
             finish(RequestKey(source: source, id: id), at: date)
         case .toolActivity(let id, let events):
@@ -129,34 +142,39 @@ public final class UsageHistory {
                 guard event.timestamp >= latestDate.addingTimeInterval(-Self.retentionInterval),
                     toolTruncatedThrough[source].map({ event.timestamp > $0 }) ?? true
                 else {
-                    if request.launchID == launchID { incompleteLaunchSources.insert(source) }
+                    incompleteLaunchSources.insert(source)
                     continue
                 }
-                let kind = event.kind == .call ? "call" : "result"
+                let callID = metadata.retain(event.callID)
                 let key = ToolKey(
-                    request: requestKey, kind: kind,
-                    identity: event.callID.map { "call:\($0)" } ?? "event:\(event.id)")
-                guard tools[key] == nil else { continue }
+                    request: requestKey, isCall: event.kind == .call,
+                    identity: callID >= 0 ? .call(callID) : .event(event.id))
+                guard tools[key] == nil else {
+                    metadata.release(callID)
+                    continue
+                }
                 tools[key] = UsageToolRecord(
-                    id: event.id, source: source, launchID: request.launchID,
-                    requestID: id, kind: kind, name: event.name,
-                    callID: event.callID, timestamp: event.timestamp)
-                if request.launchID == launchID && event.kind == .call {
+                    id: event.id, nameID: metadata.retain(event.name), timestamp: event.timestamp)
+                toolOrderIsDirty = true
+                if event.kind == .call {
                     launchTotals[source, default: UsageTotals()].toolCalls += 1
+                    toolCallTotals[
+                        AccountingBucket(source: source, date: event.timestamp), default: 0] += 1
                 }
             }
         }
         prune(at: latestDate)
-        scheduleWrite()
+        revision &+= 1
     }
 
     public func finishOpenRequests(source: String, at date: Date) {
         guard date.timeIntervalSinceReferenceDate.isFinite else { return }
         latestDate = max(latestDate, date)
-        let keys = records.keys.filter { $0.source == source && records[$0]?.endedAt == nil }
+        guard let source = sourceIDs[source] else { return }
+        let keys = activeRequests.filter { $0.source == source }
         for key in keys { finish(key, at: date) }
         prune(at: latestDate)
-        flush()
+        revision &+= 1
     }
 
     /// Selected-period requests belong to the interval in which they ended.
@@ -166,6 +184,7 @@ public final class UsageHistory {
     public func summary(
         scope: UsageScope, source: String, interval: DateInterval, now: Date
     ) -> UsageSummary {
+        let source = sourceIDs[source] ?? -1
         if scope == .sinceLaunch {
             return launchTotals[source, default: UsageTotals()].summary(
                 isPartial: incompleteLaunchSources.contains(source))
@@ -181,62 +200,154 @@ public final class UsageHistory {
                 calendar.dateInterval(of: .day, for: now)
                 ?? DateInterval(start: calendar.startOfDay(for: now), duration: 86_400)
         }
+        let key = SummaryKey(
+            scope: scope, source: source, start: range.start, end: range.end,
+            revision: revision,
+            retentionExpired: range.start < now.addingTimeInterval(-Self.retentionInterval))
+        if let cachedSummary, cachedSummary.0 == key { return cachedSummary.1 }
+        let fullStart = Date(
+            timeIntervalSinceReferenceDate: (range.start.timeIntervalSinceReferenceDate / 3600)
+                .rounded(.up) * 3600)
+        let fullEnd = Date(
+            timeIntervalSinceReferenceDate: (range.end.timeIntervalSinceReferenceDate / 3600)
+                .rounded(.down) * 3600)
         var total = UsageTotals()
-        for record in records.values where record.source == source {
-            if let end = record.endedAt {
-                if contains(range, end) { total.include(record) }
-            } else if scope == .today && contains(range, record.startedAt) {
-                total.include(record)
+        if fullStart < fullEnd {
+            for (bucket, value) in completedTotals
+            where bucket.source == source && bucket.start >= fullStart && bucket.start < fullEnd {
+                total.include(value)
+            }
+            for (bucket, count) in toolCallTotals
+            where bucket.source == source && bucket.start >= fullStart && bucket.start < fullEnd {
+                total.toolCalls += count
+            }
+            addBoundaryUsage(
+                source: source, interval: DateInterval(start: range.start, end: fullStart),
+                to: &total)
+            addBoundaryUsage(
+                source: source, interval: DateInterval(start: fullEnd, end: range.end), to: &total)
+        } else {
+            addBoundaryUsage(source: source, interval: range, to: &total)
+        }
+        if scope == .today {
+            for key in activeRequests where key.source == source {
+                if let record = records[key], contains(range, record.startedAt) {
+                    total.include(record)
+                }
             }
         }
-        total.toolCalls =
-            tools.values.filter {
-                $0.source == source && $0.kind == "call" && contains(range, $0.timestamp)
-            }.count
         let cutoff = now.addingTimeInterval(-Self.retentionInterval)
         let partial =
-            persistenceIsDisabled || range.start < cutoff
+            range.start < cutoff
             || requestTruncatedThrough[source].map { range.start <= $0 } == true
             || toolTruncatedThrough[source].map { range.start <= $0 } == true
-        return total.summary(isPartial: partial)
+        let result = total.summary(isPartial: partial)
+        cachedSummary = (key, result)
+        return result
     }
 
     public func requestLanes(source: String, interval: DateInterval) -> [RequestLane] {
-        records.values.filter {
-            $0.source == source && $0.startedAt < interval.end
-                && ($0.endedAt == nil || $0.endedAt! >= interval.start)
-        }.sorted { $0.startedAt < $1.startedAt }.map { $0.lane }
+        guard let source = sourceIDs[source] else { return [] }
+        if requestOrderIsDirty {
+            requestOrder = records.keys.sorted {
+                records[$0]!.startedAt < records[$1]!.startedAt
+            }
+            requestOrderIsDirty = false
+        }
+        var result: [RequestLane] = []
+        for key in requestOrder {
+            guard let record = records[key] else { continue }
+            if record.startedAt >= interval.end { break }
+            if key.source == source && (record.endedAt == nil || record.endedAt! >= interval.start)
+            {
+                result.append(record.lane(id: key.id, model: metadata[record.modelID]))
+            }
+        }
+        return result
     }
 
     public func toolEvents(source: String, interval: DateInterval) -> [ToolActivityEvent] {
-        tools.values.filter { $0.source == source && contains(interval, $0.timestamp) }
-            .sorted { $0.timestamp < $1.timestamp }.map { $0.event }
+        guard let source = sourceIDs[source] else { return [] }
+        prepareToolOrder()
+        // Find the visible suffix without materializing all retained events.
+        var low = 0
+        var high = toolOrder.count
+        while low < high {
+            let middle = (low + high) / 2
+            if tools[toolOrder[middle]]!.timestamp < interval.start {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        var result: [ToolActivityEvent] = []
+        for key in toolOrder[low...] {
+            guard let record = tools[key] else { continue }
+            if record.timestamp >= interval.end { break }
+            if key.request.source == source {
+                result.append(
+                    ToolActivityEvent(
+                        id: record.id, kind: key.isCall ? .call : .resultSubmission,
+                        name: metadata[record.nameID], callID: metadata[key.callID],
+                        timestamp: record.timestamp, requestID: key.request.id))
+            }
+        }
+        return result
     }
 
-    /// Schedules an atomic save off the main actor. Writes are serialized so an
-    /// older snapshot cannot replace newer usage. Call waitForPendingWrites
-    /// when a caller needs a durability barrier before terminating.
-    public func flush() {
-        scheduledWrite?.cancel()
-        scheduledWrite = nil
-        guard let directory, !persistenceIsDisabled else { return }
-        let snapshot = UsageHistorySnapshot(
-            version: 1, records: Array(records.values), tools: Array(tools.values),
-            requestTruncatedThrough: requestTruncatedThrough,
-            toolTruncatedThrough: toolTruncatedThrough)
-        let previous = pendingWrite
-        pendingWrite = Task { [weak self] in
-            await previous?.value
-            let error = await Task.detached(priority: .utility) {
-                Self.write(snapshot, directory: directory)
-            }.value
-            self?.persistenceError = error
+    private func prepareToolOrder() {
+        guard toolOrderIsDirty else { return }
+        toolOrder = tools.keys.sorted { tools[$0]!.timestamp < tools[$1]!.timestamp }
+        toolOrderIsDirty = false
+    }
+
+    private func addBoundaryUsage(source: Int, interval: DateInterval, to total: inout UsageTotals)
+    {
+        guard interval.duration > 0 else { return }
+        if completedOrderIsDirty {
+            completedOrder = records.keys.filter { records[$0]!.endedAt != nil }.sorted {
+                records[$0]!.endedAt! < records[$1]!.endedAt!
+            }
+            completedOrderIsDirty = false
+        }
+        let first = lowerBound(completedOrder.count) {
+            records[completedOrder[$0]]!.endedAt! < interval.start
+        }
+        for key in completedOrder[first...] {
+            let record = records[key]!
+            if record.endedAt! >= interval.end { break }
+            if key.source == source { total.include(record) }
+        }
+        prepareToolOrder()
+        let firstTool = lowerBound(toolOrder.count) {
+            tools[toolOrder[$0]]!.timestamp < interval.start
+        }
+        for key in toolOrder[firstTool...] {
+            let tool = tools[key]!
+            if tool.timestamp >= interval.end { break }
+            if key.request.source == source && key.isCall { total.toolCalls += 1 }
         }
     }
 
-    public func waitForPendingWrites() async {
-        flush()
-        await pendingWrite?.value
+    private func lowerBound(_ count: Int, before: (Int) -> Bool) -> Int {
+        var low = 0
+        var high = count
+        while low < high {
+            let middle = (low + high) / 2
+            if before(middle) { low = middle + 1 } else { high = middle }
+        }
+        return low
+    }
+
+    /// Compatibility barriers: session history never queues filesystem work.
+    public func flush() {}
+    public func waitForPendingWrites() async {}
+
+    private func sourceID(for source: String) -> Int {
+        if let id = sourceIDs[source] { return id }
+        let id = sourceIDs.count
+        sourceIDs[source] = id
+        return id
     }
 
     private func finish(_ key: RequestKey, at date: Date) {
@@ -245,27 +356,51 @@ public final class UsageHistory {
         record.endedAt = max(record.startedAt, record.lastUpdatedAt, date)
         record.lastUpdatedAt = record.endedAt ?? date
         records[key] = record
-        updateLaunchTotals(removing: old, adding: record)
+        activeRequests.remove(key)
+        completedOrderIsDirty = true
+        updateLaunchTotals(source: key.source, removing: old, adding: record)
     }
 
     private func updateLaunchTotals(
-        removing old: UsageRequestRecord?, adding record: UsageRequestRecord
+        source: Int, removing old: UsageRequestRecord?, adding record: UsageRequestRecord
     ) {
-        guard record.launchID == launchID else { return }
-        if let old { launchTotals[record.source, default: UsageTotals()].include(old, sign: -1) }
-        launchTotals[record.source, default: UsageTotals()].include(record)
+        if let old { launchTotals[source, default: UsageTotals()].include(old, sign: -1) }
+        launchTotals[source, default: UsageTotals()].include(record)
+        if let old, let endedAt = old.endedAt {
+            completedTotals[AccountingBucket(source: source, date: endedAt), default: UsageTotals()]
+                .include(old, sign: -1)
+        }
+        if let endedAt = record.endedAt {
+            completedTotals[AccountingBucket(source: source, date: endedAt), default: UsageTotals()]
+                .include(record)
+        }
     }
 
-    private func scheduleWrite() {
-        guard directory != nil, !persistenceIsDisabled, scheduledWrite == nil else { return }
-        scheduledWrite = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(1))
-            } catch {
-                return
+    private func removeRequest(_ key: RequestKey) {
+        guard let record = records.removeValue(forKey: key) else { return }
+        metadata.release(record.modelID)
+        activeRequests.remove(key)
+        if let end = record.endedAt {
+            let bucket = AccountingBucket(source: key.source, date: end)
+            completedTotals[bucket]?.include(record, sign: -1)
+            if completedTotals[bucket]?.requests == 0 {
+                completedTotals.removeValue(forKey: bucket)
             }
-            self?.flush()
         }
+        requestOrderIsDirty = true
+        completedOrderIsDirty = true
+    }
+
+    private func removeTool(_ key: ToolKey) {
+        guard let record = tools.removeValue(forKey: key) else { return }
+        metadata.release(record.nameID)
+        metadata.release(key.callID)
+        if key.isCall {
+            let bucket = AccountingBucket(source: key.request.source, date: record.timestamp)
+            toolCallTotals[bucket, default: 0] -= 1
+            if toolCallTotals[bucket] == 0 { toolCallTotals.removeValue(forKey: bucket) }
+        }
+        toolOrderIsDirty = true
     }
 
     private func prune(at now: Date) {
@@ -276,13 +411,13 @@ public final class UsageHistory {
         lastPrunedAt = now
         let cutoff = now.addingTimeInterval(-Self.retentionInterval)
         let expired = records.filter { ($0.value.endedAt.map { $0 < cutoff }) ?? false }
-        for (key, _) in expired { records.removeValue(forKey: key) }
+        for (key, _) in expired { removeRequest(key) }
         if records.count > recordLimit {
             let finished = records.filter { $0.value.endedAt != nil }.sorted {
                 ($0.value.endedAt ?? $0.value.startedAt) < ($1.value.endedAt ?? $1.value.startedAt)
             }
             for (key, record) in finished.prefix(records.count - recordLimit) {
-                records.removeValue(forKey: key)
+                removeRequest(key)
                 requestTruncatedThrough[key.source] = max(
                     requestTruncatedThrough[key.source] ?? .distantPast,
                     record.endedAt ?? record.startedAt)
@@ -294,17 +429,17 @@ public final class UsageHistory {
             let oldest = records.sorted { $0.value.startedAt < $1.value.startedAt }
             for (key, record) in oldest.prefix(records.count - recordLimit) {
                 finish(key, at: now)
-                records.removeValue(forKey: key)
+                removeRequest(key)
                 incompleteLaunchSources.insert(key.source)
                 requestTruncatedThrough[key.source] = max(
                     requestTruncatedThrough[key.source] ?? .distantPast, record.startedAt)
             }
         }
-        tools = tools.filter { $0.value.timestamp >= cutoff }
+        for key in tools.keys where tools[key]!.timestamp < cutoff { removeTool(key) }
         if tools.count > toolEventLimit {
             let oldest = tools.sorted { $0.value.timestamp < $1.value.timestamp }
             for (key, tool) in oldest.prefix(tools.count - toolEventLimit) {
-                tools.removeValue(forKey: key)
+                removeTool(key)
                 toolTruncatedThrough[key.request.source] = max(
                     toolTruncatedThrough[key.request.source] ?? .distantPast, tool.timestamp)
             }
@@ -313,104 +448,62 @@ public final class UsageHistory {
         toolTruncatedThrough = toolTruncatedThrough.filter { $0.value >= cutoff }
     }
 
-    private func load(at now: Date) {
-        guard let directory else { return }
-        let file = directory.appendingPathComponent("usage-history.json")
-        guard FileManager.default.fileExists(atPath: file.path) else { return }
-        do {
-            let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-            guard size <= 32 * 1_024 * 1_024 else { throw UsageHistoryError.fileTooLarge }
-            let snapshot = try JSONDecoder().decode(
-                UsageHistorySnapshot.self, from: Data(contentsOf: file))
-            guard snapshot.version == 1 else { throw UsageHistoryError.unsupportedVersion }
-            for var record in snapshot.records {
-                guard record.outputTokens >= 0, record.inputTokens.map({ $0 >= 0 }) ?? true,
-                    record.liveTPS.isFinite,
-                    record.startedAt.timeIntervalSinceReferenceDate.isFinite,
-                    record.lastUpdatedAt.timeIntervalSinceReferenceDate.isFinite,
-                    record.endedAt.map({ $0.timeIntervalSinceReferenceDate.isFinite }) ?? true,
-                    record.lastUpdatedAt >= record.startedAt,
-                    record.endedAt.map({ $0 >= record.startedAt }) ?? true
-                else { throw UsageHistoryError.invalidRecord }
-                if record.endedAt == nil {
-                    record.endedAt = max(record.startedAt, record.lastUpdatedAt)
-                    record.outputIsEstimated = true
-                }
-                let key = RequestKey(source: record.source, id: record.id)
-                guard records[key] == nil else { throw UsageHistoryError.invalidRecord }
-                records[key] = record
-            }
-            for tool in snapshot.tools {
-                guard tool.kind == "call" || tool.kind == "result" else {
-                    throw UsageHistoryError.invalidRecord
-                }
-                guard tool.timestamp.timeIntervalSinceReferenceDate.isFinite else {
-                    throw UsageHistoryError.invalidRecord
-                }
-                let request = RequestKey(source: tool.source, id: tool.requestID)
-                let key = ToolKey(
-                    request: request, kind: tool.kind,
-                    identity: tool.callID.map { "call:\($0)" } ?? "event:\(tool.id)")
-                guard tools[key] == nil else { throw UsageHistoryError.invalidRecord }
-                tools[key] = tool
-            }
-            requestTruncatedThrough = snapshot.requestTruncatedThrough
-            toolTruncatedThrough = snapshot.toolTruncatedThrough
-            prune(at: now)
-        } catch {
-            records.removeAll()
-            tools.removeAll()
-            persistenceIsDisabled = true
-            persistenceError = "Saved usage could not be loaded: \(error.localizedDescription)"
-        }
-    }
-
-    nonisolated private static func write(
-        _ snapshot: UsageHistorySnapshot, directory: URL
-    ) -> String? {
-        do {
-            try FileManager.default.createDirectory(
-                at: directory, withIntermediateDirectories: true)
-            let data = try JSONEncoder().encode(snapshot)
-            guard data.count <= 32 * 1_024 * 1_024 else { throw UsageHistoryError.fileTooLarge }
-            try data.write(
-                to: directory.appendingPathComponent("usage-history.json"), options: .atomic)
-            return nil
-        } catch {
-            return "Usage could not be saved: \(error.localizedDescription)"
-        }
-    }
-
     private func contains(_ interval: DateInterval, _ date: Date) -> Bool {
         date >= interval.start && date < interval.end
     }
 }
 
+private struct AccountingBucket: Hashable {
+    let source: Int
+    let hour: Double
+    init(source: Int, date: Date) {
+        self.source = source
+        hour = (date.timeIntervalSinceReferenceDate / 3600).rounded(.down)
+    }
+    var start: Date { Date(timeIntervalSinceReferenceDate: hour * 3600) }
+}
+
+private struct SummaryKey: Equatable {
+    let scope: UsageScope
+    let source: Int
+    let start: Date
+    let end: Date
+    let revision: UInt64
+    let retentionExpired: Bool
+}
+
 private struct RequestKey: Hashable {
-    let source: String
+    let source: Int
     let id: UUID
+}
+
+private enum ToolIdentity: Hashable {
+    case call(Int32)
+    case event(UUID)
 }
 
 private struct ToolKey: Hashable {
     let request: RequestKey
-    let kind: String
-    let identity: String
+    let isCall: Bool
+    let identity: ToolIdentity
+
+    var callID: Int32 {
+        if case .call(let id) = identity { return id }
+        return -1
+    }
 }
 
-private struct UsageRequestRecord: Codable, Sendable {
-    let id: UUID
-    let source: String
-    let launchID: UUID
+private struct UsageRequestRecord {
     let startedAt: Date
     var lastUpdatedAt: Date
     var endedAt: Date?
-    var model: String?
+    var modelID: Int32
     var inputTokens: Int?
     var outputTokens = 0
     var outputIsEstimated = true
     var liveTPS: Double = 0
 
-    var lane: RequestLane {
+    func lane(id: UUID, model: String?) -> RequestLane {
         RequestLane(
             id: id, startedAt: startedAt, endedAt: endedAt, model: model,
             outputTokens: outputTokens, outputIsEstimated: outputIsEstimated,
@@ -418,29 +511,51 @@ private struct UsageRequestRecord: Codable, Sendable {
     }
 }
 
-private struct UsageToolRecord: Codable, Sendable {
+private struct UsageToolRecord {
     let id: UUID
-    let source: String
-    let launchID: UUID
-    let requestID: UUID
-    let kind: String
-    let name: String?
-    let callID: String?
+    let nameID: Int32
     let timestamp: Date
-
-    var event: ToolActivityEvent {
-        ToolActivityEvent(
-            id: id, kind: kind == "call" ? .call : .resultSubmission,
-            name: name, callID: callID, timestamp: timestamp, requestID: requestID)
-    }
 }
 
-private struct UsageHistorySnapshot: Codable, Sendable {
-    let version: Int
-    let records: [UsageRequestRecord]
-    let tools: [UsageToolRecord]
-    let requestTruncatedThrough: [String: Date]
-    let toolTruncatedThrough: [String: Date]
+/// Reference-counted metadata slots are reused after retention eviction. This
+/// shares repeated names without retaining every unique lifetime string forever.
+private final class UsageMetadata {
+    private var ids: [String: Int32] = [:]
+    private var values: [String?] = []
+    private var references: [Int] = []
+    private var available: [Int32] = []
+
+    subscript(_ id: Int32) -> String? { id >= 0 ? values[Int(id)] : nil }
+
+    func retain(_ value: String?) -> Int32 {
+        guard let value else { return -1 }
+        if let id = ids[value] {
+            references[Int(id)] += 1
+            return id
+        }
+        let id: Int32
+        if let reused = available.popLast() {
+            id = reused
+            values[Int(id)] = value
+            references[Int(id)] = 1
+        } else {
+            id = Int32(values.count)
+            values.append(value)
+            references.append(1)
+        }
+        ids[value] = id
+        return id
+    }
+
+    func release(_ id: Int32) {
+        guard id >= 0 else { return }
+        references[Int(id)] -= 1
+        if references[Int(id)] == 0, let value = values[Int(id)] {
+            ids.removeValue(forKey: value)
+            values[Int(id)] = nil
+            available.append(id)
+        }
+    }
 }
 
 private struct UsageTotals {
@@ -466,6 +581,16 @@ private struct UsageTotals {
         }
     }
 
+    mutating func include(_ other: UsageTotals) {
+        knownInputTokens += other.knownInputTokens
+        unknownInputRequests += other.unknownInputRequests
+        outputTokens += other.outputTokens
+        estimatedRequests += other.estimatedRequests
+        toolCalls += other.toolCalls
+        requests += other.requests
+        activeRequests += other.activeRequests
+    }
+
     func summary(isPartial: Bool) -> UsageSummary {
         let input = clampedTokens(knownInputTokens)
         let output = clampedTokens(outputTokens)
@@ -480,19 +605,5 @@ private struct UsageTotals {
     private func clampedTokens(_ value: Decimal) -> (value: Int, clamped: Bool) {
         guard !value.isNaN, value <= Decimal(Int.max) else { return (Int.max, true) }
         return (max(0, NSDecimalNumber(decimal: value).intValue), false)
-    }
-}
-
-private enum UsageHistoryError: LocalizedError {
-    case unsupportedVersion
-    case invalidRecord
-    case fileTooLarge
-
-    var errorDescription: String? {
-        switch self {
-        case .unsupportedVersion: "This usage history format is not supported."
-        case .invalidRecord: "The usage history contains invalid records."
-        case .fileTooLarge: "The usage history exceeds the supported file size."
-        }
     }
 }

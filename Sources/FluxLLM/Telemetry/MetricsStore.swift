@@ -1,6 +1,11 @@
 import Foundation
 import SwiftUI
 
+public enum ChartPresentationConsumer: Hashable, Sendable {
+    case dashboard
+    case popover
+}
+
 /// Shared presentation state. Request events and aggregate backend measurements
 /// retain their different meanings; history advances independently of delivery.
 @MainActor
@@ -37,7 +42,10 @@ public final class MetricsStore {
     public private(set) var backendGPUActivity: GPUActivitySample?
     public private(set) var gpuAvailabilityMessage =
         "Waiting for macOS GPU utilization…"
-    public private(set) var gpuHistory: [TimeSeriesPoint] = []
+    public var gpuHistory: [TimeSeriesPoint] {
+        _ = historyBufferRevision
+        return gpuSamples.elements
+    }
     public var historyRange: HistoryRange = .automatic
     public var usageScope: UsageScope = .sinceLaunch
     public private(set) var historySource = BackendKind.ollama.rawValue
@@ -54,6 +62,13 @@ public final class MetricsStore {
 
     public var systemGPUHistory: [TimeSeriesPoint] {
         gpuHistoryScope == .system ? gpuHistory : []
+    }
+
+    /// Peak of the inclusive raw interval without copying the retained hour.
+    /// The status meter uses its held display timestamp as the interval end.
+    public func peakThroughput(in interval: DateInterval) -> Double? {
+        _ = historyBufferRevision
+        return throughputSamples.peak(in: interval)
     }
 
     public var isRateEstimated: Bool {
@@ -108,9 +123,15 @@ public final class MetricsStore {
     public var upstreamEndpoint = "http://localhost:11434"
 
     /// Oldest first, with timestamps so both charts share a real time axis.
-    public private(set) var tpsHistory: [TimeSeriesPoint] = []
+    public var tpsHistory: [TimeSeriesPoint] {
+        _ = historyBufferRevision
+        return throughputSamples.elements
+    }
     public private(set) var toolActivityEvents: [ToolActivityEvent] = []
-    public private(set) var toolObservationHistory: [TimeSeriesPoint] = []
+    public var toolObservationHistory: [TimeSeriesPoint] {
+        _ = historyBufferRevision
+        return toolObservationSamples.elements
+    }
     public private(set) var sampleDate = Date()
     /// All chart series and their time axis advance together once per second.
     /// The raw half-second histories above retain every captured peak and gap.
@@ -123,6 +144,16 @@ public final class MetricsStore {
     private static let maxRetiredProxyRequestIDs = 2048
     /// Bounds the number of finished request lanes kept for the chart.
     private static let maxRetiredRequestLanes = 256
+
+    private var historyBufferRevision: UInt64 = 0
+    @ObservationIgnored private var throughputSamples = SampleHistory(
+        capacity: MetricsStore.maxHistorySamples)
+    @ObservationIgnored private var gpuSamples = SampleHistory(
+        capacity: MetricsStore.maxHistorySamples)
+    @ObservationIgnored private var toolObservationSamples = SampleHistory(
+        capacity: MetricsStore.maxHistorySamples)
+    @ObservationIgnored private var presentationConsumers: Set<ChartPresentationConsumer> = []
+    @ObservationIgnored private var presentationDemandIsManaged = false
 
     @ObservationIgnored private var samplingTask: Task<Void, Never>?
     @ObservationIgnored private var lastBackendSampleAt: Date?
@@ -173,20 +204,41 @@ public final class MetricsStore {
     public init(clock: @escaping () -> Date = Date.init, historyDirectory: URL? = nil) {
         self.clock = clock
         let now = clock()
-        usageHistory = UsageHistory(directory: historyDirectory, now: now)
-        chartArchive = ChartHistoryArchive(directory: historyDirectory, now: now)
+        // The legacy directory parameter is deliberately ignored. History is
+        // session-only even when a caller still passes an old storage location.
+        _ = historyDirectory
+        usageHistory = UsageHistory(now: now)
+        chartArchive = ChartHistoryArchive(now: now)
         sampleDate = now
         chartPresentation = ChartPresentationSnapshot(timestamp: now)
     }
 
-    public func prepareHistory() async {
-        await chartArchive.prepare()
-    }
+    /// Compatibility hooks; session history performs no filesystem work.
+    public func prepareHistory() async {}
+    public func flushHistory() async {}
 
-    public func flushHistory() async {
-        usageHistory.flush()
-        await usageHistory.waitForPendingWrites()
-        await chartArchive.flushAndWait()
+    /// Native hosts register their visibility before constructing SwiftUI views.
+    /// Collection continues with no consumers, while snapshots are prepared only
+    /// when a surface can display them. Standalone stores retain automatic mode.
+    public func setChartPresentationDemand(
+        _ enabled: Bool, consumer: ChartPresentationConsumer
+    ) {
+        let wasActive = !presentationDemandIsManaged || !presentationConsumers.isEmpty
+        presentationDemandIsManaged = true
+        if enabled {
+            presentationConsumers.insert(consumer)
+        } else {
+            presentationConsumers.remove(consumer)
+        }
+        let isActive = !presentationConsumers.isEmpty
+        if isActive && !wasActive {
+            lastChartPublicationAt = nil
+            publishChartPresentationIfDue(at: sampleDate)
+        } else if !isActive && wasActive {
+            // Release snapshots held only for a closed surface; raw history is
+            // retained independently and will rebuild immediately on reopening.
+            chartPresentation = ChartPresentationSnapshot(timestamp: sampleDate)
+        }
     }
 
     public func usageSummary(in interval: DateInterval) -> UsageSummary {
@@ -256,15 +308,19 @@ public final class MetricsStore {
             // request is drawn as its own lane, so an older request's tool
             // calls are not dropped just because a sibling started later.
             let owningRequestID = requestID
+            var needsSort = false
             for event in events {
                 guard event.timestamp.timeIntervalSince1970.isFinite,
-                    retainedToolEventIDs.insert(event.id).inserted,
                     let start = requestStartedAt(for: owningRequestID),
-                    event.timestamp >= start
+                    event.timestamp >= start,
+                    retainedToolEventIDs.insert(event.id).inserted
                 else { continue }
+                if let last = toolActivityEvents.last, event.timestamp < last.timestamp {
+                    needsSort = true
+                }
                 toolActivityEvents.append(event.withRequestID(owningRequestID))
             }
-            toolActivityEvents.sort { $0.timestamp < $1.timestamp }
+            if needsSort { toolActivityEvents.sort { $0.timestamp < $1.timestamp } }
             trimToolActivity(at: sampleDate)
 
         case .updated(let requestID, let snapshot):
@@ -357,8 +413,6 @@ public final class MetricsStore {
         let now = clock()
         usageHistory.finishOpenRequests(source: historySource, at: now)
         chartArchive.endSession(source: historySource, at: now)
-        usageHistory.flush()
-        chartArchive.flush()
         usageRevision &+= 1
         historySource = sourceID ?? kind?.rawValue ?? "unconfigured"
         monitoringEpoch = epoch
@@ -400,19 +454,25 @@ public final class MetricsStore {
         lastGPUSampleAt = nil
         backendGPUActivity = nil
         gpuAvailabilityMessage = "Waiting for macOS GPU utilization…"
+        historyBufferRevision &+= 1
         gpuHistoryScope = nil
         gpuHistorySource = nil
-        gpuHistory.removeAll(keepingCapacity: true)
+        gpuSamples.removeAll(keepingCapacity: true)
         historyStartedAt = nil
-        tpsHistory.removeAll(keepingCapacity: true)
+        throughputSamples.removeAll(keepingCapacity: true)
         toolActivityEvents.removeAll(keepingCapacity: true)
-        toolObservationHistory.removeAll(keepingCapacity: true)
+        toolObservationSamples.removeAll(keepingCapacity: true)
         retainedToolEventIDs.removeAll(keepingCapacity: true)
         toolHistoryTruncatedThrough = nil
         sampleDate = clock()
-        let archived = chartArchive.history(
-            source: historySource, before: sampleDate, now: sampleDate)
-        historyStartedAt = archived.availableSince
+        historyStartedAt = chartArchive.availableSince(source: historySource, now: sampleDate)
+        let archived: ArchivedChartHistory
+        if !presentationDemandIsManaged || !presentationConsumers.isEmpty {
+            archived = chartArchive.history(
+                source: historySource, before: sampleDate, now: sampleDate)
+        } else {
+            archived = .empty
+        }
         chartPresentation = ChartPresentationSnapshot(
             timestamp: sampleDate, supportsToolActivity: kind == .ollama, archive: archived)
         lastChartPublicationAt = nil
@@ -451,7 +511,8 @@ public final class MetricsStore {
         if gpuHistoryScope != sample.scope
             || (sample.activityPercent != nil && gpuHistorySource != sample.source)
         {
-            gpuHistory.removeAll(keepingCapacity: true)
+            gpuSamples.removeAll(keepingCapacity: true)
+            historyBufferRevision &+= 1
             gpuHistoryScope = sample.scope
             gpuHistorySource = sample.source
             // Never keep another source's trace visible until the next tick.
@@ -555,18 +616,19 @@ public final class MetricsStore {
     /// A repeated timestamp replaces its point; older timestamps are ignored.
     public func sample(at date: Date? = nil) {
         let date = date ?? clock()
-        let replacingLatest = tpsHistory.last?.timestamp == date
-        if let last = tpsHistory.last {
+        let replacingLatest = throughputSamples.last?.timestamp == date
+        if let last = throughputSamples.last {
             guard date >= last.timestamp else { return }
             if date == last.timestamp {
-                tpsHistory.removeLast()
-                if gpuHistory.last?.timestamp == date { gpuHistory.removeLast() }
-                if toolObservationHistory.last?.timestamp == date {
-                    toolObservationHistory.removeLast()
+                throughputSamples.removeLast()
+                if gpuSamples.last?.timestamp == date { gpuSamples.removeLast() }
+                if toolObservationSamples.last?.timestamp == date {
+                    toolObservationSamples.removeLast()
                 }
             }
         }
         sampleDate = date
+        historyBufferRevision &+= 1
         expireNativeActivity(at: date)
         // In proxy/ollama mode the displayed rate is the sum of every open
         // request's live rate. Refresh it against this sample time so a stalled
@@ -607,49 +669,44 @@ public final class MetricsStore {
         publishDisplayRateIfDue(at: date)
         if historyStartedAt == nil { historyStartedAt = date }
         // Sleep or delayed sampling must not look like a continuous measurement.
-        if !replacingLatest, let last = tpsHistory.last, date.timeIntervalSince(last.timestamp) > 2
+        if !replacingLatest, let last = throughputSamples.last,
+            date.timeIntervalSince(last.timestamp) > 2
         {
-            tpsHistory.append(
+            throughputSamples.append(
                 TimeSeriesPoint(
                     timestamp: last.timestamp.addingTimeInterval(0.5), value: 0, isAvailable: false)
             )
         }
         let cutoff = date.addingTimeInterval(-Self.chartWindow)
-        if !replacingLatest, let last = gpuHistory.last, date.timeIntervalSince(last.timestamp) > 2
+        if !replacingLatest, let last = gpuSamples.last, date.timeIntervalSince(last.timestamp) > 2
         {
-            gpuHistory.append(
+            gpuSamples.append(
                 TimeSeriesPoint(
                     timestamp: last.timestamp.addingTimeInterval(0.5), value: 0, isAvailable: false)
             )
         }
-        tpsHistory.removeAll { $0.timestamp < cutoff }
-        tpsHistory.append(
+        throughputSamples.remove(before: cutoff)
+        throughputSamples.append(
             TimeSeriesPoint(
                 timestamp: date, value: currentTPS, isAvailable: rateIsAvailable))
-        if tpsHistory.count > Self.maxHistorySamples {
-            tpsHistory.removeFirst(tpsHistory.count - Self.maxHistorySamples)
-        }
-        gpuHistory.removeAll { $0.timestamp < cutoff }
+        gpuSamples.remove(before: cutoff)
         let gpuValue = backendGPUActivity?.activityPercent
-        gpuHistory.append(
+        gpuSamples.append(
             TimeSeriesPoint(
                 timestamp: date, value: gpuValue ?? 0, isAvailable: gpuValue != nil))
-        if gpuHistory.count > Self.maxHistorySamples {
-            gpuHistory.removeFirst(gpuHistory.count - Self.maxHistorySamples)
-        }
-        if !replacingLatest, let last = toolObservationHistory.last,
+        if !replacingLatest, let last = toolObservationSamples.last,
             date.timeIntervalSince(last.timestamp) > 2
         {
-            toolObservationHistory.append(
+            toolObservationSamples.append(
                 TimeSeriesPoint(
                     timestamp: last.timestamp.addingTimeInterval(0.5), value: 0,
                     isAvailable: false))
         }
-        if supportsToolActivity || !toolObservationHistory.isEmpty {
+        if supportsToolActivity || !toolObservationSamples.isEmpty {
             let observingTools =
                 supportsToolActivity && proxyState == .listening
                 && (backendKind == nil || connectionState == .ready)
-            toolObservationHistory.append(
+            toolObservationSamples.append(
                 TimeSeriesPoint(timestamp: date, value: 0, isAvailable: observingTools))
         }
         trimToolActivity(at: date)
@@ -785,13 +842,14 @@ public final class MetricsStore {
     }
 
     private func publishChartPresentationIfDue(at date: Date) {
+        guard !presentationDemandIsManaged || !presentationConsumers.isEmpty else { return }
         guard lastChartPublicationAt.map({ date.timeIntervalSince($0) >= 1 }) ?? true else {
             return
         }
         let firstRaw =
             [
-                tpsHistory.first?.timestamp, gpuHistory.first?.timestamp,
-                toolObservationHistory.first?.timestamp,
+                throughputSamples.first?.timestamp, gpuSamples.first?.timestamp,
+                toolObservationSamples.first?.timestamp,
             ].compactMap { $0 }.min() ?? date
         let archived = chartArchive.history(source: historySource, before: firstRaw, now: date)
         let historyInterval = DateInterval(start: date.addingTimeInterval(-86_400), end: date)
@@ -815,22 +873,24 @@ public final class MetricsStore {
     /// falsely low rate from an incomplete interval.
     private func trimToolActivity(at date: Date) {
         let cutoff = date.addingTimeInterval(-Self.chartWindow)
-        toolActivityEvents.removeAll { $0.timestamp < cutoff }
+        removeToolEvents { $0.timestamp < cutoff }
         if toolActivityEvents.count > Self.maxToolActivityEvents {
             let excess = toolActivityEvents.count - Self.maxToolActivityEvents
             let through = toolActivityEvents[excess - 1].timestamp
             toolHistoryTruncatedThrough = max(toolHistoryTruncatedThrough ?? through, through)
         }
         if let through = toolHistoryTruncatedThrough {
-            toolActivityEvents.removeAll { $0.timestamp <= through }
-            toolObservationHistory.removeAll { $0.timestamp <= through }
+            removeToolEvents { $0.timestamp <= through }
+            toolObservationSamples.remove(through: through)
         }
-        retainedToolEventIDs = Set(toolActivityEvents.map(\.id))
-        toolObservationHistory.removeAll { $0.timestamp < cutoff }
-        if toolObservationHistory.count > Self.maxHistorySamples {
-            toolObservationHistory.removeFirst(
-                toolObservationHistory.count - Self.maxHistorySamples)
-        }
+        toolObservationSamples.remove(before: cutoff)
+    }
+
+    private func removeToolEvents(while expired: (ToolActivityEvent) -> Bool) {
+        let end = toolActivityEvents.firstIndex { !expired($0) } ?? toolActivityEvents.count
+        guard end > 0 else { return }
+        for event in toolActivityEvents[..<end] { retainedToolEventIDs.remove(event.id) }
+        toolActivityEvents.removeFirst(end)
     }
 
     private func ownsRunningGeneration(_ requestID: UUID) -> Bool {
@@ -1008,4 +1068,82 @@ public struct ActiveGeneration: Sendable, Equatable {
 
 public enum GenerationState: String, Sendable {
     case running, completed, errored, cancelled
+}
+
+/// Fixed-capacity numeric sample ring. Appending/expiring samples neither shifts
+/// the retained hour nor copies arrays owned by the last chart publication.
+private struct SampleHistory {
+    private var storage: [TimeSeriesPoint] = []
+    private var head = 0
+    private(set) var count = 0
+    let capacity: Int
+
+    init(capacity: Int) {
+        self.capacity = capacity
+    }
+
+    var isEmpty: Bool { count == 0 }
+    var first: TimeSeriesPoint? { count == 0 ? nil : storage[head] }
+    var last: TimeSeriesPoint? { count == 0 ? nil : storage[(head + count - 1) % capacity] }
+    var elements: [TimeSeriesPoint] {
+        guard count > 0 else { return [] }
+        let firstCount = min(count, capacity - head)
+        if firstCount == count { return Array(storage[head..<(head + count)]) }
+        return Array(storage[head..<(head + firstCount)]) + storage[..<(count - firstCount)]
+    }
+
+    func peak(in interval: DateInterval) -> Double? {
+        var low = 0
+        var high = count
+        while low < high {
+            let middle = (low + high) / 2
+            if storage[(head + middle) % capacity].timestamp < interval.start {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        var peak: Double?
+        for offset in low..<count {
+            let point = storage[(head + offset) % capacity]
+            if point.timestamp > interval.end { break }
+            if point.isAvailable && point.value.isFinite && point.value >= 0 {
+                peak = max(peak ?? point.value, point.value)
+            }
+        }
+        return peak
+    }
+
+    mutating func append(_ point: TimeSeriesPoint) {
+        let index = (head + count) % capacity
+        if index == storage.count { storage.append(point) } else { storage[index] = point }
+        if count == capacity { head = (head + 1) % capacity } else { count += 1 }
+    }
+
+    mutating func removeLast() {
+        guard count > 0 else { return }
+        count -= 1
+        if count == 0 { head = 0 }
+    }
+
+    mutating func remove(before date: Date) {
+        while let first, first.timestamp < date { removeFirst() }
+    }
+
+    mutating func remove(through date: Date) {
+        while let first, first.timestamp <= date { removeFirst() }
+    }
+
+    private mutating func removeFirst() {
+        guard count > 0 else { return }
+        head = (head + 1) % capacity
+        count -= 1
+        if count == 0 { head = 0 }
+    }
+
+    mutating func removeAll(keepingCapacity: Bool) {
+        storage.removeAll(keepingCapacity: keepingCapacity)
+        head = 0
+        count = 0
+    }
 }

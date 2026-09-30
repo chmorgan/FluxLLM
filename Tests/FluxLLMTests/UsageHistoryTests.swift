@@ -288,9 +288,7 @@ final class UsageHistoryTests: XCTestCase {
             .count, 1)
     }
 
-    func testPersistenceReloadRetainsTodayButStartsFreshLaunchAndClosesInterruptedRequests()
-        async throws
-    {
+    func testSessionHistoryDoesNotCreateFilesAndANewSessionStartsEmpty() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let history = UsageHistory(directory: directory, now: origin)
@@ -301,69 +299,157 @@ final class UsageHistoryTests: XCTestCase {
         history.apply(
             .toolActivity(
                 requestID: interrupted.id,
-                events: [ToolActivityEvent(kind: .call, name: "search", timestamp: date(3))]),
-            source: source, at: date(4))
+                events: [
+                    ToolActivityEvent(kind: .call, name: "search", timestamp: date(3))
+                ]), source: source, at: date(4))
+        history.finishOpenRequests(source: source, at: date(5))
+        history.flush()
         await history.waitForPendingWrites()
         XCTAssertNil(history.persistenceError)
-        let reloaded = UsageHistory(directory: directory, now: date(5))
-        XCTAssertEqual(summary(reloaded).requests, 0)
-        let today = summary(reloaded, scope: .today)
-        XCTAssertEqual(today.requests, 2)
-        XCTAssertEqual(today.activeRequests, 0)
-        XCTAssertEqual(today.outputTokens, 25)
-        XCTAssertEqual(today.toolCalls, 1)
-        XCTAssertTrue(today.outputIsEstimated)
-        let lane = reloaded.requestLanes(
-            source: source, interval: DateInterval(start: origin, end: date(10))
-        )
-        .first { $0.id == interrupted.id }
-        XCTAssertEqual(lane?.endedAt, date(4))
-        XCTAssertTrue(lane?.terminal == true)
-        XCTAssertEqual(lane?.model, "test-model")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertEqual(summary(history, scope: .today).outputTokens, 25)
+        XCTAssertEqual(summary(history, scope: .today).activeRequests, 0)
+        XCTAssertEqual(summary(history).toolCalls, 1)
+        let newSession = UsageHistory(directory: directory, now: date(6))
+        XCTAssertEqual(summary(newSession).requests, 0)
+        XCTAssertEqual(summary(newSession, scope: .today).requests, 0)
+        XCTAssertTrue(
+            newSession.requestLanes(
+                source: source, interval: DateInterval(start: origin, end: date(10))
+            ).isEmpty)
     }
 
-    func testQueuedWritesCannotReplaceNewerUsageWithAnOlderSnapshot() async throws {
-        let directory = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let history = UsageHistory(directory: directory, now: origin)
+    func testCompatibilityFlushNeverChangesLatestInMemoryCorrection() async {
+        let history = UsageHistory(now: origin)
         let request = begin(history)
         update(history, request, at: 1, output: 100)
         history.flush()
         update(history, request, at: 2, output: 50, input: 3, estimated: false, finished: true)
         history.flush()
         await history.waitForPendingWrites()
-        let reloaded = UsageHistory(directory: directory, now: date(3))
-        XCTAssertEqual(summary(reloaded, scope: .today).outputTokens, 50)
-        XCTAssertFalse(summary(reloaded, scope: .today).outputIsEstimated)
+        XCTAssertEqual(summary(history, scope: .today).outputTokens, 50)
+        XCTAssertFalse(summary(history, scope: .today).outputIsEstimated)
     }
 
-    func testCorruptHistoryIsReportedAndPreservedWhileCurrentUsageStillWorks() async throws {
+    func testLegacyFilesAreNeitherLoadedNorChanged() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let file = directory.appendingPathComponent("usage-history.json")
-        let invalid = Data("{not valid history}".utf8)
-        try invalid.write(to: file)
+        let previous = Data("{legacy history deliberately not decoded}".utf8)
+        try previous.write(to: file)
         let history = UsageHistory(directory: directory, now: origin)
-        XCTAssertNotNil(history.persistenceError)
+        XCTAssertNil(history.persistenceError)
+        XCTAssertEqual(summary(history, scope: .today).requests, 0)
         let request = begin(history)
         update(history, request, at: 1, output: 3)
         await history.waitForPendingWrites()
-        XCTAssertEqual(try Data(contentsOf: file), invalid)
+        XCTAssertEqual(try Data(contentsOf: file), previous)
         XCTAssertEqual(summary(history).outputTokens, 3)
-        XCTAssertTrue(summary(history, scope: .today).isPartial)
+        XCTAssertFalse(summary(history, scope: .today).isPartial)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path),
+            ["usage-history.json"])
     }
 
-    func testStorageFailureDoesNotLoseInMemoryUsage() async throws {
+    func testInvalidLegacyLocationCannotAffectSessionUsage() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        try Data("not a directory".utf8).write(to: directory)
+        let previous = Data("not a directory".utf8)
+        try previous.write(to: directory)
         let history = UsageHistory(directory: directory, now: origin)
         let request = begin(history)
         update(history, request, at: 1, output: 8)
         await history.waitForPendingWrites()
-        XCTAssertNotNil(history.persistenceError)
+        XCTAssertNil(history.persistenceError)
         XCTAssertEqual(summary(history).outputTokens, 8)
+        XCTAssertEqual(try Data(contentsOf: directory), previous)
+    }
+
+    func testIndexedTotalsMatchReferenceLedgerAcrossHourEdgesAndCorrections() {
+        let history = UsageHistory(now: origin)
+        // Deliberately shuffled completion times and sub-second boundaries ensure
+        // the optimized complete-hour totals agree with exact edge timestamps.
+        var ledger: [(source: String, end: TimeInterval, output: Int, input: Int)] = []
+        var calls: [(source: String, time: TimeInterval)] = []
+        for index in 0..<240 {
+            let owner = index.isMultiple(of: 3) ? "other" : source
+            let start = Double(index * 113)
+            let end = start + Double((index * 17) % 300) + 0.25
+            let request = begin(history, at: start, source: owner)
+            let output = index * 7 + 1
+            let input = index % 13
+            update(history, request, at: end, output: output + 100, finished: true, source: owner)
+            update(
+                history, request, at: end + 0.1, output: output, input: input,
+                estimated: false, finished: true, source: owner)
+            ledger.append((owner, end, output, input))
+            let callTime = start + 0.125
+            let call = ToolActivityEvent(
+                kind: .call, name: "search", callID: "call-\(index)", timestamp: date(callTime))
+            history.apply(
+                .toolActivity(requestID: request.id, events: [call, call]), source: owner,
+                at: date(end))
+            calls.append((owner, callTime))
+        }
+        let edges: [TimeInterval] = [
+            0, 0.125, 0.25, 3_599.5, 3_600, 3_600.25, 7_200, 11_321.25, 27_500,
+        ]
+        for owner in [source, "other"] {
+            for lower in edges {
+                for upper in edges where upper > lower {
+                    let expected = ledger.filter {
+                        $0.source == owner && $0.end >= lower && $0.end < upper
+                    }
+                    let actual = summary(
+                        history, scope: .selectedPeriod, start: lower, end: upper, source: owner)
+                    XCTAssertEqual(actual.requests, expected.count)
+                    XCTAssertEqual(actual.outputTokens, expected.reduce(0) { $0 + $1.output })
+                    XCTAssertEqual(actual.inputTokens, expected.reduce(0) { $0 + $1.input })
+                    XCTAssertEqual(
+                        actual.toolCalls,
+                        calls.filter { $0.source == owner && $0.time >= lower && $0.time < upper }
+                            .count)
+                    XCTAssertFalse(actual.outputIsEstimated)
+                }
+            }
+        }
+    }
+
+    func testMetadataSlotsAndIndicesRemainCorrectAfterRepeatedCapacityEviction() {
+        let history = UsageHistory(now: origin, recordLimit: 3, toolEventLimit: 4)
+        for index in 0..<100 {
+            let start = Double(index * 4)
+            let request = GenerationRequest(model: "model-\(index)", startedAt: date(start))
+            history.apply(.began(request), source: source, at: date(start))
+            let call = ToolActivityEvent(
+                kind: .call, name: "tool-\(index)", callID: "call-\(index)",
+                timestamp: date(start + 1))
+            let result = ToolActivityEvent(
+                kind: .resultSubmission, name: "tool-\(index)", callID: "call-\(index)",
+                timestamp: date(start + 2))
+            history.apply(
+                .toolActivity(requestID: request.id, events: [call, call, result]), source: source,
+                at: date(start + 2))
+            update(
+                history, request, at: start + 3, output: index, input: 1, estimated: false,
+                finished: true)
+            let interval = DateInterval(start: origin, end: date(start + 4))
+            let lanes = history.requestLanes(source: source, interval: interval)
+            XCTAssertEqual(lanes.last?.model, "model-\(index)")
+            XCTAssertEqual(lanes.count, min(index + 1, 3))
+            let tools = history.toolEvents(source: source, interval: interval)
+            XCTAssertEqual(tools.last?.name, "tool-\(index)")
+            XCTAssertEqual(tools.last?.callID, "call-\(index)")
+            XCTAssertEqual(tools.count, min((index + 1) * 2, 4))
+        }
+        XCTAssertEqual(summary(history).requests, 100)
+        XCTAssertEqual(summary(history).outputTokens, (0..<100).reduce(0, +))
+        XCTAssertEqual(summary(history).toolCalls, 100)
+        XCTAssertFalse(summary(history).isPartial)
+        XCTAssertTrue(summary(history, scope: .selectedPeriod, end: 400).isPartial)
+        XCTAssertEqual(
+            summary(history, scope: .selectedPeriod, end: 400).outputTokens, 97 + 98 + 99)
     }
 
     private func temporaryDirectory() -> URL {

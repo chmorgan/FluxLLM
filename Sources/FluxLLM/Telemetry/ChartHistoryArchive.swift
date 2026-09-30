@@ -39,16 +39,25 @@ public struct ArchivedChartHistory: Equatable, Sendable {
     }
 
     public var availableSince: Date? {
-        (throughput + systemGPU + toolObservation).compactMap { $0.first?.start }.min()
+        var earliest: Date?
+        for series in [throughput, systemGPU, toolObservation] {
+            for segment in series {
+                if let date = segment.first?.start { earliest = min(earliest ?? date, date) }
+            }
+        }
+        return earliest
     }
 }
 
-/// Keeps a day of minute averages independently of the recent, raw chart buffer.
-/// A nil directory is deliberately memory-only, including in ordinary unit tests.
+/// Keeps a day of minute averages in memory for the current application session.
+/// No history is loaded or written, including when a legacy directory is supplied.
 @MainActor
 public final class ChartHistoryArchive {
     public static let retention: TimeInterval = 24 * 60 * 60
-    public private(set) var persistenceError: String?
+
+    // Compatibility for callers transitioning away from persistence. These never
+    // perform IO or schedule work and can be removed when the callers are migrated.
+    public var persistenceError: String? { nil }
 
     nonisolated private static let bucketInterval: TimeInterval = 60
     nonisolated private static let maximumGap: TimeInterval = 5
@@ -58,38 +67,9 @@ public final class ChartHistoryArchive {
     private var sources: [String: Source] = [:]
     private var activeSource: String?
     private var latestDate: Date
-    private let file: URL?
-    private let writer = ArchiveWriter()
-    private var restoreTask: Task<Void, Never>?
-    private var writeTask: Task<Void, Never>?
-    private var revision: UInt64 = 0
-    private var persistenceEnabled = true
 
     public init(directory: URL? = nil, now: Date = Date()) {
         latestDate = now
-        file = directory?.appendingPathComponent("chart-history.json")
-        guard let file else { return }
-        restoreTask = Task { [weak self] in
-            let result = await Task.detached(priority: .utility) {
-                ArchiveFile.read(file)
-            }.value
-            guard let self else { return }
-            switch result {
-            case .success(let saved):
-                for (key, restored) in saved.sources {
-                    let current = self.sources[key] ?? Source()
-                    self.sources[key] = Source(restored: restored, followedBy: current)
-                }
-                self.trim(at: self.latestDate)
-            case .failure(let error):
-                // Keep an unreadable or newer archive intact for recovery. New
-                // observations can still be collected in memory this session.
-                self.persistenceEnabled = false
-                self.persistenceError = error.message
-                self.writeTask?.cancel()
-                self.writeTask = nil
-            }
-        }
     }
 
     public func record(
@@ -103,13 +83,17 @@ public final class ChartHistoryArchive {
             sources[source]?.endRun()
             activeSource = source
         }
-        var history = sources[source] ?? Source()
+        let history: Source
+        if let existing = sources[source] {
+            history = existing
+        } else {
+            history = Source()
+            sources[source] = history
+        }
         history.throughput.record(throughput)
         history.systemGPU.record(gpu)
         history.toolObservation.record(toolObservation)
-        sources[source] = history
         trim(at: latestDate)
-        scheduleWrite(immediately: false)
     }
 
     /// Return complete archived buckets preceding the raw buffer. Never split a
@@ -128,52 +112,26 @@ public final class ChartHistoryArchive {
                 before: before, cutoff: cutoff, now: now))
     }
 
+    /// Earliest retained observation without allocating a chart snapshot.
+    public func availableSince(source: String, now: Date) -> Date? {
+        guard now.timeIntervalSince1970.isFinite else { return nil }
+        trim(at: now)
+        return sources[source]?.availableSince(at: now)
+    }
+
     public func endSession(source: String, at date: Date) {
         sources[source]?.endRun()
         if activeSource == source { activeSource = nil }
         if date.timeIntervalSince1970.isFinite { latestDate = max(latestDate, date) }
-        scheduleWrite(immediately: false)
     }
 
-    /// Wait for asynchronous restoration when an owner needs the initial archive.
-    public func prepare() async {
-        await restoreTask?.value
-    }
-
-    /// Queue an immediate atomic save without doing filesystem work on the main actor.
-    public func flush() {
-        scheduleWrite(immediately: true)
-    }
-
-    public func flushAndWait() async {
-        flush()
-        await writeTask?.value
-    }
-
-    private func scheduleWrite(immediately: Bool) {
-        guard let file, persistenceEnabled else { return }
-        if !immediately, writeTask != nil { return }
-        writeTask?.cancel()
-        revision &+= 1
-        let revision = revision
-        writeTask = Task { [weak self] in
-            if !immediately {
-                do { try await Task.sleep(for: .seconds(30)) } catch { return }
-            }
-            guard let self else { return }
-            await self.restoreTask?.value
-            guard !Task.isCancelled, self.persistenceEnabled else { return }
-            let archive = ArchiveFile(sources: self.sources.mapValues(\.saved))
-            let error = await self.writer.write(archive, to: file, revision: revision)
-            guard self.revision == revision else { return }
-            self.persistenceError = error
-            self.writeTask = nil
-        }
-    }
+    public func prepare() async {}
+    public func flush() {}
+    public func flushAndWait() async {}
 
     private func trim(at date: Date) {
         let cutoff = date.addingTimeInterval(-Self.retention)
-        for key in Array(sources.keys) {
+        for key in sources.keys {
             sources[key]?.trim(before: cutoff)
             if sources[key]?.lastDate == nil { sources.removeValue(forKey: key) }
         }
@@ -187,68 +145,122 @@ public final class ChartHistoryArchive {
         }
     }
 
-    private struct Source {
+    // Reference ownership keeps recording into a dictionary entry from copying
+    // its bucket buffers on each sample. All access stays on the main actor.
+    private final class Source {
         var throughput = Series()
         var systemGPU = Series()
         var toolObservation = Series()
 
-        init() {}
-
-        init(restored: SavedSource, followedBy current: Source) {
-            throughput = Series(restored: restored.throughput, followedBy: current.throughput)
-            systemGPU = Series(restored: restored.systemGPU, followedBy: current.systemGPU)
-            toolObservation = Series(
-                restored: restored.toolObservation, followedBy: current.toolObservation)
-        }
-
-        var saved: SavedSource {
-            SavedSource(
-                throughput: throughput.segments, systemGPU: systemGPU.segments,
-                toolObservation: toolObservation.segments)
-        }
-
         var lastDate: Date? {
-            [throughput.lastDate, systemGPU.lastDate, toolObservation.lastDate]
-                .compactMap { $0 }.max()
+            var latest = throughput.lastDate
+            if let date = systemGPU.lastDate { latest = max(latest ?? date, date) }
+            if let date = toolObservation.lastDate { latest = max(latest ?? date, date) }
+            return latest
         }
 
-        mutating func endRun() {
+        func availableSince(at now: Date) -> Date? {
+            var earliest = throughput.availableSince(at: now)
+            if let date = systemGPU.availableSince(at: now) {
+                earliest = min(earliest ?? date, date)
+            }
+            if let date = toolObservation.availableSince(at: now) {
+                earliest = min(earliest ?? date, date)
+            }
+            return earliest
+        }
+
+        func endRun() {
             throughput.endRun()
             systemGPU.endRun()
             toolObservation.endRun()
         }
 
-        mutating func trim(before cutoff: Date) {
+        func trim(before cutoff: Date) {
             throughput.trim(before: cutoff)
             systemGPU.trim(before: cutoff)
             toolObservation.trim(before: cutoff)
         }
     }
 
+    private struct Entry {
+        var bucket: ArchivedChartBucket
+        let beginsRun: Bool
+    }
+
+    /// A bounded ring with amortized constant-time insertion and expiry. Segment
+    /// boundaries are flags rather than individually allocated nested arrays.
+    private struct BucketBuffer {
+        private var entries: [Entry?] = []
+        private var head = 0
+        private(set) var count = 0
+
+        var isEmpty: Bool { count == 0 }
+        var first: Entry? { isEmpty ? nil : self[0] }
+        var last: Entry? { isEmpty ? nil : self[count - 1] }
+
+        subscript(index: Int) -> Entry {
+            get { entries[(head + index) % entries.count]! }
+            set { entries[(head + index) % entries.count] = newValue }
+        }
+
+        mutating func append(_ entry: Entry) {
+            if count == ChartHistoryArchive.maximumBucketsPerSeries { removeFirst() }
+            if count == entries.count {
+                let capacity = min(
+                    max(16, entries.count * 2), ChartHistoryArchive.maximumBucketsPerSeries)
+                var grown = [Entry?](repeating: nil, count: capacity)
+                for index in 0..<count { grown[index] = self[index] }
+                entries = grown
+                head = 0
+            }
+            entries[(head + count) % entries.count] = entry
+            count += 1
+        }
+
+        mutating func removeFirst() {
+            guard !isEmpty else { return }
+            entries[head] = nil
+            head = (head + 1) % entries.count
+            count -= 1
+        }
+
+        mutating func removeLast() {
+            guard !isEmpty else { return }
+            entries[(head + count - 1) % entries.count] = nil
+            count -= 1
+        }
+
+        /// First bucket satisfying a monotone predicate over ordered end times.
+        func lowerBound(where predicate: (Date) -> Bool) -> Int {
+            var low = 0
+            var high = count
+            while low < high {
+                let middle = low + (high - low) / 2
+                if predicate(self[middle].bucket.end) {
+                    high = middle
+                } else {
+                    low = middle + 1
+                }
+            }
+            return low
+        }
+    }
+
     private struct Series {
-        var segments: [[ArchivedChartBucket]] = []
+        var buckets = BucketBuffer()
         var lastSample: TimeSeriesPoint?
         var priorBucket: ArchivedChartBucket?
         var lastWasAvailable = false
         var lastBeganRun = false
         var beginsRun = true
 
-        init() {}
+        var lastDate: Date? { buckets.last?.bucket.end }
 
-        init(restored: [[ArchivedChartBucket]], followedBy current: Series) {
-            self = current
-            let earliestCurrent = current.segments.first?.first?.start ?? .distantFuture
-            let valid = restored.compactMap { segment -> [ArchivedChartBucket]? in
-                let buckets = segment.filter { $0.isValid && $0.end < earliestCurrent }
-                    .sorted { $0.start < $1.start }
-                return buckets.isEmpty ? nil : buckets
-            }.sorted { $0[0].start < $1[0].start }
-            segments = valid + current.segments
-            // A restored run never silently reconnects across app downtime.
-            if current.lastSample == nil { beginsRun = true }
+        func availableSince(at now: Date) -> Date? {
+            guard let first = buckets.first?.bucket, first.end <= now else { return nil }
+            return first.start
         }
-
-        var lastDate: Date? { segments.last?.last?.end }
 
         mutating func endRun() {
             beginsRun = true
@@ -264,10 +276,9 @@ public final class ChartHistoryArchive {
             if let lastSample, point.timestamp == lastSample.timestamp {
                 if lastWasAvailable {
                     if let priorBucket {
-                        segments[segments.count - 1][segments.last!.count - 1] = priorBucket
+                        buckets[buckets.count - 1].bucket = priorBucket
                     } else {
-                        segments[segments.count - 1].removeLast()
-                        if segments.last?.isEmpty == true { segments.removeLast() }
+                        buckets.removeLast()
                     }
                 }
                 // A duplicate unavailable reading cannot heal a previous missing sample.
@@ -275,7 +286,7 @@ public final class ChartHistoryArchive {
             } else {
                 priorBucket = nil
             }
-            let previousDate = segments.last?.last?.end
+            let previousDate = buckets.last?.bucket.end
             let gap = previousDate.map { point.timestamp.timeIntervalSince($0) } ?? .infinity
             if !available {
                 beginsRun = true
@@ -284,21 +295,21 @@ public final class ChartHistoryArchive {
             } else {
                 let bucket = ArchivedChartBucket(
                     start: point.timestamp, end: point.timestamp, value: point.value, count: 1)
-                if beginsRun || gap > ChartHistoryArchive.maximumGap || segments.isEmpty {
-                    segments.append([bucket])
+                if beginsRun || gap > ChartHistoryArchive.maximumGap || buckets.isEmpty {
+                    buckets.append(Entry(bucket: bucket, beginsRun: true))
                     priorBucket = nil
                     lastBeganRun = true
-                } else if let previous = segments.last?.last,
+                } else if let previous = buckets.last?.bucket,
                     Self.minute(previous.end) == Self.minute(point.timestamp)
                 {
                     priorBucket = previous
                     let count = previous.count + 1
                     let mean = previous.value + (point.value - previous.value) / Double(count)
-                    segments[segments.count - 1][segments.last!.count - 1] = ArchivedChartBucket(
+                    buckets[buckets.count - 1].bucket = ArchivedChartBucket(
                         start: previous.start, end: point.timestamp, value: mean, count: count)
                     lastBeganRun = false
                 } else {
-                    segments[segments.count - 1].append(bucket)
+                    buckets.append(Entry(bucket: bucket, beginsRun: false))
                     priorBucket = nil
                     lastBeganRun = false
                 }
@@ -309,80 +320,31 @@ public final class ChartHistoryArchive {
         }
 
         mutating func trim(before cutoff: Date) {
-            segments = segments.compactMap {
-                let retained = $0.filter { $0.end >= cutoff }
-                return retained.isEmpty ? nil : retained
-            }
-            var excess =
-                segments.reduce(0) { $0 + $1.count }
-                - ChartHistoryArchive.maximumBucketsPerSeries
-            while excess > 0, !segments.isEmpty {
-                let removed = min(excess, segments[0].count)
-                segments[0].removeFirst(removed)
-                excess -= removed
-                if segments[0].isEmpty { segments.removeFirst() }
-            }
-            if segments.isEmpty { endRun() }
+            while let first = buckets.first, first.bucket.end < cutoff { buckets.removeFirst() }
+            if buckets.isEmpty { endRun() }
         }
 
         func visible(before: Date, cutoff: Date, now: Date) -> [[ArchivedChartBucket]] {
-            segments.compactMap {
-                let retained = $0.filter { $0.end < before && $0.end >= cutoff && $0.end <= now }
-                return retained.isEmpty ? nil : retained
+            let lower = buckets.lowerBound { $0 >= cutoff }
+            let upper = min(
+                buckets.lowerBound { $0 >= before }, buckets.lowerBound { $0 > now })
+            guard lower < upper else { return [] }
+            var segments: [[ArchivedChartBucket]] = []
+            var run: [ArchivedChartBucket] = []
+            for index in lower..<upper {
+                let entry = buckets[index]
+                if entry.beginsRun, !run.isEmpty {
+                    segments.append(run)
+                    run = []
+                }
+                run.append(entry.bucket)
             }
+            if !run.isEmpty { segments.append(run) }
+            return segments
         }
 
         private static func minute(_ date: Date) -> Double {
             (date.timeIntervalSince1970 / ChartHistoryArchive.bucketInterval).rounded(.down)
-        }
-    }
-}
-
-private struct SavedSource: Codable, Sendable {
-    let throughput: [[ArchivedChartBucket]]
-    let systemGPU: [[ArchivedChartBucket]]
-    let toolObservation: [[ArchivedChartBucket]]
-}
-
-private struct ArchiveFile: Codable, Sendable {
-    var version = 1
-    let sources: [String: SavedSource]
-
-    static func read(_ file: URL) -> Result<ArchiveFile, ArchiveError> {
-        do {
-            guard FileManager.default.fileExists(atPath: file.path) else {
-                return .success(ArchiveFile(sources: [:]))
-            }
-            let archive = try JSONDecoder().decode(ArchiveFile.self, from: Data(contentsOf: file))
-            guard archive.version == 1 else {
-                return .failure(ArchiveError(message: "Unsupported chart history version."))
-            }
-            return .success(archive)
-        } catch {
-            return .failure(
-                ArchiveError(message: "Could not load chart history: \(error.localizedDescription)")
-            )
-        }
-    }
-}
-
-private struct ArchiveError: Error, Sendable {
-    let message: String
-}
-
-private actor ArchiveWriter {
-    private var latestRevision: UInt64 = 0
-
-    func write(_ archive: ArchiveFile, to file: URL, revision: UInt64) -> String? {
-        guard revision >= latestRevision else { return nil }
-        latestRevision = revision
-        do {
-            try FileManager.default.createDirectory(
-                at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONEncoder().encode(archive).write(to: file, options: .atomic)
-            return nil
-        } catch {
-            return "Could not save chart history: \(error.localizedDescription)"
         }
     }
 }

@@ -338,6 +338,148 @@ final class MetricsStoreTests: XCTestCase {
         XCTAssertTrue(store.tpsHistory.allSatisfy { !$0.isAvailable })
     }
 
+    func testHiddenConsumersCollectSamplesWithoutPublishingAndReopenImmediately() {
+        var now = origin
+        let store = MetricsStore(clock: { now })
+        store.setChartPresentationDemand(false, consumer: .dashboard)
+        store.setChartPresentationDemand(false, consumer: .popover)
+        let hidden = store.chartPresentation
+        for index in 0..<40 {
+            now = origin.addingTimeInterval(Double(index) / 2)
+            store.sample()
+        }
+        XCTAssertEqual(store.tpsHistory.count, 40)
+        XCTAssertEqual(store.chartPresentation, hidden)
+        store.setChartPresentationDemand(true, consumer: .dashboard)
+        XCTAssertEqual(store.chartPresentation.timestamp, now)
+        XCTAssertEqual(store.chartPresentation.throughput, store.tpsHistory)
+        store.setChartPresentationDemand(true, consumer: .popover)
+        store.setChartPresentationDemand(false, consumer: .dashboard)
+        now = now.addingTimeInterval(1)
+        store.sample()
+        XCTAssertEqual(
+            store.chartPresentation.timestamp, now,
+            "The remaining visible consumer keeps publication active")
+        store.setChartPresentationDemand(false, consumer: .popover)
+        XCTAssertTrue(
+            store.chartPresentation.throughput.isEmpty,
+            "Closed surfaces release their presentation arrays")
+        now = now.addingTimeInterval(1)
+        store.sample()
+        store.setChartPresentationDemand(true, consumer: .popover)
+        XCTAssertEqual(store.chartPresentation.timestamp, now)
+        XCTAssertEqual(store.chartPresentation.throughput, store.tpsHistory)
+    }
+
+    func testSampleRingsWrapPreservePublishedSnapshotsAndReplaceLatestTimestamp() {
+        let store = MetricsStore(clock: { self.origin })
+        store.proxyState = .listening
+        store.setChartPresentationDemand(false, consumer: .dashboard)
+        for index in 0..<100 {
+            store.sample(at: origin.addingTimeInterval(Double(index) / 2))
+        }
+        store.setChartPresentationDemand(true, consumer: .dashboard)
+        let saved = store.chartPresentation
+        store.setChartPresentationDemand(false, consumer: .dashboard)
+        let total = MetricsStore.maxHistorySamples * 3
+        for index in 100..<total {
+            store.sample(at: origin.addingTimeInterval(Double(index) / 2))
+        }
+        let expected = (total - MetricsStore.maxHistorySamples..<total).map {
+            origin.addingTimeInterval(Double($0) / 2)
+        }
+        XCTAssertEqual(store.tpsHistory.map(\.timestamp), expected)
+        XCTAssertEqual(store.gpuHistory.map(\.timestamp), expected)
+        XCTAssertEqual(store.toolObservationHistory.map(\.timestamp), expected)
+        XCTAssertEqual(saved.throughput.count, 100)
+        XCTAssertEqual(saved.throughput.first?.timestamp, origin)
+        let current = store.tpsHistory
+        store.sample(at: expected.last!)
+        XCTAssertEqual(store.tpsHistory, current)
+        store.setChartPresentationDemand(true, consumer: .dashboard)
+        XCTAssertEqual(store.chartPresentation.throughput, current)
+        store.sample(at: expected.last!.addingTimeInterval(MetricsStore.chartWindow + 10))
+        XCTAssertEqual(store.tpsHistory.count, 1)
+        XCTAssertEqual(store.toolObservationHistory.count, 1)
+    }
+
+    func testLegacyHistoryLocationIsUntouchedAcrossSessionsAndShutdownHooks() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "MetricsStore-session-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MetricsStore(clock: { self.origin }, historyDirectory: directory)
+        await store.prepareHistory()
+        store.beginBackendSession(kind: .ollama, epoch: UUID())
+        let request = GenerationRequest(startedAt: origin)
+        store.apply(.began(request))
+        store.apply(.updated(requestID: request.id, snapshot: finalSnapshot(tokens: 12)))
+        store.sample(at: origin.addingTimeInterval(1))
+        store.beginBackendSession(kind: .vllm, epoch: UUID())
+        await store.flushHistory()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        let fresh = MetricsStore(clock: { self.origin }, historyDirectory: directory)
+        XCTAssertEqual(
+            fresh.usageSummary(in: DateInterval(start: origin, duration: 10)).requests, 0)
+        XCTAssertTrue(fresh.chartPresentation.throughput.isEmpty)
+    }
+
+    func testBackendSwitchDoesNotRestoreArchivedPresentationWhileHidden() {
+        var now = origin
+        let store = MetricsStore(clock: { now })
+        let epoch = UUID()
+        store.beginBackendSession(kind: .vllm, epoch: epoch, sourceID: "A")
+        for index in 0...240 {
+            now = origin.addingTimeInterval(Double(index) / 2)
+            store.applyBackendSample(
+                BackendSample(kind: .vllm, timestamp: now, currentTPS: 7, runningRequests: 1),
+                epoch: epoch)
+            store.sample()
+        }
+        store.setChartPresentationDemand(false, consumer: .dashboard)
+        store.setChartPresentationDemand(false, consumer: .popover)
+        now = now.addingTimeInterval(1)
+        store.beginBackendSession(kind: .vllm, epoch: UUID(), sourceID: "B")
+        now = now.addingTimeInterval(1)
+        store.beginBackendSession(kind: .vllm, epoch: UUID(), sourceID: "A")
+        XCTAssertEqual(store.chartPresentation.archive, .empty)
+        XCTAssertTrue(store.chartPresentation.throughput.isEmpty)
+        XCTAssertEqual(store.historyAge, now.timeIntervalSince(origin))
+        store.setChartPresentationDemand(true, consumer: .dashboard)
+        XCTAssertFalse(store.chartPresentation.archive.throughput.isEmpty)
+        XCTAssertEqual(store.chartPresentation.archive.availableSince, origin)
+    }
+
+    func testScalarThroughputPeakMatchesInclusiveRawIntervalAndExcludesFutureSamples() {
+        var now = origin
+        let store = MetricsStore(clock: { now })
+        let epoch = UUID()
+        store.beginBackendSession(kind: .vllm, epoch: epoch)
+        store.setChartPresentationDemand(false, consumer: .dashboard)
+        for index in 0..<80 {
+            now = origin.addingTimeInterval(Double(index) / 2)
+            store.applyBackendSample(
+                BackendSample(
+                    kind: .vllm, timestamp: now,
+                    currentTPS: index.isMultiple(of: 7) ? nil : Double(index), runningRequests: 1),
+                epoch: epoch)
+            store.sample()
+        }
+        let intervals = [
+            DateInterval(start: origin.addingTimeInterval(-10), end: origin.addingTimeInterval(-1)),
+            DateInterval(start: origin, end: origin.addingTimeInterval(9.5)),
+            DateInterval(start: origin.addingTimeInterval(10), end: origin.addingTimeInterval(15)),
+            DateInterval(start: origin.addingTimeInterval(20), end: now),
+        ]
+        let samples = store.tpsHistory
+        for interval in intervals {
+            let expected = samples.filter {
+                $0.timestamp >= interval.start && $0.timestamp <= interval.end
+                    && $0.isAvailable && $0.value.isFinite && $0.value >= 0
+            }.map(\.value).max()
+            XCTAssertEqual(store.peakThroughput(in: interval), expected)
+        }
+    }
+
     private func finalSnapshot(tokens: Int) -> GenerationSnapshot {
         GenerationSnapshot(
             outputTokens: tokens, promptTokens: 3, isEstimated: false,
