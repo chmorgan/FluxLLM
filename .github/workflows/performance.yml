@@ -1,0 +1,61 @@
+name: Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner to validate and measure
+        type: choice
+        default: macos-15
+        options:
+          - macos-15
+          - macos-15-xlarge
+      mode:
+        description: Check fixed limits or record a baseline
+        type: choice
+        default: check
+        options:
+          - check
+          - baseline
+  pull_request:
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'scripts/*performance*'
+      - 'Package.*'
+      - '.github/workflows/performance.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  performance:
+    name: Release app performance
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    # Build time is separate; the runner enforces a 300-second measurement cap.
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      PERFORMANCE_MODE: ${{ inputs.mode || 'check' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build, calibrate, and run the fixed performance workload
+        run: python3 scripts/run_performance_checks.py "$PERFORMANCE_MODE"
+      - name: Preserve measurements even when a limit or capability fails
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .performance-results/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
