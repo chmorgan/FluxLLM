@@ -1,9 +1,8 @@
 import Foundation
 
 /// Aged telemetry shared by the resource regression harness and isolated app playback.
-/// Build it before opening the measured interval, using the same public ingestion
-/// and persistence paths as the application. The caller owns and removes the
-/// temporary directory.
+/// Uses ordinary in-memory ingestion with fixed timestamps. No fixture files,
+/// restoration, or alternate accounting paths are involved.
 @MainActor
 public enum PerformanceHistoryFixture {
     public static let model = "resource-fixture"
@@ -17,23 +16,16 @@ public enum PerformanceHistoryFixture {
     public static let rawSampleCount = MetricsStore.maxHistorySamples
     public static let rawRequestOutputTokens = 520
 
-    /// Populate a fresh, caller-scoped temporary directory. Retained usage spans
-    /// seven days; all requests finish before the later raw one-hour fixture.
-    /// Initializing at endingAt keeps retention fixed while replaying old events,
-    /// so fixture construction does not simulate seven days of pruning timers.
-    public static func seedPersistentHistory(directory: URL, source: String, endingAt: Date)
-        async throws
-    {
-        let fileManager = FileManager.default
-        for name in ["usage-history.json", "chart-history.json"] {
-            guard !fileManager.fileExists(atPath: directory.appendingPathComponent(name).path)
-            else {
-                throw FixtureError.existingHistory(name)
-            }
-        }
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    public struct SessionHistory {
+        public let usage: UsageHistory
+        public let archive: ChartHistoryArchive
+    }
 
-        let history = UsageHistory(directory: directory, now: endingAt)
+    /// Seven days of completed usage and four older chart hours. Initializing at
+    /// endingAt holds retention fixed while replaying events, rather than
+    /// simulating seven days of pruning work during fixture construction.
+    public static func makeSessionHistory(source: String, endingAt: Date) -> SessionHistory {
+        let history = UsageHistory(now: endingAt)
         let firstStart = endingAt.addingTimeInterval(-7 * 24 * 3_600)
         let lastStart = endingAt.addingTimeInterval(-3_605)
         let spacing = lastStart.timeIntervalSince(firstStart) / Double(persistentRequestCount - 1)
@@ -60,13 +52,7 @@ public enum PerformanceHistoryFixture {
                         isEstimated: false, finished: true, elapsed: 3, timestamp: endedAt)),
                 source: source, at: endedAt)
         }
-        // This method supplies its own flush; calling flush first would enqueue
-        // a second full snapshot and needlessly inflate fixture setup writes.
-        await history.waitForPendingWrites()
-        if let error = history.persistenceError { throw FixtureError.persistence(error) }
-
-        let archive = ChartHistoryArchive(directory: directory, now: endingAt)
-        await archive.prepare()
+        let archive = ChartHistoryArchive(now: endingAt)
         let archiveStart = endingAt.addingTimeInterval(-5 * 3_600)
         // Four older hours at the largest cadence that preserves an archive
         // segment. The raw fixture adds the most recent hour at 2 Hz afterward.
@@ -78,8 +64,7 @@ public enum PerformanceHistoryFixture {
                 gpu: TimeSeriesPoint(timestamp: timestamp, value: gpuPercent),
                 toolObservation: TimeSeriesPoint(timestamp: timestamp, value: 0))
         }
-        await archive.flushAndWait()
-        if let error = archive.persistenceError { throw FixtureError.persistence(error) }
+        return SessionHistory(usage: history, archive: archive)
     }
 
     /// Fill an already-selected Ollama session without suspending the main actor.
@@ -151,7 +136,7 @@ public enum PerformanceHistoryFixture {
         store.updateConnection(.ready, at: endingAt)
     }
 
-    /// Stable fixture identities; namespaces distinguish persisted requests,
+    /// Stable fixture identities; namespaces distinguish older session requests,
     /// raw requests, and each kind of tool event without sharing dedupe keys.
     public static func fixedID(namespace: UInt16, index: Int) -> UUID {
         precondition(index >= 0)
@@ -177,8 +162,4 @@ public enum PerformanceHistoryFixture {
             timestamp: timestamp, requestID: requestID)
     }
 
-    private enum FixtureError: Error {
-        case existingHistory(String)
-        case persistence(String)
-    }
 }

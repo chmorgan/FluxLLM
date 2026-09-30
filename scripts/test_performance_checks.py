@@ -41,8 +41,7 @@ def measurement(cycles=3):
             "phases": phases, "validation": {"passed": True, "requests": 2 * cycles,
                                               "chunks": 65 * 40 * 2 * cycles, "tool_calls": 2 * cycles,
                                               "tool_results": 2 * cycles,
-                                              "usage_reloaded": True, "archive_reloaded": True,
-                                              "periodic_persistence_verified": True}}
+                                              "session_history_verified": True, "history_files_absent": True}}
 
 
 def budget(result=None):
@@ -175,22 +174,22 @@ class SchemaTests(unittest.TestCase):
 
     def test_passed_flag_cannot_replace_exact_workload_and_reload_evidence(self):
         for field, value in (("requests", 0), ("chunks", 0), ("tool_calls", 0),
-                             ("tool_results", 0), ("usage_reloaded", False), ("archive_reloaded", 1)):
+                             ("tool_results", 0), ("session_history_verified", False), ("history_files_absent", 1)):
             with self.subTest(field=field):
                 result = measurement()
                 result["validation"][field] = value
                 with self.assertRaises(perf.InvalidResult):
                     perf.validate_result(result, scenario())
 
-    def test_periodic_persistence_evidence_cannot_be_missing_false_or_truthy(self):
+    def test_no_history_file_evidence_cannot_be_missing_false_or_truthy(self):
         for value in (None, False, 1, "true"):
             with self.subTest(value=value):
                 result = measurement()
                 if value is None:
-                    result["validation"].pop("periodic_persistence_verified")
+                    result["validation"].pop("history_files_absent")
                 else:
-                    result["validation"]["periodic_persistence_verified"] = value
-                with self.assertRaisesRegex(perf.InvalidResult, "periodic_persistence_verified"):
+                    result["validation"]["history_files_absent"] = value
+                with self.assertRaisesRegex(perf.InvalidResult, "history_files_absent"):
                     perf.validate_result(result, scenario())
 
     def test_manifest_counts_for_idle_and_high_rate(self):
@@ -263,7 +262,7 @@ class SchemaTests(unittest.TestCase):
             original = perf.workload_fingerprint(root)
             self.assertRegex(original, r"^[0-9a-f]{64}$")
             production = root / "Sources" / "App.swift"
-            production.parent.mkdir()
+            production.parent.mkdir(exist_ok=True)
             production.write_text("production optimization")
             self.assertEqual(perf.workload_fingerprint(root), original)
             (root / perf.WORKLOAD_SOURCES[0]).write_text("changed synthetic workload")

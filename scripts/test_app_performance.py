@@ -132,6 +132,93 @@ class ResourceGateTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_explicit_visibility_failure_keeps_remaining_ui_commands_running(self):
+        collector = mock.Mock()
+        collector.command.side_effect = [
+            {"command": "show_dashboard", "status": "error", "reason": "Dashboard did not become visible"},
+            {"command": "show_popover", "status": "ok"}]
+        invalid = []
+        app.visible(collector, True, invalid)
+        self.assertEqual(collector.command.call_count, 2)
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("coverage is incomplete", invalid[0])
+
+    def test_visibility_continuation_does_not_swallow_transport_or_other_errors(self):
+        collector = mock.Mock()
+        collector.command.side_effect = TimeoutError("transport failed")
+        with self.assertRaises(TimeoutError):
+            app.visible(collector, True, [])
+        collector.command.side_effect = None
+        collector.command.return_value = {"command": "show_dashboard", "status": "error", "reason": "unrelated failure"}
+        with self.assertRaises(app.InvalidResult):
+            app.visible(collector, True, [])
+
+    def test_logging_whitelist_is_exact_and_anchored_to_the_owned_uuid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            storage = {"root": temporary, "run_id": "00000000-0000-0000-0000-000000000001"}
+            directory = Path(temporary).resolve() / storage["run_id"] / "Diagnostics"
+            expected = [str(directory), *(str(directory / name) for name in
+                                         ("diagnostics.jsonl", "diagnostics.1.jsonl", "diagnostics.2.jsonl"))]
+            response = {"logging_destination": str(directory / "diagnostics.jsonl"), "logging_destinations": expected}
+            self.assertEqual(app.validated_logging_destinations(response, storage), sorted(expected))
+            for unexpected in (str(directory.parent / "History"), str(directory / "other.jsonl"), "/tmp/diagnostics.jsonl"):
+                with self.subTest(unexpected=unexpected), self.assertRaises(app.InvalidResult):
+                    app.validated_logging_destinations(dict(response, logging_destinations=expected[:3] + [unexpected]), storage)
+
+    def test_invalid_logger_destinations_grant_no_write_interval(self):
+        collector = mock.Mock()
+        collector.storage = {"root": "/tmp", "run_id": "owned-uuid"}
+        collector.command.return_value = {"status": "ok", "logging_enabled": True,
+                                          "collector_control_before_seconds": 1,
+                                          "logging_destination": "/tmp/other/log.jsonl",
+                                          "logging_destinations": ["/tmp/other/log.jsonl"]}
+        case = {"invalid": [], "logging_transitions": [], "logging_destinations": []}
+        self.assertIsNone(app.set_logging(collector, True, case, None))
+        self.assertTrue(case["invalid"])
+        self.assertEqual(case["logging_destinations"], [])
+
+    def test_both_history_modes_launch_with_an_empty_external_directory(self):
+        for history in ("fresh", "populated"):
+            with self.subTest(history=history), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                artifacts, storage = directory / "artifacts", directory / "storage"
+                artifacts.mkdir()
+                storage.mkdir()
+                process = mock.Mock()
+                process.stdout, process.stdin = io.BytesIO(), io.BytesIO()
+                process.poll.return_value = 0
+                with mock.patch.object(app.tempfile, "mkdtemp", return_value=str(storage)), \
+                        mock.patch.object(app.subprocess, "Popen", return_value=process) as launch, \
+                        mock.patch.object(app, "stop_process_group"):
+                    collector = app.Collector(Path("/collector"), Path("/app"),
+                                              {"history": history, "upstream_url": "http://127.0.0.1:123"},
+                                              {}, artifacts, app.Deadline(5))
+                    try:
+                        self.assertEqual(launch.call_count, 1)
+                        self.assertEqual(launch.call_args.args[0][1], "--app")
+                        self.assertEqual(list((storage / collector.storage["run_id"]).iterdir()), [])
+                        self.assertFalse((artifacts / "seed.log").exists())
+                    finally:
+                        collector.close()
+
+    def test_chart_assertion_failure_preserves_emitted_measurements(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            result = {"configuration": "release", "equivalentOutputs": True,
+                      "budgetStatus": "enforced", "cases": [{"cpuSeconds": 0.03} for _ in range(6)]}
+            app.write_json(directory / "chart.json", result)
+            with mock.patch.object(app, "execute_logged", return_value={"exit_code": 1}):
+                measured = app.run_chart(Path("/tests"), directory, app.Deadline(5))
+            self.assertEqual(measured["result"], result)
+            self.assertTrue(measured["failures"])
+            self.assertEqual(measured["invalid"], [])
+
+    def test_chart_success_without_result_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(app, "execute_logged", return_value={"exit_code": 0}):
+                measured = app.run_chart(Path("/tests"), Path(temporary), app.Deadline(5))
+            self.assertTrue(measured["invalid"])
+
     def test_malformed_oversized_duplicate_and_nonfinite_records_are_rejected(self):
         for raw in (b"not-json", b"[]", b'{"type":"sample","type":"error"}',
                     b'{"type":"sample","cpu_seconds":NaN}', b" " * (app.MAX_RECORD_BYTES + 1)):
@@ -262,15 +349,19 @@ class ProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             executable = directory / "collector"
-            executable.write_text(f"#!{sys.executable}\n"
-                                  "import json,sys,time\n"
-                                  "if '--preflight' in sys.argv:\n"
-                                  " print('calibration diagnostic',file=sys.stderr,flush=True)\n"
-                                  " time.sleep(60)\n"
-                                  "else:\n"
-                                  " print(json.dumps({'type':'self_test','passed':True,'cpu':{'available':True}}))\n")
-            executable.chmod(0o700)
-            result = app.preflight(executable, directory, app.Deadline(5), timeout=0.2)
+
+            def launch(command, **options):
+                process = mock.Mock()
+                if "--preflight" in command:
+                    options["stderr"].write(b"calibration diagnostic\n")
+                    process.wait.side_effect = subprocess.TimeoutExpired(command, 0.2)
+                else:
+                    options["stdout"].write(b'{"type":"self_test","passed":true,"cpu":{"available":true}}\n')
+                    process.wait.return_value = 0
+                return process
+
+            with mock.patch.object(app.subprocess, "Popen", side_effect=launch), mock.patch.object(app, "stop_process_group"):
+                result = app.preflight(executable, directory, app.Deadline(5), timeout=0.2)
             self.assertTrue(result["execution"]["timed_out"])
             self.assertEqual(result["execution"]["exit_code"], None)
             self.assertIn("calibration diagnostic", (directory / "preflight-stderr.log").read_text())

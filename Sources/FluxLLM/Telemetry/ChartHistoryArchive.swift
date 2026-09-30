@@ -112,6 +112,16 @@ public final class ChartHistoryArchive {
                 before: before, cutoff: cutoff, now: now))
     }
 
+    /// Number of visible throughput buckets, without allocating their segments.
+    public func bucketCount(source: String, before: Date, now: Date) -> Int {
+        guard now.timeIntervalSince1970.isFinite, before.timeIntervalSince1970.isFinite else {
+            return 0
+        }
+        trim(at: now)
+        return sources[source]?.throughput.visibleCount(
+            before: before, cutoff: now.addingTimeInterval(-Self.retention), now: now) ?? 0
+    }
+
     /// Earliest retained observation without allocating a chart snapshot.
     public func availableSince(source: String, now: Date) -> Date? {
         guard now.timeIntervalSince1970.isFinite else { return nil }
@@ -322,6 +332,13 @@ public final class ChartHistoryArchive {
         mutating func trim(before cutoff: Date) {
             while let first = buckets.first, first.bucket.end < cutoff { buckets.removeFirst() }
             if buckets.isEmpty { endRun() }
+        }
+
+        func visibleCount(before: Date, cutoff: Date, now: Date) -> Int {
+            let lower = buckets.lowerBound { $0 >= cutoff }
+            let upper = min(
+                buckets.lowerBound { $0 >= before }, buckets.lowerBound { $0 > now })
+            return max(0, upper - lower)
         }
 
         func visible(before: Date, cutoff: Date, now: Date) -> [[ArchivedChartBucket]] {

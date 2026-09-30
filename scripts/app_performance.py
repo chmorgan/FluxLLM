@@ -310,12 +310,6 @@ class Collector:
         run_directory.mkdir()
         self.storage = {"root": str(storage_root), "run_id": run_id}
         write_json(directory / "storage.json", self.storage)
-        if configuration["history"] == "populated":
-            seed = execute_logged([str(executable), "--seed-history", str(run_directory / "History"),
-                                   "--source", "ollama|" + configuration["upstream_url"] + "|",
-                                   "--ending-at-epoch", str(time.time())], directory / "seed.log", deadline.remaining())
-            write_json(directory / "seed.json", seed)
-            require(seed["exit_code"] == 0, "External populated-history construction failed; see seed.log")
         self.raw = (directory / "collector.jsonl").open("wb")
         self.stderr = (directory / "collector-stderr.log").open("wb")
         environment = os.environ.copy()
@@ -487,10 +481,36 @@ def fixture_request(base_url, endpoint, deadline, body=None):
         connection.close()
 
 
-def visible(collector, show):
+def visible(collector, show, invalid=None):
+    visibility_errors = {"show_dashboard": "Dashboard did not become visible",
+                         "show_popover": "Popover did not become visible",
+                         "close_dashboard": "Dashboard did not close",
+                         "close_popover": "Popover did not close"}
     for command in (("show_dashboard", "show_popover") if show else ("close_popover", "close_dashboard")):
         response = collector.command(command)
+        if (invalid is not None and response.get("status") == "error" and response.get("command") == command
+                and response.get("reason") == visibility_errors[command]):
+            invalid.append(f"UI lifecycle coverage is incomplete: {response['reason']}")
+            continue
         require(response.get("status", "ok") == "ok", f"UI command {command} was not applied")
+
+
+def validated_logging_destinations(response, storage):
+    run_directory = Path(storage["root"]).resolve() / storage["run_id"]
+    directory = run_directory / "Diagnostics"
+    expected = {str(directory), *(str(directory / name) for name in
+                                 ("diagnostics.jsonl", "diagnostics.1.jsonl", "diagnostics.2.jsonl"))}
+    destinations = response.get("logging_destinations")
+    require(isinstance(destinations, list) and len(destinations) == 4
+            and all(isinstance(path, str) and Path(path).is_absolute() for path in destinations),
+            "Logging enable did not identify all four exact owned destinations")
+    canonical = {str(Path(path).resolve()) for path in destinations}
+    require(canonical == expected, "Logging destinations escape the fixed owned Diagnostics paths")
+    primary = response.get("logging_destination")
+    require(isinstance(primary, str) and Path(primary).is_absolute()
+            and str(Path(primary).resolve()) == str(directory / "diagnostics.jsonl"),
+            "The primary logging destination is not the owned diagnostics.jsonl file")
+    return sorted(expected)
 
 
 def set_logging(collector, enabled, case, open_interval):
@@ -505,11 +525,12 @@ def set_logging(collector, enabled, case, open_interval):
         case["invalid"].append(f"Logging {'enable' if enabled else 'disable/drain'} was not verified: {response.get('reason', response.get('status'))}")
         return open_interval
     if enabled:
-        destination = response.get("logging_destination")
-        if not isinstance(destination, str) or not Path(destination).is_absolute():
-            case["invalid"].append("Logging enable did not identify its exact destination")
-        else:
-            case["logging_destinations"].append(destination)
+        try:
+            destinations = validated_logging_destinations(response, collector.storage)
+        except (OSError, ValueError, KeyError) as error:
+            case["invalid"].append(str(error))
+            return open_interval
+        case["logging_destinations"] = destinations
         return boundary
     if open_interval is not None:
         case["logging_intervals"].append((open_interval, boundary))
@@ -588,9 +609,9 @@ def run_case(specification, collector_path, app_path, upstream, gpu_capability, 
                     "Populated retained-history dimensions changed")
         open_interval = set_logging(collector, False, case, open_interval)
         if specification["ui"] in ("closed", "visible"):
-            visible(collector, True)
+            visible(collector, True, case["invalid"])
             if specification["ui"] == "closed":
-                visible(collector, False)
+                visible(collector, False, case["invalid"])
         if specification["name"] == "logging-transitions":
             run_continuous_logging(collector, specification, case, proxy_url, upstream, deadline, cycle_start)
         for stage_index, stage in enumerate([] if specification["name"] == "logging-transitions" else specification["stages"]):
@@ -615,9 +636,9 @@ def run_case(specification, collector_path, app_path, upstream, gpu_capability, 
                         "Live telemetry did not advance while network streams were active")
             if stage.get("open_close_cycles"):
                 for cycle in range(stage["open_close_cycles"]):
-                    visible(collector, True)
+                    visible(collector, True, case["invalid"])
                     collector.wait_until(started + (cycle + 0.5) * stage["seconds"] / stage["open_close_cycles"])
-                    visible(collector, False)
+                    visible(collector, False, case["invalid"])
                     collector.wait_until(started + (cycle + 1) * stage["seconds"] / stage["open_close_cycles"])
             else:
                 collector.wait_until(stage_end)
@@ -648,6 +669,11 @@ def run_case(specification, collector_path, app_path, upstream, gpu_capability, 
             launched = next((event for event in collector.events if event["type"] == "launched"), {})
             case["environment"] = launched.get("environment", {})
             exits = [event for event in collector.events if event["type"] == "exited"]
+            stopped = [event.get("event", {}) for event in collector.events
+                       if event["type"] == "app_event" and event.get("event", {}).get("type") == "stopped"]
+            if not stopped or stopped[-1].get("status") != "ok":
+                case["invalid"].append("App shutdown/drain barrier did not complete successfully"
+                                       + (f": {stopped[-1].get('error', 'unspecified error')}" if stopped else ""))
             if exits and exits[-1].get("status") != 0:
                 case["invalid"].append(f"App terminated with exit status {exits[-1].get('status')}")
             if not exits or exits[-1].get("trace_coverage") is not True:
@@ -794,13 +820,22 @@ def run_chart(tests, directory, deadline):
     result = execute_logged(["xcrun", "xctest", "-XCTest",
                              "FluxLLMTests.ChartPreparationPerformanceTests/testFreshChartPublicationsReportCPUAndWallCost", str(tests)],
                             directory / "chart.log", deadline.remaining(), environment)
-    require(result["exit_code"] == 0, "Release chart reproduction failed; see chart.log")
-    report = load_json(path)
-    # A skipped or empty test command must not masquerade as a successful run.
-    require(isinstance(report, dict) and report.get("configuration") == "release", "Chart measurement did not report a Release result")
-    require(report.get("equivalentOutputs") is True and isinstance(report.get("cases"), list) and len(report["cases"]) == 6,
-            "Chart measurement did not validate all six paired cases")
-    return {"execution": result, "result": report}
+    measured = {"execution": result, "failures": [], "invalid": []}
+    if result["exit_code"] is None:
+        measured["invalid"].append("Release chart reproduction timed out; see chart.log")
+    elif result["exit_code"] != 0:
+        measured["failures"].append(f"Release chart reproduction failed with exit status {result['exit_code']}; see chart.log")
+    try:
+        report = load_json(path)
+        measured["result"] = report
+        # Preserve emitted measurements even when XCTest subsequently reports
+        # a budget assertion failure. An empty/skipped run still cannot pass.
+        require(isinstance(report, dict) and report.get("configuration") == "release", "Chart measurement did not report a Release result")
+        require(report.get("equivalentOutputs") is True and isinstance(report.get("cases"), list) and len(report["cases"]) == 6,
+                "Chart measurement did not validate all six paired cases")
+    except (OSError, ValueError) as error:
+        measured["invalid"].append(f"Chart result is incomplete: {error}")
+    return measured
 
 
 def comparison_key(report):
@@ -929,6 +964,8 @@ def run(argv=None):
             write_json(output / "report.json", report)
         print("Measuring fresh chart publications within the remaining deadline…", flush=True)
         report["chart"] = run_chart(paths["tests"], output, deadline)
+        report["failures"].extend(report["chart"].get("failures", []))
+        report["invalid"].extend(report["chart"].get("invalid", []))
         require(measurement_identity() == report["measurement_identity"], "Measurement sources changed during the performance stage")
         report["performance_elapsed_seconds"] = time.monotonic() - started
         deadline.remaining()

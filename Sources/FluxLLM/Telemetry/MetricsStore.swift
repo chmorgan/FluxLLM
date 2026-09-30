@@ -72,6 +72,31 @@ public final class MetricsStore {
         return throughputSamples.peak(in: interval)
     }
 
+    /// Scalar diagnostics do not materialize retained arrays in the measured app.
+    public var throughputSampleCount: Int {
+        _ = historyBufferRevision
+        return throughputSamples.count
+    }
+
+    public var systemGPUSampleCount: Int {
+        _ = historyBufferRevision
+        return gpuHistoryScope == .system ? gpuSamples.count : 0
+    }
+
+    public var toolObservationSampleCount: Int {
+        _ = historyBufferRevision
+        return toolObservationSamples.count
+    }
+
+    public var archivedThroughputBucketCount: Int {
+        _ = historyBufferRevision
+        var before = sampleDate
+        if let first = throughputSamples.first?.timestamp { before = min(before, first) }
+        if let first = gpuSamples.first?.timestamp { before = min(before, first) }
+        if let first = toolObservationSamples.first?.timestamp { before = min(before, first) }
+        return chartArchive.bucketCount(source: historySource, before: before, now: sampleDate)
+    }
+
     public var isRateEstimated: Bool {
         throughputBasis == .estimated
             && (activeGeneration?.state == .running || currentTPS > 0)
@@ -202,14 +227,19 @@ public final class MetricsStore {
     @ObservationIgnored private var retainedToolEventIDs: Set<UUID> = []
     @ObservationIgnored private var toolHistoryTruncatedThrough: Date?
 
-    public init(clock: @escaping () -> Date = Date.init, historyDirectory: URL? = nil) {
+    public init(
+        clock: @escaping () -> Date = Date.init, historyDirectory: URL? = nil,
+        usageHistory: UsageHistory? = nil, chartArchive: ChartHistoryArchive? = nil
+    ) {
         self.clock = clock
         let now = clock()
         // The legacy directory parameter is deliberately ignored. History is
         // session-only even when a caller still passes an old storage location.
         _ = historyDirectory
-        usageHistory = UsageHistory(now: now)
-        chartArchive = ChartHistoryArchive(now: now)
+        // Optional session dependencies transfer existing in-memory state;
+        // retaining these instances does not copy or deserialize their contents.
+        self.usageHistory = usageHistory ?? UsageHistory(now: now)
+        self.chartArchive = chartArchive ?? ChartHistoryArchive(now: now)
         sampleDate = now
         chartPresentation = ChartPresentationSnapshot(timestamp: now)
     }

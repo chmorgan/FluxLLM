@@ -24,8 +24,6 @@ struct FluxLLMResourceCollector {
                 try await preflight()
             } else if arguments == ["--self-test"] {
                 try selfTest()
-            } else if arguments.first == "--seed-history" {
-                try await seedHistory(arguments)
             } else if arguments.first == "--terminate-owned" {
                 try terminateOwned(arguments)
             } else {
@@ -59,56 +57,8 @@ struct FluxLLMResourceCollector {
 
     private static func usageError() -> CollectorFailure {
         .message(
-            "Usage: FluxLLMResourceCollector --preflight | --self-test | --app /absolute/FluxLLMApp [--deadline 300] | --seed-history /absolute/History --source SOURCE --ending-at-epoch SECONDS | --terminate-owned PID --birth-time-us MICROSECONDS"
+            "Usage: FluxLLMResourceCollector --preflight | --self-test | --app /absolute/FluxLLMApp [--deadline 300] | --terminate-owned PID --birth-time-us MICROSECONDS"
         )
-    }
-
-    @MainActor
-    private static func seedHistory(_ arguments: [String]) async throws {
-        guard arguments.count == 6, arguments[0] == "--seed-history",
-            arguments[2] == "--source", arguments[4] == "--ending-at-epoch",
-            arguments[1].hasPrefix("/"), let epoch = Double(arguments[5]), epoch.isFinite,
-            epoch > 0
-        else { throw usageError() }
-        let directory = URL(fileURLWithPath: arguments[1], isDirectory: true)
-            .resolvingSymlinksInPath()
-        let roots = [
-            FileManager.default.temporaryDirectory,
-            URL(fileURLWithPath: "/private/tmp", isDirectory: true),
-        ]
-        .map { $0.resolvingSymlinksInPath().path }
-        guard roots.contains(where: { directory.path.hasPrefix($0 + "/") }),
-            directory.lastPathComponent == "History",
-            UUID(uuidString: directory.deletingLastPathComponent().lastPathComponent) != nil
-        else {
-            throw CollectorFailure.message(
-                "History fixtures require an isolated temporary UUID/History directory")
-        }
-        if FileManager.default.fileExists(atPath: directory.path) {
-            guard try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty else {
-                throw CollectorFailure.message(
-                    "Refusing to overwrite a nonempty history fixture directory")
-            }
-        }
-        let source = arguments[3]
-        let parts = source.split(separator: "|", omittingEmptySubsequences: false)
-        guard parts.count == 3, parts[0] == "ollama", parts[2].isEmpty,
-            let upstream = URL(string: String(parts[1])), upstream.scheme == "http",
-            upstream.host == "127.0.0.1", upstream.port.map({ (1...65535).contains($0) }) == true,
-            upstream.user == nil, upstream.password == nil, upstream.query == nil,
-            upstream.fragment == nil
-        else {
-            throw CollectorFailure.message(
-                "History fixtures require the isolated numeric-loopback Ollama source")
-        }
-        let started = ProcessResources.monotonicSeconds()
-        try await PerformanceHistoryFixture.seedPersistentHistory(
-            directory: directory, source: source, endingAt: Date(timeIntervalSince1970: epoch))
-        try emit([
-            "type": "history_seeded", "directory": directory.path, "source": source,
-            "ending_at_epoch": epoch,
-            "elapsed_seconds": ProcessResources.monotonicSeconds() - started,
-        ])
     }
 
     private static func terminateOwned(_ arguments: [String]) throws {

@@ -91,8 +91,7 @@ final class PerformanceControl {
         }
         let directory = root.appendingPathComponent(runID.uuidString, isDirectory: true)
         let history = directory.appendingPathComponent("History", isDirectory: true)
-        try Self.validatePreparedDirectory(
-            directory, history: history, populated: configuration.history == "populated")
+        try Self.validatePreparedDirectory(directory, history: history)
         self.configuration = configuration
         self.upstream = upstream
         self.runDirectory = directory
@@ -174,6 +173,9 @@ final class PerformanceControl {
                 let started = try await task.value
                 session = started
                 startupTask = nil
+                try await started.store.diagnosticLogger.setEnabled(
+                    configuration.logging_enabled ?? false,
+                    directory: try validatedLoggingDirectory())
                 gpuReporter?.sample()
                 send([
                     "type": "ready", "command_id": command.command_id, "protocol_version": 1,
@@ -181,7 +183,10 @@ final class PerformanceControl {
                     "proxy_url": "http://127.0.0.1:\(started.proxyPort)",
                     "history_directory": historyDirectory.path,
                     "preferences_suite": preferencesSuite,
-                    "snapshot": started.snapshot(), "logging_supported": false,
+                    "snapshot": snapshot(of: started), "logging_supported": true,
+                    "logging_enabled": started.store.diagnosticLogger.isEnabled,
+                    "logging_destination": loggingDestination.path,
+                    "logging_destinations": loggingDestinations,
                     "monotonic_seconds": Self.monotonicSeconds(),
                 ])
             } catch {
@@ -224,14 +229,17 @@ final class PerformanceControl {
                 reason = "Popover did not close"
             }
         case "set_logging":
-            guard command.enabled != nil else {
+            guard let enabled = command.enabled else {
                 fail("set_logging requires enabled: boolean", commandID: command.command_id)
                 return
             }
-            // The pre-optimization baseline has no diagnostic logging switch.
-            // The runner must mark this gate unavailable, never assume disabled.
-            status = "unsupported"
-            reason = "Diagnostic logging control is unavailable in this baseline"
+            do {
+                try await session.store.diagnosticLogger.setEnabled(
+                    enabled, directory: try validatedLoggingDirectory())
+            } catch {
+                status = "error"
+                reason = session.store.diagnosticLogger.errorMessage ?? String(describing: error)
+            }
         case "shutdown":
             shutdownCommandID = command.command_id
         default:
@@ -242,11 +250,16 @@ final class PerformanceControl {
         }
         var event: [String: Any] = [
             "type": "ack", "command": command.command, "command_id": command.command_id,
-            "status": status, "snapshot": session.snapshot(),
+            "status": status, "snapshot": snapshot(of: session),
         ]
         if command.command == "set_logging" {
-            event["logging_enabled"] = NSNull()
-            event["drained"] = false
+            let logger = session.store.diagnosticLogger
+            event["logging_enabled"] = logger.isEnabled
+            // setEnabled(false) returns/throws only after acceptance has
+            // stopped and its serial writer has drained and closed.
+            event["drained"] = command.enabled == false && !logger.isEnabled && !logger.isUpdating
+            event["logging_destination"] = loggingDestination.path
+            event["logging_destinations"] = loggingDestinations
         }
         event["monotonic_seconds"] = Self.monotonicSeconds()
         if let reason { event["reason"] = reason }
@@ -301,7 +314,14 @@ final class PerformanceControl {
         }
         gpuReporter?.stopAndEmitFinal()
         hasStopped = true
-        send(["type": "stopped", "command_id": shutdownCommandID, "status": "ok"])
+        var event: [String: Any] = [
+            "type": "stopped", "command_id": shutdownCommandID, "status": "ok",
+        ]
+        if let error = session?.shutdownError {
+            event["status"] = "error"
+            event["error"] = error
+        }
+        send(event)
     }
 
     private func fail(_ message: String, commandID: String) {
@@ -311,6 +331,51 @@ final class PerformanceControl {
 
     private func send(_ object: [String: Any]) {
         writer.send(object)
+    }
+
+    private var loggingDirectory: URL {
+        runDirectory.appendingPathComponent("Diagnostics", isDirectory: true)
+    }
+
+    private var loggingDestination: URL {
+        loggingDirectory.appendingPathComponent("diagnostics.jsonl")
+    }
+
+    private var loggingDestinations: [String] {
+        [loggingDirectory.path, loggingDestination.path]
+            + (1...2).map {
+                loggingDirectory.appendingPathComponent("diagnostics.\($0).jsonl").path
+            }
+    }
+
+    private func validatedLoggingDirectory() throws -> URL {
+        let directory = loggingDirectory
+        guard
+            directory.resolvingSymlinksInPath().standardizedFileURL.path
+                == directory.standardizedFileURL.path
+        else {
+            throw ControlError.invalid(
+                "The diagnostic destination must remain inside the owned run directory")
+        }
+        if FileManager.default.fileExists(atPath: directory.path) {
+            let values = try directory.resourceValues(forKeys: [
+                .isDirectoryKey, .isSymbolicLinkKey,
+            ])
+            guard values.isDirectory == true, values.isSymbolicLink != true else {
+                throw ControlError.invalid("The diagnostic destination must be a directory")
+            }
+        }
+        return directory
+    }
+
+    private func snapshot(of session: PerformanceApplicationSession) -> [String: Any] {
+        var value = session.snapshot()
+        let logger = session.store.diagnosticLogger
+        value["logging_enabled"] = logger.isEnabled
+        value["logging_supported"] = true
+        value["logging_dropped_records"] = logger.droppedCount
+        value["logging_error"] = logger.errorMessage as Any? ?? NSNull()
+        return value
     }
 
     private nonisolated static func validatePipe(_ descriptor: Int32, reading: Bool) throws {
@@ -334,10 +399,10 @@ final class PerformanceControl {
         return Double(value.tv_sec) + Double(value.tv_nsec) / 1_000_000_000
     }
 
-    /// The external collector may precreate this unique UUID directory and
-    /// legacy fixture files. Refuse symlinks and unrelated existing contents.
+    /// Both fixtures are populated in memory. The external collector may
+    /// precreate this unique UUID directory, but never supplies legacy files.
     private nonisolated static func validatePreparedDirectory(
-        _ directory: URL, history: URL, populated: Bool
+        _ directory: URL, history: URL
     ) throws {
         let manager = FileManager.default
         for url in [directory, history] {
@@ -360,22 +425,11 @@ final class PerformanceControl {
                 throw ControlError.invalid("Performance run directory contains unrelated files")
             }
         }
-        let expected: Set<String> = populated ? ["usage-history.json", "chart-history.json"] : []
         let names =
             manager.fileExists(atPath: history.path)
             ? Set(try manager.contentsOfDirectory(atPath: history.path)) : []
-        guard names == expected else {
-            throw ControlError.invalid(
-                "Performance history files do not match the requested fixture")
-        }
-        for name in names {
-            let file = history.appendingPathComponent(name)
-            let values = try file.resourceValues(forKeys: [
-                .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
-            ])
-            guard values.isRegularFile == true, values.isSymbolicLink != true,
-                let bytes = values.fileSize, bytes > 0, bytes <= 32 * 1024 * 1024
-            else { throw ControlError.invalid("Invalid prepared performance history file") }
+        guard names.isEmpty else {
+            throw ControlError.invalid("Session-only performance history directories must be empty")
         }
     }
 

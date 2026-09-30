@@ -37,6 +37,53 @@ final class ResourceUsageRegressionTests: XCTestCase {
         if let error = completion.error { throw error }
     }
 
+    func testSessionFixturePreservesDimensionsAndCreatesNoHistoryFiles() throws {
+        let endingAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let source = "ollama|http://127.0.0.1:11434|"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "SessionFixture-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let seeded = ResourceHistoryFixture.makeSessionHistory(source: source, endingAt: endingAt)
+        let clock = ResourceWorkloadClock(now: endingAt.addingTimeInterval(-3600))
+        let store = MetricsStore(
+            clock: { clock.now }, historyDirectory: directory,
+            usageHistory: seeded.usage, chartArchive: seeded.archive)
+        store.setChartPresentationDemand(false, consumer: .dashboard)
+        store.beginBackendSession(kind: .ollama, epoch: UUID(), sourceID: source)
+        ResourceHistoryFixture.seedRawHistory(store: store, endingAt: endingAt) { clock.fixed = $0 }
+        store.usageScope = .selectedPeriod
+        let interval = DateInterval(
+            start: endingAt.addingTimeInterval(-8 * 86400), end: endingAt.addingTimeInterval(1))
+        let actual = store.usageSummary(in: interval)
+        XCTAssertEqual(actual.requests, 19_256)
+        XCTAssertEqual(actual.toolCalls, 19_256)
+        XCTAssertEqual(actual.inputTokens, 19_256 * 32)
+        XCTAssertEqual(actual.outputTokens, 19_000 * 128 + 256 * 520)
+        XCTAssertEqual(actual.activeRequests, 0)
+        XCTAssertFalse(actual.isPartial)
+        XCTAssertEqual(seeded.usage.toolEvents(source: source, interval: interval).count, 38_512)
+        let expectedTimes = (0..<7_201).map {
+            endingAt.addingTimeInterval(-3600 + Double($0) * 0.5)
+        }
+        XCTAssertEqual(store.tpsHistory.map(\.timestamp), expectedTimes)
+        XCTAssertEqual(store.systemGPUHistory.map(\.timestamp), expectedTimes)
+        XCTAssertEqual(store.toolObservationHistory.map(\.timestamp), expectedTimes)
+        XCTAssertEqual(store.systemGPUHistory.map(\.value), Array(repeating: 42.0, count: 7_201))
+        XCTAssertEqual(store.throughputSampleCount, 7_201)
+        XCTAssertEqual(store.systemGPUSampleCount, 7_201)
+        XCTAssertEqual(store.toolObservationSampleCount, 7_201)
+        XCTAssertEqual(store.toolActivityEvents.count, 512)
+        XCTAssertGreaterThanOrEqual(store.archivedThroughputBucketCount, 200)
+        let archived = seeded.archive.history(
+            source: source, before: expectedTimes[0], now: endingAt)
+        XCTAssertEqual(
+            store.archivedThroughputBucketCount, archived.throughput.reduce(0) { $0 + $1.count })
+        XCTAssertEqual(
+            store.chartPresentation.archive, .empty,
+            "Hidden setup must not retain presentation arrays")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
     private func runSyntheticAppResourceUsage() async throws {
         let environment = ProcessInfo.processInfo.environment
         let scenario = try ResourceScenario(environment: environment)
@@ -65,17 +112,14 @@ final class ResourceUsageRegressionTests: XCTestCase {
         settings.ollamaHost = "127.0.0.1"
         settings.ollamaPort = try XCTUnwrap(upstream.port)
         let source = "ollama|\(upstream.absoluteString)|"
-        if scenario.history == "populated" {
-            resourceLog("Seeding persistent history")
-            try await ResourceHistoryFixture.seedPersistentHistory(
-                directory: directory, source: source, endingAt: Date())
-            resourceLog("Persistent history seeded")
-        }
-
         let rawEnd = Date()
         let clock = ResourceWorkloadClock(now: rawEnd.addingTimeInterval(-3600))
-        let store = MetricsStore(clock: { clock.now }, historyDirectory: directory)
-        await store.prepareHistory()
+        let seeded =
+            scenario.history == "populated"
+            ? ResourceHistoryFixture.makeSessionHistory(source: source, endingAt: rawEnd) : nil
+        let usage = seeded?.usage ?? UsageHistory(now: rawEnd)
+        let archive = seeded?.archive ?? ChartHistoryArchive(now: rawEnd)
+        let store = MetricsStore(clock: { clock.now }, usageHistory: usage, chartArchive: archive)
         let proxyHolder = ResourceProxyHolder()
         let coordinator = MonitoringCoordinator(
             settings: settings, store: store,
@@ -107,11 +151,11 @@ final class ResourceUsageRegressionTests: XCTestCase {
                 }
                 resourceLog("Raw history seeded")
                 try resourceRequire(
-                    store.tpsHistory.count == MetricsStore.maxHistorySamples,
+                    store.throughputSampleCount == MetricsStore.maxHistorySamples,
                     "Populated fixture did not fill the retained raw history")
                 try resourceRequire(
-                    store.systemGPUHistory.count == MetricsStore.maxHistorySamples
-                        && store.toolObservationHistory.count == MetricsStore.maxHistorySamples,
+                    store.systemGPUSampleCount == MetricsStore.maxHistorySamples
+                        && store.toolObservationSampleCount == MetricsStore.maxHistorySamples,
                     "Populated fixture lost GPU/tool observation history")
                 store.usageScope = .selectedPeriod
                 let seeded = store.usageSummary(
@@ -131,13 +175,13 @@ final class ResourceUsageRegressionTests: XCTestCase {
                     "Populated usage history is incomplete; reduced work cannot pass")
                 try resourceRequire(
                     store.toolActivityEvents.count == ResourceHistoryFixture.rawToolEventCount
-                        && store.chartPresentation.archive.throughput.flatMap({ $0 }).count >= 200,
+                        && store.archivedThroughputBucketCount >= 200,
                     "Populated tool events or older chart archive are incomplete")
                 store.usageScope = .sinceLaunch
             }
             clock.useWallClock()
-            // Initial seeding/restoration/forced durability is outside measurement.
-            await store.flushHistory()
+            // Fixture construction is outside this legacy test-host measurement.
+            // The separate actual-app collector records launch/setup resources.
             controller.start()
             store.startSampling()
             try await Task.sleep(for: .seconds(2))
@@ -219,8 +263,6 @@ final class ResourceUsageRegressionTests: XCTestCase {
                         probe: probe, store: store, ui: scenario.ui))
             }
 
-            // Reload before shutdown or an explicit flush can hide missing timer
-            // writes. Extra restored copies exist only after all timed phases.
             let measuredPhasesEndedAt = Date()
             store.stopSampling()
             controller.stop()
@@ -228,45 +270,43 @@ final class ResourceUsageRegressionTests: XCTestCase {
                 start: rawEnd.addingTimeInterval(-8 * 86400),
                 end: measuredPhasesEndedAt.addingTimeInterval(1))
             store.usageScope = .selectedPeriod
-            let expectedSaved = store.usageSummary(in: interval)
+            let expectedSession = store.usageSummary(in: interval)
             let seedResults =
                 scenario.history == "populated"
                 ? ResourceHistoryFixture.persistentRequestCount
                     + ResourceHistoryFixture.rawRequestCount : 0
-            try await validatePeriodicPersistence(
-                directory: directory, source: source, interval: interval,
-                expectedUsage: expectedSaved, expectedResults: seedResults + validatedResults,
+            try resourceRequire(
+                expectedSession.requests == seedResults + validatedRequests,
+                "Session history lost completed requests")
+            try resourceRequire(
+                expectedSession.toolCalls == seedResults + validatedTools,
+                "Session history lost tool calls")
+            try validateSessionHistory(
+                usage: usage, archive: archive, source: source, interval: interval,
+                expectedUsage: expectedSession, expectedResults: seedResults + validatedResults,
                 measuredFrom: measuredPhasesStartedAt, measuredThrough: measuredPhasesEndedAt)
-
-            // Final shutdown durability is a separate check from periodic writes.
             await coordinator.stop()
-            await store.flushHistory()
-            try resourceRequire(store.historyPersistenceError == nil, "History persistence failed")
-            let restored = UsageHistory(directory: directory, now: Date())
-            let restoredSummary = restored.summary(
-                scope: .selectedPeriod, source: source, interval: interval, now: Date())
             try resourceRequire(
-                restored.persistenceError == nil && restoredSummary == expectedSaved,
-                "Reloaded usage differs from the measured workload")
+                usage.summary(
+                    scope: .selectedPeriod, source: source, interval: interval, now: Date())
+                    == expectedSession,
+                "Stopping monitoring changed completed session usage")
             try resourceRequire(
-                restored.toolEvents(source: source, interval: interval)
-                    .filter { $0.kind == .resultSubmission }.count == seedResults
-                    + validatedResults,
-                "Tool result submissions did not survive reload")
-            let restoredArchive = ChartHistoryArchive(directory: directory, now: Date())
-            await restoredArchive.prepare()
-            let archive = restoredArchive.history(source: source, before: Date(), now: Date())
+                try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty,
+                "Session history unexpectedly wrote files")
+            let nextSession = UsageHistory(directory: directory, now: Date())
             try resourceRequire(
-                restoredArchive.persistenceError == nil && !archive.throughput.isEmpty,
-                "Chart archive did not survive reload")
+                nextSession.summary(
+                    scope: .sinceLaunch, source: source, interval: interval, now: Date()
+                ).requests == 0,
+                "A new session unexpectedly inherited usage")
             let report: [String: Any] = [
                 "schema_version": 1, "scenario": scenario.json,
                 "environment": resourceEnvironment(), "phases": phases,
                 "validation": [
                     "passed": true, "requests": validatedRequests, "chunks": validatedChunks,
                     "tool_calls": validatedTools, "tool_results": validatedResults,
-                    "usage_reloaded": true, "archive_reloaded": true,
-                    "periodic_persistence_verified": true,
+                    "session_history_verified": true, "history_files_absent": true,
                 ],
                 "test_bundle_path": Bundle(for: ResourceUsageRegressionTests.self).bundleURL.path,
                 "measurement_notes": [
@@ -285,82 +325,55 @@ final class ResourceUsageRegressionTests: XCTestCase {
             controller.stop()
             store.stopSampling()
             await coordinator.stop()
-            await store.flushHistory()
             throw error
         }
     }
 
-    private func validatePeriodicPersistence(
-        directory: URL, source: String, interval: DateInterval,
+    private func validateSessionHistory(
+        usage: UsageHistory, archive: ChartHistoryArchive, source: String, interval: DateInterval,
         expectedUsage: UsageSummary, expectedResults: Int,
         measuredFrom: Date, measuredThrough: Date
-    ) async throws {
-        // Every active workload has at least five settled seconds for the normal
-        // one-second usage write. Idle cases only require unchanged seeded totals;
-        // they need not dirty or rewrite an otherwise unchanged usage file.
-        let usage = UsageHistory(directory: directory, now: measuredThrough)
+    ) throws {
         let summary = usage.summary(
             scope: .selectedPeriod, source: source, interval: interval, now: measuredThrough)
         try resourceRequire(
-            usage.persistenceError == nil && summary == expectedUsage,
-            "Periodic usage writes did not persist completed workload totals before final flush")
+            summary == expectedUsage, "Session usage differs from the measured workload")
         try resourceRequire(
             usage.toolEvents(source: source, interval: interval)
                 .filter { $0.kind == .resultSubmission }.count == expectedResults,
-            "Periodic usage writes did not persist tool results before final flush")
-
-        let restored = ChartHistoryArchive(directory: directory, now: measuredThrough)
-        await restored.prepare()
-        let archive = restored.history(
+            "Session history lost tool result submissions")
+        let retained = archive.history(
             source: source, before: measuredThrough.addingTimeInterval(1), now: measuredThrough)
-        try resourceRequire(
-            restored.persistenceError == nil,
-            "The periodic chart archive could not be reloaded before final flush")
-        // Allow the 30-second write cadence, a complete 60-second bucket, and
-        // five seconds of scheduling slack. Seeded archive data alone cannot pass.
-        let oldestAllowed = max(measuredFrom, measuredThrough.addingTimeInterval(-95))
+        let oldestAllowed = max(measuredFrom, measuredThrough.addingTimeInterval(-5))
         for (name, series) in [
-            ("throughput", archive.throughput),
-            ("GPU", archive.systemGPU),
-            ("tool observation", archive.toolObservation),
+            ("throughput", retained.throughput), ("GPU", retained.systemGPU),
+            ("tool observation", retained.toolObservation),
         ] {
             let latest = series.flatMap { $0 }.map(\.end).max()
             try resourceRequire(
                 latest.map { $0 > measuredFrom && $0 >= oldestAllowed } == true,
-                "Periodic \(name) archive writes did not persist recent measured samples before final flush"
-            )
+                "The in-memory \(name) archive did not collect recent measured samples")
         }
     }
 
     private func prepareUI(_ mode: String, controller: MenuBarController) async throws {
         if mode == "never-opened" { return }
-        // Invoke the actual native actions without changing production visibility
-        // behavior. Reflection is limited to verifying the retained private hosts.
-        let click = NSSelectorFromString("handleClick")
-        let command = NSSelectorFromString("performMenuCommand:")
-        try resourceRequire(
-            controller.responds(to: click) && controller.responds(to: command),
-            "Native menu actions changed; update the lifecycle fixture")
+        // Preserve the production popover delegate so actual visibility gates
+        // control chart hosts throughout the same native paths used by the app.
         let popover = try XCTUnwrap(
             Mirror(reflecting: controller).children.first { $0.label == "popover" }?.value
                 as? NSPopover)
-        let lifecycle = ResourcePopoverLifecycle()
-        let previousDelegate = popover.delegate
-        popover.delegate = lifecycle
-        defer { popover.delegate = previousDelegate }
-        controller.perform(click)
+        controller.performanceSetPopoverVisible(true)
         try await waitForCondition("Popover did not finish opening", timeout: 10) {
-            lifecycle.didShow
+            popover.isShown
+                && popover.contentViewController?.view.window?.occlusionState.contains(.visible)
+                    == true
         }
-        try resourceRequire(popover.isShown, "Popover was not actually opened")
-        controller.perform(click)
-        try await waitForCondition("Popover did not finish closing", timeout: 10) {
-            lifecycle.didClose
+        controller.performanceSetPopoverVisible(false)
+        try await waitForCondition("Popover did not release its host after closing", timeout: 10) {
+            !popover.isShown && popover.contentViewController == nil
         }
-        try resourceRequire(!popover.isShown, "Popover did not close")
-        let item = NSMenuItem()
-        item.tag = try XCTUnwrap(MenuCommand.allCases.firstIndex { $0 == .dashboard })
-        controller.perform(command, with: item)
+        controller.performanceSetDashboardVisible(true)
         try await waitForCondition("Dashboard did not become visible", timeout: 10) {
             NSApp.windows.contains {
                 $0 is DashboardWindow && $0.isVisible && $0.occlusionState.contains(.visible)
@@ -371,7 +384,7 @@ final class ResourceUsageRegressionTests: XCTestCase {
             window.isVisible && window.occlusionState.contains(.visible),
             "A visible dashboard requires an unobscured logged-in desktop")
         if mode == "closed" {
-            window.close()
+            controller.performanceSetDashboardVisible(false)
             try await waitForCondition("Dashboard did not close", timeout: 10) { !window.isVisible }
             try resourceRequire(
                 !window.isVisible && !popover.isShown, "The retained UI is still visible")
@@ -431,7 +444,7 @@ final class ResourceUsageRegressionTests: XCTestCase {
                 publication = store.chartPresentation.publicationID
             }
             try resourceRequire(
-                store.tpsHistory.count <= MetricsStore.maxHistorySamples,
+                store.throughputSampleCount <= MetricsStore.maxHistorySamples,
                 "Raw history exceeded its retention cap")
             let dashboard = NSApp.windows.compactMap { $0 as? DashboardWindow }.first
             if ui == "visible" {
@@ -450,9 +463,14 @@ final class ResourceUsageRegressionTests: XCTestCase {
                 elapsed <= seconds + 5, "Measurement exceeded its allowed phase duration")
             if elapsed >= seconds, try await finished() { break }
         }
-        try resourceRequire(
-            publicationCount >= max(1, Int(seconds / 3)),
-            "Chart publication stalled; skipped work cannot pass resource checks")
+        if ui == "visible" {
+            try resourceRequire(
+                publicationCount >= max(1, Int(seconds / 3)),
+                "Visible chart publication stalled; skipped work cannot pass resource checks")
+        } else {
+            try resourceRequire(
+                publicationCount == 0, "A hidden surface continued publishing charts")
+        }
         if expectsLiveGeneration {
             try resourceRequire(
                 liveProgressCount >= Int(seconds / 3), "Insufficient live telemetry progress")
@@ -537,16 +555,6 @@ private final class ResourceProxyHolder {
 private final class ResourceTestCompletion {
     var finished = false
     var error: Error?
-}
-
-/// Observe native animation completion during setup instead of assuming a
-/// fixed delay is sufficient on a busy machine.
-@MainActor
-private final class ResourcePopoverLifecycle: NSObject, NSPopoverDelegate {
-    var didShow = false
-    var didClose = false
-    func popoverDidShow(_ notification: Notification) { didShow = true }
-    func popoverDidClose(_ notification: Notification) { didClose = true }
 }
 
 /// Discovery must never probe the user's real Ollama or saved endpoints. Actual

@@ -3,7 +3,7 @@ import Foundation
 import ServiceManagement
 
 /// Owns the real app components for an explicitly requested isolated resource
-/// run. The upstream is external; telemetry, timers, UI and persistence retain
+/// run. The upstream is external; telemetry, timers, UI and history retain
 /// their production paths and run inside the measured executable.
 @MainActor
 public final class PerformanceApplicationSession {
@@ -15,6 +15,7 @@ public final class PerformanceApplicationSession {
     public let preferencesSuite: String
     public let historyKind: String
     public let proxyPort: Int
+    public private(set) var shutdownError: String?
 
     private let clock: PerformanceWorkloadClock
     private let defaults: UserDefaults
@@ -56,25 +57,14 @@ public final class PerformanceApplicationSession {
         settings.ollamaHost = "127.0.0.1"
         settings.ollamaPort = upstreamPort
         let source = "ollama|\(upstream.absoluteString)|"
-        if populated {
-            // The external helper constructs legacy fixture files before this
-            // process launches. Only production loading and live ingestion
-            // belong to the app's measured resource use.
-            guard
-                ["usage-history.json", "chart-history.json"].allSatisfy({
-                    FileManager.default.fileExists(
-                        atPath: historyDirectory.appendingPathComponent($0).path)
-                })
-            else {
-                throw PerformanceSessionError.invalid(
-                    "Populated history must be prepared by the external helper")
-            }
-        }
         let rawEnd = Date()
         let clock = PerformanceWorkloadClock(
             now: rawEnd.addingTimeInterval(-MetricsStore.chartWindow))
-        let store = MetricsStore(clock: { clock.now }, historyDirectory: historyDirectory)
-        await store.prepareHistory()
+        let seeded =
+            populated
+            ? PerformanceHistoryFixture.makeSessionHistory(source: source, endingAt: rawEnd) : nil
+        let store = MetricsStore(
+            clock: { clock.now }, usageHistory: seeded?.usage, chartArchive: seeded?.archive)
         let proxyHolder = PerformanceProxyHolder()
         let coordinator = MonitoringCoordinator(
             settings: settings, store: store,
@@ -111,9 +101,9 @@ public final class PerformanceApplicationSession {
                 PerformanceHistoryFixture.persistentRequestCount
                 + PerformanceHistoryFixture.rawRequestCount
             let valid =
-                store.tpsHistory.count == MetricsStore.maxHistorySamples
-                && store.systemGPUHistory.count == MetricsStore.maxHistorySamples
-                && store.toolObservationHistory.count == MetricsStore.maxHistorySamples
+                store.throughputSampleCount == MetricsStore.maxHistorySamples
+                && store.systemGPUSampleCount == MetricsStore.maxHistorySamples
+                && store.toolObservationSampleCount == MetricsStore.maxHistorySamples
                 && seeded.requests == requests && seeded.toolCalls == requests
                 && seeded.inputTokens == requests * 32
                 && seeded.outputTokens == PerformanceHistoryFixture.persistentRequestCount
@@ -121,7 +111,7 @@ public final class PerformanceApplicationSession {
                     + PerformanceHistoryFixture.rawRequestCount
                     * PerformanceHistoryFixture.rawRequestOutputTokens
                 && store.toolActivityEvents.count == PerformanceHistoryFixture.rawToolEventCount
-                && store.chartPresentation.archive.throughput.reduce(0, { $0 + $1.count }) >= 200
+                && store.archivedThroughputBucketCount >= 200
             store.usageScope = .sinceLaunch
             guard valid else {
                 await coordinator.stop()
@@ -129,11 +119,6 @@ public final class PerformanceApplicationSession {
             }
         }
         clock.fixed = nil
-        await store.flushHistory()
-        guard store.historyPersistenceError == nil else {
-            await coordinator.stop()
-            throw PerformanceSessionError.invalid("Fixture persistence failed")
-        }
         PerformancePresentationCounters.shared.enable()
         controller.start()
         store.startSampling()
@@ -170,10 +155,8 @@ public final class PerformanceApplicationSession {
             "chart_preparations": counters["chart_preparations"] as Any? ?? NSNull(),
             "canvas_draws": counters["canvas_draws"] as Any? ?? NSNull(),
             "metal_frames": counters["metal_frames"] as Any? ?? NSNull(),
-            "raw_samples": store.tpsHistory.count,
-            "archive_buckets": store.chartPresentation.archive.throughput.reduce(0) {
-                $0 + $1.count
-            },
+            "raw_samples": store.throughputSampleCount,
+            "archive_buckets": store.archivedThroughputBucketCount,
             "connection_state": store.connectionState.rawValue,
             "proxy_state": String(describing: store.proxyState),
             "history": historyKind,
@@ -186,7 +169,11 @@ public final class PerformanceApplicationSession {
                     + PerformanceHistoryFixture.rawToolEventCount : 0,
             "history_verified": true,
             "history_persistence_error": store.historyPersistenceError as Any? ?? NSNull(),
-            "logging_enabled": NSNull(),
+            "logging_enabled": store.diagnosticLogger.isEnabled,
+            "logging_supported": true,
+            "logging_error": store.diagnosticLogger.errorMessage as Any? ?? NSNull(),
+            "logging_dropped_records": store.diagnosticLogger.droppedCount,
+            "shutdown_error": shutdownError as Any? ?? NSNull(),
         ]
     }
 
@@ -199,8 +186,14 @@ public final class PerformanceApplicationSession {
         progress?("coordinator_stop")
         await coordinator.stop()
         store.stopSampling()
-        progress?("history_flush")
-        await store.flushHistory()
+        progress?("logging_drain")
+        do {
+            try await store.diagnosticLogger.setEnabled(false)
+        } catch {
+            shutdownError =
+                store.diagnosticLogger.errorMessage ?? "Diagnostic logging failed to close."
+            progress?("logging_failed")
+        }
         progress?("session_stopped")
     }
 }

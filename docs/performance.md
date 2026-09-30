@@ -41,15 +41,18 @@ silently make the workload easier.
 The populated fixture retains approximately 19,000 historical requests, 38,000
 tool events, 7,201 raw samples per series, four older archive hours, and 256 recent
 request lanes. Its identities, relative timestamps, and expected totals are
-fixed. Generating fixture data is external preparation; loading or ingesting it
-inside FluxLLM remains part of the app's measured lifetime. The baseline retains
-existing production persistence until the production history implementation is
-changed. Test setup must not disable the behavior being reproduced.
+fixed. The app constructs retained session history through the ordinary in-memory
+ingestion APIs. Construction and live ingestion count toward the app's measured
+lifetime. No history files are created or restored. Pre-optimization baselines
+retain their original persistence behavior and identify that implementation in
+their source and binary hashes.
 
 Native AppKit actions open, close, and restore the real windows at fixed sizes.
 The runner verifies visibility and ongoing telemetry/rendering rather than
 assuming that an action acknowledgment proves the complete UI workload ran.
-A covered or missing visible window invalidates that scenario.
+A covered or missing visible window invalidates that scenario. A populated app
+that cannot become ready within 20 seconds also fails setup; its resource samples
+are retained, but the report does not claim the scheduled load completed.
 
 ## Measurements and limits
 

@@ -37,6 +37,7 @@ WORKLOAD_SOURCES = (
     "Tests/FluxLLMTests/ResourceUsageRegressionTests.swift",
     "Tests/FluxLLMTests/Fixtures/ResourceHistoryFixture.swift",
     "Tests/FluxLLMTests/Fixtures/ProcessResourceProbe.swift",
+    "Sources/FluxLLM/Performance/PerformanceHistoryFixture.swift",
 )
 
 
@@ -136,8 +137,8 @@ def validate_result(result, expected_scenario):
     for field, count in expected.items():
         number(validation.get(field), f"validation.{field}", integer=True)
         require(validation[field] == count, f"validation.{field} must equal the expected workload count {count}")
-    for field in ("usage_reloaded", "archive_reloaded", "periodic_persistence_verified"):
-        require(validation.get(field) is True, f"validation.{field} must confirm persisted data was reloaded")
+    for field in ("session_history_verified", "history_files_absent"):
+        require(validation.get(field) is True, f"validation.{field} must verify the in-memory history policy")
     phases = result.get("phases")
     require(isinstance(phases, list), "phases must be an array")
     expected_phases = [(name, cycle) for cycle in range(1, scenario["cycles"] + 1)
