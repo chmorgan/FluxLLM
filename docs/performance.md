@@ -66,8 +66,9 @@ Both measured variants declare the performance-only policy
 `popover_lifecycle_policy: explicit-performance-commands-v2`. Under this policy,
 explicit harness show/close commands control the native popover's lifetime;
 incidental desktop focus changes cannot dismiss a requested visible interval.
-The harness first waits for native activation and a ready status-item anchor,
-then makes one show attempt. Readiness and resulting visibility share a single
+The harness first waits for native activation, a ready status-item anchor, and
+the previous popover's native `didClose` callback, then makes one show attempt.
+Readiness and resulting visibility share a single
 four-second deadline. Failures preserve the actual before/final readiness
 state, mark UI coverage incomplete, and allow the remaining resource workload
 to continue. Transport and unrelated protocol failures still invalidate the case.
@@ -79,6 +80,40 @@ rather than assuming an action acknowledgment proves the complete UI workload ra
 A covered or missing visible window invalidates that scenario. A populated app
 that cannot become ready within 20 seconds also fails setup; its resource samples
 are retained, but the report does not claim the scheduled load completed.
+
+## Runtime work covered by the regression suite
+
+Backend polling reuses a client-owned ephemeral HTTP session. Each request keeps
+its own response limit, cancellation, and completion state. GPU polling reads
+only the device's `PerformanceStatistics` property at the existing cadence.
+
+Stream framing scans incoming bytes incrementally and decodes each JSON record
+once. Token and tool accounting borrow the same Foundation dictionaries without
+converting the whole record into Swift dictionaries. The proxy forwards bytes immediately. Ordinary accounting snapshots are
+constructed at most every 50 ms per request, with one scheduled quiet-tail flush;
+first output, tools, and terminal outcomes bypass that delay. The shared UI inbox
+still coalesces ordinary updates, so those updates can take up to 100 ms across
+both stages. Their timestamps remain the original record-receipt timestamps.
+
+Visible chart consumers request their actual live or pinned intervals. Raw
+queries retain complete averaging bins and predecessor observations, and request
+queries use the completed-time index plus active requests. Geometry caches hold
+one publication at one size and scale. Scalar readings update separately from
+chart preparation. Activity indicators publish only when request membership or
+output availability changes; raw token accounting continues at its normal cadence.
+The retained tool-owner query advances its cached interval boundaries instead of
+rescanning the retained day on every chart publication. Insertions and pruning
+invalidate that bounded cache. Rail decoration ticks do not rebuild the static bars and
+pause between visible effects; hidden surfaces release their hosts and caches.
+Explicit dashboard opening attaches its host before ordering the native window
+front. This avoids the large first-use allocation and writes reproduced when a
+host is inserted into an already visible empty window. Native visibility still
+controls host release after an unsuccessful presentation or later occlusion.
+Chart canvases render their existing drawing operations through `ImageRenderer`
+into an AppKit Core Graphics context. Each native view creates its renderer on
+first drawing and releases it with the view's content. Isolated renderer probes
+motivate this path; complete application measurements still enforce CPU, memory,
+and write budgets across first window opening and subsequent UI rendering.
 
 ## Measurements and limits
 
