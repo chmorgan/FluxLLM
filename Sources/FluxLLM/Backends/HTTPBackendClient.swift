@@ -57,7 +57,12 @@ public actor HTTPBackendClient: BackendClientProtocol {
         },
         wallClock: @escaping @Sendable () -> Date = { Date() }
     ) {
-        self.transport = transport ?? { request in try await BoundedBackendRequest().send(request) }
+        if let transport {
+            self.transport = transport
+        } else {
+            let transport = BoundedBackendTransport()
+            self.transport = { request in try await transport.send(request) }
+        }
         self.monotonicTime = monotonicTime
         self.wallClock = wallClock
     }
@@ -418,81 +423,94 @@ public actor HTTPBackendClient: BackendClientProtocol {
     }
 }
 
-/// A bounded, ephemeral request owns its session until completion. Cancellation and
-/// delegate callbacks share a lock; only the first terminal callback resumes the task.
-private final class BoundedBackendRequest: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+/// A client reuses one ephemeral session, including its connection pool. The
+/// delegate owns independent bounded state for each request and never the session.
+final class BoundedBackendTransport: @unchecked Sendable {
+    typealias SessionFactory =
+        @Sendable (URLSessionConfiguration, any URLSessionDelegate) -> URLSession
+
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<BackendHTTPResponse, Error>?
+    private let delegate = BoundedBackendSessionDelegate()
+    private let sessionFactory: SessionFactory
     private var session: URLSession?
-    private var task: URLSessionDataTask?
-    private var data = Data()
-    private var statusCode = 0
-    private var cancelled = false
+
+    init(
+        sessionFactory: @escaping SessionFactory = {
+            URLSession(configuration: $0, delegate: $1, delegateQueue: nil)
+        }
+    ) {
+        self.sessionFactory = sessionFactory
+    }
+
+    deinit { session?.invalidateAndCancel() }
 
     func send(_ request: URLRequest) async throws -> BackendHTTPResponse {
-        try await withTaskCancellationHandler {
+        let state = BoundedBackendRequest()
+        return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let configuration = URLSessionConfiguration.ephemeral
-                configuration.timeoutIntervalForRequest = 1.5
-                configuration.timeoutIntervalForResource = 3
-                configuration.urlCredentialStorage = nil
-                configuration.httpCookieStorage = nil
-                configuration.httpShouldSetCookies = false
-                configuration.urlCache = nil
-                let session = URLSession(
-                    configuration: configuration, delegate: self, delegateQueue: nil)
-                let task = session.dataTask(with: request)
-                let shouldCancel = lock.withLock {
-                    self.continuation = continuation
-                    self.session = session
-                    self.task = task
-                    return cancelled
+                let task = lock.withLock {
+                    if session == nil {
+                        let configuration = URLSessionConfiguration.ephemeral
+                        configuration.timeoutIntervalForRequest = 1.5
+                        configuration.timeoutIntervalForResource = 3
+                        configuration.urlCredentialStorage = nil
+                        configuration.httpCookieStorage = nil
+                        configuration.httpShouldSetCookies = false
+                        configuration.urlCache = nil
+                        session = sessionFactory(configuration, delegate)
+                    }
+                    return session!.dataTask(with: request)
                 }
-                if shouldCancel { finish(.failure(CancellationError())) } else { task.resume() }
+                delegate.register(state, for: task)
+                let taskID = task.taskIdentifier
+                state.start(task: task, continuation: continuation) { [weak delegate] in
+                    delegate?.remove(taskID)
+                }
             }
         } onCancel: {
-            self.lock.withLock { self.cancelled = true }
-            self.finish(.failure(CancellationError()))
+            state.cancel()
         }
+    }
+}
+
+/// Session callbacks look up only the task they belong to. Removing a completed
+/// task also makes late delegate callbacks harmless after cancellation or overflow.
+private final class BoundedBackendSessionDelegate: NSObject, URLSessionDataDelegate,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var requests: [Int: BoundedBackendRequest] = [:]
+
+    func register(_ request: BoundedBackendRequest, for task: URLSessionTask) {
+        lock.withLock { requests[task.taskIdentifier] = request }
+    }
+
+    func remove(_ taskID: Int) {
+        _ = lock.withLock { requests.removeValue(forKey: taskID) }
+    }
+
+    private func request(for task: URLSessionTask) -> BoundedBackendRequest? {
+        lock.withLock { requests[task.taskIdentifier] }
     }
 
     func urlSession(
         _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
         completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
     ) {
-        guard let response = response as? HTTPURLResponse else {
+        guard let request = request(for: dataTask) else {
             completionHandler(.cancel)
-            finish(.failure(BackendClientError.invalidResponse))
             return
         }
-        guard response.expectedContentLength <= HTTPBackendClient.maximumResponseBytes else {
-            completionHandler(.cancel)
-            finish(.failure(BackendClientError.responseTooLarge))
-            return
-        }
-        lock.withLock { statusCode = response.statusCode }
-        completionHandler(.allow)
+        completionHandler(request.receive(response))
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
-        let overflow = lock.withLock {
-            guard data.count + chunk.count <= HTTPBackendClient.maximumResponseBytes else {
-                return true
-            }
-            data.append(chunk)
-            return false
-        }
-        if overflow { finish(.failure(BackendClientError.responseTooLarge)) }
+        request(for: dataTask)?.receive(chunk)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?)
     {
-        if let error {
-            finish(.failure(error))
-        } else {
-            let response = lock.withLock { BackendHTTPResponse(statusCode: statusCode, data: data) }
-            finish(.success(response))
-        }
+        request(for: task)?.complete(error: error)
     }
 
     func urlSession(
@@ -516,17 +534,97 @@ private final class BoundedBackendRequest: NSObject, URLSessionDataDelegate, @un
             completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
+}
+
+/// Cancellation can precede continuation installation. Keep the first terminal
+/// outcome so that both that race and late delegate callbacks complete exactly once.
+private final class BoundedBackendRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<BackendHTTPResponse, Error>?
+    private var task: URLSessionDataTask?
+    private var onFinish: (@Sendable () -> Void)?
+    private var outcome: Result<BackendHTTPResponse, Error>?
+    private var data = Data()
+    private var statusCode = 0
+
+    func start(
+        task: URLSessionDataTask,
+        continuation: CheckedContinuation<BackendHTTPResponse, Error>,
+        onFinish: @escaping @Sendable () -> Void
+    ) {
+        let completed = lock.withLock { () -> Result<BackendHTTPResponse, Error>? in
+            if let outcome { return outcome }
+            self.task = task
+            self.continuation = continuation
+            self.onFinish = onFinish
+            return nil
+        }
+        if let completed {
+            onFinish()
+            task.cancel()
+            continuation.resume(with: completed)
+        } else {
+            task.resume()
+        }
+    }
+
+    func cancel() { finish(.failure(CancellationError())) }
+
+    func receive(_ response: URLResponse) -> URLSession.ResponseDisposition {
+        guard let response = response as? HTTPURLResponse else {
+            finish(.failure(BackendClientError.invalidResponse))
+            return .cancel
+        }
+        guard response.expectedContentLength <= HTTPBackendClient.maximumResponseBytes else {
+            finish(.failure(BackendClientError.responseTooLarge))
+            return .cancel
+        }
+        return lock.withLock {
+            guard outcome == nil else { return .cancel }
+            statusCode = response.statusCode
+            return .allow
+        }
+    }
+
+    func receive(_ chunk: Data) {
+        let overflow = lock.withLock {
+            guard outcome == nil else { return false }
+            guard chunk.count <= HTTPBackendClient.maximumResponseBytes - data.count else {
+                return true
+            }
+            data.append(chunk)
+            return false
+        }
+        if overflow { finish(.failure(BackendClientError.responseTooLarge)) }
+    }
+
+    func complete(error: Error?) {
+        if let error {
+            finish(.failure(error))
+        } else {
+            let response = lock.withLock { BackendHTTPResponse(statusCode: statusCode, data: data) }
+            finish(.success(response))
+        }
+    }
 
     private func finish(_ result: Result<BackendHTTPResponse, Error>) {
         let state = lock.withLock {
-            () -> (CheckedContinuation<BackendHTTPResponse, Error>?, URLSession?) in
-            let state = (continuation, session)
+            () -> (
+                CheckedContinuation<BackendHTTPResponse, Error>?, URLSessionDataTask?,
+                (@Sendable () -> Void)?
+            )? in
+            guard outcome == nil else { return nil }
+            outcome = result
+            let state = (continuation, task, onFinish)
             continuation = nil
-            session = nil
             task = nil
+            onFinish = nil
+            data = Data()
             return state
         }
-        state.1?.invalidateAndCancel()
+        guard let state else { return }
+        state.2?()
+        if case .failure = result { state.1?.cancel() }
         state.0?.resume(with: result)
     }
 }
