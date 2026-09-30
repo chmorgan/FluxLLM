@@ -7,6 +7,96 @@ import XCTest
 final class ToolCallParserTests: XCTestCase {
     private let origin = Date(timeIntervalSince1970: 1_800_000_000)
 
+    func testDecodedRecordsPreserveIdentityAndMalformedShapeHandling() {
+        var strings = ToolCallParser()
+        var decoded = ToolCallParser()
+        var foundation = ToolCallParser()
+        let payloads = [
+            #"{"message":{"content":"Hello","tool_calls":[{"function":{"index":0,"name":"search","arguments":"{"}}]}}"#,
+            #"{"message":{"tool_calls":[null,3,{"id":"new","function":{"name":"read","arguments":{}}}]}}"#,
+            #"{"message":{"tool_calls":"invalid"}}"#,
+            #"{"message":{"tool_calls":[{"id":"call-a","function":{"index":0,"name":"search","arguments":{}}}]}}"#,
+            #"{"message":{"tool_calls":[{"id":"call-b","function":{"index":0,"name":"search","arguments":{}}}]}}"#,
+            #"{"message":{"tool_calls":[{"function":{"name":"anonymous","arguments":{}}},{"function":{"index":true,"name":"invalid","arguments":"{"}}]}}"#,
+        ]
+        var observedNames: [String?] = []
+        for (index, payload) in payloads.enumerated() {
+            let timestamp = origin.addingTimeInterval(Double(index))
+            let expected = strings.ingest(payload, at: timestamp)
+            let object =
+                (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any]
+            let actual = object.map { decoded.ingest($0, at: timestamp) } ?? []
+            let borrowed =
+                DecodedGenerationRecord(data: Data(payload.utf8))
+                .map { foundation.ingest($0, at: timestamp) } ?? []
+            XCTAssertEqual(actual.map(\.kind), expected.map(\.kind), payload)
+            XCTAssertEqual(actual.map(\.name), expected.map(\.name), payload)
+            XCTAssertEqual(actual.map(\.callID), expected.map(\.callID), payload)
+            XCTAssertEqual(actual.map(\.timestamp), expected.map(\.timestamp), payload)
+            XCTAssertEqual(borrowed.map(\.kind), actual.map(\.kind), payload)
+            XCTAssertEqual(borrowed.map(\.name), actual.map(\.name), payload)
+            XCTAssertEqual(borrowed.map(\.callID), actual.map(\.callID), payload)
+            XCTAssertEqual(borrowed.map(\.timestamp), actual.map(\.timestamp), payload)
+            observedNames.append(contentsOf: actual.map(\.name))
+        }
+        XCTAssertEqual(observedNames, ["search", "search", "anonymous"])
+    }
+
+    func testBorrowedMalformedCallArrayCannotConsumeAnIdentity() throws {
+        var parser = ToolCallParser()
+        let malformed = try XCTUnwrap(
+            DecodedGenerationRecord(
+                data: Data(
+                    #"{"message":{"tool_calls":[{"id":"a","function":{"name":"read_🌊","arguments":{}}},null]}}"#
+                        .utf8)))
+        XCTAssertTrue(parser.ingest(malformed, at: origin).isEmpty)
+
+        let valid = try XCTUnwrap(
+            DecodedGenerationRecord(
+                data: Data(
+                    #"{"message":{"tool_calls":[{"id":"a","function":{"name":"read_🌊","arguments":{}}}]}}"#
+                        .utf8)))
+        let events = parser.ingest(valid, at: origin.addingTimeInterval(1))
+        XCTAssertEqual(events.map(\.name), ["read_🌊"])
+        XCTAssertEqual(events.map(\.callID), ["a"])
+        XCTAssertTrue(parser.ingest(valid, at: origin.addingTimeInterval(2)).isEmpty)
+    }
+
+    func testNativeDictionaryShapesRetainStrictStringKeys() {
+        var parser = ToolCallParser()
+        let invalidArguments: [Int: String] = [1: "not a JSON key"]
+        let anonymous: [String: Any] = [
+            "function": ["name": "invalid", "arguments": invalidArguments] as [String: Any]
+        ]
+        XCTAssertTrue(
+            parser.ingest(
+                [
+                    "message": ["tool_calls": [anonymous]]
+                ], at: origin
+            ).isEmpty)
+
+        let mixed: [Any] = [
+            ["id": "a", "function": ["name": "read", "arguments": [String: Any]()]]
+                as [String: Any],
+            [1: "not a JSON key"],
+        ]
+        XCTAssertTrue(
+            parser.ingest(
+                [
+                    "message": ["tool_calls": mixed]
+                ], at: origin
+            ).isEmpty)
+        let valid: [String: Any] = [
+            "message": [
+                "tool_calls": [
+                    ["id": "a", "function": ["name": "read", "arguments": [String: Any]()]]
+                        as [String: Any]
+                ]
+            ]
+        ]
+        XCTAssertEqual(parser.ingest(valid, at: origin).map(\.callID), ["a"])
+    }
+
     func testEmitsEachIdentifiedCallOnceWithNameAndObservationTime() {
         var parser = ToolCallParser()
         let payload =

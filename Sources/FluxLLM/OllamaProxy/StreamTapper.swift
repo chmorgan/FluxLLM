@@ -3,34 +3,101 @@ import NIO
 import NIOHTTP1
 
 /// Serializes the terminal outcome shared by the two sides of a proxied request.
-/// The lock protects only event emission; the sink enqueues without awaiting work.
+/// The lock protects pending accounting and event emission; the sink enqueues
+/// without awaiting work.
 final class GenerationRelay: @unchecked Sendable {
+    typealias Scheduler = GenerationEventInbox.Scheduler
+    typealias SnapshotFactory = @Sendable (TokenState, Date) -> GenerationSnapshot
+
+    private struct PendingState {
+        let state: TokenState
+        let timestamp: Date
+    }
+
     private let request: GenerationRequest?
     private let sink: @Sendable (GenerationEvent) -> Void
+    private let makeSnapshot: SnapshotFactory
     private let lock = NSLock()
     private var terminal = false
+    private var emittedFirstOutput = false
+    private var pendingState: PendingState?
+    private var schedule: Scheduler?
+    private var scheduledDelivery: GenerationEventInbox.Cancellation?
+    private var scheduleRevision: UInt64 = 0
 
-    init(request: GenerationRequest?, sink: @escaping @Sendable (GenerationEvent) -> Void) {
+    init(
+        request: GenerationRequest?, sink: @escaping @Sendable (GenerationEvent) -> Void,
+        schedule: Scheduler? = nil,
+        makeSnapshot: @escaping SnapshotFactory = { state, timestamp in
+            state.snapshot(at: timestamp)
+        }
+    ) {
         self.request = request
         self.sink = sink
+        self.schedule = schedule
+        self.makeSnapshot = makeSnapshot
         if let request { sink(.began(request)) }
+    }
+
+    /// Installed once by the upstream handler. The scheduler enqueues work;
+    /// it must not invoke its callback synchronously while this lock is held.
+    func setLiveUpdateScheduler(_ schedule: @escaping Scheduler) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !terminal, self.schedule == nil else { return }
+        self.schedule = schedule
     }
 
     func toolActivity(_ events: [ToolActivityEvent]) {
         lock.lock()
         defer { lock.unlock() }
         guard !terminal, let request, !events.isEmpty else { return }
+        flushPendingState()
         sink(.toolActivity(requestID: request.id, events: events))
     }
 
+    /// Store compact cumulative accounting before constructing a UI snapshot.
+    /// Only one delayed callback is outstanding, irrespective of record rate.
+    /// The existing global inbox can add another 50 ms before UI delivery;
+    /// forwarding network bytes never waits for either accounting stage.
+    /// The relay lock also lets a racing cancellation flush accepted accounting
+    /// before emitting its terminal event, without reaching into the NIO handler.
+    func update(_ state: TokenState, at timestamp: Date, toolEvents: [ToolActivityEvent] = []) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !terminal, let request else { return }
+        let firstOutput = state.hasOutput && !emittedFirstOutput
+        if firstOutput { emittedFirstOutput = true }
+        pendingState = PendingState(state: state, timestamp: timestamp)
+        if state.isTerminal || firstOutput || !toolEvents.isEmpty || schedule == nil {
+            cancelScheduledDelivery()
+            if !toolEvents.isEmpty {
+                sink(.toolActivity(requestID: request.id, events: toolEvents))
+            }
+            terminal = state.isTerminal
+            flushPendingState()
+        } else if scheduledDelivery == nil, let schedule {
+            scheduleRevision &+= 1
+            let revision = scheduleRevision
+            scheduledDelivery = schedule(.milliseconds(50)) { [weak self] in
+                self?.deliverPendingState(revision: revision)
+            }
+        }
+    }
+
+    /// Already-materialized terminal snapshots (including premature EOF) still
+    /// share the same serialized terminal decision and replace pending live data.
     func update(_ snapshot: GenerationSnapshot, toolEvents: [ToolActivityEvent] = []) {
         lock.lock()
         defer { lock.unlock() }
         guard !terminal, let request else { return }
+        cancelScheduledDelivery()
+        pendingState = nil
         if !toolEvents.isEmpty {
             sink(.toolActivity(requestID: request.id, events: toolEvents))
         }
         terminal = snapshot.finished || snapshot.error != nil
+        if snapshot.outputTokens > 0 { emittedFirstOutput = true }
         sink(.updated(requestID: request.id, snapshot: snapshot))
     }
 
@@ -38,6 +105,7 @@ final class GenerationRelay: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !terminal else { return }
+        flushPendingState()
         terminal = true
         if let request { sink(.failed(requestID: request.id, message: message)) }
     }
@@ -46,8 +114,33 @@ final class GenerationRelay: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !terminal else { return }
+        flushPendingState()
         terminal = true
         if let request { sink(.cancelled(requestID: request.id)) }
+    }
+
+    private func deliverPendingState(revision: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !terminal, revision == scheduleRevision else { return }
+        scheduledDelivery = nil
+        flushPendingState()
+    }
+
+    private func flushPendingState() {
+        cancelScheduledDelivery()
+        guard let pendingState, let request else { return }
+        self.pendingState = nil
+        sink(
+            .updated(
+                requestID: request.id,
+                snapshot: makeSnapshot(pendingState.state, pendingState.timestamp)))
+    }
+
+    private func cancelScheduledDelivery() {
+        scheduleRevision &+= 1
+        scheduledDelivery?()
+        scheduledDelivery = nil
     }
 }
 
@@ -73,6 +166,18 @@ final class StreamTapper: ChannelInboundHandler {
         self.serverChannel = serverChannel
         self.relay = relay
         self.isGeneration = isGeneration
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        let eventLoop = context.eventLoop
+        relay.setLiveUpdateScheduler { delay, action in
+            let components = delay.components
+            let nanoseconds =
+                components.seconds * 1_000_000_000
+                + components.attoseconds / 1_000_000_000
+            let task = eventLoop.scheduleTask(in: .nanoseconds(nanoseconds)) { action() }
+            return { task.cancel() }
+        }
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -134,7 +239,7 @@ final class StreamTapper: ChannelInboundHandler {
 
     private func tapBody(_ buffer: ByteBuffer) {
         if isStreaming {
-            for payload in parser.feed(Array(buffer.readableBytesView)) {
+            for payload in parser.feedBytes(buffer.readableBytesView) {
                 ingest(payload)
             }
         } else {
@@ -146,21 +251,26 @@ final class StreamTapper: ChannelInboundHandler {
 
     private func finalize() {
         if isStreaming {
-            for payload in parser.finish() { ingest(payload) }
-        } else if let body = nonStreamBody,
-            let text = String(bytes: body.readableBytesView, encoding: .utf8)
-        {
-            ingest(text)
+            for payload in parser.finishBytes() { ingest(payload) }
+        } else if let body = nonStreamBody, SSEParser.isValidUTF8(body.readableBytesView) {
+            ingest(Data(body.readableBytesView))
         }
-        relay.update(counter.finish())
+        if !counter.isTerminal { relay.update(counter.finish()) }
     }
 
-    private func ingest(_ payload: String) {
-        let events = toolCalls.ingest(payload, at: Date())
-        counter.ingest(payload)
+    private func ingest(_ payload: Data) {
+        let timestamp = Date()
+        var events: [ToolActivityEvent] = []
+        // Both parsers borrow one decoded Foundation record and its message;
+        // ordinary text records need no whole-dictionary Swift bridge.
+        if let record = DecodedGenerationRecord(data: payload) {
+            events = toolCalls.ingest(record, at: timestamp)
+            counter.ingest(record, at: timestamp)
+        }
         // Discrete calls must arrive before a terminal snapshot from the same
         // payload, which closes the request and stops further relay emissions.
-        relay.update(counter.snapshot(), toolEvents: events)
+        // Malformed records retain the existing cumulative snapshot behavior.
+        relay.update(counter, at: timestamp, toolEvents: events)
     }
 
     private func forward(_ part: HTTPServerResponsePart, upstream: Channel) {

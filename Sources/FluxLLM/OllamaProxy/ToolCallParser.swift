@@ -11,13 +11,24 @@ struct ToolCallParser {
 
     mutating func ingest(_ payload: String, at timestamp: Date) -> [ToolActivityEvent] {
         guard let data = payload.data(using: .utf8),
-            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let message = object["message"] as? [String: Any],
-            let calls = message["tool_calls"] as? [[String: Any]]
+            let record = DecodedGenerationRecord(data: data)
+        else { return [] }
+        return ingest(record, at: timestamp)
+    }
+
+    mutating func ingest(_ object: [String: Any], at timestamp: Date) -> [ToolActivityEvent] {
+        ingest(DecodedGenerationRecord(object), at: timestamp)
+    }
+
+    /// Accepts the same decoded record that feeds the proxy's token counter.
+    mutating func ingest(_ record: DecodedGenerationRecord, at timestamp: Date)
+        -> [ToolActivityEvent]
+    {
+        guard let calls = record.message?.dictionaries("tool_calls")
         else { return [] }
 
         return calls.compactMap { call in
-            guard let function = call["function"] as? [String: Any],
+            guard let function = call.dictionary("function"),
                 let name = Self.nonempty(function["name"])
             else { return nil }
 
@@ -28,7 +39,7 @@ struct ToolCallParser {
             } else {
                 // Native anonymous calls have complete structured arguments.
                 // Incomplete fragments have no reliable identity for merging.
-                guard function["arguments"] is [String: Any] else { return nil }
+                guard function.dictionary("arguments") != nil else { return nil }
             }
             return ToolActivityEvent(kind: .call, name: name, callID: callID, timestamp: timestamp)
         }

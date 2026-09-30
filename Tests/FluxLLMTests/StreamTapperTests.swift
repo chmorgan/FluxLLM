@@ -23,6 +23,54 @@ final class StreamTapperTests: XCTestCase {
         try await verifyLiveForwarding(chat: true)
     }
 
+    func testSharedRecordPreservesTextToolsMalformedBytesAndFinalCorrection() async throws {
+        let gate = MockResponseGate()
+        let call =
+            #"{"id":"call-1","function":{"name":"read_file","arguments":{}}}"#
+        let first =
+            #"{"message":{"content":"Hello 🌊","thinking":"Reasoning","tool_calls":[\#(call)]},"done":false}"#
+            + "\n" + #"{"message":"# + "\n"
+            + "[]\n"
+            + #"{"message":{"content":null,"tool_calls":"invalid"},"done":false}"# + "\n"
+        let firstBytes =
+            Array(first.utf8)
+            + Array(#"{"response":""#.utf8) + [UInt8(0xFF)] + Array("\"}\n".utf8)
+        let final =
+            #"{"message":{"content":"Done","tool_calls":[\#(call),{"id":"call-2","function":{"name":"search","arguments":{}}}]},"done":true,"eval_count":1,"prompt_eval_count":3,"eval_duration":500000000}"#
+            + "\n"
+        let fixture = MockOllamaResponse(
+            contentType: "application/x-ndjson", firstBytes: firstBytes,
+            remainingBytes: Array(final.utf8), gate: gate, streaming: true)
+        try await withProxy(response: fixture) { context in
+            let probe = StreamingProbe()
+            let session = URLSession(configuration: .ephemeral, delegate: probe, delegateQueue: nil)
+            defer { session.invalidateAndCancel() }
+            session.dataTask(with: context.request(path: "/api/chat")).resume()
+            try await waitForCondition("Text and tools must be observed before completion") {
+                probe.data == Data(firstBytes) && context.store.outputTokens == 2
+                    && context.store.toolActivityEvents.count == 1
+            }
+            XCTAssertFalse(probe.isComplete)
+            XCTAssertTrue(context.store.outputIsEstimated)
+            XCTAssertEqual(context.store.toolActivityEvents.map(\.callID), ["call-1"])
+
+            await gate.release()
+            try await waitForCondition("Final usage and the terminal record's new call must arrive")
+            {
+                probe.isComplete && context.store.activeGeneration?.state == .completed
+            }
+            XCTAssertNil(probe.error)
+            XCTAssertEqual(probe.data, fixture.body, "Malformed telemetry must still pass through")
+            XCTAssertEqual(
+                context.store.outputTokens, 1, "Final usage can correct an estimate down")
+            XCTAssertEqual(context.store.promptTokens, 3)
+            XCTAssertEqual(context.store.lastMeasuredTPS, 2)
+            XCTAssertFalse(context.store.outputIsEstimated)
+            XCTAssertEqual(context.store.toolActivityEvents.map(\.callID), ["call-1", "call-2"])
+            XCTAssertEqual(context.store.toolActivityEvents.map(\.name), ["read_file", "search"])
+        }
+    }
+
     func testChatToolCallsArriveBeforeCompletionWithoutCountingAsText() async throws {
         let gate = MockResponseGate()
         let call =
