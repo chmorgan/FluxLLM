@@ -19,6 +19,8 @@ final class IOKitGPUActivitySamplerTests: XCTestCase {
         fixture.set(time: 3, clients: [client(1, time: 1_000_000_100)])
         let active = await sampler.sample(processes: [worker])
         XCTAssertEqual(try XCTUnwrap(active.activityPercent), 50, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(active.intervalSeconds), 2, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(active.executionSeconds), 1, accuracy: 0.0001)
         XCTAssertEqual(active.processIDs, [42])
     }
 

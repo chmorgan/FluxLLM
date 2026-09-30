@@ -204,6 +204,7 @@ struct LuminousActivityChart: View {
             }
             ZStack(alignment: .topLeading) {
                 Canvas { context, _ in
+                    PerformancePresentationCounters.shared.record(.canvasDraws)
                     drawGrid(in: &context, layout: layout)
                     drawSeries(
                         device, color: gpuColor, fillOpacity: 0.14, in: &context, rect: layout.main)
@@ -245,6 +246,7 @@ struct LuminousActivityChart: View {
                 }
                 if let selected {
                     Canvas { context, _ in
+                        PerformancePresentationCounters.shared.record(.canvasDraws)
                         drawCursor(
                             selected.timestamp, generated: generated, device: device,
                             in: &context, layout: layout)

@@ -34,6 +34,11 @@ let package = Package(
               ],
             path: "Sources/FluxLLMApp"
           ),
+          .executableTarget(
+            name: "FluxLLMResourceCollector",
+            dependencies: ["FluxLLM"],
+            path: "Sources/FluxLLMResourceCollector"
+          ),
           .testTarget(
             name: "FluxLLMTests",
             dependencies: ["FluxLLM"],

@@ -38,10 +38,12 @@ struct RequestRailLayer: View {
 
         ZStack {
             Canvas { context, _ in
+                PerformancePresentationCounters.shared.record(.canvasDraws)
                 drawBars(segments, overflow: overflow, in: &context)
             }
             TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { clock in
                 Canvas { context, _ in
+                    PerformancePresentationCounters.shared.record(.canvasDraws)
                     if effectsEnabled {
                         drawDecorations(segments, at: clock.date, in: &context)
                     }

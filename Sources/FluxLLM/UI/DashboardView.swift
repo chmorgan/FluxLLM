@@ -19,6 +19,7 @@ final class PreparedDashboardCharts {
         snapshot: ChartPresentationSnapshot, duration: TimeInterval,
         requestRails: RequestRailPresentation? = nil, windowEnd: Date? = nil, isLive: Bool = true
     ) {
+        PerformancePresentationCounters.shared.record(.chartPreparations)
         publicationID = snapshot.publicationID
         self.duration = duration
         let end = min(windowEnd ?? snapshot.timestamp, snapshot.timestamp)

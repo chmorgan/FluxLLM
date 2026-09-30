@@ -42,11 +42,15 @@ public struct GPUActivitySample: Sendable, Equatable {
     public let source: String
     public let unavailableReason: String?
     public let scope: GPUActivityScope
+    /// Exact counter interval and accumulated execution time, when available.
+    public let intervalSeconds: Double?
+    public let executionSeconds: Double?
 
     public init(
         timestamp: Date = Date(), activityPercent: Double? = nil,
         processIDs: [Int32] = [], source: String = "macOS per-process GPU time",
-        unavailableReason: String? = nil, scope: GPUActivityScope = .backendProcesses
+        unavailableReason: String? = nil, scope: GPUActivityScope = .backendProcesses,
+        intervalSeconds: Double? = nil, executionSeconds: Double? = nil
     ) {
         self.timestamp = timestamp
         self.activityPercent = activityPercent
@@ -54,6 +58,8 @@ public struct GPUActivitySample: Sendable, Equatable {
         self.source = source
         self.unavailableReason = unavailableReason
         self.scope = scope
+        self.intervalSeconds = intervalSeconds
+        self.executionSeconds = executionSeconds
     }
 }
 

@@ -143,7 +143,8 @@ public actor IOKitGPUActivitySampler: GPUActivitySampling {
         // Parallel queues can legitimately exceed 100%. This is accumulated
         // execution time / wall time, not a measurement of GPU core occupancy.
         return GPUActivitySample(
-            timestamp: instant.date, activityPercent: activity, processIDs: measuredProcessIDs)
+            timestamp: instant.date, activityPercent: activity, processIDs: measuredProcessIDs,
+            intervalSeconds: elapsed, executionSeconds: gpuNanoseconds / 1_000_000_000)
     }
 }
 

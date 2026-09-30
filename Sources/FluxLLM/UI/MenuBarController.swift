@@ -163,6 +163,21 @@ public final class MenuBarController: NSObject {
         openDashboardWindow()
     }
 
+    /// Explicit lifecycle control for the isolated app resource harness. These
+    /// use the same paths as menu actions and report actual native visibility.
+    public func performanceSetDashboardVisible(_ visible: Bool) {
+        if visible { openDashboardWindow() } else { dashboardWindow?.close() }
+    }
+
+    public func performanceSetPopoverVisible(_ visible: Bool) {
+        guard isStarted else { return }
+        if visible != popover.isShown { togglePopover() }
+    }
+
+    public var performanceVisibility: (dashboard: Bool, popover: Bool) {
+        (dashboardWindow?.isVisible == true, popover.isShown)
+    }
+
     /// AppKit owns resize limits; SwiftUI gives the chart the remaining height.
     static func makeDashboardWindow(store: MetricsStore, actions: MenuActions = MenuActions())
         -> DashboardWindow
@@ -270,6 +285,7 @@ public final class MenuBarController: NSObject {
 
     private func updateStatusItem() {
         guard isStarted, let statusItem, let button = statusItem.button else { return }
+        PerformancePresentationCounters.shared.record(.statusUpdates)
         let availableHeight =
             button.bounds.height > 0
             ? button.bounds.height : NSStatusBar.system.thickness
