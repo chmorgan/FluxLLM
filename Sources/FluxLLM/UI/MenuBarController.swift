@@ -10,7 +10,7 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     private let settings: AppSettings
     private let launchAtLogin: LaunchAtLoginController
     private let menuActions = MenuActions()
-    private let popover = NSPopover()
+    private let popover = MenuBarController.makePopover()
     private let popoverPresentation = DashboardPresentationState()
     private var popoverVisibilityObserver: DashboardWindowVisibilityObserver?
     private var isPopoverClosing = false
@@ -24,6 +24,21 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     private var isStarted = false
 
     public static let appTitle = "FluxLLM"
+    public static let performancePopoverLifecyclePolicy = "explicit-performance-commands-v2"
+
+    /// Installed only by authenticated performance control. Nil during normal
+    /// app use; records lifecycle boundaries, never drawing or timer callbacks.
+    public static var performanceUICheckpoint: ((String) -> Void)?
+
+    private static func makePopover() -> NSPopover {
+        performanceUICheckpoint?("popover.native_create.begin")
+        let popover = NSPopover()
+        performanceUICheckpoint?("popover.native_create.end")
+        return popover
+    }
+
+    /// Inspect the actual native policy without exposing or replacing its host.
+    var popoverBehavior: NSPopover.Behavior { popover.behavior }
 
     public init(
         metricsStore: MetricsStore, coordinator: MonitoringCoordinator, settings: AppSettings,
@@ -82,7 +97,7 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         settingsActionTask?.cancel()
         iconTimer?.invalidate()
         iconTimer = nil
-        popover.performClose(nil)
+        closePopover()
         releasePopoverContent()
         dashboardWindow?.close()
         settingsWindow?.close()
@@ -107,13 +122,21 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         if isContextClick { showCommandMenu() } else { togglePopover() }
     }
 
+    private func closePopover() {
+        Self.performanceUICheckpoint?("popover.native_close.begin")
+        popover.performClose(nil)
+        Self.performanceUICheckpoint?("popover.native_close.end")
+    }
+
     private func togglePopover() {
         guard let button = statusItem?.button else { return }
         if popover.isShown {
-            popover.performClose(nil)
+            closePopover()
         } else {
             preparePopoverContent()
+            Self.performanceUICheckpoint?("popover.native_show.begin")
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            Self.performanceUICheckpoint?("popover.native_show.end")
             NSApp.activate(ignoringOtherApps: true)
             popover.contentViewController?.view.window?.makeKey()
         }
@@ -123,14 +146,18 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         isPopoverClosing = false
         setPopoverPresentationActive(true)
         guard popover.contentViewController == nil else { return }
+        Self.performanceUICheckpoint?("popover.swiftui_create.begin")
         let hosting = NSHostingController(
             rootView: DashboardPopoverContent(
                 store: metricsStore, actions: menuActions, presentation: popoverPresentation
             )
             .frame(width: DashboardView.compactWidth)
-            .onExitCommand { [weak self] in self?.popover.performClose(nil) })
+            .onExitCommand { [weak self] in self?.closePopover() })
+        Self.performanceUICheckpoint?("popover.swiftui_create.end")
+        Self.performanceUICheckpoint?("popover.host_attach.begin")
         hosting.sizingOptions = [.preferredContentSize]
         popover.contentViewController = hosting
+        Self.performanceUICheckpoint?("popover.host_attach.end")
     }
 
     public func popoverDidShow(_ notification: Notification) {
@@ -163,10 +190,13 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     }
 
     private func releasePopoverContent() {
+        let hadContent = popover.contentViewController != nil
+        if hadContent { Self.performanceUICheckpoint?("popover.host_release.begin") }
         popoverVisibilityObserver?.stop()
         popoverVisibilityObserver = nil
         setPopoverPresentationActive(false)
         popover.contentViewController = nil
+        if hadContent { Self.performanceUICheckpoint?("popover.host_release.end") }
     }
 
     private func buildCommandMenu() -> NSMenu {
@@ -190,7 +220,7 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
 
     private func showCommandMenu() {
         guard let button = statusItem?.button else { return }
-        popover.performClose(nil)
+        closePopover()
         buildCommandMenu().popUp(
             positioning: nil, at: CGPoint(x: 0, y: button.bounds.minY), in: button)
     }
@@ -204,11 +234,13 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
 
     private func openDashboardWindow() {
         guard isStarted else { return }
-        popover.performClose(nil)
+        closePopover()
         if dashboardWindow == nil {
             dashboardWindow = Self.makeDashboardWindow(store: metricsStore, actions: menuActions)
         }
+        Self.performanceUICheckpoint?("dashboard.native_show.begin")
         dashboardWindow?.present()
+        Self.performanceUICheckpoint?("dashboard.native_show.end")
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -221,12 +253,64 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     /// Explicit lifecycle control for the isolated app resource harness. These
     /// use the same paths as menu actions and report actual native visibility.
     public func performanceSetDashboardVisible(_ visible: Bool) {
-        if visible { openDashboardWindow() } else { dashboardWindow?.close() }
+        if visible {
+            openDashboardWindow()
+        } else {
+            Self.performanceUICheckpoint?("dashboard.native_close.begin")
+            dashboardWindow?.close()
+            Self.performanceUICheckpoint?("dashboard.native_close.end")
+        }
     }
 
     public func performanceSetPopoverVisible(_ visible: Bool) {
         guard isStarted else { return }
+        // The harness owns explicit close commands. Incidental focus changes
+        // must not shorten its requested visible interval. Keep the native
+        // content, animation, visibility and rendering paths unchanged; normal
+        // menu interaction continues to use the transient policy from init.
+        popover.behavior = .applicationDefined
         if visible != popover.isShown { togglePopover() }
+    }
+
+    public var performancePopoverReadiness: PerformancePopoverReadiness {
+        let button = statusItem?.button
+        let window = button?.window
+        return PerformancePopoverReadiness(
+            controllerStarted: isStarted, appActive: NSApp.isActive,
+            activationPolicy: NSApp.activationPolicy().rawValue,
+            anchorExists: button != nil, anchorWindowExists: window != nil,
+            anchorWindowVisible: window?.isVisible == true,
+            anchorScreenPresent: window?.screen != nil,
+            anchorHidden: button?.isHiddenOrHasHiddenAncestor ?? true,
+            anchorBoundsWidth: Double(button?.bounds.width ?? 0),
+            anchorBoundsHeight: Double(button?.bounds.height ?? 0),
+            popoverIsShown: popover.isShown,
+            popoverWindowVisible: popover.contentViewController?.view.window?.isVisible == true)
+    }
+
+    /// Wait for native activation and an attached status anchor before the one
+    /// controlled show attempt. This never opens, retries, or fabricates a view.
+    public func performancePreparePopover(until deadline: ContinuousClock.Instant) async
+        -> (readiness: PerformancePopoverReadiness, ready: Bool)
+    {
+        NSApp.activate(ignoringOtherApps: true)
+        return await Self.waitForPerformancePopoverReadiness(
+            until: deadline, read: { self.performancePopoverReadiness })
+    }
+
+    static func waitForPerformancePopoverReadiness(
+        until deadline: ContinuousClock.Instant,
+        read: @MainActor () -> PerformancePopoverReadiness,
+        now: @MainActor () -> ContinuousClock.Instant = { ContinuousClock.now },
+        pause: @MainActor () async -> Void = { try? await Task.sleep(for: .milliseconds(20)) }
+    ) async -> (readiness: PerformancePopoverReadiness, ready: Bool) {
+        var state = read()
+        while now() < deadline && !Task.isCancelled {
+            if state.isReady { return (state, true) }
+            await pause()
+            state = read()
+        }
+        return (state, false)
     }
 
     public var performanceVisibility: (dashboard: Bool, popover: Bool) {
@@ -249,20 +333,24 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     static func makeDashboardWindow(store: MetricsStore, actions: MenuActions = MenuActions())
         -> DashboardWindow
     {
+        Self.performanceUICheckpoint?("dashboard.native_create.begin")
         let window = DashboardWindow(
             contentRect: NSRect(origin: .zero, size: DashboardView.preferredWindowSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
+        Self.performanceUICheckpoint?("dashboard.native_create.end")
         window.title = "FluxLLM Dashboard"
         window.isReleasedWhenClosed = false
         window.delegate = window
         let presentation = DashboardPresentationState()
         window.configurePresentation(
             makeContent: {
+                Self.performanceUICheckpoint?("dashboard.swiftui_create.begin")
                 let hosting = NSHostingController(
                     rootView: DashboardView(actions: actions, presentation: presentation)
                         .environment(store))
                 hosting.sizingOptions = []
+                Self.performanceUICheckpoint?("dashboard.swiftui_create.end")
                 return hosting
             },
             visibilityChanged: { visible in
@@ -277,7 +365,7 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     private func showSettings() {
         guard isStarted else { return }
         launchAtLogin.refresh()
-        popover.performClose(nil)
+        closePopover()
         if settingsWindow == nil {
             settingsWindow = Self.makeSettingsWindow(
                 settings: settings, store: metricsStore, launchAtLogin: launchAtLogin,
@@ -322,7 +410,7 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
 
     private func showAbout() {
         guard isStarted else { return }
-        popover.performClose(nil)
+        closePopover()
         NSApp.activate(ignoringOtherApps: true)
         let sourceLink = "github.com/chmorgan/fluxllm"
         let paragraphStyle = NSMutableParagraphStyle()
@@ -394,5 +482,45 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
             case .busy: "Settings are already being applied. Try again when they finish."
             }
         }
+    }
+}
+
+/// Native facts captured by the explicit performance adapter, independently of
+/// chart demand. Status-bar windows need not be key or main windows.
+public struct PerformancePopoverReadiness: Equatable {
+    let controllerStarted: Bool
+    let appActive: Bool
+    let activationPolicy: Int
+    let anchorExists: Bool
+    let anchorWindowExists: Bool
+    let anchorWindowVisible: Bool
+    let anchorScreenPresent: Bool
+    let anchorHidden: Bool
+    let anchorBoundsWidth: Double
+    let anchorBoundsHeight: Double
+    let popoverIsShown: Bool
+    let popoverWindowVisible: Bool
+
+    public var isReady: Bool {
+        controllerStarted && appActive && anchorExists && anchorWindowExists
+            && anchorWindowVisible && anchorScreenPresent && !anchorHidden
+            && anchorBoundsWidth.isFinite && anchorBoundsWidth > 0
+            && anchorBoundsHeight.isFinite && anchorBoundsHeight > 0
+    }
+
+    public var diagnostics: [String: Any] {
+        [
+            "controller_started": controllerStarted, "app_active": appActive,
+            "activation_policy": activationPolicy,
+            "anchor_exists": anchorExists, "anchor_window_exists": anchorWindowExists,
+            "anchor_window_visible": anchorWindowVisible,
+            "anchor_screen_present": anchorScreenPresent,
+            "anchor_hidden": anchorHidden,
+            "anchor_bounds_width": anchorBoundsWidth.isFinite ? anchorBoundsWidth as Any : NSNull(),
+            "anchor_bounds_height": anchorBoundsHeight.isFinite
+                ? anchorBoundsHeight as Any : NSNull(),
+            "popover_is_shown": popoverIsShown, "popover_window_visible": popoverWindowVisible,
+            "ready": isReady,
+        ]
     }
 }

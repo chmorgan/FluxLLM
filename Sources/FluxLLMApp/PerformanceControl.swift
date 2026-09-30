@@ -15,6 +15,7 @@ final class PerformanceControl {
         let history: String
         let protocol_version: Int
         let logging_enabled: Bool?
+        let fixture_ending_at_epoch: Double?
     }
 
     // Preserve the field names in the performance JSON protocol.
@@ -41,6 +42,8 @@ final class PerformanceControl {
     private var stopTask: Task<Void, Never>?
     private(set) var hasStopped = false
     private var shutdownCommandID = "termination"
+    private var checkpointSequence = 0
+    private var checkpointParentCommandID = "collector-handshake"
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment) throws {
         guard ProcessInfo.processInfo.arguments.contains("--performance-control") else {
@@ -61,6 +64,11 @@ final class PerformanceControl {
             let upstream = parts.url
         else {
             throw ControlError.invalid("Invalid performance configuration or non-loopback upstream")
+        }
+        if let epoch = configuration.fixture_ending_at_epoch {
+            guard epoch.isFinite, abs(Date().timeIntervalSince1970 - epoch) < 120 else {
+                throw ControlError.invalid("Fixture ending time must be finite and recent")
+            }
         }
         let fileManager = FileManager.default
         let root = URL(
@@ -162,11 +170,17 @@ final class PerformanceControl {
                 return
             }
             handshaken = true
+            checkpointParentCommandID = command.command_id
+            MenuBarController.performanceUICheckpoint = { [weak self] phase in
+                self?.emitUICheckpoint(phase)
+            }
             let task = Task { @MainActor in
                 try await PerformanceApplicationSession.start(
                     upstream: upstream, historyDirectory: historyDirectory,
                     preferencesSuite: preferencesSuite,
-                    populated: configuration.history == "populated")
+                    populated: configuration.history == "populated",
+                    fixtureEndingAt: configuration.fixture_ending_at_epoch.map(
+                        Date.init(timeIntervalSince1970:)))
             }
             startupTask = task
             do {
@@ -183,6 +197,12 @@ final class PerformanceControl {
                     "proxy_url": "http://127.0.0.1:\(started.proxyPort)",
                     "history_directory": historyDirectory.path,
                     "preferences_suite": preferencesSuite,
+                    "popover_lifecycle_policy": MenuBarController.performancePopoverLifecyclePolicy,
+                    "ui_checkpoint_schema_version": 1,
+                    "ui_checkpoint_sampling": "self-rusage-and-collector-receipt",
+                    "fixture_schema_version": PerformanceHistoryFixture.schemaVersion,
+                    "fixture_equivalence_sha256": started.fixtureManifest.sha256,
+                    "fixture_component_sha256": started.fixtureManifest.components,
                     "snapshot": snapshot(of: started), "logging_supported": true,
                     "logging_enabled": started.store.diagnosticLogger.isEnabled,
                     "logging_destination": loggingDestination.path,
@@ -199,8 +219,15 @@ final class PerformanceControl {
             fail("Performance startup is unavailable", commandID: command.command_id)
             return
         }
+        if ["show_dashboard", "close_dashboard", "show_popover", "close_popover", "shutdown"]
+            .contains(command.command)
+        {
+            checkpointParentCommandID = command.command_id
+        }
         var status = "ok"
         var reason: String?
+        var popoverReadinessBeforeShow: [String: Any]?
+        var uiFailurePhase: String?
         switch command.command {
         case "snapshot":
             break
@@ -217,10 +244,26 @@ final class PerformanceControl {
                 reason = "Dashboard did not close"
             }
         case "show_popover":
-            session.menuBarController.performanceSetPopoverVisible(true)
-            if !(await waitForVisibility(popover: true)) {
+            // Activation, anchor readiness and native visibility share one
+            // deadline; successful preparation permits exactly one show call.
+            let deadline = ContinuousClock.now.advanced(by: .seconds(4))
+            emitUICheckpoint("popover.readiness.begin")
+            let prepared = await session.menuBarController.performancePreparePopover(
+                until: deadline)
+            emitUICheckpoint("popover.readiness.end")
+            popoverReadinessBeforeShow = prepared.readiness.diagnostics
+            if !prepared.ready {
                 status = "error"
-                reason = "Popover did not become visible"
+                reason = "Popover native anchor did not become ready"
+                uiFailurePhase = "popover_readiness"
+            } else {
+                session.menuBarController.performanceSetPopoverVisible(true)
+                if !(await waitForVisibility(popover: true, until: deadline)) {
+                    status = "error"
+                    reason = "Popover did not become visible"
+                    uiFailurePhase = "popover_visibility"
+                }
+                emitUICheckpoint("popover.visibility_wait.end")
             }
         case "close_popover":
             session.menuBarController.performanceSetPopoverVisible(false)
@@ -261,6 +304,14 @@ final class PerformanceControl {
             event["logging_destination"] = loggingDestination.path
             event["logging_destinations"] = loggingDestinations
         }
+        if command.command == "show_popover" || command.command == "close_popover" {
+            event["popover_readiness"] =
+                session.menuBarController.performancePopoverReadiness.diagnostics
+        }
+        if let popoverReadinessBeforeShow {
+            event["popover_readiness_before_show"] = popoverReadinessBeforeShow
+        }
+        if let uiFailurePhase { event["ui_failure_phase"] = uiFailurePhase }
         event["monotonic_seconds"] = Self.monotonicSeconds()
         if let reason { event["reason"] = reason }
         gpuReporter?.sample()
@@ -274,8 +325,11 @@ final class PerformanceControl {
         }
     }
 
-    private func waitForVisibility(dashboard: Bool? = nil, popover: Bool? = nil) async -> Bool {
-        for _ in 0..<100 {
+    private func waitForVisibility(
+        dashboard: Bool? = nil, popover: Bool? = nil,
+        until deadline: ContinuousClock.Instant = ContinuousClock.now.advanced(by: .seconds(2))
+    ) async -> Bool {
+        while ContinuousClock.now < deadline && !Task.isCancelled {
             guard let visibility = session?.menuBarController.performanceVisibility else {
                 return false
             }
@@ -312,6 +366,7 @@ final class PerformanceControl {
                 "phase": phase, "monotonic_seconds": Self.monotonicSeconds(),
             ])
         }
+        MenuBarController.performanceUICheckpoint = nil
         gpuReporter?.stopAndEmitFinal()
         hasStopped = true
         var event: [String: Any] = [
@@ -327,6 +382,40 @@ final class PerformanceControl {
     private func fail(_ message: String, commandID: String) {
         send(["type": "error", "command_id": commandID, "error": message])
         NSApp.terminate(nil)
+    }
+
+    private func emitUICheckpoint(_ phase: String) {
+        checkpointSequence += 1
+        // A distinct ID makes the collector sample this lifecycle boundary
+        // without satisfying the runner's pending command acknowledgement.
+        // Self rusage preserves short-lived allocation peaks at the producer;
+        // the independent collector receipt sample exposes observer latency.
+        var usage = rusage_info_v4()
+        let started = Self.monotonicSeconds()
+        let result = withUnsafeMutablePointer(to: &usage) { pointer in
+            pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                proc_pid_rusage(getpid(), RUSAGE_INFO_V4, $0)
+            }
+        }
+        let errorCode: Int32? = result == 0 ? nil : errno
+        let finished = Self.monotonicSeconds()
+        send([
+            "type": "ui_checkpoint", "checkpoint_schema_version": 1,
+            "command_id": "ui-checkpoint-\(checkpointSequence)",
+            "parent_command_id": checkpointParentCommandID, "phase": phase,
+            "process_id": getpid(), "birth_time_us": gpuReporter?.birthTime as Any? ?? NSNull(),
+            "monotonic_seconds": (started + finished) / 2,
+            "resource_read_started_monotonic_seconds": started,
+            "resource_read_finished_monotonic_seconds": finished,
+            "resource_provider": "self-proc-pid-rusage-v4",
+            "resource_kernel_result": result, "resource_errno": errorCode as Any? ?? NSNull(),
+            "process_start_abstime": result == 0 ? usage.ri_proc_start_abstime as Any : NSNull(),
+            "physical_footprint_bytes": result == 0 ? usage.ri_phys_footprint as Any : NSNull(),
+            "lifetime_peak_footprint_bytes": result == 0
+                ? usage.ri_lifetime_max_phys_footprint as Any : NSNull(),
+            "physical_write_bytes": result == 0 ? usage.ri_diskio_byteswritten as Any : NSNull(),
+            "logical_write_bytes": result == 0 ? usage.ri_logical_writes as Any : NSNull(),
+        ])
     }
 
     private func send(_ object: [String: Any]) {
@@ -470,7 +559,7 @@ private final class PerformanceGPUReporter: @unchecked Sendable {
     private let queue = DispatchQueue(label: "FluxLLM performance GPU observer", qos: .utility)
     private var timer: DispatchSourceTimer?
     private let processID = getpid()
-    private let birthTime: UInt64?
+    fileprivate let birthTime: UInt64?
 
     init(writer: PerformanceEventWriter) {
         self.writer = writer

@@ -1,10 +1,12 @@
+import CryptoKit
 import Foundation
 
 /// Aged telemetry shared by the resource regression harness and isolated app playback.
-/// Uses ordinary in-memory ingestion with fixed timestamps. No fixture files,
-/// restoration, or alternate accounting paths are involved.
+/// Usage/request accounting follows production ingestion. Raw observations are
+/// restored in one common instrumentation step, then published normally.
 @MainActor
 public enum PerformanceHistoryFixture {
+    public static let schemaVersion = 2
     public static let model = "resource-fixture"
     public static let gpuSource = "Resource fixture system GPU"
     public static let gpuPercent = 42.0
@@ -67,13 +69,17 @@ public enum PerformanceHistoryFixture {
         return SessionHistory(usage: history, archive: archive)
     }
 
+    /// Restore a completed observation window without replaying its historical
+    /// chart publications. Request, tool, health and GPU ingestion is unchanged;
+    /// all construction and the first ordinary publication remain measured.
+    /// `replaySamples` retains the previous setup path for equivalence tests.
     /// Fill an already-selected Ollama session without suspending the main actor.
     /// Initialize the injected clock at endingAt - chartWindow before starting
     /// the coordinator, and start normal sampling after this method returns.
     /// Any initial coordinator GPU sample must use that same clock/source; newer
     /// timestamps would correctly cause the store to reject this historical data.
     public static func seedRawHistory(
-        store: MetricsStore, endingAt: Date, setClock: (Date) -> Void
+        store: MetricsStore, endingAt: Date, replaySamples: Bool = false, setClock: (Date) -> Void
     ) {
         let start = endingAt.addingTimeInterval(-MetricsStore.chartWindow)
         precondition(store.backendKind == .ollama, "Select the fixture's Ollama session first")
@@ -87,6 +93,12 @@ public enum PerformanceHistoryFixture {
         let epoch = store.monitoringEpoch
         store.proxyState = .listening
         var request: GenerationRequest?
+        var throughput: [TimeSeriesPoint] = []
+        var gpu: [TimeSeriesPoint] = []
+        var tools: [TimeSeriesPoint] = []
+        throughput.reserveCapacity(rawSampleCount - 1)
+        gpu.reserveCapacity(rawSampleCount - 1)
+        tools.reserveCapacity(rawSampleCount - 1)
         for sampleIndex in 0..<rawSampleCount {
             let timestamp = start.addingTimeInterval(Double(sampleIndex) * 0.5)
             setClock(timestamp)
@@ -129,11 +141,133 @@ public enum PerformanceHistoryFixture {
                     if finished { request = nil }
                 }
             }
-            store.sample(at: timestamp)
+            if replaySamples {
+                // Reference playback retained for equivalence tests only.
+                store.sample(at: timestamp)
+            } else if sampleIndex < rawSampleCount - 1 {
+                let active = requestIndex < rawRequestCount && (1...25).contains(phase)
+                throughput.append(TimeSeriesPoint(timestamp: timestamp, value: active ? 40 : 0))
+                gpu.append(TimeSeriesPoint(timestamp: timestamp, value: gpuPercent))
+                tools.append(TimeSeriesPoint(timestamp: timestamp, value: 0))
+            }
         }
         precondition(request == nil, "The fixture must leave no generation open")
         setClock(endingAt)
         store.updateConnection(.ready, at: endingAt)
+        if !replaySamples {
+            store.restorePerformanceFixtureSamples(
+                throughput: throughput, gpu: gpu, toolObservation: tools)
+            // Include the ordinary first publication and all UI consequences in
+            // the measured process, without replaying an hour of publications.
+            store.sample(at: endingAt)
+        }
+    }
+
+    public struct EquivalenceManifest: Equatable {
+        public let sha256: String
+        public let components: [String: String]
+    }
+
+    /// Digest actual seeded state, not expected constants. Relative microsecond
+    /// coordinates remove wall-clock/source identity; UUIDs, values, availability,
+    /// terminal state and each selected hour's authoritative usage remain exact.
+    /// Calendar minute bucket boundaries vary with launch time, so the archive
+    /// component compares observation counts and weighted sums for all series.
+    public static func equivalenceManifest(
+        store: MetricsStore, endingAt: Date, populated: Bool
+    ) -> EquivalenceManifest {
+        func offset(_ date: Date) -> Int64 {
+            Int64((date.timeIntervalSince(endingAt) * 1_000_000).rounded())
+        }
+        func digest(_ visit: (inout SHA256) -> Void) -> String {
+            var hash = SHA256()
+            visit(&hash)
+            return hash.finalize().map { String(format: "%02x", $0) }.joined()
+        }
+        func row(_ hash: inout SHA256, _ value: String) {
+            hash.update(data: Data((value + "\n").utf8))
+        }
+        var components: [String: String] = [:]
+        components["raw_samples"] = digest { hash in
+            for (name, points) in [
+                ("throughput", store.tpsHistory), ("gpu", store.systemGPUHistory),
+                ("tools", store.toolObservationHistory),
+            ] {
+                row(&hash, "\(name)|\(points.count)")
+                for point in points {
+                    row(
+                        &hash,
+                        "\(offset(point.timestamp))|\(point.value.bitPattern)|\(point.isAvailable)")
+                }
+            }
+        }
+        components["request_lanes"] = digest { hash in
+            for lane in store.requestLanes.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+                row(
+                    &hash,
+                    [
+                        lane.id.uuidString, String(offset(lane.startedAt)),
+                        lane.endedAt.map { String(offset($0)) } ?? "nil", lane.model ?? "nil",
+                        String(lane.outputTokens), String(lane.outputIsEstimated),
+                        String(lane.liveTPS.bitPattern), String(lane.terminal),
+                    ].joined(separator: "|"))
+            }
+        }
+        components["tool_events"] = digest { hash in
+            for event in store.toolActivityEvents.sorted(by: { $0.id.uuidString < $1.id.uuidString }
+            ) {
+                row(
+                    &hash,
+                    [
+                        event.id.uuidString, event.kind == .call ? "call" : "result",
+                        event.requestID?.uuidString ?? "nil", event.name ?? "nil",
+                        event.callID ?? "nil",
+                        String(offset(event.timestamp)),
+                    ].joined(separator: "|"))
+            }
+        }
+        let originalScope = store.usageScope
+        store.usageScope = .selectedPeriod
+        components["hourly_usage"] = digest { hash in
+            for hour in 0..<168 {
+                let summary = store.usageSummary(
+                    in: DateInterval(
+                        start: endingAt.addingTimeInterval(Double(hour - 168) * 3_600),
+                        duration: 3_600))
+                row(
+                    &hash,
+                    [
+                        String(hour), String(summary.requests), String(summary.activeRequests),
+                        summary.inputTokens.map(String.init) ?? "nil",
+                        String(summary.unknownInputRequests),
+                        String(summary.outputTokens), String(summary.outputIsEstimated),
+                        String(summary.toolCalls), String(summary.isPartial),
+                    ].joined(separator: "|"))
+            }
+        }
+        store.usageScope = originalScope
+        let archive = store.performanceFixtureArchive(endingAt: endingAt)
+        components["archive_observations"] = digest { hash in
+            for (name, segments) in [
+                ("throughput", archive.throughput), ("gpu", archive.systemGPU),
+                ("tools", archive.toolObservation),
+            ] {
+                var count = 0
+                var weightedSum = 0.0
+                for segment in segments {
+                    for bucket in segment {
+                        count += bucket.count
+                        weightedSum += bucket.value * Double(bucket.count)
+                    }
+                }
+                row(&hash, "\(name)|\(count)|\(Int64((weightedSum * 1_000).rounded()))")
+            }
+        }
+        let hash = digest { hash in
+            row(&hash, "fixture-schema|\(schemaVersion)|\(populated ? "populated" : "fresh")")
+            for key in components.keys.sorted() { row(&hash, "\(key)|\(components[key]!)") }
+        }
+        return EquivalenceManifest(sha256: hash, components: components)
     }
 
     /// Stable fixture identities; namespaces distinguish older session requests,

@@ -662,6 +662,48 @@ public final class MetricsStore {
         }
     }
 
+    /// Instrumentation-only restoration of an already observed fixture window.
+    /// Production ingestion, timers and publication retain their normal paths.
+    /// The caller supplies all but the final point, then invokes ordinary sample().
+    func restorePerformanceFixtureSamples(
+        throughput: [TimeSeriesPoint], gpu: [TimeSeriesPoint],
+        toolObservation: [TimeSeriesPoint]
+    ) {
+        precondition(throughput.count == Self.maxHistorySamples - 1)
+        precondition(gpu.count == throughput.count && toolObservation.count == throughput.count)
+        precondition(tpsHistory.count <= 1 && gpuHistory.count <= 1)
+        for index in throughput.indices {
+            precondition(throughput[index].timestamp == gpu[index].timestamp)
+            precondition(throughput[index].timestamp == toolObservation[index].timestamp)
+            if index > 0 {
+                precondition(
+                    throughput[index].timestamp.timeIntervalSince(throughput[index - 1].timestamp)
+                        == 0.5)
+            }
+        }
+        throughputSamples.removeAll(keepingCapacity: true)
+        gpuSamples.removeAll(keepingCapacity: true)
+        toolObservationSamples.removeAll(keepingCapacity: true)
+        for point in throughput { throughputSamples.append(point) }
+        for point in gpu { gpuSamples.append(point) }
+        for point in toolObservation { toolObservationSamples.append(point) }
+        historyBufferRevision &+= 1
+        if historyStartedAt == nil { historyStartedAt = throughput.first?.timestamp }
+        for index in throughput.indices {
+            chartArchive.record(
+                source: historySource, at: throughput[index].timestamp,
+                throughput: throughput[index], gpu: gpu[index],
+                toolObservation: toolObservation[index])
+        }
+    }
+
+    /// Read actual retained archive contents for the fixture equivalence digest.
+    /// This does not publish a dashboard snapshot or alter demand.
+    func performanceFixtureArchive(endingAt: Date) -> ArchivedChartHistory {
+        chartArchive.history(
+            source: historySource, before: endingAt.addingTimeInterval(1), now: endingAt)
+    }
+
     /// Sample explicitly for deterministic tests, or let `startSampling()` call
     /// this twice per second. The inclusive window retains its boundary point.
     /// A repeated timestamp replaces its point; older timestamps are ignored.

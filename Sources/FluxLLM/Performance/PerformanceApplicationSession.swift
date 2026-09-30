@@ -15,6 +15,7 @@ public final class PerformanceApplicationSession {
     public let preferencesSuite: String
     public let historyKind: String
     public let proxyPort: Int
+    public let fixtureManifest: PerformanceHistoryFixture.EquivalenceManifest
     public private(set) var shutdownError: String?
 
     private let clock: PerformanceWorkloadClock
@@ -27,7 +28,8 @@ public final class PerformanceApplicationSession {
         controller: MenuBarController, settings: AppSettings,
         historyDirectory: URL, preferencesSuite: String,
         historyKind: String, proxyPort: Int, clock: PerformanceWorkloadClock,
-        defaults: UserDefaults, rawEnd: Date
+        defaults: UserDefaults, rawEnd: Date,
+        fixtureManifest: PerformanceHistoryFixture.EquivalenceManifest
     ) {
         self.store = store
         self.coordinator = coordinator
@@ -40,11 +42,12 @@ public final class PerformanceApplicationSession {
         self.clock = clock
         self.defaults = defaults
         self.rawEnd = rawEnd
+        self.fixtureManifest = fixtureManifest
     }
 
     public static func start(
         upstream: URL, historyDirectory: URL, preferencesSuite: String,
-        populated: Bool
+        populated: Bool, fixtureEndingAt: Date? = nil
     ) async throws -> PerformanceApplicationSession {
         guard upstream.scheme == "http", upstream.host == "127.0.0.1",
             let upstreamPort = upstream.port, (1...65535).contains(upstreamPort)
@@ -57,9 +60,9 @@ public final class PerformanceApplicationSession {
         settings.ollamaHost = "127.0.0.1"
         settings.ollamaPort = upstreamPort
         let source = "ollama|\(upstream.absoluteString)|"
-        let rawEnd = Date()
+        let rawEnd = fixtureEndingAt ?? Date()
         let clock = PerformanceWorkloadClock(
-            now: rawEnd.addingTimeInterval(-MetricsStore.chartWindow))
+            now: populated ? rawEnd.addingTimeInterval(-MetricsStore.chartWindow) : rawEnd)
         let seeded =
             populated
             ? PerformanceHistoryFixture.makeSessionHistory(source: source, endingAt: rawEnd) : nil
@@ -81,10 +84,16 @@ public final class PerformanceApplicationSession {
         let controller = MenuBarController(
             metricsStore: store, coordinator: coordinator, settings: settings,
             launchAtLogin: LaunchAtLoginController(service: PerformanceLoginService()))
+        // Match AppDelegate: native hosts register their closed visibility
+        // before monitoring or ingestion begins. Otherwise this standalone
+        // store prepares thousands of snapshots that no app surface requests.
+        PerformancePresentationCounters.shared.enable()
+        controller.start()
         await coordinator.start()
         guard store.connectionState == .ready, store.historySource == source,
             let proxyPort = proxyHolder.proxy?.boundPort
         else {
+            controller.stop()
             await coordinator.stop()
             throw PerformanceSessionError.invalid("The isolated fixture failed to become ready")
         }
@@ -114,19 +123,24 @@ public final class PerformanceApplicationSession {
                 && store.archivedThroughputBucketCount >= 200
             store.usageScope = .sinceLaunch
             guard valid else {
+                controller.stop()
                 await coordinator.stop()
                 throw PerformanceSessionError.invalid("The populated fixture lost required history")
             }
         }
+        let manifest = PerformanceHistoryFixture.equivalenceManifest(
+            store: store, endingAt: rawEnd, populated: populated)
         clock.fixed = nil
-        PerformancePresentationCounters.shared.enable()
-        controller.start()
+        // External preparation can take several seconds. Refresh fixture health
+        // before wall-clock sampling, exactly as the next successful poll would.
+        store.updateConnection(.ready, at: Date())
         store.startSampling()
         return PerformanceApplicationSession(
             store: store, coordinator: coordinator, controller: controller,
             settings: settings, historyDirectory: historyDirectory,
             preferencesSuite: preferencesSuite, historyKind: populated ? "populated" : "fresh",
-            proxyPort: proxyPort, clock: clock, defaults: defaults, rawEnd: rawEnd)
+            proxyPort: proxyPort, clock: clock, defaults: defaults, rawEnd: rawEnd,
+            fixtureManifest: manifest)
     }
 
     /// Compact scalar snapshots avoid copying chart histories over the pipe.
@@ -135,6 +149,10 @@ public final class PerformanceApplicationSession {
         let visibility = menuBarController.performanceVisibility
         let counters = PerformancePresentationCounters.shared.snapshot()
         return [
+            "popover_lifecycle_policy": MenuBarController.performancePopoverLifecyclePolicy,
+            "fixture_schema_version": PerformanceHistoryFixture.schemaVersion,
+            "fixture_equivalence_sha256": fixtureManifest.sha256,
+            "fixture_component_sha256": fixtureManifest.components,
             "requests": usage.requests,
             "completed_requests": usage.requests - usage.activeRequests,
             "output_tokens": usage.outputTokens,
