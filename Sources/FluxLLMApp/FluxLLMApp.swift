@@ -95,6 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await coordinator.stop()
             metricsStore.stopSampling()
             await metricsStore.flushHistory()
+            try? await metricsStore.diagnosticLogger.setEnabled(false)
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

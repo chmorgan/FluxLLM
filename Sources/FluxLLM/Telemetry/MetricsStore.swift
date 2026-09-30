@@ -11,6 +11,7 @@ public enum ChartPresentationConsumer: Hashable, Sendable {
 @MainActor
 @Observable
 public final class MetricsStore {
+    public let diagnosticLogger = DiagnosticLogger()
     public private(set) var activeGeneration: ActiveGeneration?
     public private(set) var currentTPS: Double = 0
     /// The numeric rate and meter deliberately update more slowly than raw
@@ -263,6 +264,26 @@ public final class MetricsStore {
         guard epoch == nil || epoch == monitoringEpoch,
             backendKind == nil || backendKind == .ollama
         else { return }
+        if diagnosticLogger.isEnabled {
+            switch event {
+            case .began(let request):
+                diagnosticLogger.record(
+                    .requestStarted, requestID: request.id, backend: backendKind)
+            case .updated(let id, let snapshot):
+                diagnosticLogger.record(
+                    snapshot.error != nil
+                        ? .requestFailed : (snapshot.finished ? .requestFinished : .requestUpdated),
+                    requestID: id, backend: backendKind, count: snapshot.outputTokens)
+            case .failed(let id, _), .cancelled(let id):
+                diagnosticLogger.record(.requestFailed, requestID: id, backend: backendKind)
+            case .toolActivity(let id, let events):
+                for event in events {
+                    diagnosticLogger.record(
+                        event.kind == .call ? .toolCall : .toolResult,
+                        requestID: id, backend: backendKind)
+                }
+            }
+        }
         usageHistory.apply(event, source: historySource, at: clock())
         usageRevision &+= 1
         switch event {
@@ -615,6 +636,7 @@ public final class MetricsStore {
     /// this twice per second. The inclusive window retains its boundary point.
     /// A repeated timestamp replaces its point; older timestamps are ignored.
     public func sample(at date: Date? = nil) {
+        diagnosticLogger.record(.sample, backend: backendKind, count: openProxyRequests.count)
         let date = date ?? clock()
         let replacingLatest = throughputSamples.last?.timestamp == date
         if let last = throughputSamples.last {

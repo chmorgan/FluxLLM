@@ -13,33 +13,26 @@ final class AppSettingsTests: XCTestCase {
         }
     }
 
-    func testMenuBarPreferencesPersistEveryVisibilityCombinationImmediately() throws {
+    func testMenuBarPreferencesChangeOnlyInTheCurrentSession() throws {
         for showTokens in [false, true] {
             for showLogo in [false, true] {
                 try withDefaults { defaults in
                     let settings = AppSettings(defaults: defaults)
                     settings.showMenuBarTokensPerSecond = showTokens
 
-                    let afterTokens = AppSettings(defaults: defaults)
-                    XCTAssertEqual(afterTokens.showMenuBarTokensPerSecond, showTokens)
-                    XCTAssertTrue(afterTokens.showMenuBarLogo)
-
                     settings.showMenuBarLogo = showLogo
+                    XCTAssertEqual(settings.showMenuBarTokensPerSecond, showTokens)
+                    XCTAssertEqual(settings.showMenuBarLogo, showLogo)
                     let reloaded = AppSettings(defaults: defaults)
-                    XCTAssertEqual(reloaded.showMenuBarTokensPerSecond, showTokens)
-                    XCTAssertEqual(reloaded.showMenuBarLogo, showLogo)
-
-                    let data = try XCTUnwrap(defaults.data(forKey: "appSettings"))
-                    let snapshot = try XCTUnwrap(
-                        JSONSerialization.jsonObject(with: data) as? [String: Any])
-                    XCTAssertEqual(snapshot["showMenuBarTokensPerSecond"] as? Bool, showTokens)
-                    XCTAssertEqual(snapshot["showMenuBarLogo"] as? Bool, showLogo)
+                    XCTAssertTrue(reloaded.showMenuBarTokensPerSecond)
+                    XCTAssertTrue(reloaded.showMenuBarLogo)
+                    XCTAssertNil(defaults.data(forKey: "appSettings"))
                 }
             }
         }
     }
 
-    func testPreferencesRoundTripInIsolatedDefaultsSuite() throws {
+    func testConnectionPreferencesDoNotWriteDefaults() throws {
         try withDefaults { defaults in
             let settings = AppSettings(defaults: defaults)
             XCTAssertEqual(settings.proxyPort, 11435)
@@ -50,11 +43,16 @@ final class AppSettingsTests: XCTestCase {
             settings.ollamaPort = 11499
             settings.autoStartProxy = false
             let reloaded = AppSettings(defaults: defaults)
-            XCTAssertEqual(reloaded.proxyPort, 12035)
-            XCTAssertEqual(reloaded.ollamaHost, "127.0.0.1")
-            XCTAssertEqual(reloaded.ollamaPort, 11499)
-            XCTAssertFalse(reloaded.autoStartProxy)
+            XCTAssertEqual(settings.proxyPort, 12035)
+            XCTAssertEqual(settings.ollamaHost, "127.0.0.1")
+            XCTAssertEqual(settings.ollamaPort, 11499)
+            XCTAssertFalse(settings.autoStartProxy)
+            XCTAssertEqual(reloaded.proxyPort, 11435)
+            XCTAssertEqual(reloaded.ollamaHost, "localhost")
+            XCTAssertEqual(reloaded.ollamaPort, 11434)
+            XCTAssertTrue(reloaded.autoStartProxy)
             XCTAssertNil(reloaded.configurationError)
+            XCTAssertNil(defaults.data(forKey: "appSettings"))
         }
     }
 
@@ -129,6 +127,34 @@ final class AppSettingsTests: XCTestCase {
         }
     }
 
+    func testChangingEveryPreferenceLeavesExistingSavedDataUntouched() throws {
+        try withDefaults { defaults in
+            let original = Data(
+                """
+                {"proxyPort":12035,"ollamaHost":"localhost","ollamaPort":11499,
+                 "autoStartProxy":false,"showMenuBarLogo":false}
+                """.utf8)
+            defaults.set(original, forKey: "appSettings")
+            let settings = AppSettings(defaults: defaults)
+            settings.proxyPort = 13035
+            settings.ollamaHost = "remote.example"
+            settings.ollamaPort = 13034
+            settings.autoStartProxy = true
+            settings.showMenuBarTokensPerSecond = false
+            settings.showMenuBarLogo = true
+            settings.backendSelection = .llamaCpp
+            settings.backendEndpoints[.llamaCpp] = "https://example.com/inference"
+            settings.llamaCppModel = "session-model"
+            settings.lastAutomaticBackendID = "session-backend"
+            XCTAssertEqual(defaults.data(forKey: "appSettings"), original)
+            let nextSession = AppSettings(defaults: defaults)
+            XCTAssertEqual(nextSession.proxyPort, 12035)
+            XCTAssertFalse(nextSession.showMenuBarLogo)
+            XCTAssertEqual(nextSession.backendSelection, .automatic)
+            XCTAssertNil(nextSession.lastAutomaticBackendID)
+        }
+    }
+
     func testInvalidPortsAreRejectedAndEphemeralPortRequiresOptIn() {
         for port in [-1, 0, 65_536] {
             XCTAssertNotNil(
@@ -180,7 +206,7 @@ final class AppSettingsTests: XCTestCase {
                 proxyPort: 11435, ollamaHost: "ollama.example", ollamaPort: 11435))
     }
 
-    func testBackendSelectionAndEndpointsRoundTrip() throws {
+    func testBackendSelectionAndEndpointsRemainSessionOnly() throws {
         try withDefaults { defaults in
             let settings = AppSettings(defaults: defaults)
             settings.backendSelection = .llamaCpp
@@ -188,15 +214,16 @@ final class AppSettingsTests: XCTestCase {
             settings.llamaCppModel = "test-model"
             settings.lastAutomaticBackendID = "vllm|http://127.0.0.1:8000"
             let reloaded = AppSettings(defaults: defaults)
-            XCTAssertEqual(reloaded.backendSelection, .llamaCpp)
-            XCTAssertEqual(reloaded.lastAutomaticBackendID, settings.lastAutomaticBackendID)
-            let configuration = try reloaded.configuration(for: .llamaCpp)
+            XCTAssertEqual(reloaded.backendSelection, .automatic)
+            XCTAssertNil(reloaded.lastAutomaticBackendID)
+            let configuration = try settings.configuration(for: .llamaCpp)
             XCTAssertEqual(configuration.baseURL.absoluteString, "https://inference.example/llama")
             XCTAssertEqual(configuration.model, "test-model")
+            XCTAssertNil(defaults.data(forKey: "appSettings"))
         }
     }
 
-    func testBrandMigrationCopiesValidPreferencesOnce() throws {
+    func testLegacyPreferencesAreReadWithoutMigrationWrites() throws {
         try withDefaults { current in
             try withDefaults { legacy in
                 legacy.set(
@@ -210,20 +237,21 @@ final class AppSettingsTests: XCTestCase {
                 XCTAssertEqual(migrated.backendSelection, .automatic)
                 XCTAssertTrue(migrated.showMenuBarTokensPerSecond)
                 XCTAssertTrue(migrated.showMenuBarLogo)
-                XCTAssertNotNil(current.data(forKey: "appSettings"))
+                XCTAssertNil(current.data(forKey: "appSettings"))
                 migrated.backendSelection = .vllm
                 migrated.showMenuBarTokensPerSecond = false
                 migrated.showMenuBarLogo = false
                 let retained = AppSettings(defaults: current, legacyDefaults: legacy)
-                XCTAssertEqual(retained.backendSelection, .vllm)
-                XCTAssertFalse(retained.showMenuBarTokensPerSecond)
-                XCTAssertFalse(retained.showMenuBarLogo)
+                XCTAssertEqual(retained.backendSelection, .automatic)
+                XCTAssertTrue(retained.showMenuBarTokensPerSecond)
+                XCTAssertTrue(retained.showMenuBarLogo)
+                XCTAssertNil(current.data(forKey: "appSettings"))
                 XCTAssertNotNil(legacy.data(forKey: "appSettings"))
             }
         }
     }
 
-    func testBrandMigrationPreservesExplicitMenuBarPreferences() throws {
+    func testLegacyReadsPreservePreferencesWithoutCopyingThem() throws {
         try withDefaults { current in
             try withDefaults { legacy in
                 let snapshot = """
@@ -236,9 +264,10 @@ final class AppSettingsTests: XCTestCase {
                 XCTAssertFalse(migrated.showMenuBarTokensPerSecond)
                 XCTAssertFalse(migrated.showMenuBarLogo)
 
-                let reloaded = AppSettings(defaults: current)
+                let reloaded = AppSettings(defaults: current, legacyDefaults: legacy)
                 XCTAssertFalse(reloaded.showMenuBarTokensPerSecond)
                 XCTAssertFalse(reloaded.showMenuBarLogo)
+                XCTAssertNil(current.data(forKey: "appSettings"))
                 XCTAssertEqual(legacy.data(forKey: "appSettings"), Data(snapshot.utf8))
             }
         }
@@ -286,7 +315,7 @@ final class AppSettingsTests: XCTestCase {
         }
     }
 
-    func testMenuBarPreferencesPersistWhileBackendDraftIsInvalid() throws {
+    func testMenuBarPreferencesApplyWithoutSavingInvalidBackendDraft() throws {
         try withDefaults { defaults in
             let settings = AppSettings(defaults: defaults)
             settings.proxyPort = 0
@@ -297,21 +326,16 @@ final class AppSettingsTests: XCTestCase {
 
             settings.showMenuBarTokensPerSecond = false
             settings.showMenuBarLogo = false
+            XCTAssertFalse(settings.showMenuBarTokensPerSecond)
+            XCTAssertFalse(settings.showMenuBarLogo)
             let reloaded = AppSettings(defaults: defaults)
-            XCTAssertFalse(reloaded.showMenuBarTokensPerSecond)
-            XCTAssertFalse(reloaded.showMenuBarLogo)
-            XCTAssertEqual(reloaded.proxyPort, 0)
-            XCTAssertEqual(reloaded.backendSelection, .vllm)
-            XCTAssertEqual(reloaded.backendEndpoints[.vllm], "file:///tmp/server")
-            XCTAssertThrowsError(try reloaded.configuration(for: .ollama))
-            XCTAssertThrowsError(try reloaded.configuration(for: .vllm))
-
-            reloaded.showMenuBarTokensPerSecond = true
-            reloaded.showMenuBarLogo = true
-            let restored = AppSettings(defaults: defaults)
-            XCTAssertTrue(restored.showMenuBarTokensPerSecond)
-            XCTAssertTrue(restored.showMenuBarLogo)
-            XCTAssertThrowsError(try restored.configuration(for: .vllm))
+            XCTAssertTrue(reloaded.showMenuBarTokensPerSecond)
+            XCTAssertTrue(reloaded.showMenuBarLogo)
+            XCTAssertEqual(reloaded.proxyPort, 11435)
+            XCTAssertEqual(reloaded.backendSelection, .automatic)
+            XCTAssertNoThrow(try reloaded.configuration(for: .ollama))
+            XCTAssertNoThrow(try reloaded.configuration(for: .vllm))
+            XCTAssertNil(defaults.data(forKey: "appSettings"))
         }
     }
 

@@ -1,7 +1,7 @@
 import ServiceManagement
 import SwiftUI
 
-/// Connection drafts take effect together when saved; edits never interrupt monitoring.
+/// Connection drafts take effect together when applied for this session.
 public struct SettingsView: View {
     @ObservedObject private var settings: AppSettings
     @ObservedObject private var launchAtLogin: LaunchAtLoginController
@@ -56,13 +56,13 @@ public struct SettingsView: View {
                     Text(error).font(.caption).foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
                 } else if didApply {
-                    Text("Settings saved. Monitoring updates automatically.")
+                    Text("Settings applied for this session. Monitoring updates automatically.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 HStack {
                     if isApplying { ProgressView().controlSize(.small) }
                     Spacer()
-                    Button("Save", action: apply)
+                    Button("Apply", action: apply)
                         .keyboardShortcut(.defaultAction)
                         .disabled(isApplying || draftError != nil)
                 }
@@ -95,6 +95,11 @@ public struct SettingsView: View {
             }
             Text("Changes to launch at login take effect immediately.")
                 .font(.caption).foregroundStyle(.secondary)
+            Text(
+                "Other settings apply only until FluxLLM quits. Existing saved preferences are read at launch."
+            )
+            .font(.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
             if launchAtLogin.status == .requiresApproval {
                 Text("FluxLLM won’t launch at login until you allow it in System Settings.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -106,6 +111,34 @@ public struct SettingsView: View {
             if let error = launchAtLogin.errorMessage {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if let logger = store?.diagnosticLogger {
+                Divider()
+                Toggle(
+                    "Diagnostic logging",
+                    isOn: Binding(
+                        get: { logger.isEnabled },
+                        set: { enabled in
+                            Task { @MainActor in
+                                try? await logger.setEnabled(enabled)
+                            }
+                        })
+                )
+                .disabled(logger.isUpdating)
+                Text(
+                    "Off at every launch. Logs contain timing and counts, never prompts or responses. Files are limited to 3 MiB in ~/Library/Logs/FluxLLM."
+                )
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                if logger.isUpdating { ProgressView().controlSize(.small) }
+                if let error = logger.errorMessage {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if logger.droppedCount > 0 {
+                    Text("\(logger.droppedCount) diagnostic records dropped.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
     }

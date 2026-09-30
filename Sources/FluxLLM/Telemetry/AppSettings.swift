@@ -2,31 +2,27 @@ import Combine
 import Darwin
 import Foundation
 
-/// Persisted display and backend preferences. Connection drafts take effect on Apply.
+/// Session preferences. Existing saved preferences are read for compatibility, never rewritten.
 @MainActor
 public final class AppSettings: ObservableObject {
-    @Published public var proxyPort: Int { didSet { save() } }
-    @Published public var ollamaHost: String { didSet { save() } }
-    @Published public var ollamaPort: Int { didSet { save() } }
-    @Published public var autoStartProxy: Bool { didSet { save() } }
-    @Published public var showMenuBarTokensPerSecond: Bool { didSet { save() } }
-    @Published public var showMenuBarLogo: Bool { didSet { save() } }
-    @Published public var backendSelection: BackendSelection { didSet { save() } }
-    @Published public var backendEndpoints: [BackendKind: String] { didSet { save() } }
-    @Published public var llamaCppModel: String { didSet { save() } }
-    @Published public var lastAutomaticBackendID: String? { didSet { save() } }
+    @Published public var proxyPort: Int
+    @Published public var ollamaHost: String
+    @Published public var ollamaPort: Int
+    @Published public var autoStartProxy: Bool
+    @Published public var showMenuBarTokensPerSecond: Bool
+    @Published public var showMenuBarLogo: Bool
+    @Published public var backendSelection: BackendSelection
+    @Published public var backendEndpoints: [BackendKind: String]
+    @Published public var llamaCppModel: String
+    @Published public var lastAutomaticBackendID: String?
 
-    private let defaults: UserDefaults
     private let settingsKey = "appSettings"
-    private var isLoading = true
 
     public init(defaults: UserDefaults = .standard, legacyDefaults: UserDefaults? = nil) {
-        self.defaults = defaults
         let currentData = defaults.data(forKey: settingsKey)
         var snapshot = currentData.flatMap {
             try? JSONDecoder().decode(SettingsSnapshot.self, from: $0)
         }
-        var migrated = false
         if defaults.object(forKey: settingsKey) == nil {
             let legacyData =
                 legacyDefaults?.data(forKey: settingsKey)
@@ -41,7 +37,6 @@ public final class AppSettings: ObservableObject {
                     ollamaPort: legacy.ollamaPort) == nil
             {
                 snapshot = legacy
-                migrated = true
             }
         }
         proxyPort = snapshot?.proxyPort ?? 11435
@@ -57,8 +52,6 @@ public final class AppSettings: ObservableObject {
                 .map { ($0, snapshot?.backendEndpoints?[$0.rawValue] ?? $0.defaultEndpoint) })
         llamaCppModel = snapshot?.llamaCppModel ?? ""
         lastAutomaticBackendID = snapshot?.lastAutomaticBackendID
-        isLoading = false
-        if migrated { save() }
     }
 
     public var configurationError: String? {
@@ -145,29 +138,11 @@ public final class AppSettings: ObservableObject {
         }
         return trimmed
     }
-
-    private func save() {
-        // Optional published properties already have an initial nil value, so
-        // assigning them during initialization can invoke their observers.
-        guard !isLoading else { return }
-        let snapshot = SettingsSnapshot(
-            proxyPort: proxyPort, ollamaHost: ollamaHost,
-            ollamaPort: ollamaPort, autoStartProxy: autoStartProxy,
-            showMenuBarTokensPerSecond: showMenuBarTokensPerSecond,
-            showMenuBarLogo: showMenuBarLogo,
-            backendSelection: backendSelection,
-            backendEndpoints: Dictionary(
-                uniqueKeysWithValues: backendEndpoints.map { ($0.key.rawValue, $0.value) }),
-            llamaCppModel: llamaCppModel, lastAutomaticBackendID: lastAutomaticBackendID)
-        if let data = try? JSONEncoder().encode(snapshot) {
-            defaults.set(data, forKey: settingsKey)
-        }
-    }
 }
 
 /// Extra fields from earlier settings snapshots are intentionally ignored. This
 /// keeps existing proxy preferences while removing controls with no POC behavior.
-private struct SettingsSnapshot: Codable {
+private struct SettingsSnapshot: Decodable {
     let proxyPort: Int
     let ollamaHost: String
     let ollamaPort: Int
