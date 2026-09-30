@@ -44,6 +44,7 @@ public final class UsageHistory {
     private let toolEventLimit: Int
     private var records: [RequestKey: UsageRequestRecord] = [:]
     private var tools: [ToolKey: UsageToolRecord] = [:]
+    private var retainedToolEventCounts: [RequestKey: Int] = [:]
     private var launchTotals: [Int: UsageTotals] = [:]
     private var requestTruncatedThrough: [Int: Date] = [:]
     private var toolTruncatedThrough: [Int: Date] = [:]
@@ -55,10 +56,12 @@ public final class UsageHistory {
     private var completedOrderIsDirty = true
     private var completedTotals: [AccountingBucket: UsageTotals] = [:]
     private var toolCallTotals: [AccountingBucket: Int] = [:]
-    private var requestOrder: [RequestKey] = []
-    private var requestOrderIsDirty = true
     private var toolOrder: [ToolKey] = []
     private var toolOrderIsDirty = true
+    private var cachedToolOwners: ToolOwnerQueryCache?
+    /// Counts visited event records, excluding binary-search probes, so regression
+    /// checks can distinguish a rolling query from rescanning the retained day.
+    private(set) var toolOwnerQueryVisitedEvents: UInt64 = 0
     private var revision: UInt64 = 0
     private var cachedSummary: (SummaryKey, UsageSummary)?
     private var latestDate: Date
@@ -97,7 +100,6 @@ public final class UsageHistory {
                 startedAt: request.startedAt, lastUpdatedAt: request.startedAt,
                 modelID: metadata.retain(request.model))
             records[key] = record
-            requestOrderIsDirty = true
             activeRequests.insert(key)
             updateLaunchTotals(source: source, removing: nil, adding: record)
         case .updated(let id, let snapshot):
@@ -155,7 +157,9 @@ public final class UsageHistory {
                 }
                 tools[key] = UsageToolRecord(
                     id: event.id, nameID: metadata.retain(event.name), timestamp: event.timestamp)
+                retainedToolEventCounts[requestKey, default: 0] += 1
                 toolOrderIsDirty = true
+                cachedToolOwners = nil
                 if event.kind == .call {
                     launchTotals[source, default: UsageTotals()].toolCalls += 1
                     toolCallTotals[
@@ -246,27 +250,35 @@ public final class UsageHistory {
         return result
     }
 
-    public func requestLanes(source: String, interval: DateInterval) -> [RequestLane] {
+    public func requestLanes(
+        source: String, interval: DateInterval, inclusiveEnd: Bool = false
+    ) -> [RequestLane] {
         guard let source = sourceIDs[source] else { return [] }
-        if requestOrderIsDirty {
-            requestOrder = records.keys.sorted {
-                records[$0]!.startedAt < records[$1]!.startedAt
-            }
-            requestOrderIsDirty = false
+        prepareCompletedOrder()
+        // Completion order skips requests that ended before the viewport while
+        // retaining long-running requests that began before its lower boundary.
+        let first = lowerBound(completedOrder.count) {
+            records[completedOrder[$0]]!.endedAt! < interval.start
         }
         var result: [RequestLane] = []
-        for key in requestOrder {
-            guard let record = records[key] else { continue }
-            if record.startedAt >= interval.end { break }
-            if key.source == source && (record.endedAt == nil || record.endedAt! >= interval.start)
-            {
-                result.append(record.lane(id: key.id, model: metadata[record.modelID]))
-            }
+        func appendLane(_ key: RequestKey) {
+            guard key.source == source, let record = records[key],
+                record.startedAt < interval.end
+                    || (inclusiveEnd && record.startedAt == interval.end)
+            else { return }
+            result.append(record.lane(id: key.id, model: metadata[record.modelID]))
         }
-        return result
+        for key in completedOrder[first...] { appendLane(key) }
+        for key in activeRequests { appendLane(key) }
+        return result.sorted {
+            $0.startedAt == $1.startedAt
+                ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
+        }
     }
 
-    public func toolEvents(source: String, interval: DateInterval) -> [ToolActivityEvent] {
+    public func toolEvents(
+        source: String, interval: DateInterval, inclusiveEnd: Bool = false
+    ) -> [ToolActivityEvent] {
         guard let source = sourceIDs[source] else { return [] }
         prepareToolOrder()
         // Find the visible suffix without materializing all retained events.
@@ -283,7 +295,9 @@ public final class UsageHistory {
         var result: [ToolActivityEvent] = []
         for key in toolOrder[low...] {
             guard let record = tools[key] else { continue }
-            if record.timestamp >= interval.end { break }
+            if inclusiveEnd ? record.timestamp > interval.end : record.timestamp >= interval.end {
+                break
+            }
             if key.request.source == source {
                 result.append(
                     ToolActivityEvent(
@@ -295,21 +309,103 @@ public final class UsageHistory {
         return result
     }
 
+    /// Retained ownership survives viewport clipping without copying event payloads.
+    /// A supplied interval uses the same half-open boundaries as usage accounting.
+    public func requestIDsWithToolEvents(
+        source: String, interval: DateInterval? = nil
+    ) -> Set<UUID> {
+        guard let source = sourceIDs[source] else { return [] }
+        guard let interval else {
+            return Set(retainedToolEventCounts.keys.lazy.filter { $0.source == source }.map(\.id))
+        }
+        prepareToolOrder()
+        if let cachedToolOwners, cachedToolOwners.source == source,
+            cachedToolOwners.interval == interval
+        {
+            return cachedToolOwners.owners
+        }
+
+        let first = lowerBound(toolOrder.count) {
+            tools[toolOrder[$0]]!.timestamp < interval.start
+        }
+        let end = lowerBound(toolOrder.count) {
+            !(tools[toolOrder[$0]]!.timestamp >= interval.end)
+        }
+        let range = first..<max(first, end)
+        let cache: ToolOwnerQueryCache
+        if let previous = cachedToolOwners, previous.source == source,
+            interval.start >= previous.interval.start, interval.end >= previous.interval.end
+        {
+            cache = previous
+            // Disjoint moves remove the previous range and add only the new
+            // range. Events in the unobserved gap never enter the cache.
+            adjustToolOwners(
+                in: previous.range.lowerBound..<min(first, previous.range.upperBound),
+                by: -1, cache: cache)
+            adjustToolOwners(
+                in: max(previous.range.upperBound, first)..<range.upperBound,
+                by: 1, cache: cache)
+        } else {
+            cache = ToolOwnerQueryCache(source: source, interval: interval, range: range)
+            adjustToolOwners(in: range, by: 1, cache: cache)
+        }
+        cache.interval = interval
+        cache.range = range
+        cachedToolOwners = cache
+        return cache.owners
+    }
+
+    private func adjustToolOwners(in range: Range<Int>, by delta: Int, cache: ToolOwnerQueryCache) {
+        toolOwnerQueryVisitedEvents &+= UInt64(range.count)
+        for index in range {
+            let key = toolOrder[index]
+            guard key.request.source == cache.source else { continue }
+            let id = key.request.id
+            let count = cache.counts[id, default: 0] + delta
+            if count == 0 {
+                cache.counts.removeValue(forKey: id)
+                cache.owners.remove(id)
+            } else {
+                cache.counts[id] = count
+                if count == 1 && delta > 0 { cache.owners.insert(id) }
+            }
+        }
+    }
+
+    /// Only one bounded query is retained. A reference cache avoids copying its
+    /// refcounts whenever the two endpoints advance; returned sets remain values.
+    private final class ToolOwnerQueryCache {
+        let source: Int
+        var interval: DateInterval
+        var range: Range<Int>
+        var counts: [UUID: Int] = [:]
+        var owners: Set<UUID> = []
+
+        init(source: Int, interval: DateInterval, range: Range<Int>) {
+            self.source = source
+            self.interval = interval
+            self.range = range
+        }
+    }
+
     private func prepareToolOrder() {
         guard toolOrderIsDirty else { return }
         toolOrder = tools.keys.sorted { tools[$0]!.timestamp < tools[$1]!.timestamp }
         toolOrderIsDirty = false
     }
 
+    private func prepareCompletedOrder() {
+        guard completedOrderIsDirty else { return }
+        completedOrder = records.keys.filter { records[$0]!.endedAt != nil }.sorted {
+            records[$0]!.endedAt! < records[$1]!.endedAt!
+        }
+        completedOrderIsDirty = false
+    }
+
     private func addBoundaryUsage(source: Int, interval: DateInterval, to total: inout UsageTotals)
     {
         guard interval.duration > 0 else { return }
-        if completedOrderIsDirty {
-            completedOrder = records.keys.filter { records[$0]!.endedAt != nil }.sorted {
-                records[$0]!.endedAt! < records[$1]!.endedAt!
-            }
-            completedOrderIsDirty = false
-        }
+        prepareCompletedOrder()
         let first = lowerBound(completedOrder.count) {
             records[completedOrder[$0]]!.endedAt! < interval.start
         }
@@ -387,12 +483,15 @@ public final class UsageHistory {
                 completedTotals.removeValue(forKey: bucket)
             }
         }
-        requestOrderIsDirty = true
         completedOrderIsDirty = true
     }
 
     private func removeTool(_ key: ToolKey) {
         guard let record = tools.removeValue(forKey: key) else { return }
+        retainedToolEventCounts[key.request, default: 0] -= 1
+        if retainedToolEventCounts[key.request] == 0 {
+            retainedToolEventCounts.removeValue(forKey: key.request)
+        }
         metadata.release(record.nameID)
         metadata.release(key.callID)
         if key.isCall {
@@ -401,6 +500,7 @@ public final class UsageHistory {
             if toolCallTotals[bucket] == 0 { toolCallTotals.removeValue(forKey: bucket) }
         }
         toolOrderIsDirty = true
+        cachedToolOwners = nil
     }
 
     private func prune(at now: Date) {

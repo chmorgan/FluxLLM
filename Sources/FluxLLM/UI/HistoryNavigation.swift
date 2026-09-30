@@ -15,6 +15,14 @@ struct HistoryNavigation: Equatable, Sendable {
 
     var isLive: Bool { pinnedInterval == nil }
 
+    /// Mirrors navigation without resolving a moving endpoint early. Go Live
+    /// deliberately retains the width selected before the pin was released.
+    var presentationViewport: ChartPresentationViewport {
+        if let pinnedInterval { return .fixed(pinnedInterval) }
+        if let selectedDuration { return .live(duration: selectedDuration) }
+        return .historyRange
+    }
+
     func interval(now: Date, historyAge: TimeInterval) -> DateInterval {
         if let pinnedInterval { return Self.bounded(pinnedInterval, now: now) }
         let duration = selectedDuration ?? preset.duration(historyAge: historyAge)

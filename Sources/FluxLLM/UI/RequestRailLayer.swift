@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// Stable request bars and their short-lived decoration layer. The display clock
-/// is deliberately local: a lightning frame never prepares chart histories.
+/// Timestamp geometry and the bar canvas only depend on chart publications.
+/// Decoration state lives in a child so a glint never rebuilds the stable rail.
 struct RequestRailLayer: View {
     let lanes: [RequestLane]
     let presentation: RequestRailPresentation
@@ -13,16 +13,7 @@ struct RequestRailLayer: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var contrast
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @State private var windowVisible = false
-    @State private var prepared: [PreparedEffect] = []
-    @State private var twinkles: [Twinkle] = []
-    @State private var animating = false
-
-    private var effectsEnabled: Bool {
-        isLive && !reduceMotion && !reduceTransparency && contrast != .increased && windowVisible
-    }
 
     var body: some View {
         let segments = RequestRailGeometry.layout(
@@ -31,105 +22,18 @@ struct RequestRailLayer: View {
         let overflow = RequestRailGeometry.overflow(
             lanes: lanes, assignments: presentation.assignments, now: now,
             duration: duration, rect: rect)
-        let liveIDs = segments.filter(\.isLive).map { $0.lane.id }
-        let work = WorkKey(
-            events: presentation.events.map(EffectKey.init), liveIDs: liveIDs,
-            duration: duration, enabled: effectsEnabled)
 
         ZStack {
             Canvas { context, _ in
                 PerformancePresentationCounters.shared.record(.canvasDraws)
                 drawBars(segments, overflow: overflow, in: &context)
             }
-            TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { clock in
-                Canvas { context, _ in
-                    PerformancePresentationCounters.shared.record(.canvasDraws)
-                    if effectsEnabled {
-                        drawDecorations(segments, at: clock.date, in: &context)
-                    }
-                }
-            }
+            RequestRailDecorations(
+                lanes: lanes, segments: segments, presentation: presentation, now: now,
+                duration: duration, rect: rect, isLive: isLive)
         }
-        .background(RequestRailWindowVisibility(isVisible: $windowVisible))
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-        .task(id: work) {
-            await runDecorations(work: work)
-        }
-        .onDisappear { animating = false }
-    }
-
-    /// Profiles are cached by receipt identity, so a new telemetry snapshot or a
-    /// resized chart cannot change an existing bolt's forks or burst family.
-    @MainActor
-    private func runDecorations(work: WorkKey) async {
-        guard work.enabled else {
-            animating = false
-            twinkles = []
-            return
-        }
-        let cached = Dictionary(uniqueKeysWithValues: prepared.map { ($0.key, $0) })
-        prepared = presentation.events.compactMap { event in
-            guard event.expiresAt > Date(),
-                let lane = lanes.first(where: { $0.id == event.requestID }),
-                let assignment = presentation.assignments[lane.id],
-                (0..<RequestRailState.individualTrackCount).contains(assignment.track)
-            else { return nil }
-            let key = EffectKey(event)
-            if let existing = cached[key] { return existing }
-            return PreparedEffect(
-                key: key, startedAt: event.startedAt, expiresAt: event.expiresAt,
-                profile: RequestRailEffectProfile(
-                    seed: event.seed,
-                    requestDuration: (lane.endedAt ?? now).timeIntervalSince(lane.startedAt),
-                    completion: event.kind == .completion))
-        }
-        twinkles.removeAll { $0.endsAt <= Date() || !work.liveIDs.contains($0.requestID) }
-        animating = !work.liveIDs.isEmpty || !prepared.isEmpty
-        var sequence = UInt64(max(0, Date().timeIntervalSinceReferenceDate * 1_000))
-
-        while !Task.isCancelled {
-            let timestamp = Date()
-            let hasTail = prepared.contains { $0.expiresAt > timestamp }
-            guard !work.liveIDs.isEmpty || hasTail else {
-                animating = false
-                twinkles = []
-                return
-            }
-            twinkles.removeAll { $0.endsAt <= timestamp }
-            if !work.liveIDs.isEmpty {
-                // A single scheduler keeps the entire chart to at most two
-                // simultaneous glints, even during a dense request burst.
-                var random = RequestRailRandom(seed: sequence)
-                let index = min(
-                    work.liveIDs.count - 1, Int(random.unit() * Double(work.liveIDs.count)))
-                let id = work.liveIDs[index]
-                var requestRandom = RequestRailRandom(seed: Self.seed(id) ^ sequence)
-                let start = max(
-                    lanes.first(where: { $0.id == id })?.startedAt ?? timestamp,
-                    timestamp.addingTimeInterval(-duration))
-                let fraction = 0.08 + requestRandom.unit() * 0.84
-                let twinkle = Twinkle(
-                    requestID: id, startedAt: timestamp,
-                    duration: 0.43 + requestRandom.unit() * 0.16,
-                    location: start.addingTimeInterval(
-                        timestamp.timeIntervalSince(start) * fraction),
-                    size: 2 + requestRandom.unit() * 1.3,
-                    angle: requestRandom.unit() * 0.7,
-                    star: requestRandom.unit() > 0.45)
-                twinkles = Array((twinkles + [twinkle]).suffix(2))
-                sequence &+= 1
-            }
-            do {
-                try await Task.sleep(for: .milliseconds(505))
-            } catch { return }
-        }
-    }
-
-    private static func seed(_ id: UUID) -> UInt64 {
-        id.uuidString.utf8.reduce(UInt64(14_695_981_039_346_656_037)) {
-            ($0 ^ UInt64($1)) &* 1_099_511_628_211
-        }
     }
 
     private func color(for lane: RequestLane) -> Color {
@@ -193,6 +97,153 @@ struct RequestRailLayer: View {
                 }
             }
         }
+    }
+
+    private func circle(at point: CGPoint, radius: CGFloat) -> Path {
+        Path(
+            ellipseIn: CGRect(
+                x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2))
+    }
+}
+
+private struct RequestRailDecorations: View {
+    let lanes: [RequestLane]
+    let segments: [RequestRailGeometry.Segment]
+    let presentation: RequestRailPresentation
+    let now: Date
+    let duration: TimeInterval
+    let rect: CGRect
+    let isLive: Bool
+
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @State private var windowVisible = false
+    @State private var prepared: [PreparedEffect] = []
+    @State private var twinkles: [Twinkle] = []
+    @State private var animating = false
+
+    private var effectsEnabled: Bool {
+        isLive && !reduceMotion && !reduceTransparency && contrast != .increased && windowVisible
+    }
+
+    var body: some View {
+        let eligibility = RequestRailAnimationEligibility(
+            segments: segments, events: presentation.events, now: now, duration: duration)
+        let work = WorkKey(
+            events: presentation.events.map(EffectKey.init), eligibility: eligibility,
+            duration: duration, enabled: effectsEnabled)
+        let decoratedSegments = segments.filter { segment in
+            segment.isLive || prepared.contains { $0.key.requestID == segment.lane.id }
+        }
+
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { clock in
+            Canvas { context, _ in
+                PerformancePresentationCounters.shared.record(.canvasDraws)
+                // A paused timeline can retain its previous date. Clear its last
+                // frame explicitly when the visible effect interval has ended.
+                if effectsEnabled && animating {
+                    drawDecorations(decoratedSegments, at: clock.date, in: &context)
+                }
+            }
+        }
+        .background(RequestRailWindowVisibility(isVisible: $windowVisible))
+        .task(id: work) {
+            await runDecorations(work: work)
+        }
+        .onDisappear { animating = false }
+    }
+
+    /// Profiles are cached by receipt identity, so a new telemetry snapshot or a
+    /// resized chart cannot change an existing bolt's forks or burst family.
+    @MainActor
+    private func runDecorations(work: WorkKey) async {
+        guard work.enabled else {
+            animating = false
+            prepared = []
+            twinkles = []
+            return
+        }
+        let timestamp = Date()
+        let cached = Dictionary(uniqueKeysWithValues: prepared.map { ($0.key, $0) })
+        prepared = presentation.events.compactMap { event in
+            guard event.expiresAt > timestamp,
+                let lane = lanes.first(where: { $0.id == event.requestID }),
+                let assignment = presentation.assignments[lane.id],
+                (0..<RequestRailState.individualTrackCount).contains(assignment.track)
+            else { return nil }
+            let key = EffectKey(event)
+            let effect =
+                cached[key]
+                ?? PreparedEffect(
+                    key: key, startedAt: event.startedAt, expiresAt: event.expiresAt,
+                    profile: RequestRailEffectProfile(
+                        seed: event.seed,
+                        requestDuration: (lane.endedAt ?? now).timeIntervalSince(lane.startedAt),
+                        completion: event.kind == .completion))
+            return effect.visibleUntil > timestamp ? effect : nil
+        }
+        let liveIDs = work.eligibility.liveIDs
+        twinkles.removeAll { $0.endsAt <= timestamp || !liveIDs.contains($0.requestID) }
+        var sequence = UInt64(max(0, timestamp.timeIntervalSinceReferenceDate * 1_000))
+        var nextTwinkleAt: Date? = liveIDs.isEmpty ? nil : timestamp
+
+        while !Task.isCancelled {
+            let timestamp = Date()
+            let currentPrepared = prepared.filter { $0.visibleUntil > timestamp }
+            if prepared.count != currentPrepared.count { prepared = currentPrepared }
+            var currentTwinkles = twinkles.filter { $0.endsAt > timestamp }
+            if let due = nextTwinkleAt, due <= timestamp {
+                // A single scheduler keeps the entire chart to at most two
+                // simultaneous glints, even during a dense request burst.
+                var random = RequestRailRandom(seed: sequence)
+                let index = min(
+                    liveIDs.count - 1, Int(random.unit() * Double(liveIDs.count)))
+                let id = liveIDs[index]
+                var requestRandom = RequestRailRandom(seed: Self.seed(id) ^ sequence)
+                let start = max(
+                    segments.first(where: { $0.lane.id == id })?.lane.startedAt ?? timestamp,
+                    timestamp.addingTimeInterval(-duration))
+                let fraction = 0.08 + requestRandom.unit() * 0.84
+                let twinkle = Twinkle(
+                    requestID: id, startedAt: timestamp,
+                    duration: 0.43 + requestRandom.unit() * 0.16,
+                    location: start.addingTimeInterval(
+                        timestamp.timeIntervalSince(start) * fraction),
+                    size: 2 + requestRandom.unit() * 1.3,
+                    angle: requestRandom.unit() * 0.7,
+                    star: requestRandom.unit() > 0.45)
+                currentTwinkles = Array((currentTwinkles + [twinkle]).suffix(2))
+                nextTwinkleAt = timestamp.addingTimeInterval(
+                    RequestRailAnimationSchedule.twinkleInterval)
+                sequence &+= 1
+            }
+            if twinkles != currentTwinkles { twinkles = currentTwinkles }
+            let visibleEffects = prepared.filter {
+                work.eligibility.effectIDs.contains($0.key.eventID)
+            }
+            let schedule = RequestRailAnimationSchedule(
+                at: timestamp,
+                visibleUntil: visibleEffects.map(\.visibleUntil) + currentTwinkles.map(\.endsAt),
+                nextTwinkleAt: nextTwinkleAt, retainedUntil: prepared.map(\.visibleUntil))
+            if animating != schedule.isAnimating { animating = schedule.isAnimating }
+            guard let nextUpdate = schedule.nextUpdate else { return }
+            do {
+                try await Task.sleep(for: .seconds(max(0, nextUpdate.timeIntervalSinceNow)))
+            } catch { return }
+        }
+    }
+
+    private static func seed(_ id: UUID) -> UInt64 {
+        id.uuidString.utf8.reduce(UInt64(14_695_981_039_346_656_037)) {
+            ($0 ^ UInt64($1)) &* 1_099_511_628_211
+        }
+    }
+
+    private func color(for lane: RequestLane) -> Color {
+        RequestLanePalette.color(
+            at: presentation.assignments[lane.id]?.colorIndex ?? 0, scheme: colorScheme)
     }
 
     private func drawDecorations(
@@ -417,6 +468,10 @@ struct RequestRailLayer: View {
         let startedAt: Date
         let seed: UInt64
 
+        var eventID: RequestRailEvent.ID {
+            RequestRailEvent.ID(requestID: requestID, kind: completion ? .completion : .arrival)
+        }
+
         init(_ event: RequestRailEvent) {
             requestID = event.requestID
             completion = event.kind == .completion
@@ -427,7 +482,7 @@ struct RequestRailLayer: View {
 
     private struct WorkKey: Hashable {
         let events: [EffectKey]
-        let liveIDs: [UUID]
+        let eligibility: RequestRailAnimationEligibility
         let duration: TimeInterval
         let enabled: Bool
     }
@@ -437,9 +492,12 @@ struct RequestRailLayer: View {
         let startedAt: Date
         let expiresAt: Date
         let profile: RequestRailEffectProfile
+        var visibleUntil: Date {
+            min(expiresAt, startedAt.addingTimeInterval(profile.visibleDuration))
+        }
     }
 
-    private struct Twinkle {
+    private struct Twinkle: Equatable {
         let requestID: UUID
         let startedAt: Date
         let duration: TimeInterval
@@ -670,6 +728,16 @@ struct RequestRailEffectProfile: Equatable {
             at += 0.045 + electric.unit() * 0.055
         }
         crackles = states
+    }
+
+    /// The receipt remains available longer than its final visible frame.
+    /// Arrival, initial flash, lightning settle, and the optional final burst
+    /// overlap, so each profile has one continuous animation interval.
+    var visibleDuration: TimeInterval {
+        guard completion else { return burstDuration }
+        let lightningEnd = surgeDelay + surgeDuration + 0.15
+        let burstEnd = explodes ? surgeDelay + surgeDuration + burstDuration : 0
+        return max(0.24, lightningEnd, burstEnd)
     }
 
     static func clamp(_ value: Double) -> Double { min(1, max(0, value)) }

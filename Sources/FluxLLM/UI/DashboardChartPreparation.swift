@@ -64,10 +64,10 @@ final class PreparedDashboardCharts {
         let renderedIDs = Set(rendered.map(\.id))
         // A frozen window can precede a request's first tool event. Keep its
         // empty overlay (and observed zero-rate spans) just as in live history.
-        for event in eventsByID.values {
-            guard let id = event.requestID, renderedIDs.contains(id) else { continue }
-            if grouped[id] == nil { grouped[id] = [] }
-        }
+        let knownToolRequests =
+            snapshot.toolActivityRequestIDs
+            ?? Set(eventsByID.values.compactMap(\.requestID))
+        for id in knownToolRequests where renderedIDs.contains(id) { grouped[id] = [] }
         for event in events {
             guard let id = event.requestID, renderedIDs.contains(id) else { continue }
             grouped[id, default: []].append(event)

@@ -1,11 +1,74 @@
 import Foundation
+import Observation
 import XCTest
 
 @testable import FluxLLM
 
+private final class ActivityObservationCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
+}
+
 @MainActor
 final class BackendActivityTests: XCTestCase {
     private let origin = Date(timeIntervalSince1970: 1_000)
+
+    func testActivityObservationChangesForLifecycleButNotTokenUpdates() {
+        let store = MetricsStore(clock: { self.origin })
+        let request = GenerationRequest(startedAt: origin)
+        store.apply(.began(request))
+        let firstOutput = ActivityObservationCount()
+        withObservationTracking {
+            _ = store.backendActivity
+            _ = store.activityRequestStartedAt
+        } onChange: {
+            firstOutput.increment()
+        }
+        store.apply(
+            .updated(
+                requestID: request.id,
+                snapshot: GenerationSnapshot(
+                    outputTokens: 1, liveTPS: 10, timestamp: origin.addingTimeInterval(0.1))))
+        XCTAssertEqual(firstOutput.value, 1, "First output changes the activity phase immediately")
+
+        let continuing = ActivityObservationCount()
+        withObservationTracking {
+            _ = store.backendActivity
+            _ = store.activityRequestStartedAt
+        } onChange: {
+            continuing.increment()
+        }
+        for count in 2...40 {
+            store.apply(
+                .updated(
+                    requestID: request.id,
+                    snapshot: GenerationSnapshot(
+                        outputTokens: count, liveTPS: Double(count),
+                        timestamp: origin.addingTimeInterval(Double(count) / 10))))
+        }
+        XCTAssertEqual(store.outputTokens, 40, "Raw accounting remains current")
+        XCTAssertEqual(continuing.value, 0, "Unchanged activity must not rebuild observing views")
+        store.apply(.cancelled(requestID: request.id))
+        XCTAssertEqual(continuing.value, 1, "Terminal activity still publishes immediately")
+        XCTAssertNil(store.activityRequestStartedAt)
+    }
+
+    func testActivityObservationPublishesSessionReset() {
+        let store = MetricsStore(clock: { self.origin })
+        store.apply(.began(GenerationRequest(startedAt: origin)))
+        let changes = ActivityObservationCount()
+        withObservationTracking {
+            _ = store.activityRequestStartedAt
+        } onChange: {
+            changes.increment()
+        }
+        store.beginBackendSession(kind: .ollama, epoch: UUID())
+        XCTAssertEqual(changes.value, 1)
+        XCTAssertNil(store.activityRequestStartedAt)
+        XCTAssertEqual(store.backendActivity, .unknown)
+    }
 
     func testObservedRequestRemainsActiveWhileHealthAndRatesAreUnavailable() {
         let store = MetricsStore(clock: { self.origin })

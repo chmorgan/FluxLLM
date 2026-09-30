@@ -18,6 +18,9 @@ struct LuminousActivityChart: View {
     let observationTime: Date?
     let onSelectInterval: ((DateInterval) -> Void)?
     let onFitRequest: ((RequestLane) -> Void)?
+    /// Without an immutable publication ID, each new set of view inputs must
+    /// invalidate geometry even when its window and scales happen to match.
+    let geometryPublicationID: UUID
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var contrast
@@ -27,6 +30,7 @@ struct LuminousActivityChart: View {
     @State private var toolScale = ChartScaleState()
     @State private var hoverLocation: CGPoint?
     @State private var dragSelection: DragSelection?
+    @State private var geometryCache = LuminousChartGeometryCache()
     @GestureState private var isSelecting = false
 
     init(
@@ -38,7 +42,8 @@ struct LuminousActivityChart: View {
         heightCompression: CGFloat = 0,
         isLive: Bool = true, observationTime: Date? = nil,
         onSelectInterval: ((DateInterval) -> Void)? = nil,
-        onFitRequest: ((RequestLane) -> Void)? = nil
+        onFitRequest: ((RequestLane) -> Void)? = nil,
+        publicationID: UUID? = nil
     ) {
         self.throughput = throughput
         self.gpu = gpu
@@ -60,6 +65,7 @@ struct LuminousActivityChart: View {
         self.observationTime = observationTime
         self.onSelectInterval = onSelectInterval
         self.onFitRequest = onFitRequest
+        geometryPublicationID = publicationID ?? UUID()
         var tokens = ChartScaleState()
         tokens.update(peak: throughput.peak ?? 0, now: now)
         _tokenScale = State(initialValue: tokens)
@@ -183,19 +189,15 @@ struct LuminousActivityChart: View {
 
     private var plot: some View {
         GeometryReader { geometry in
-            let layout = PlotLayout(size: geometry.size, hasTools: tools != nil, compact: compact)
-            let generated = projected(
-                throughput.zeroFilledPlotSegments, in: layout.main,
-                upperBound: tokenScale.upperBound)
-            let device = projected(gpu.plotSegments, in: layout.main, upperBound: 100)
-            // Tool tracks are drawn per request, each in its lane's color.
-            let perLaneCallPoints: [(RequestLane, [[CGPoint]])] = lanes.compactMap { lane in
-                guard let history = requestTools[lane.id] else { return nil }
-                let points = projected(
-                    history.zeroFilledPlotSegments, in: layout.tools,
-                    upperBound: toolScale.upperBound)
-                return (lane, points)
-            }
+            let frame = geometryCache.frame(
+                for: .init(
+                    publicationID: geometryPublicationID, now: now, duration: duration,
+                    size: geometry.size, compact: compact, hasTools: tools != nil,
+                    tokenUpperBound: tokenScale.upperBound, toolUpperBound: toolScale.upperBound),
+                throughput: throughput, gpu: gpu, requestTools: requestTools)
+            let layout = frame.layout
+            let generated = frame.generated
+            let device = frame.device
             let selected = (dragSelection == nil ? hoverLocation : nil).flatMap {
                 ChartInspectionGeometry.selection(
                     at: $0, now: now, duration: duration, main: layout.main,
@@ -211,17 +213,13 @@ struct LuminousActivityChart: View {
                     drawSeries(
                         generated, color: generatedColor, fillOpacity: 0.25, in: &context,
                         rect: layout.main)
-                    drawEndpoint(generated.last?.last, color: generatedColor, in: &context)
-                    if let current = gpu.current {
-                        drawEndpoint(
-                            project(
-                                current.timestamp, value: current.value, in: layout.main,
-                                upperBound: 100), color: gpuColor, in: &context)
-                    }
-                    for (lane, points) in perLaneCallPoints {
-                        drawTools(
-                            points, history: requestTools[lane.id]!, in: &context,
-                            rect: layout.tools, color: laneColor(lane))
+                    drawEndpoint(frame.generatedEndpoint, color: generatedColor, in: &context)
+                    drawEndpoint(frame.deviceEndpoint, color: gpuColor, in: &context)
+                    // Tool tracks retain their request's current appearance.
+                    for lane in lanes {
+                        if let track = frame.requestTools[lane.id] {
+                            drawTools(track, in: &context, color: laneColor(lane))
+                        }
                     }
                     if !compact {
                         if layout.lanes.height > 0 {
@@ -388,47 +386,8 @@ struct LuminousActivityChart: View {
             .accessibilityHidden(true)
     }
 
-    private struct PlotLayout {
-        let main: CGRect
-        let lanes: CGRect
-        let tools: CGRect
-
-        var selection: CGRect {
-            let bottom = tools.height > 0 ? tools.maxY : (lanes.height > 0 ? lanes.maxY : main.maxY)
-            return CGRect(
-                x: main.minX, y: main.minY, width: main.width,
-                height: bottom - main.minY)
-        }
-
-        init(size: CGSize, hasTools: Bool, compact: Bool) {
-            let toolHeight: CGFloat = compact ? 30 : 34
-            // The lane band is fixed-height and always reserved in the full view
-            // (it shows an empty state when no request history is visible); compact
-            // suppresses it entirely.
-            let laneReserve: CGFloat = compact ? 0 : (laneBandHeight + 22)
-            let reserved: CGFloat = (hasTools ? toolHeight + 22 : 0) + laneReserve
-            main = CGRect(
-                x: 29, y: 5, width: max(size.width - 62, 1),
-                height: max(size.height - 10 - reserved, 1))
-            lanes = CGRect(
-                x: main.minX, y: main.maxY + 22, width: main.width,
-                height: laneReserve == 0 ? 0 : laneBandHeight)
-            tools = CGRect(
-                x: main.minX, y: main.maxY + 22 + laneReserve, width: main.width,
-                height: hasTools ? toolHeight : 0)
-        }
-    }
-
-    private func projected(
-        _ segments: [[ChartDisplayPoint]], in rect: CGRect, upperBound: Double
-    ) -> [[CGPoint]] {
-        guard duration.isFinite, duration > 0, upperBound.isFinite, upperBound > 0 else {
-            return []
-        }
-        return segments.map { points in
-            points.map { project($0.timestamp, value: $0.value, in: rect, upperBound: upperBound) }
-        }
-    }
+    private typealias PlotLayout = LuminousChartGeometryCache.Layout
+    private typealias PlotSegment = LuminousChartGeometryCache.Segment
 
     private func project(_ timestamp: Date, value: Double, in rect: CGRect, upperBound: Double)
         -> CGPoint
@@ -439,37 +398,14 @@ struct LuminousActivityChart: View {
             y: rect.maxY - CGFloat(min(max(value / upperBound, 0), 1)) * rect.height)
     }
 
-    private func line(_ points: [CGPoint], smoothed: Bool) -> Path {
-        Path { path in
-            guard let first = points.first else { return }
-            path.move(to: first)
-            if smoothed {
-                for span in ChartCurveGeometry.spans(points: points) {
-                    if span.isVertical {
-                        path.addLine(to: span.end)
-                    } else {
-                        path.addCurve(
-                            to: span.end, control1: span.control1, control2: span.control2)
-                    }
-                }
-            } else {
-                for point in points.dropFirst() { path.addLine(to: point) }
-            }
-        }
-    }
-
     private func drawSeries(
-        _ segments: [[CGPoint]], color: Color, fillOpacity: Double,
+        _ segments: [PlotSegment], color: Color, fillOpacity: Double,
         in context: inout GraphicsContext, rect: CGRect
     ) {
-        for points in segments {
-            guard let first = points.first, let last = points.last else { continue }
-            let trace = line(points, smoothed: true)
-            if hasEffects && points.count > 1 {
-                var area = trace
-                area.addLine(to: CGPoint(x: last.x, y: rect.maxY))
-                area.addLine(to: CGPoint(x: first.x, y: rect.maxY))
-                area.closeSubpath()
+        for segment in segments {
+            guard let first = segment.points.first else { continue }
+            let trace = segment.trace
+            if hasEffects, let area = segment.area {
                 context.fill(
                     area,
                     with: .linearGradient(
@@ -488,7 +424,7 @@ struct LuminousActivityChart: View {
             context.stroke(
                 trace, with: .color(color),
                 style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round, lineJoin: .round))
-            if points.count == 1 { drawEndpoint(first, color: color, in: &context) }
+            if segment.points.count == 1 { drawEndpoint(first, color: color, in: &context) }
         }
     }
 
@@ -522,30 +458,23 @@ struct LuminousActivityChart: View {
     }
 
     private func drawTools(
-        _ segments: [[CGPoint]], history: ToolActivityHistory,
-        in context: inout GraphicsContext, rect: CGRect, color: Color
+        _ track: LuminousChartGeometryCache.ToolTrack,
+        in context: inout GraphicsContext, color: Color
     ) {
-        for points in segments {
+        for segment in track.segments {
             context.stroke(
-                line(points, smoothed: false), with: .color(color),
+                segment.trace, with: .color(color),
                 style: StrokeStyle(
                     lineWidth: contrast == .increased ? 2.2 : 1.6, lineCap: .round,
                     lineJoin: .round, dash: [4, 3]))
         }
-        for event in history.resultMarkers {
-            let point = project(event.timestamp, value: 0, in: rect, upperBound: 1)
-            var diamond = Path()
-            diamond.move(to: CGPoint(x: point.x, y: point.y - 3))
-            diamond.addLine(to: CGPoint(x: point.x + 3, y: point.y))
-            diamond.addLine(to: CGPoint(x: point.x, y: point.y + 3))
-            diamond.addLine(to: CGPoint(x: point.x - 3, y: point.y))
-            diamond.closeSubpath()
+        for diamond in track.resultDiamonds {
             context.fill(diamond, with: .color(color))
         }
     }
 
     private func drawCursor(
-        _ timestamp: Date, generated: [[CGPoint]], device: [[CGPoint]],
+        _ timestamp: Date, generated: [PlotSegment], device: [PlotSegment],
         in context: inout GraphicsContext, layout: PlotLayout
     ) {
         let x = project(timestamp, value: 0, in: layout.main, upperBound: 1).x
@@ -562,17 +491,17 @@ struct LuminousActivityChart: View {
         }
     }
 
-    private func inspectedY(atX x: CGFloat, segments: [[CGPoint]])
+    private func inspectedY(atX x: CGFloat, segments: [PlotSegment])
         -> CGFloat?
     {
-        segments.compactMap { points in
-            if points.count == 1, let point = points.first, point.x == x { return point.y }
-            return ChartCurveGeometry.value(atX: x, spans: ChartCurveGeometry.spans(points: points))
-        }.last
+        for segment in segments.reversed() {
+            if let y = segment.inspectedY(atX: x) { return y }
+        }
+        return nil
     }
 
     private func inspectedValue(
-        atX x: CGFloat, segments: [[CGPoint]], rect: CGRect, upperBound: Double
+        atX x: CGFloat, segments: [PlotSegment], rect: CGRect, upperBound: Double
     ) -> Double? {
         inspectedY(atX: x, segments: segments).map {
             min(max(Double((rect.maxY - $0) / rect.height) * upperBound, 0), upperBound)
@@ -625,7 +554,7 @@ struct LuminousActivityChart: View {
 
     @ViewBuilder
     private func inspection(
-        selected: ChartInspectionSelection, generated: [[CGPoint]], device: [[CGPoint]],
+        selected: ChartInspectionSelection, generated: [PlotSegment], device: [PlotSegment],
         layout: PlotLayout, geometry: GeometryProxy
     ) -> some View {
         if let pointer = hoverLocation {
@@ -658,7 +587,7 @@ struct LuminousActivityChart: View {
     }
 
     private func inspectionContent(
-        selected: ChartInspectionSelection, generated: [[CGPoint]], device: [[CGPoint]],
+        selected: ChartInspectionSelection, generated: [PlotSegment], device: [PlotSegment],
         layout: PlotLayout
     ) -> ChartInspectionContent {
         let timestamp = selected.timestamp

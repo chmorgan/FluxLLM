@@ -47,7 +47,15 @@ public final class MetricsStore {
         _ = historyBufferRevision
         return gpuSamples.elements
     }
-    public var historyRange: HistoryRange = .automatic
+    public var historyRange: HistoryRange = .automatic {
+        didSet {
+            guard historyRange != oldValue, presentationDemandIsManaged,
+                presentationConsumers.contains(.dashboard),
+                presentationViewports[.dashboard, default: .historyRange] == .historyRange
+            else { return }
+            refreshChartPresentation()
+        }
+    }
     public var usageScope: UsageScope = .sinceLaunch
     public private(set) var historySource = BackendKind.ollama.rawValue
     private var usageRevision: UInt64 = 0
@@ -104,11 +112,7 @@ public final class MetricsStore {
 
     public var backendActivity: BackendActivity {
         if backendKind == nil || backendKind == .ollama {
-            if let startedAt = activityRequestStartedAt {
-                return .observedRequests(
-                    count: openProxyRequests.count, startedAt: startedAt,
-                    hasOutput: openProxyRequests.values.contains { $0.hasOutput })
-            }
+            if let observedProxyActivity { return observedProxyActivity }
             return connectionState == .ready ? .idle : .unknown
         }
         return nativeActivity
@@ -118,7 +122,10 @@ public final class MetricsStore {
 
     /// Only proxy lifecycles supply a real start time; native counts never do.
     public var activityRequestStartedAt: Date? {
-        openProxyRequests.values.map(\.startedAt).min()
+        guard case .observedRequests(_, let startedAt, _) = observedProxyActivity else {
+            return nil
+        }
+        return startedAt
     }
 
     public var historyAge: TimeInterval {
@@ -180,6 +187,8 @@ public final class MetricsStore {
         capacity: MetricsStore.maxHistorySamples)
     @ObservationIgnored private var presentationConsumers: Set<ChartPresentationConsumer> = []
     @ObservationIgnored private var presentationDemandIsManaged = false
+    @ObservationIgnored private var presentationViewports:
+        [ChartPresentationConsumer: ChartPresentationViewport] = [:]
 
     @ObservationIgnored private var samplingTask: Task<Void, Never>?
     @ObservationIgnored private var lastBackendSampleAt: Date?
@@ -210,6 +219,9 @@ public final class MetricsStore {
         var model: String?
     }
     private var openProxyRequests: [UUID: ObservedProxyRequest] = [:]
+    // Activity consumers need lifecycle changes, not every token/rate mutation
+    // of the request dictionary. Keep an equality-checked observable projection.
+    private var observedProxyActivity: BackendActivity?
     /// Terminal lanes that finished within the chart window, newest first, kept
     /// so a request's lane stays visible as it scrolls off the time axis.
     @ObservationIgnored private var retiredRequestLanes: [RequestLane] = []
@@ -225,6 +237,7 @@ public final class MetricsStore {
     private var gpuHistorySource: String?
     @ObservationIgnored private var historyStartedAt: Date?
     @ObservationIgnored private var retainedToolEventIDs: Set<UUID> = []
+    @ObservationIgnored private var retainedToolRequestCounts: [UUID: Int] = [:]
     @ObservationIgnored private var toolHistoryTruncatedThrough: Date?
 
     public init(
@@ -256,20 +269,40 @@ public final class MetricsStore {
     ) {
         let wasActive = !presentationDemandIsManaged || !presentationConsumers.isEmpty
         presentationDemandIsManaged = true
+        let previousConsumers = presentationConsumers
         if enabled {
             presentationConsumers.insert(consumer)
         } else {
             presentationConsumers.remove(consumer)
         }
         let isActive = !presentationConsumers.isEmpty
-        if isActive && !wasActive {
-            lastChartPublicationAt = nil
-            publishChartPresentationIfDue(at: sampleDate)
+        if isActive && (!wasActive || previousConsumers != presentationConsumers) {
+            refreshChartPresentation()
         } else if !isActive && wasActive {
             // Release snapshots held only for a closed surface; raw history is
             // retained independently and will rebuild immediately on reopening.
             chartPresentation = ChartPresentationSnapshot(timestamp: sampleDate)
         }
+    }
+
+    /// Navigation can update while hidden. The next native activation publishes
+    /// this interval immediately, before a dashboard host evaluates its body.
+    public func setChartPresentationViewport(
+        _ viewport: ChartPresentationViewport, consumer: ChartPresentationConsumer
+    ) {
+        let previous =
+            presentationViewports[consumer]
+            ?? (consumer == .popover ? .live(duration: 60) : .historyRange)
+        guard previous != viewport else { return }
+        presentationViewports[consumer] = viewport
+        if presentationDemandIsManaged && presentationConsumers.contains(consumer) {
+            refreshChartPresentation()
+        }
+    }
+
+    private func refreshChartPresentation() {
+        lastChartPublicationAt = nil
+        publishChartPresentationIfDue(at: sampleDate)
     }
 
     public func usageSummary(in interval: DateInterval) -> UsageSummary {
@@ -294,6 +327,7 @@ public final class MetricsStore {
         guard epoch == nil || epoch == monitoringEpoch,
             backendKind == nil || backendKind == .ollama
         else { return }
+        defer { refreshObservedProxyActivity() }
         if diagnosticLogger.isEnabled {
             switch event {
             case .began(let request):
@@ -370,6 +404,7 @@ public final class MetricsStore {
                     needsSort = true
                 }
                 toolActivityEvents.append(event.withRequestID(owningRequestID))
+                retainedToolRequestCounts[owningRequestID, default: 0] += 1
             }
             if needsSort { toolActivityEvents.sort { $0.timestamp < $1.timestamp } }
             trimToolActivity(at: sampleDate)
@@ -467,6 +502,7 @@ public final class MetricsStore {
         usageRevision &+= 1
         historySource = sourceID ?? kind?.rawValue ?? "unconfigured"
         monitoringEpoch = epoch
+        presentationViewports.removeAll(keepingCapacity: true)
         backendKind = kind
         connectionState = kind == nil ? .detecting : .connecting
         healthConnectionState = connectionState
@@ -474,6 +510,7 @@ public final class MetricsStore {
         connectionMessage = nil
         activeGeneration = nil
         openProxyRequests.removeAll(keepingCapacity: true)
+        if observedProxyActivity != nil { observedProxyActivity = nil }
         retiredRequestLanes.removeAll(keepingCapacity: true)
         seenProxyRequestIDs.removeAll(keepingCapacity: true)
         retiredProxyRequestIDs.removeAll(keepingCapacity: true)
@@ -514,6 +551,7 @@ public final class MetricsStore {
         toolActivityEvents.removeAll(keepingCapacity: true)
         toolObservationSamples.removeAll(keepingCapacity: true)
         retainedToolEventIDs.removeAll(keepingCapacity: true)
+        retainedToolRequestCounts.removeAll(keepingCapacity: true)
         toolHistoryTruncatedThrough = nil
         sampleDate = clock()
         historyStartedAt = chartArchive.availableSince(source: historySource, now: sampleDate)
@@ -578,7 +616,8 @@ public final class MetricsStore {
                     supportsToolActivity: chartPresentation.supportsToolActivity,
                     archive: chartPresentation.archive,
                     historicalRequestLanes: chartPresentation.historicalRequestLanes,
-                    historicalToolActivity: chartPresentation.historicalToolActivity)
+                    historicalToolActivity: chartPresentation.historicalToolActivity,
+                    toolActivityRequestIDs: chartPresentation.toolActivityRequestIDs)
             }
         }
         let validScope: Bool
@@ -945,17 +984,98 @@ public final class MetricsStore {
                 throughputSamples.first?.timestamp, gpuSamples.first?.timestamp,
                 toolObservationSamples.first?.timestamp,
             ].compactMap { $0 }.min() ?? date
-        let archived = chartArchive.history(source: historySource, before: firstRaw, now: date)
-        let historyInterval = DateInterval(start: date.addingTimeInterval(-86_400), end: date)
-        let savedLanes = usageHistory.requestLanes(source: historySource, interval: historyInterval)
-        let savedTools = usageHistory.toolEvents(source: historySource, interval: historyInterval)
+        let selection: ChartPresentationSelection?
+        if presentationDemandIsManaged {
+            let age = historyStartedAt.map { max(0, date.timeIntervalSince($0)) } ?? 0
+            selection = ChartPresentationSelection(
+                windows: presentationConsumers.map { consumer in
+                    let viewport =
+                        presentationViewports[consumer]
+                        ?? (consumer == .popover ? .live(duration: 60) : .historyRange)
+                    return viewport.interval(at: date, range: historyRange, historyAge: age)
+                })
+        } else {
+            selection = nil
+        }
+        let needsArchive =
+            selection?.needsArchive(rawStarts: [
+                throughputSamples.first?.timestamp, gpuSamples.first?.timestamp,
+                toolObservationSamples.first?.timestamp,
+            ]) ?? true
+        let archived =
+            needsArchive
+            ? chartArchive.history(source: historySource, before: firstRaw, now: date) : .empty
+        let sampleIntervals = selection?.sampleIntervals(archive: archived)
+        let historyIntervals =
+            selection.map { ChartPresentationSelection.merged($0.windows) }
+            ?? [DateInterval(start: date.addingTimeInterval(-86_400), end: date)]
+        // Whole bins may begin before the retained presentation day. Match
+        // the established full-snapshot event horizon even for a day-wide bin.
+        let historyStart = date.addingTimeInterval(-86_400)
+        let toolIntervals = (sampleIntervals ?? historyIntervals).map {
+            DateInterval(start: max(historyStart, $0.start), end: $0.end)
+        }
+        var savedLanes: [UUID: RequestLane] = [:]
+        for interval in historyIntervals {
+            for lane in usageHistory.requestLanes(
+                source: historySource, interval: interval, inclusiveEnd: selection != nil
+            ) { savedLanes[lane.id] = lane }
+        }
+        var savedTools: [UUID: ToolActivityEvent] = [:]
+        for interval in toolIntervals {
+            for event in usageHistory.toolEvents(
+                source: historySource, interval: interval,
+                inclusiveEnd: selection != nil && interval.end < date
+            ) { savedTools[event.id] = event }
+        }
+        let visibleTools = sampleIntervals.map { currentToolEvents(in: $0) } ?? toolActivityEvents
+        let knownToolRequests = selection.map { _ in
+            usageHistory.requestIDsWithToolEvents(
+                source: historySource,
+                interval: DateInterval(start: date.addingTimeInterval(-86_400), end: date)
+            )
+            .union(retainedToolRequestCounts.keys)
+        }
         chartPresentation = ChartPresentationSnapshot(
-            timestamp: date, throughput: tpsHistory, systemGPU: systemGPUHistory,
-            toolActivity: toolActivityEvents, requestLanes: requestLanes,
-            toolObservation: toolObservationHistory, supportsToolActivity: supportsToolActivity,
-            archive: archived, historicalRequestLanes: savedLanes,
-            historicalToolActivity: savedTools)
+            timestamp: date,
+            throughput: sampleIntervals.map { throughputSamples.elements(in: $0) } ?? tpsHistory,
+            systemGPU: gpuHistoryScope == .system
+                ? (sampleIntervals.map { gpuSamples.elements(in: $0) } ?? gpuHistory) : [],
+            toolActivity: visibleTools, requestLanes: requestLanes,
+            toolObservation: sampleIntervals.map { toolObservationSamples.elements(in: $0) }
+                ?? toolObservationHistory,
+            supportsToolActivity: supportsToolActivity, archive: archived,
+            historicalRequestLanes: savedLanes.values.sorted {
+                $0.startedAt == $1.startedAt
+                    ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
+            },
+            historicalToolActivity: savedTools.values.sorted {
+                $0.timestamp == $1.timestamp
+                    ? $0.id.uuidString < $1.id.uuidString : $0.timestamp < $1.timestamp
+            },
+            toolActivityRequestIDs: knownToolRequests)
         lastChartPublicationAt = date
+    }
+
+    private func currentToolEvents(in intervals: [DateInterval]) -> [ToolActivityEvent] {
+        var result: [ToolActivityEvent] = []
+        for interval in intervals {
+            var low = 0
+            var high = toolActivityEvents.count
+            while low < high {
+                let middle = (low + high) / 2
+                if toolActivityEvents[middle].timestamp < interval.start {
+                    low = middle + 1
+                } else {
+                    high = middle
+                }
+            }
+            for event in toolActivityEvents[low...] {
+                if event.timestamp > interval.end { break }
+                result.append(event)
+            }
+        }
+        return result
     }
 
     private var supportsToolActivity: Bool {
@@ -983,12 +1103,32 @@ public final class MetricsStore {
     private func removeToolEvents(while expired: (ToolActivityEvent) -> Bool) {
         let end = toolActivityEvents.firstIndex { !expired($0) } ?? toolActivityEvents.count
         guard end > 0 else { return }
-        for event in toolActivityEvents[..<end] { retainedToolEventIDs.remove(event.id) }
+        for event in toolActivityEvents[..<end] {
+            retainedToolEventIDs.remove(event.id)
+            if let requestID = event.requestID {
+                retainedToolRequestCounts[requestID, default: 0] -= 1
+                if retainedToolRequestCounts[requestID] == 0 {
+                    retainedToolRequestCounts.removeValue(forKey: requestID)
+                }
+            }
+        }
         toolActivityEvents.removeFirst(end)
     }
 
     private func ownsRunningGeneration(_ requestID: UUID) -> Bool {
         activeGeneration?.id == requestID && activeGeneration?.state == .running
+    }
+
+    private func refreshObservedProxyActivity() {
+        let activity: BackendActivity?
+        if let startedAt = openProxyRequests.values.lazy.map(\.startedAt).min() {
+            activity = .observedRequests(
+                count: openProxyRequests.count, startedAt: startedAt,
+                hasOutput: openProxyRequests.values.contains { $0.hasOutput })
+        } else {
+            activity = nil
+        }
+        if activity != observedProxyActivity { observedProxyActivity = activity }
     }
 
     /// The displayed throughput is the sum of every open request's own live
@@ -1112,13 +1252,15 @@ public struct ChartPresentationSnapshot: Sendable, Equatable {
     public let archive: ArchivedChartHistory
     public let historicalRequestLanes: [RequestLane]
     public let historicalToolActivity: [ToolActivityEvent]
+    /// Known overlays survive a frozen window even if its first tool event is later.
+    public let toolActivityRequestIDs: Set<UUID>?
 
     public init(
         timestamp: Date, throughput: [TimeSeriesPoint] = [], systemGPU: [TimeSeriesPoint] = [],
         toolActivity: [ToolActivityEvent] = [], requestLanes: [RequestLane] = [],
         toolObservation: [TimeSeriesPoint] = [], supportsToolActivity: Bool = false,
         archive: ArchivedChartHistory = .empty, historicalRequestLanes: [RequestLane] = [],
-        historicalToolActivity: [ToolActivityEvent] = []
+        historicalToolActivity: [ToolActivityEvent] = [], toolActivityRequestIDs: Set<UUID>? = nil
     ) {
         self.timestamp = timestamp
         self.throughput = throughput
@@ -1130,6 +1272,7 @@ public struct ChartPresentationSnapshot: Sendable, Equatable {
         self.archive = archive
         self.historicalRequestLanes = historicalRequestLanes
         self.historicalToolActivity = historicalToolActivity
+        self.toolActivityRequestIDs = toolActivityRequestIDs
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -1141,6 +1284,7 @@ public struct ChartPresentationSnapshot: Sendable, Equatable {
             && lhs.archive == rhs.archive
             && lhs.historicalRequestLanes == rhs.historicalRequestLanes
             && lhs.historicalToolActivity == rhs.historicalToolActivity
+            && lhs.toolActivityRequestIDs == rhs.toolActivityRequestIDs
     }
 }
 
@@ -1184,6 +1328,43 @@ private struct SampleHistory {
         let firstCount = min(count, capacity - head)
         if firstCount == count { return Array(storage[head..<(head + count)]) }
         return Array(storage[head..<(head + firstCount)]) + storage[..<(count - firstCount)]
+    }
+
+    /// Retain the real source boundary plus each whole-bin range and its
+    /// immediate predecessor. Logical ring indices avoid copying the full hour.
+    func elements(in intervals: [DateInterval]) -> [TimeSeriesPoint] {
+        guard count > 0 else { return [] }
+        func lowerBound(_ date: Date, inclusive: Bool) -> Int {
+            var low = 0
+            var high = count
+            while low < high {
+                let middle = (low + high) / 2
+                let timestamp = storage[(head + middle) % capacity].timestamp
+                if timestamp < date || (inclusive && timestamp == date) {
+                    low = middle + 1
+                } else {
+                    high = middle
+                }
+            }
+            return low
+        }
+        var ranges: [Range<Int>] = [0..<1]
+        for interval in intervals {
+            let start = max(0, lowerBound(interval.start, inclusive: false) - 1)
+            let end = lowerBound(interval.end, inclusive: true)
+            if start < end { ranges.append(start..<end) }
+        }
+        var result: [TimeSeriesPoint] = []
+        var copiedThrough = 0
+        for range in ranges.sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            let start = max(copiedThrough, range.lowerBound)
+            guard start < range.upperBound else { continue }
+            for offset in start..<range.upperBound {
+                result.append(storage[(head + offset) % capacity])
+            }
+            copiedThrough = range.upperBound
+        }
+        return result
     }
 
     func peak(in interval: DateInterval) -> Double? {

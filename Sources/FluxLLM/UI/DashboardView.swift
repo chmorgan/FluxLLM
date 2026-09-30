@@ -50,17 +50,22 @@ struct DashboardView: View {
             }
         }
         .background(TelemetryPanelBackground())
+        .onAppear { updateChartViewport(for: currentNavigation) }
         .onChange(of: store.monitoringEpoch) { _, _ in
             presentation.synchronize(with: store)
+            updateChartViewport(for: currentNavigation)
+        }
+        .onChange(of: currentNavigation) { _, navigation in
+            updateChartViewport(for: navigation)
         }
     }
 
     private var compactContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            header()
+            DashboardScalarContent { header() }
             activityCard()
             if store.backendKind != nil {
-                compactDetails
+                DashboardScalarContent { compactDetails }
             }
             Divider()
             Button(action: actions.onOpenDashboardWindow) {
@@ -83,26 +88,28 @@ struct DashboardView: View {
 
     private func dashboardContent(narrow: Bool, density: DashboardHeightPolicy) -> some View {
         DashboardStackLayout(spacing: density.rowSpacing) {
-            header(narrow: narrow, density: density)
+            DashboardScalarContent { header(narrow: narrow, density: density) }
             historyControls(narrow: narrow)
             activityCard(narrow: narrow, density: density)
                 .layoutValue(key: DashboardFlexibleRow.self, value: true)
             if store.backendKind != nil {
                 VStack(alignment: .leading, spacing: density.value(8, 4)) {
                     Divider()
-                    dashboardDetails(narrow: narrow, density: density)
+                    DashboardScalarContent { dashboardDetails(narrow: narrow, density: density) }
                 }
             }
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "info.circle")
-                Text(GPUActivityPresentation.summary)
-                    .lineLimit(narrow ? nil : 1).minimumScaleFactor(0.9)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .font(.system(size: 11)).foregroundStyle(.secondary)
-            .help(gpuHelp)
-            .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
-                ["dashboard-footer": $0]
+            DashboardScalarContent {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "info.circle")
+                    Text(GPUActivityPresentation.summary)
+                        .lineLimit(narrow ? nil : 1).minimumScaleFactor(0.9)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .help(gpuHelp)
+                .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
+                    ["dashboard-footer": $0]
+                }
             }
         }
         .padding(.horizontal, DashboardSizingPolicy.horizontalInset)
@@ -237,23 +244,28 @@ struct DashboardView: View {
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: density.value(12, 8)))
             : AnyLayout(HStackLayout(alignment: .top, spacing: 16))
         return VStack(alignment: .leading, spacing: isCompact ? 10 : density.cardSpacing) {
-            metricLayout {
-                VStack(alignment: .leading, spacing: isCompact ? 6 : density.metricLabelSpacing) {
-                    sectionHeader("Generated", color: throughputColor)
-                    throughputValue(size: isCompact ? 32 : density.value(40, 28))
+            DashboardScalarContent {
+                metricLayout {
+                    VStack(alignment: .leading, spacing: isCompact ? 6 : density.metricLabelSpacing)
+                    {
+                        sectionHeader("Generated", color: throughputColor)
+                        throughputValue(size: isCompact ? 32 : density.value(40, 28))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: isCompact ? 6 : density.metricLabelSpacing)
+                    {
+                        sectionHeader("System GPU", color: gpuColor)
+                        gpuValue(
+                            size: isCompact ? 30 : density.value(38, 28),
+                            height: isCompact ? 40 : density.metricValueHeight)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(gpuHelp)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                VStack(alignment: .leading, spacing: isCompact ? 6 : density.metricLabelSpacing) {
-                    sectionHeader("System GPU", color: gpuColor)
-                    gpuValue(
-                        size: isCompact ? 30 : density.value(38, 28),
-                        height: isCompact ? 40 : density.metricValueHeight)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(gpuHelp)
+                .frame(
+                    height: narrow ? nil : (isCompact ? 60 : density.metricRowHeight),
+                    alignment: .top)
             }
-            .frame(
-                height: narrow ? nil : (isCompact ? 60 : density.metricRowHeight), alignment: .top)
             LuminousActivityChart(
                 throughput: prepared.throughput, gpu: prepared.gpu,
                 tools: prepared.toolActivity, now: chartInterval.end,
@@ -276,26 +288,29 @@ struct DashboardView: View {
                         var updated = currentNavigation
                         updated.fit(lane, now: store.chartPresentation.timestamp)
                         navigationBinding.wrappedValue = updated
-                    }
+                    },
+                publicationID: prepared.publicationID
             )
             .accessibilityIdentifier("activity-chart")
             .transformAnchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
                 $0["activity-chart"] = $1
             }
             .zIndex(1)
-            HStack(spacing: 8) {
-                Text(
-                    prepared.omittedRequestCount > 0
-                        ? "\(observationScope) · \(prepared.omittedRequestCount) older rails omitted"
-                        : observationScope
-                )
-                .help(throughputHelp)
-                Spacer(minLength: 0)
-                Text("GPU · This Mac").help(gpuHelp)
+            DashboardScalarContent {
+                HStack(spacing: 8) {
+                    Text(
+                        prepared.omittedRequestCount > 0
+                            ? "\(observationScope) · \(prepared.omittedRequestCount) older rails omitted"
+                            : observationScope
+                    )
+                    .help(throughputHelp)
+                    Spacer(minLength: 0)
+                    Text("GPU · This Mac").help(gpuHelp)
+                }
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(height: 12)
             }
-            .font(.system(size: 10)).foregroundStyle(.secondary)
-            .lineLimit(1)
-            .frame(height: 12)
         }
         .padding(.horizontal, isCompact ? 12 : 18)
         .padding(.vertical, isCompact ? 12 : density.cardPadding)
@@ -493,9 +508,24 @@ struct DashboardView: View {
             get: { currentNavigation },
             set: {
                 presentation.navigation = $0
-                store.historyRange = $0.preset
+                // Moving presets use the shared range. Custom/frozen views own
+                // their interval, so install that before changing the preset.
+                if $0.isLive && $0.preset != .custom {
+                    store.historyRange = $0.preset
+                    updateChartViewport(for: $0)
+                } else {
+                    updateChartViewport(for: $0)
+                    store.historyRange = $0.preset
+                }
             })
     }
+    private func updateChartViewport(for navigation: HistoryNavigation) {
+        let viewport: ChartPresentationViewport =
+            isCompact
+            ? .live(duration: 60) : navigation.presentationViewport
+        store.setChartPresentationViewport(viewport, consumer: isCompact ? .popover : .dashboard)
+    }
+
     private var usageScope: Binding<UsageScope> {
         Binding(get: { store.usageScope }, set: { store.usageScope = $0 })
     }
@@ -569,4 +599,14 @@ struct DashboardView: View {
         let queued = store.queuedRequests ?? 0
         return queued > 0 ? "\(running) active · \(queued) queued" : running.formatted()
     }
+}
+
+/// Observation reads in this closure belong to the child body. High-rate token,
+/// activity and GPU scalar changes therefore leave the chart parent untouched.
+private struct DashboardScalarContent<Content: View>: View {
+    private let content: () -> Content
+
+    init(@ViewBuilder content: @escaping () -> Content) { self.content = content }
+
+    var body: some View { content() }
 }
