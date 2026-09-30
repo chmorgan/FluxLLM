@@ -51,6 +51,11 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         super.init()
         wireActions()
 
+        // Give AppKit a usable first-open size without constructing charts to
+        // measure them. The visible host supplies its actual preferred size,
+        // which is remembered for later presentations.
+        popoverPresentation.placeholderSize = NSSize(width: DashboardView.compactWidth, height: 480)
+
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
@@ -142,10 +147,13 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         }
     }
 
-    private func preparePopoverContent() {
+    @discardableResult
+    func preparePopoverContent() -> NSViewController {
         isPopoverClosing = false
-        setPopoverPresentationActive(true)
-        guard popover.contentViewController == nil else { return }
+        // A show attempt can fail or remain occluded. Only the native window
+        // visibility observer may activate chart demand and the rendering tree.
+        setPopoverPresentationActive(false)
+        if let existing = popover.contentViewController { return existing }
         Self.performanceUICheckpoint?("popover.swiftui_create.begin")
         let hosting = NSHostingController(
             rootView: DashboardPopoverContent(
@@ -158,6 +166,7 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         hosting.sizingOptions = [.preferredContentSize]
         popover.contentViewController = hosting
         Self.performanceUICheckpoint?("popover.host_attach.end")
+        return hosting
     }
 
     public func popoverDidShow(_ notification: Notification) {
@@ -182,7 +191,9 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     }
 
     private func setPopoverPresentationActive(_ active: Bool) {
-        if !active, let size = popover.contentViewController?.view.bounds.size {
+        if !active, let size = popover.contentViewController?.view.bounds.size,
+            size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 1
+        {
             popoverPresentation.placeholderSize = size
         }
         metricsStore.setChartPresentationDemand(active, consumer: .popover)

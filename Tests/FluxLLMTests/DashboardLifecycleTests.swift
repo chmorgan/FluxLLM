@@ -6,6 +6,62 @@ import XCTest
 
 @MainActor
 final class DashboardLifecycleTests: XCTestCase {
+    func testPopoverPreparationKeepsChartWorkInactiveUntilNativeVisibility() throws {
+        _ = NSApplication.shared
+        drainNativeUpdates()
+        let origin = Date(timeIntervalSince1970: 2_000_000_000)
+        let store = MetricsStore(clock: { origin })
+        let suite = "FluxLLM.popover-lifecycle-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        let coordinator = MonitoringCoordinator(settings: settings, store: store)
+        let controller = MenuBarController(
+            metricsStore: store, coordinator: coordinator, settings: settings)
+        defer { controller.stop() }
+        store.setChartPresentationDemand(false, consumer: .popover)
+        let unpublished = store.chartPresentation.publicationID
+        let counters = PerformancePresentationCounters.shared
+        counters.enable()
+
+        let host = controller.preparePopoverContent()
+        host.view.layoutSubtreeIfNeeded()
+        drainNativeUpdates()
+        let initialSize = host.view.fittingSize
+        XCTAssertEqual(initialSize.width, DashboardView.compactWidth, accuracy: 0.5)
+        XCTAssertEqual(initialSize.height, 480, accuracy: 0.5)
+        XCTAssertFalse(
+            host.view.window?.isVisible ?? false,
+            "Preparing content must not show a native window")
+
+        for second in 1...3 {
+            store.sample(at: origin.addingTimeInterval(Double(second)))
+            host.view.layoutSubtreeIfNeeded()
+            drainNativeUpdates()
+        }
+        XCTAssertFalse(store.tpsHistory.isEmpty, "Collection continues before a window is visible")
+        XCTAssertEqual(store.chartPresentation.publicationID, unpublished)
+        XCTAssertTrue(store.chartPresentation.throughput.isEmpty)
+        XCTAssertEqual(counters.snapshot()["chart_preparations"], 0)
+        XCTAssertEqual(counters.snapshot()["canvas_draws"], 0)
+        XCTAssertFalse(controller.performanceVisibility.popover)
+
+        // The native close callbacks remember a measured size without building
+        // the chart merely to size the next attempted presentation.
+        let remembered = NSSize(width: DashboardView.compactWidth, height: 390)
+        host.view.setFrameSize(remembered)
+        controller.popoverWillClose(Notification(name: NSPopover.willCloseNotification))
+        controller.popoverDidClose(Notification(name: NSPopover.didCloseNotification))
+        let reopened = controller.preparePopoverContent()
+        XCTAssertFalse(reopened === host)
+        reopened.view.layoutSubtreeIfNeeded()
+        drainNativeUpdates()
+        XCTAssertEqual(reopened.view.fittingSize.width, remembered.width, accuracy: 0.5)
+        XCTAssertEqual(reopened.view.fittingSize.height, remembered.height, accuracy: 0.5)
+        XCTAssertEqual(store.chartPresentation.publicationID, unpublished)
+        XCTAssertEqual(counters.snapshot()["chart_preparations"], 0)
+    }
+
     func testNativeVisibilityReleasesHostsAndRestoresTheLatestSnapshot() throws {
         _ = NSApplication.shared
         let store = MetricsStore()
