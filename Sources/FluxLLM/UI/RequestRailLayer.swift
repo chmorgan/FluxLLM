@@ -24,7 +24,7 @@ struct RequestRailLayer: View {
             duration: duration, rect: rect)
 
         ZStack {
-            Canvas { context, _ in
+            ChartCanvas { context, _ in
                 PerformancePresentationCounters.shared.record(.canvasDraws)
                 drawBars(segments, overflow: overflow, in: &context)
             }
@@ -139,7 +139,7 @@ private struct RequestRailDecorations: View {
         }
 
         TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { clock in
-            Canvas { context, _ in
+            ChartCanvas { context, _ in
                 PerformancePresentationCounters.shared.record(.canvasDraws)
                 // A paused timeline can retain its previous date. Clear its last
                 // frame explicitly when the visible effect interval has ended.

@@ -6,6 +6,36 @@ import XCTest
 
 @MainActor
 final class DashboardLifecycleTests: XCTestCase {
+    func testExplicitPresentationAttachesContentBeforeOrderingTheWindow() {
+        _ = NSApplication.shared
+        let window = LifecycleDashboardWindow(
+            contentRect: NSRect(origin: .zero, size: DashboardView.preferredWindowSize),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.setActivationPolicy = { _ in }
+        defer { window.close() }
+        var sequence: [String] = []
+        window.configurePresentation(
+            makeContent: {
+                sequence.append("create")
+                let controller = NSViewController()
+                controller.view = NSView()
+                return controller
+            }, visibilityChanged: { sequence.append($0 ? "activate" : "deactivate") })
+        window.onOrderFront = {
+            XCTAssertTrue(window.isPresentationContentActive)
+            sequence.append("show")
+        }
+        XCTAssertTrue(sequence.isEmpty, "An unopened window must not create chart content")
+        window.present()
+        XCTAssertEqual(sequence, ["activate", "create", "show"])
+        window.synchronizePresentationVisibility()
+        XCTAssertFalse(
+            window.isPresentationContentActive, "Failed visibility releases the prepared host")
+        XCTAssertEqual(sequence.last, "deactivate")
+        window.onOrderFront = nil
+    }
+
     func testPopoverPreparationKeepsChartWorkInactiveUntilNativeVisibility() throws {
         _ = NSApplication.shared
         drainNativeUpdates()
@@ -226,8 +256,9 @@ final class DashboardLifecycleTests: XCTestCase {
 @MainActor
 private final class LifecycleDashboardWindow: DashboardWindow {
     var simulatedVisible = false
+    var onOrderFront: (() -> Void)?
     override var presentationIsVisible: Bool { isDashboardOpen && simulatedVisible }
-    override func makeKeyAndOrderFront(_ sender: Any?) {}
+    override func makeKeyAndOrderFront(_ sender: Any?) { onOrderFront?() }
     override func close() {
         // This mock never orders a native window in, so AppKit does not reset
         // its internal closed state on present(). Deliver the matching close

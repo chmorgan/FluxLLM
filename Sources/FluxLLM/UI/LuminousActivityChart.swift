@@ -205,7 +205,7 @@ struct LuminousActivityChart: View {
                     lanes: lanes, assignments: requestRails.assignments)
             }
             ZStack(alignment: .topLeading) {
-                Canvas { context, _ in
+                ChartCanvas { context, _ in
                     PerformancePresentationCounters.shared.record(.canvasDraws)
                     drawGrid(in: &context, layout: layout)
                     drawSeries(
@@ -243,7 +243,7 @@ struct LuminousActivityChart: View {
                     .accessibilityHidden(true)
                 }
                 if let selected {
-                    Canvas { context, _ in
+                    ChartCanvas { context, _ in
                         PerformancePresentationCounters.shared.record(.canvasDraws)
                         drawCursor(
                             selected.timestamp, generated: generated, device: device,

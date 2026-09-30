@@ -19,6 +19,11 @@ class DashboardWindow: NSWindow, NSWindowDelegate {
             isDashboardOpen = true
             setActivationPolicy(.regular)
         }
+        // An explicit show owns this work. Attach the host before AppKit presents
+        // the window: installing it into an already visible empty window selects
+        // a much larger first-use renderer. The queued visibility check still
+        // releases the host if presentation does not make the window visible.
+        setPresentationContentActive(true)
         if isMiniaturized { deminiaturize(nil) }
         makeKeyAndOrderFront(nil)
         schedulePresentationUpdate()
