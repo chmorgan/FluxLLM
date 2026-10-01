@@ -185,3 +185,50 @@ final class LuminousChartGeometryCache {
         }
     }
 }
+
+/// Native surface bounds, distinct from the full-chart coordinate system used
+/// by cached paths. Clipping alone would leave an unnecessarily large backing.
+enum ChartSurfaceBounds {
+    // The furthest spark endpoint is <40.09pt from its origin, including its
+    // round stroke cap. Other burst families, glints and lightning fit inside.
+    static let decorationMargin: CGFloat = 41
+    static let cursorMargin: CGFloat = 7  // 6pt endpoint halo plus antialiasing.
+
+    static func decorations(rail: CGRect, plotSize: CGSize) -> CGRect {
+        guard valid(rail), let plot = plotRect(plotSize) else { return .zero }
+        return clipped(rail.insetBy(dx: -decorationMargin, dy: -decorationMargin), to: plot)
+    }
+
+    static func cursor(x: CGFloat, plotSize: CGSize) -> CGRect {
+        guard x.isFinite, let plot = plotRect(plotSize) else { return .zero }
+        return clipped(
+            CGRect(x: x - cursorMargin, y: 0, width: cursorMargin * 2, height: plot.height),
+            to: plot)
+    }
+
+    private static func plotRect(_ size: CGSize) -> CGRect? {
+        guard size.width.isFinite, size.height.isFinite,
+            size.width > 0, size.height > 0
+        else { return nil }
+        return CGRect(origin: .zero, size: size)
+    }
+
+    private static func valid(_ rect: CGRect) -> Bool {
+        // CGRect's width/height accessors standardize negative raw sizes.
+        // Invalid layout proposals must not become small drawable slivers.
+        rect.origin.x.isFinite && rect.origin.y.isFinite && rect.size.width.isFinite
+            && rect.size.height.isFinite && rect.size.width > 0 && rect.size.height > 0
+    }
+
+    private static func clipped(_ rect: CGRect, to plot: CGRect) -> CGRect {
+        let result = rect.intersection(plot)
+        guard !result.isNull, !result.isEmpty else { return .zero }
+        // Integer-point origins keep the original pixel phase at both supported
+        // 1x and 2x backing scales, including fractional chart layout sizes.
+        let aligned = CGRect(
+            x: floor(result.minX), y: floor(result.minY),
+            width: ceil(result.maxX) - floor(result.minX),
+            height: ceil(result.maxY) - floor(result.minY))
+        return aligned.intersection(plot)
+    }
+}

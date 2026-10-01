@@ -242,6 +242,234 @@ final class ChartCanvasTests: XCTestCase {
         XCTAssertNil(renderedData, "Removing a surface must release its renderer and chart payload")
     }
 
+    func testStableRevisionSkipsUpdatesAndChangedRevisionReplacesPixels() throws {
+        let size = CGSize(width: 20, height: 12)
+        let environment = EnvironmentValues()
+        let view = DisplayTrackingView(frame: CGRect(origin: .zero, size: size))
+        let red: ChartCanvas.Drawing = { context, size in
+            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.red))
+        }
+        view.update(drawing: red, environment: environment, revision: AnyHashable(1))
+        let first = try bitmap(size: size)
+        draw(view, into: first)
+        view.displayRequests = 0
+
+        for _ in 0..<20 {
+            view.update(drawing: red, environment: environment, revision: AnyHashable(1))
+        }
+        XCTAssertEqual(
+            view.displayRequests, 0, "Equivalent parent updates must not redraw the chart")
+
+        view.update(
+            drawing: { context, size in
+                context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.blue))
+            }, environment: environment, revision: AnyHashable(2))
+        XCTAssertGreaterThan(view.displayRequests, 0)
+        let next = try bitmap(size: size)
+        draw(view, into: next)
+        XCTAssertNotEqual(
+            bytes(first), bytes(next), "A new publication must replace retained pixels")
+    }
+
+    func testUnversionedDrawingAlwaysAcceptsReplacement() {
+        let size = CGSize(width: 20, height: 12)
+        let view = DisplayTrackingView(frame: CGRect(origin: .zero, size: size))
+        let environment = EnvironmentValues()
+        let revisions: [AnyHashable?] = [AnyHashable(1), nil, nil]
+        for revision in revisions {
+            view.displayRequests = 0
+            view.update(drawing: { _, _ in }, environment: environment, revision: revision)
+            XCTAssertGreaterThan(
+                view.displayRequests, 0, "A nil revision cannot promise identical pixels")
+        }
+    }
+
+    func testDrawingEnvironmentChangesInvalidateAnUnchangedRevision() {
+        var baseline = EnvironmentValues()
+        baseline.colorScheme = .light
+        baseline.displayScale = 1
+        baseline.layoutDirection = .leftToRight
+        baseline.locale = Locale(identifier: "en_US")
+        baseline.timeZone = TimeZone(secondsFromGMT: 0)!
+        baseline.calendar = Calendar(identifier: .gregorian)
+        baseline.dynamicTypeSize = .medium
+        baseline.font = .system(size: 12)
+        baseline.legibilityWeight = .regular
+        let changes: [(String, (inout EnvironmentValues) -> Void)] = [
+            ("color scheme", { $0.colorScheme = .dark }),
+            ("display scale", { $0.displayScale = 2 }),
+            ("layout direction", { $0.layoutDirection = .rightToLeft }),
+            ("locale", { $0.locale = Locale(identifier: "fr_FR") }),
+            ("time zone", { $0.timeZone = TimeZone(secondsFromGMT: 7_200)! }),
+            ("calendar", { $0.calendar = Calendar(identifier: .buddhist) }),
+            ("dynamic type", { $0.dynamicTypeSize = .accessibility1 }),
+            ("font", { $0.font = .system(size: 18, weight: .bold) }),
+            ("legibility", { $0.legibilityWeight = .bold }),
+        ]
+        for (name, change) in changes {
+            let view = DisplayTrackingView(frame: CGRect(x: 0, y: 0, width: 20, height: 12))
+            view.update(drawing: { _, _ in }, environment: baseline, revision: AnyHashable(1))
+            var changed = baseline
+            change(&changed)
+            view.displayRequests = 0
+            view.update(drawing: { _, _ in }, environment: changed, revision: AnyHashable(1))
+            XCTAssertGreaterThan(view.displayRequests, 0, "Changed \(name) must invalidate drawing")
+            view.displayRequests = 0
+            view.update(drawing: { _, _ in }, environment: changed, revision: AnyHashable(1))
+            XCTAssertEqual(
+                view.displayRequests, 0, "The new \(name) must become the retained environment")
+        }
+    }
+
+    func testEnvironmentChangeWithStableRevisionReachesRenderedPixels() throws {
+        let size = CGSize(width: 20, height: 12)
+        let view = DisplayTrackingView(frame: CGRect(origin: .zero, size: size))
+        var environment = EnvironmentValues()
+        environment.colorScheme = .light
+        let drawing: ChartCanvas.Drawing = { context, size in
+            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.primary))
+        }
+        view.update(drawing: drawing, environment: environment, revision: AnyHashable(1))
+        let light = try bitmap(size: size)
+        draw(view, into: light)
+        environment.colorScheme = .dark
+        view.update(drawing: drawing, environment: environment, revision: AnyHashable(1))
+        let dark = try bitmap(size: size)
+        draw(view, into: dark)
+        XCTAssertGreaterThan(rgbSum(dark), rgbSum(light) + 10_000)
+    }
+
+    func testRevisionReuseRetainsOnlyAcceptedImmutableChartData() {
+        final class ChartData {}
+        let view = DisplayTrackingView(frame: CGRect(x: 0, y: 0, width: 20, height: 12))
+        let environment = EnvironmentValues()
+        weak var accepted: ChartData?
+        weak var skipped: ChartData?
+        weak var replacement: ChartData?
+        autoreleasepool {
+            let data = ChartData()
+            accepted = data
+            view.update(
+                drawing: { [data] _, _ in withExtendedLifetime(data) {} },
+                environment: environment, revision: AnyHashable(1))
+        }
+        autoreleasepool {
+            let data = ChartData()
+            skipped = data
+            view.update(
+                drawing: { [data] _, _ in withExtendedLifetime(data) {} },
+                environment: environment, revision: AnyHashable(1))
+        }
+        XCTAssertNotNil(accepted, "An unchanged revision retains its accepted immutable drawing")
+        XCTAssertNil(skipped, "Skipped parent updates must not retain additional chart payloads")
+        autoreleasepool {
+            let data = ChartData()
+            replacement = data
+            view.update(
+                drawing: { [data] _, _ in withExtendedLifetime(data) {} },
+                environment: environment, revision: AnyHashable(2))
+        }
+        XCTAssertNil(accepted, "A new revision replaces the previous prepared chart payload")
+        XCTAssertNotNil(replacement)
+        ChartCanvas.dismantleNSView(view, coordinator: ())
+        XCTAssertNil(replacement)
+        view.displayRequests = 0
+        view.update(drawing: { _, _ in }, environment: environment, revision: AnyHashable(2))
+        XCTAssertGreaterThan(
+            view.displayRequests, 0, "Dismantling must also clear revision reuse state")
+    }
+
+    func testChangedCropOriginInvalidatesTheSameRevision() throws {
+        let size = CGSize(width: 40, height: 24)
+        let view = DisplayTrackingView(frame: CGRect(origin: .zero, size: size))
+        let environment = EnvironmentValues()
+        let drawing: ChartCanvas.Drawing = { context, _ in
+            context.fill(Path(CGRect(x: 15, y: 12, width: 8, height: 6)), with: .color(.red))
+        }
+        view.update(
+            drawing: drawing, environment: environment, revision: AnyHashable(1),
+            drawingBounds: CGRect(origin: .zero, size: size))
+        let first = try bitmap(size: size)
+        draw(view, into: first)
+        view.displayRequests = 0
+        view.update(
+            drawing: drawing, environment: environment, revision: AnyHashable(1),
+            drawingBounds: CGRect(origin: CGPoint(x: 10, y: 5), size: size))
+        XCTAssertGreaterThan(view.displayRequests, 0, "Moving a same-sized crop changes its pixels")
+        let shifted = try bitmap(size: size)
+        draw(view, into: shifted)
+        XCTAssertNotEqual(bytes(first), bytes(shifted))
+    }
+
+    func testCroppedSurfacesRecomposeToTheFullChartAtBothDisplayScales() throws {
+        let size = CGSize(width: 220, height: 260)
+        let rail = CGRect(x: 60, y: 90, width: 100, height: 84)
+        let cursorX: CGFloat = 110
+        let decoration: ChartCanvas.Drawing = { context, _ in
+            context.fill(
+                Path(
+                    ellipseIn: CGRect(x: rail.minX - 30, y: rail.minY - 30, width: 60, height: 60)),
+                with: .radialGradient(
+                    Gradient(colors: [.white, .cyan.opacity(0)]),
+                    center: rail.origin, startRadius: 0, endRadius: 30))
+            var spark = Path()
+            spark.move(to: CGPoint(x: rail.maxX - 5, y: rail.maxY - 5))
+            spark.addLine(to: CGPoint(x: rail.maxX + 35, y: rail.maxY + 20))
+            context.stroke(
+                spark, with: .color(.orange),
+                style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+        }
+        let cursor: ChartCanvas.Drawing = { context, _ in
+            var line = Path()
+            line.move(to: CGPoint(x: cursorX, y: 5))
+            line.addLine(to: CGPoint(x: cursorX, y: size.height - 8))
+            context.stroke(line, with: .color(.white.opacity(0.55)), lineWidth: 0.8)
+            context.fill(
+                Path(ellipseIn: CGRect(x: cursorX - 6, y: 30, width: 12, height: 12)),
+                with: .color(.cyan.opacity(0.3)))
+        }
+        let layers: [(CGRect, ChartCanvas.Drawing)] = [
+            (ChartSurfaceBounds.decorations(rail: rail, plotSize: size), decoration),
+            (ChartSurfaceBounds.cursor(x: cursorX, plotSize: size), cursor),
+        ]
+        for scale in [CGFloat(1), 2] {
+            var environment = EnvironmentValues()
+            environment.displayScale = scale
+            environment.colorScheme = .dark
+            let full = try bitmap(size: size, scale: scale)
+            let recomposed = try bitmap(size: size, scale: scale)
+            for (crop, drawing) in layers {
+                let baseline = makeView(size: size, drawing: drawing, environment: environment)
+                draw(baseline, into: full)
+
+                let cropped = DisplayTrackingView(frame: CGRect(origin: .zero, size: crop.size))
+                var localSize: CGSize?
+                cropped.update(
+                    drawing: { context, proposed in
+                        localSize = proposed
+                        drawing(&context, proposed)
+                    }, environment: environment, revision: AnyHashable(1), drawingBounds: crop)
+                let pixels = try bitmap(size: crop.size, scale: scale)
+                draw(cropped, into: pixels)
+                XCTAssertEqual(localSize, crop.size)
+                let image = try XCTUnwrap(pixels.makeImage())
+                // The crop uses SwiftUI's top-left coordinates; CGContext's
+                // destination rectangle is measured from its bottom-left.
+                recomposed.draw(
+                    image,
+                    in: CGRect(
+                        x: crop.minX, y: size.height - crop.maxY,
+                        width: crop.width, height: crop.height))
+            }
+            let maximumDifference =
+                zip(bytes(full), bytes(recomposed))
+                .map { abs(Int($0) - Int($1)) }.max() ?? 0
+            XCTAssertLessThanOrEqual(
+                maximumDifference, 1, "Cropping must preserve pixels at \(scale)×")
+            XCTAssertGreaterThan(bytes(recomposed).filter { $0 > 0 }.count, 100)
+        }
+    }
+
     private func makeView(
         size: CGSize, drawing: @escaping ChartCanvas.Drawing,
         environment: EnvironmentValues = EnvironmentValues()

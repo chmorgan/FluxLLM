@@ -198,6 +198,21 @@ struct LuminousActivityChart: View {
             let layout = frame.layout
             let generated = frame.generated
             let device = frame.device
+            let railSegments =
+                compact
+                ? []
+                : RequestRailGeometry.layout(
+                    lanes: lanes, assignments: requestRails.assignments, now: now,
+                    duration: duration, rect: layout.lanes)
+            let railOverflow =
+                compact
+                ? []
+                : RequestRailGeometry.overflow(
+                    lanes: lanes, assignments: requestRails.assignments, now: now,
+                    duration: duration, rect: layout.lanes)
+            let staticRevision = StaticDrawingRevision(
+                frame: ObjectIdentifier(frame), lanes: lanes,
+                assignments: requestRails.assignments, colors: laneColorIndex)
             let selected = (dragSelection == nil ? hoverLocation : nil).flatMap {
                 ChartInspectionGeometry.selection(
                     at: $0, now: now, duration: duration, main: layout.main,
@@ -205,7 +220,7 @@ struct LuminousActivityChart: View {
                     lanes: lanes, assignments: requestRails.assignments)
             }
             ZStack(alignment: .topLeading) {
-                ChartCanvas { context, _ in
+                ChartCanvas(role: .staticChart, revision: staticRevision) { context, _ in
                     PerformancePresentationCounters.shared.record(.canvasDraws)
                     drawGrid(in: &context, layout: layout)
                     drawSeries(
@@ -230,25 +245,44 @@ struct LuminousActivityChart: View {
                                 at: CGPoint(x: layout.lanes.minX, y: layout.lanes.minY - 6),
                                 anchor: .leading)
                         }
+                        // Preserve the former bar layer's position in drawing
+                        // order, sharing the static chart's native backing.
+                        RequestRailBarDrawing(
+                            rect: layout.lanes, presentation: requestRails,
+                            colorScheme: colorScheme, contrast: contrast,
+                            reduceTransparency: reduceTransparency
+                        ).draw(railSegments, overflow: railOverflow, in: &context)
                     }
                 }
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
                 if !compact {
                     RequestRailLayer(
-                        lanes: lanes, presentation: requestRails, now: now,
-                        duration: duration, rect: layout.lanes, isLive: isLive
+                        lanes: lanes, segments: railSegments, presentation: requestRails, now: now,
+                        duration: duration, rect: layout.lanes, plotSize: geometry.size,
+                        isLive: isLive
                     )
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
                 }
                 if let selected {
-                    ChartCanvas { context, _ in
+                    let cursorX = project(
+                        selected.timestamp, value: 0, in: layout.main, upperBound: 1
+                    ).x
+                    let bounds = ChartSurfaceBounds.cursor(x: cursorX, plotSize: geometry.size)
+                    ChartCanvas(
+                        role: .cursor,
+                        revision: CursorDrawingRevision(
+                            frame: ObjectIdentifier(frame), timestamp: selected.timestamp),
+                        drawingBounds: bounds
+                    ) { context, _ in
                         PerformancePresentationCounters.shared.record(.canvasDraws)
                         drawCursor(
                             selected.timestamp, generated: generated, device: device,
                             in: &context, layout: layout)
                     }
+                    .frame(width: bounds.width, height: bounds.height)
+                    .offset(x: bounds.minX, y: bounds.minY)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
                 }
@@ -299,6 +333,23 @@ struct LuminousActivityChart: View {
                 dragSelection = nil
             }
         }
+    }
+
+    /// Frame identity covers immutable publication, viewport and scales. Small
+    /// rail values additionally cover callers changing assignment/color inputs
+    /// independently. Histories and point arrays are never scanned or hashed.
+    private struct StaticDrawingRevision: Hashable {
+        let frame: ObjectIdentifier
+        let lanes: [RequestLane]
+        let assignments: [UUID: RequestRailAssignment]
+        let colors: [UUID: Int]
+
+        func hash(into hasher: inout Hasher) { hasher.combine(frame) }
+    }
+
+    private struct CursorDrawingRevision: Hashable {
+        let frame: ObjectIdentifier
+        let timestamp: Date
     }
 
     private struct DragSelection {
@@ -414,11 +465,15 @@ struct LuminousActivityChart: View {
                             .init(color: color.opacity(0.01), location: 1),
                         ]), startPoint: CGPoint(x: 0, y: rect.minY),
                         endPoint: CGPoint(x: 0, y: rect.maxY)))
-                context.drawLayer { glow in
-                    glow.addFilter(.blur(radius: compact ? 2.5 : 3))
-                    glow.stroke(
-                        trace, with: .color(color.opacity(colorScheme == .dark ? 0.35 : 0.24)),
-                        style: StrokeStyle(lineWidth: 7, lineCap: .round, lineJoin: .round))
+                // Diagnostic-only ablation: preserve the area and primary
+                // stroke, omitting only the filtered series glow pass.
+                if PerformanceGraphicsDiagnostics.shared.mode != .noBlur {
+                    context.drawLayer { glow in
+                        glow.addFilter(.blur(radius: compact ? 2.5 : 3))
+                        glow.stroke(
+                            trace, with: .color(color.opacity(colorScheme == .dark ? 0.35 : 0.24)),
+                            style: StrokeStyle(lineWidth: 7, lineCap: .round, lineJoin: .round))
+                    }
                 }
             }
             context.stroke(

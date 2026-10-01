@@ -1,47 +1,42 @@
 import AppKit
 import SwiftUI
 
-/// Timestamp geometry and the bar canvas only depend on chart publications.
-/// Decoration state lives in a child so a glint never rebuilds the stable rail.
+/// Static bars share the main chart surface; animation owns only its local band.
 struct RequestRailLayer: View {
     let lanes: [RequestLane]
+    let segments: [RequestRailGeometry.Segment]
     let presentation: RequestRailPresentation
     let now: Date
     let duration: TimeInterval
     let rect: CGRect
+    let plotSize: CGSize
     let isLive: Bool
 
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.colorSchemeContrast) private var contrast
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-
     var body: some View {
-        let segments = RequestRailGeometry.layout(
-            lanes: lanes, assignments: presentation.assignments, now: now,
-            duration: duration, rect: rect)
-        let overflow = RequestRailGeometry.overflow(
-            lanes: lanes, assignments: presentation.assignments, now: now,
-            duration: duration, rect: rect)
-
-        ZStack {
-            ChartCanvas { context, _ in
-                PerformancePresentationCounters.shared.record(.canvasDraws)
-                drawBars(segments, overflow: overflow, in: &context)
-            }
-            RequestRailDecorations(
-                lanes: lanes, segments: segments, presentation: presentation, now: now,
-                duration: duration, rect: rect, isLive: isLive)
-        }
+        RequestRailDecorations(
+            lanes: lanes, segments: segments, presentation: presentation, now: now,
+            duration: duration, rect: rect, plotSize: plotSize, isLive: isLive
+        )
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
+}
+
+/// The drawing operations and order are identical to the former bar Canvas.
+/// Keeping this value outside the animation subtree avoids rebuilding bars for glints.
+struct RequestRailBarDrawing {
+    let rect: CGRect
+    let presentation: RequestRailPresentation
+    let colorScheme: ColorScheme
+    let contrast: ColorSchemeContrast
+    let reduceTransparency: Bool
 
     private func color(for lane: RequestLane) -> Color {
         RequestLanePalette.color(
             at: presentation.assignments[lane.id]?.colorIndex ?? 0, scheme: colorScheme)
     }
 
-    private func drawBars(
+    func draw(
         _ segments: [RequestRailGeometry.Segment],
         overflow: [RequestRailGeometry.OverflowSegment], in context: inout GraphicsContext
     ) {
@@ -113,6 +108,7 @@ private struct RequestRailDecorations: View {
     let now: Date
     let duration: TimeInterval
     let rect: CGRect
+    let plotSize: CGSize
     let isLive: Bool
 
     @Environment(\.colorScheme) private var colorScheme
@@ -138,16 +134,31 @@ private struct RequestRailDecorations: View {
             segment.isLive || prepared.contains { $0.key.requestID == segment.lane.id }
         }
 
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { clock in
-            ChartCanvas { context, _ in
-                PerformancePresentationCounters.shared.record(.canvasDraws)
-                // A paused timeline can retain its previous date. Clear its last
-                // frame explicitly when the visible effect interval has ended.
-                if effectsEnabled && animating {
-                    drawDecorations(decoratedSegments, at: clock.date, in: &context)
+        let bounds = ChartSurfaceBounds.decorations(rail: rect, plotSize: plotSize)
+        // Keep one native surface throughout an active request/effect episode,
+        // including gaps between glints, and release it when genuinely idle.
+        let needsSurface =
+            effectsEnabled
+            && (!eligibility.liveIDs.isEmpty || !eligibility.effectIDs.isEmpty
+                || !prepared.isEmpty || animating)
+        ZStack(alignment: .topLeading) {
+            Color.clear
+            if needsSurface && !bounds.isEmpty {
+                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { clock in
+                    ChartCanvas(role: .railDecorations, drawingBounds: bounds) { context, _ in
+                        PerformancePresentationCounters.shared.record(.canvasDraws)
+                        // A paused timeline can retain its previous date. Draw
+                        // an empty frame after the visible interval has ended.
+                        if effectsEnabled && animating {
+                            drawDecorations(decoratedSegments, at: clock.date, in: &context)
+                        }
+                    }
+                    .frame(width: bounds.width, height: bounds.height)
+                    .offset(x: bounds.minX, y: bounds.minY)
                 }
             }
         }
+        .frame(width: plotSize.width, height: plotSize.height, alignment: .topLeading)
         .background(RequestRailWindowVisibility(isVisible: $windowVisible))
         .task(id: work) {
             await runDecorations(work: work)
