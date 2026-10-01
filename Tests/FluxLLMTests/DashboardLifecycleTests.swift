@@ -6,6 +6,66 @@ import XCTest
 
 @MainActor
 final class DashboardLifecycleTests: XCTestCase {
+    func testTrueCloseReleasesNativeWindowAndRecreatesRememberedGeometry() throws {
+        _ = NSApplication.shared
+        let store = MetricsStore()
+        let suite = "FluxLLM.window-release-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        let controller = MenuBarController(
+            metricsStore: store,
+            coordinator: MonitoringCoordinator(settings: settings, store: store), settings: settings
+        )
+        defer { controller.stop() }
+        var remembered: NSRect?
+        for cycle in 0..<3 {
+            weak var closedWindow: DashboardWindow?
+            autoreleasepool {
+                let window = controller.prepareDashboardWindow()
+                closedWindow = window
+                window.setActivationPolicy = { _ in }
+                if let remembered { XCTAssertEqual(window.frame, remembered) }
+                window.setContentSize(NSSize(width: 800 + cycle * 20, height: 800 + cycle * 20))
+                remembered = window.frame
+                window.present()
+                XCTAssertTrue(controller.prepareDashboardWindow() === window)
+                window.windowDidMiniaturize(
+                    Notification(name: NSWindow.didMiniaturizeNotification, object: window))
+                XCTAssertTrue(
+                    controller.prepareDashboardWindow() === window,
+                    "Minimization preserves the native window")
+                window.close()
+            }
+            drainNativeUpdates()
+            XCTAssertNil(closedWindow, "True close must release native backing along with the host")
+        }
+    }
+
+    func testImmediateReopenCancelsPendingNativeWindowRelease() throws {
+        _ = NSApplication.shared
+        let store = MetricsStore()
+        let suite = "FluxLLM.window-reopen-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        let controller = MenuBarController(
+            metricsStore: store,
+            coordinator: MonitoringCoordinator(settings: settings, store: store), settings: settings
+        )
+        defer { controller.stop() }
+        let window = controller.prepareDashboardWindow()
+        window.setActivationPolicy = { _ in }
+        window.present()
+        window.close()
+        window.present()
+        drainNativeUpdates()
+        XCTAssertTrue(controller.prepareDashboardWindow() === window)
+        XCTAssertTrue(window.isDashboardOpen)
+        window.close()
+        drainNativeUpdates()
+    }
+
     func testExplicitPresentationAttachesContentBeforeOrderingTheWindow() {
         _ = NSApplication.shared
         let window = LifecycleDashboardWindow(

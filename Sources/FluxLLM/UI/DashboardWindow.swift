@@ -10,6 +10,7 @@ class DashboardWindow: NSWindow, NSWindowDelegate {
     private var presentationVisibilityChanged: ((Bool) -> Void)?
     private var visibilityGeneration = 0
     private let placeholder = NSViewController()
+    var presentationClosed: ((DashboardWindow) -> Void)?
     var setActivationPolicy: @MainActor (NSApplication.ActivationPolicy) -> Void = {
         _ = NSApp.setActivationPolicy($0)
     }
@@ -34,18 +35,20 @@ class DashboardWindow: NSWindow, NSWindowDelegate {
         guard isDashboardOpen else { return }
         isDashboardOpen = false
         setActivationPolicy(.accessory)
+        presentationClosed?(self)
     }
 
-    /// A closed window preserves its frame and native sizing behavior, without
-    /// retaining an observing SwiftUI host. The factory owns only light state.
+    /// Occlusion and minimization retain only a placeholder. The owner can
+    /// release the native window after a true close, remembering its frame.
     func configurePresentation(
+        installPlaceholder: Bool = true,
         makeContent: @escaping () -> NSViewController,
         visibilityChanged: @escaping (Bool) -> Void
     ) {
         makePresentationContent = makeContent
         presentationVisibilityChanged = visibilityChanged
         placeholder.view = NSView(frame: NSRect(origin: .zero, size: contentLayoutRect.size))
-        replacePresentationContent(with: placeholder)
+        if installPlaceholder { replacePresentationContent(with: placeholder) }
     }
 
     /// Kept separate from content attachment so lifecycle tests can exercise the

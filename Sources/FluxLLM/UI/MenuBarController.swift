@@ -18,6 +18,8 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     private var popoverVisibilityObserver: DashboardWindowVisibilityObserver?
     private var isPopoverClosing = false
     private var dashboardWindow: DashboardWindow?
+    private let dashboardPresentation = DashboardPresentationState()
+    private var dashboardFrame: NSRect?
     private var settingsWindow: NSWindow?
     private var iconTimer: Timer?
     private var settingsActionTask: Task<Void, Error>?
@@ -252,13 +254,33 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     private func openDashboardWindow() {
         guard isStarted else { return }
         closePopover()
-        if dashboardWindow == nil {
-            dashboardWindow = Self.makeDashboardWindow(store: metricsStore, actions: menuActions)
-        }
+        let window = prepareDashboardWindow()
         Self.performanceUICheckpoint?("dashboard.native_show.begin")
-        dashboardWindow?.present()
+        window.present()
         Self.performanceUICheckpoint?("dashboard.native_show.end")
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Preserve navigation and geometry independently of AppKit's closed window
+    /// and its backing stores. A minimized or occluded window stays reusable.
+    func prepareDashboardWindow() -> DashboardWindow {
+        if let dashboardWindow { return dashboardWindow }
+        let window = Self.makeDashboardWindow(
+            store: metricsStore, actions: menuActions, presentation: dashboardPresentation)
+        if let dashboardFrame { window.setFrame(dashboardFrame, display: false) }
+        window.presentationClosed = { [weak self] closed in
+            guard let self, self.dashboardWindow === closed else { return }
+            self.dashboardFrame = closed.frame
+            // AppKit still uses the receiver while dispatching willClose.
+            DispatchQueue.main.async { [weak self, weak closed] in
+                guard let self, let closed, self.dashboardWindow === closed,
+                    !closed.isDashboardOpen
+                else { return }
+                self.dashboardWindow = nil
+            }
+        }
+        dashboardWindow = window
+        return window
     }
 
     /// A Dock click restores the open dashboard, including when it is minimized.
@@ -355,7 +377,10 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     }
 
     /// AppKit owns resize limits; SwiftUI gives the chart the remaining height.
-    static func makeDashboardWindow(store: MetricsStore, actions: MenuActions = MenuActions())
+    static func makeDashboardWindow(
+        store: MetricsStore, actions: MenuActions = MenuActions(),
+        presentation: DashboardPresentationState = DashboardPresentationState()
+    )
         -> DashboardWindow
     {
         Self.performanceUICheckpoint?("dashboard.native_create.begin")
@@ -367,13 +392,26 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         window.title = "FluxLLM Dashboard"
         window.isReleasedWhenClosed = false
         window.delegate = window
-        let presentation = DashboardPresentationState()
+        let directHost = PerformanceGraphicsDiagnostics.shared.mode == .directHost
         window.configurePresentation(
+            installPlaceholder: !directHost,
             makeContent: {
                 Self.performanceUICheckpoint?("dashboard.swiftui_create.begin")
-                let hosting = NSHostingController(
-                    rootView: DashboardView(actions: actions, presentation: presentation)
-                        .environment(store))
+                let dashboard = DashboardView(actions: actions, presentation: presentation)
+                    .environment(store)
+                // Diagnostic comparison holds the viewport constant to isolate
+                // first attachment and initial SwiftUI sizing. Normal windows
+                // remain fully resizable; this mode is performance-control only.
+                if directHost {
+                    let hosting = NSHostingController(
+                        rootView: dashboard.frame(
+                            width: DashboardView.preferredWindowSize.width,
+                            height: DashboardView.preferredWindowSize.height))
+                    hosting.sizingOptions = []
+                    Self.performanceUICheckpoint?("dashboard.swiftui_create.end")
+                    return hosting
+                }
+                let hosting = NSHostingController(rootView: dashboard)
                 hosting.sizingOptions = []
                 Self.performanceUICheckpoint?("dashboard.swiftui_create.end")
                 return hosting
