@@ -241,6 +241,7 @@ Choose one diagnostic mode per invocation with `--graphics-mode`:
 | `empty-drawing` | Keep the native canvas and renderer lifecycle but use an empty drawing closure. |
 | `no-renderer` | Keep native canvas layout but skip renderer creation and drawing. |
 | `bitmap-destination` | Render through a bounded temporary CPU bitmap before copying into the native destination. |
+| `bitmap-layer-destination` | Keep ImageRenderer, gradients, and blur, render into a bounded CPU bitmap, and assign the finished image directly to `CALayer.contents`. |
 | `no-blur` | Keep the renderer and drawing geometry while skipping the main-series Gaussian blur. |
 | `cpu-glow` | Use a bounded CPU raster glow in place of the filtered series-glow pass. |
 | `no-gradients` | Substitute solid fills for the three chart gradient operations, preserving geometry and animation. |
@@ -249,6 +250,15 @@ Choose one diagnostic mode per invocation with `--graphics-mode`:
 Both gradient controls require valid substitution counters throughout the capture
 and a positive count after the visible workload. They affect the three Canvas
 gradient operations; SwiftUI surface and rim gradients remain unchanged.
+
+The layer-destination control bounds each bitmap buffer to 32 MiB and retains
+one current layer image per chart surface. It never copies that image into the
+native window drawing context. The runner requires zero bitmap failures and
+zero native draw callbacks throughout the capture, positive chart draws and
+image presentations after the visible workload, reconciled role/image byte
+counters, and zero retained image bytes at closed checkpoints. ImageRenderer
+must still be created for drawn roles. These requested image and scratch-buffer
+bytes describe owned CPU data, not measured GPU allocation.
 
 Optionally add `--no-popover-animation` independently of the graphics mode to
 disable native popover animation for this diagnostic. The runner verifies the
@@ -262,6 +272,19 @@ CPU/GPU gates and other native workloads. A successful diagnostic is never a
 regression pass and does not alter the normal CPU, memory, GPU, or write limits
 above. Exit zero means `diagnostic_captured`; failed validation, incomplete native
 reports, or timeout produces `diagnostic_incomplete` and a nonzero exit.
+
+For a comparison without native memory profilers, add `--no-native-inspection`
+to each invocation. The same fixture, commands, waits, and kernel checkpoints
+remain; `footprint`, `vmmap`, and `heap` stages are explicitly skipped and their
+categories remain unavailable. After clean process exit, validated fixture work,
+and final memory accounting, the report includes average CPU and maximum rolling
+one-second CPU for the authenticated kernel interval from `04-before-traffic`
+to `06-after-traffic`. This interval includes fixture start and completion/drain
+overhead in both compared runs and excludes startup. Counter continuity,
+sampling gaps, PID/birth identity, ready/final events, and exact kernel boundaries
+are checked before computing CPU. Captures with native inspection explicitly
+report this CPU comparison as unavailable. Neither variant evaluates CPU/GPU
+gates; both retain the 90-second deadline.
 
 Results use a unique ignored `.performance-results/memory-*` directory, or a new
 directory supplied with `--output-dir`. Existing artifacts are never overwritten.
@@ -277,7 +300,8 @@ bytes, which already include swapped bytes. `vmmap` reports rounded binary sizes
 physical footprint are different quantities and must not be added together.
 
 Graphics counters describe canvas/renderer lifecycle and requested pixel areas,
-dimensions, scale, and temporary bitmap bytes, grouped by drawing role. Requested
+dimensions, scale, temporary bitmap bytes, and retained layer image bytes,
+grouped by drawing role. Requested
 backing sizes are **not measured GPU allocations or GPU utilization**. Missing
 counters remain unavailable, never zero; older frozen products can run in normal
 mode without them, while alternate modes require matching mode/counter evidence.

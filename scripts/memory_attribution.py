@@ -21,7 +21,7 @@ import app_performance as app
 from run_performance_checks import interrupted, load_json, number, require, write_json
 
 
-GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
+GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "bitmap-layer-destination", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
 GRADIENT_ABLATION_MODES = ("no-gradients", "no-gradients-or-blur")
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 DEADLINE_SECONDS = 90
@@ -303,7 +303,7 @@ def parse_probe(tool, output, json_output, pid):
     return {"vmmap": parse_vmmap, "heap": parse_heap}[tool](text, pid)
 
 
-def validate_graphics(snapshot, mode, *, completed_visible_workload=False):
+def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False):
     value = snapshot.get("graphics_diagnostics")
     if "graphics_diagnostics" not in snapshot and mode == "normal":
         return {"available": False, "reason": "This frozen app does not expose graphics diagnostic counters; native and kernel memory evidence remain separate."}
@@ -325,6 +325,13 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False):
     fields = ("created", "destroyed", "live", "peak_live", "updates", "renderer_creations", "renderer_updates",
               "renderer_destructions", "live_renderers", "peak_live_renderers", "draws", "skipped_draws",
               "current_pixel_area", "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes")
+    layer_destination = mode == "bitmap-layer-destination"
+    if layer_destination:
+        fields += ("current_layer_image_bytes", "peak_layer_image_bytes")
+        presentations = unsigned(value.get("layer_bitmap_presentations"), "graphics.layer_bitmap_presentations")
+        for field in ("layer_bitmap_failures", "layer_bitmap_native_draws"):
+            require(unsigned(value.get(field), f"graphics.{field}") == 0,
+                    f"Layer bitmap destination reported {field}; the comparison is invalid")
     for name, role in roles.items():
         require(isinstance(role, dict), f"Invalid graphics role {name}")
         for field in fields:
@@ -337,16 +344,70 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False):
         for current, peak in (("live", "peak_live"), ("live_renderers", "peak_live_renderers"),
                               ("current_pixel_area", "peak_pixel_area"), ("current_bitmap_bytes", "peak_bitmap_bytes")):
             require(role[peak] >= role[current], f"Graphics {name} peak is below current {current}")
-    for global_current, local_current, global_peak, local_peak in (
+        if layer_destination:
+            require(role["peak_layer_image_bytes"] >= role["current_layer_image_bytes"],
+                    f"Graphics {name} layer image peak is below current bytes")
+            if role["live"] == 0 or expected_closed:
+                require(role["current_layer_image_bytes"] == 0,
+                        f"Graphics {name} retains layer image bytes after its surface closed")
+            if completed_visible_workload and role["draws"] > 0:
+                require(role["renderer_creations"] > 0 and role["peak_layer_image_bytes"] > 0,
+                        f"Graphics {name} drawing lacks renderer or layer image evidence")
+    totals = (
             ("live_canvases", "live", "peak_live_canvases", "peak_live"),
             ("live_renderers", "live_renderers", "peak_live_renderers", "peak_live_renderers"),
             ("current_pixel_area", "current_pixel_area", "peak_pixel_area", "peak_pixel_area"),
-            ("current_bitmap_bytes", "current_bitmap_bytes", "peak_bitmap_bytes", "peak_bitmap_bytes")):
+            ("current_bitmap_bytes", "current_bitmap_bytes", "peak_bitmap_bytes", "peak_bitmap_bytes"))
+    if layer_destination:
+        totals += (("current_layer_image_bytes", "current_layer_image_bytes", "peak_layer_image_bytes", "peak_layer_image_bytes"),)
+    for global_current, local_current, global_peak, local_peak in totals:
         current = unsigned(value.get(global_current), f"graphics.{global_current}")
         peak = unsigned(value.get(global_peak), f"graphics.{global_peak}")
         require(current == sum(role[local_current] for role in roles.values()), f"Graphics {global_current} total mismatch")
         require(current <= peak <= sum(role[local_peak] for role in roles.values()), f"Graphics {global_peak} is inconsistent")
+        if layer_destination and global_peak == "peak_layer_image_bytes":
+            require(peak >= max(role[local_peak] for role in roles.values()),
+                    "Graphics layer image peak is below a role peak")
+    if layer_destination:
+        require(presentations == sum(role["draws"] for role in roles.values()),
+                "Layer bitmap presentations do not reconcile with drawn role frames")
+        if completed_visible_workload:
+            require(presentations > 0 and roles["static_chart"]["draws"] > 0
+                    and value["peak_layer_image_bytes"] > 0,
+                    "Completed visible workload did not present a drawn chart layer image; the comparison is invalid")
     return {"available": True, "counters": value}
+
+
+def workload_cpu_diagnostic(samples, events, workload, identity, memory_validation):
+    """CPU attribution only after complete owned-process and memory validation."""
+    require(workload.get("validated") is True, "CPU workload did not complete its fixture validation")
+    require(memory_validation.get("problems") == [], "CPU comparison lacks valid final memory accounting")
+    problems = app.sample_validation_problems(samples)
+    require(not problems["shared"] and not problems["cpu_seconds"],
+            "CPU comparison has invalid samples: " + "; ".join(problems["shared"] + problems["cpu_seconds"]))
+    ready = app.authenticated_cpu_ready(samples, events)
+    require(all(ready[key] == identity[key] for key in ("process_id", "birth_time_us")),
+            "CPU comparison differs from the owned process identity")
+    exits = [event for event in events if event.get("type") == "exited"]
+    require(len(exits) == 1 and type(exits[0].get("status")) is int and exits[0]["status"] == 0
+            and exits[0].get("final_sample") == samples[-1] and samples[-1].get("phase") == "final",
+            "CPU comparison lacks a clean authenticated final sample")
+    boundaries = []
+    for label in ("before", "after"):
+        timestamp = number(workload.get(label, {}).get("runner_collector_sample_monotonic_seconds"),
+                           f"CPU workload {label} boundary")
+        matches = [sample for sample in samples if sample["monotonic_seconds"] == timestamp]
+        require(len(matches) == 1 and matches[0].get("phase") == "control_boundary",
+                f"CPU workload {label} boundary has no unique kernel control sample")
+        boundaries.append(timestamp)
+    require(ready["monotonic_seconds"] <= boundaries[0] < boundaries[1],
+            "CPU workload boundaries do not follow authenticated readiness")
+    metrics = app.cpu_interval_metrics(samples, *boundaries)
+    return {"available": True, "gate_evaluated": False, "source": "owned process cumulative kernel CPU counter",
+            "start_monotonic_seconds": boundaries[0], "end_monotonic_seconds": boundaries[1],
+            "interval": "04-before-traffic through 06-after-traffic; includes fixture start and completion/drain overhead",
+            "ready_boundary": ready, **metrics,
+            "average_cpu_percent": 100 * metrics["cpu_seconds"] / metrics["elapsed_seconds"]}
 
 
 def validate_popover_animation(snapshot, no_animation):
@@ -360,9 +421,10 @@ def validate_popover_animation(snapshot, no_animation):
 
 
 class MemoryDiagnostic:
-    def __init__(self, output, deadline, graphics_mode, no_popover_animation=False):
+    def __init__(self, output, deadline, graphics_mode, no_popover_animation=False, no_native_inspection=False):
         self.output, self.deadline, self.graphics_mode = output, deadline, graphics_mode
         self.no_popover_animation = no_popover_animation
+        self.no_native_inspection = no_native_inspection
         self.collector = self.fixture = self.active_probe = None
         self.identity = None
         self.report = {"schema_version": 1, "kind": "memory-attribution-diagnostic", "status": "running",
@@ -370,7 +432,11 @@ class MemoryDiagnostic:
                        "cpu_gate_evaluated": False, "gpu_gate_evaluated": False,
                        "graphics_mode": graphics_mode, "deadline_seconds": DEADLINE_SECONDS,
                        "no_popover_animation_requested": no_popover_animation,
-                       "errors": [], "checkpoints": [], "probes": [], "commands": [],
+                       "native_inspection_enabled": not no_native_inspection,
+                       "workload_cpu": {"available": False, "gate_evaluated": False,
+                                        "reason": "Awaiting validated workload and final accounting" if no_native_inspection
+                                        else "Native inspection perturbs runtime; CPU comparison is unavailable"},
+                       "errors": [], "checkpoints": [], "probes": [], "inspection_stages": [], "commands": [],
                        "driver_sha256": app.path_hash(Path(__file__)),
                        "caveat": "Native VM/heap inspection and graphics modes perturb runtime. These are attribution diagnostics, not CPU/GPU or regression passes. Pixel/bitmap requests are not measured GPU allocations."}
 
@@ -399,7 +465,8 @@ class MemoryDiagnostic:
                 f"Wrong native UI state at {label}: dashboard={snapshot.get('dashboard_visible')}, popover={snapshot.get('popover_visible')}")
         require(type(snapshot.get("active_requests")) is int and snapshot["active_requests"] == active,
                 f"Wrong active stream count at {label}: {snapshot.get('active_requests')}")
-        entry["graphics_validation"] = validate_graphics(snapshot, self.graphics_mode)
+        entry["graphics_validation"] = validate_graphics(snapshot, self.graphics_mode,
+                                                        expected_closed=not dashboard and not popover)
         entry["popover_animation_validation"] = validate_popover_animation(snapshot, self.no_popover_animation)
         self.save()
         return snapshot
@@ -474,8 +541,13 @@ class MemoryDiagnostic:
 
     def probe(self, label, dashboard, popover, active, heap=False):
         self.checkpoint(label + "-before-probe", dashboard, popover, active)
-        for tool in ("footprint", "vmmap", "heap") if heap else ("footprint", "vmmap"):
-            self.inspect_tool(label, tool)
+        self.report["inspection_stages"].append({"label": label,
+            "status": "skipped" if self.no_native_inspection else "requested",
+            "reason": "--no-native-inspection preserves kernel checkpoints without native profilers" if self.no_native_inspection else None})
+        self.save()
+        if not self.no_native_inspection:
+            for tool in ("footprint", "vmmap", "heap") if heap else ("footprint", "vmmap"):
+                self.inspect_tool(label, tool)
         self.checkpoint(label + "-after-probe", dashboard, popover, active)
 
     def perform(self, paths, provenance, identity):
@@ -583,8 +655,14 @@ class MemoryDiagnostic:
                 with self.deadline.interrupt_at(self.deadline.end - 0.25):
                     self.report["memory_validation"] = app.memory_evidence(self.collector.samples, final)
                 self.report["errors"].extend(self.report["memory_validation"]["problems"])
+                if self.no_native_inspection:
+                    self.report["workload_cpu"] = workload_cpu_diagnostic(
+                        self.collector.samples, self.collector.events, self.report.get("workload", {}),
+                        self.identity, self.report["memory_validation"])
             except (ValueError, KeyError, TypeError, TimeoutError) as error:
                 self.report["errors"].append(str(error))
+                if self.no_native_inspection:
+                    self.report["workload_cpu"] = {"available": False, "gate_evaluated": False, "reason": str(error)}
 
     def emergency_collector_cleanup(self):
         """Do not orphan the app if a collector protocol/cleanup call fails."""
@@ -627,6 +705,15 @@ def summary_markdown(report):
                      f"{group_bytes('malloc')} | {megabytes(heap.get('allocated_bytes'))} |")
     lines.extend(["", "Decimal MB. Tool snapshots occur at different times. Footprint dirty includes swapped; heap/VM values must not be added to footprint.", "",
                   "Raw native reports, collector samples, graphics role counters, exact commands, identity checks, and fixture validation are in memory-report.json and adjacent artifacts."])
+    cpu = report.get("workload_cpu", {})
+    if cpu.get("available"):
+        lines.extend(["", "| Workload CPU diagnostic | Value |", "|---|---:|",
+                      f"| Average CPU | {cpu['average_cpu_percent']:.3f}% |",
+                      f"| Maximum rolling one-second CPU | {cpu['rolling_1s_percent']:.3f}% |",
+                      f"| Interval | {cpu['elapsed_seconds']:.3f} seconds |", "",
+                      cpu["interval"] + ". No CPU gate is evaluated."])
+    elif cpu:
+        lines.extend(["", "Workload CPU unavailable: " + cpu.get("reason", "Missing evidence") + "."])
     if report["errors"]:
         lines.extend(["", "Unavailable or invalid evidence:", ""])
         lines.extend("- " + error.replace("\n", " ") for error in report["errors"])
@@ -659,6 +746,8 @@ def parser():
     result.add_argument("--graphics-mode", choices=GRAPHICS_MODES, default="normal")
     result.add_argument("--no-popover-animation", action="store_true",
                         help="Diagnostic only: disable native popover animation and verify the app acknowledgment")
+    result.add_argument("--no-native-inspection", action="store_true",
+                        help="Skip footprint/vmmap/heap; preserve kernel checkpoints and measure workload CPU after final validation")
     result.add_argument("--output-dir", type=Path, help="New, nonexisting artifact directory; default .performance-results/memory-UTC-unique")
     return result
 
@@ -678,7 +767,7 @@ def run(argv=None):
         return 1
     started = time.monotonic()
     deadline = MemoryDeadline()
-    diagnostic = MemoryDiagnostic(output, deadline, args.graphics_mode, args.no_popover_animation)
+    diagnostic = MemoryDiagnostic(output, deadline, args.graphics_mode, args.no_popover_animation, args.no_native_inspection)
     try:
         with deadline.interrupt_at(deadline.end - deadline.cleanup_reserve):
             paths, provenance, identity = validate_products(args)

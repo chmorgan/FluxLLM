@@ -21,12 +21,109 @@ def graphics(mode="normal"):
     return {"graphics_diagnostics": {
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
+        **({"layer_bitmap_presentations": 0, "layer_bitmap_failures": 0, "layer_bitmap_native_draws": 0,
+            "current_layer_image_bytes": 0, "peak_layer_image_bytes": 0} if mode == "bitmap-layer-destination" else {}),
         "live_canvases": 0, "peak_live_canvases": 0, "live_renderers": 0, "peak_live_renderers": 0,
         "current_pixel_area": 0, "peak_pixel_area": 0, "current_bitmap_bytes": 0, "peak_bitmap_bytes": 0,
-        "roles": {role: dict.fromkeys(fields, 0) for role in ("static_chart", "cursor", "rail_bars", "rail_decorations")}}}
+        "roles": {role: dict.fromkeys(fields + (("current_layer_image_bytes", "peak_layer_image_bytes")
+                                               if mode == "bitmap-layer-destination" else ()), 0)
+                  for role in ("static_chart", "cursor", "rail_bars", "rail_decorations")}}}
+
+
+def drawn_layer_graphics():
+    snapshot = graphics("bitmap-layer-destination")
+    value = snapshot["graphics_diagnostics"]
+    value.update(layer_bitmap_presentations=3, live_canvases=1, peak_live_canvases=1,
+                 live_renderers=1, peak_live_renderers=1, current_layer_image_bytes=400, peak_layer_image_bytes=400)
+    value["roles"]["static_chart"].update(created=1, live=1, peak_live=1, renderer_creations=1,
+        live_renderers=1, peak_live_renderers=1, draws=3, current_layer_image_bytes=400, peak_layer_image_bytes=400)
+    return snapshot
 
 
 class GraphicsTests(unittest.TestCase):
+    def test_layer_destination_requires_all_new_fields_without_breaking_old_modes(self):
+        for mode in memory.GRAPHICS_MODES:
+            self.assertTrue(memory.validate_graphics(graphics(mode), mode)["available"])
+        for field in ("layer_bitmap_presentations", "layer_bitmap_failures", "layer_bitmap_native_draws",
+                      "current_layer_image_bytes", "peak_layer_image_bytes"):
+            for invalid in (None, True, -1, 0.0, "0"):
+                snapshot = graphics("bitmap-layer-destination")
+                snapshot["graphics_diagnostics"][field] = invalid
+                with self.subTest(field=field, invalid=invalid), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, "bitmap-layer-destination")
+            snapshot = graphics("bitmap-layer-destination")
+            del snapshot["graphics_diagnostics"][field]
+            with self.subTest(field=field, invalid="missing"), self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, "bitmap-layer-destination")
+        for role in graphics()["graphics_diagnostics"]["roles"]:
+            for field in ("current_layer_image_bytes", "peak_layer_image_bytes"):
+                snapshot = graphics("bitmap-layer-destination")
+                del snapshot["graphics_diagnostics"]["roles"][role][field]
+                with self.subTest(role=role, field=field), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, "bitmap-layer-destination")
+
+    def test_layer_destination_rejects_failure_or_native_drawing_in_control_snapshots(self):
+        for field in ("layer_bitmap_failures", "layer_bitmap_native_draws"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "bitmap-layer-destination")
+                snapshot = graphics("bitmap-layer-destination")
+                snapshot["graphics_diagnostics"][field] = 1
+                diagnostic.collector = mock.Mock()
+                diagnostic.collector.command.return_value = {"status": "ok", "snapshot": snapshot}
+                with mock.patch.object(diagnostic, "verify_identity"), self.assertRaises(InvalidResult):
+                    diagnostic.command("show_dashboard")
+                with self.assertRaises(InvalidResult):
+                    diagnostic.validate_control_snapshot(snapshot)
+
+    def test_layer_destination_requires_visible_work_and_image_lifecycle_evidence(self):
+        mode = "bitmap-layer-destination"
+        with self.assertRaisesRegex(InvalidResult, "did not present"):
+            memory.validate_graphics(graphics(mode), mode, completed_visible_workload=True)
+        self.assertTrue(memory.validate_graphics(drawn_layer_graphics(), mode, completed_visible_workload=True)["available"])
+        for change in (lambda value: value.update(layer_bitmap_presentations=0),
+                       lambda value: value["roles"]["static_chart"].update(draws=0),
+                       lambda value: value["roles"]["rail_decorations"].update(draws=1),
+                       lambda value: value.update(current_layer_image_bytes=399),
+                       lambda value: value.update(peak_layer_image_bytes=401)):
+            snapshot = drawn_layer_graphics()
+            change(snapshot["graphics_diagnostics"])
+            with self.subTest(change=change), self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+        snapshot = drawn_layer_graphics()
+        with self.assertRaisesRegex(InvalidResult, "retains layer image"):
+            memory.validate_graphics(snapshot, mode, expected_closed=True)
+        value = snapshot["graphics_diagnostics"]
+        value.update(live_canvases=0, live_renderers=0)
+        value["roles"]["static_chart"].update(destroyed=1, live=0, renderer_destructions=1, live_renderers=0)
+        with self.assertRaisesRegex(InvalidResult, "retains layer image"):
+            memory.validate_graphics(snapshot, mode)
+        value["current_layer_image_bytes"] = value["roles"]["static_chart"]["current_layer_image_bytes"] = 0
+        self.assertTrue(memory.validate_graphics(snapshot, mode, expected_closed=True)["available"])
+
+    def test_layer_image_global_peak_can_be_between_role_peak_and_sum(self):
+        snapshot = graphics("bitmap-layer-destination")
+        value = snapshot["graphics_diagnostics"]
+        for role in value["roles"].values():
+            role["peak_layer_image_bytes"] = 100
+        value["peak_layer_image_bytes"] = 150
+        self.assertTrue(memory.validate_graphics(snapshot, "bitmap-layer-destination")["available"])
+        value["peak_layer_image_bytes"] = 99
+        with self.assertRaisesRegex(InvalidResult, "below a role peak"):
+            memory.validate_graphics(snapshot, "bitmap-layer-destination")
+
+    def test_layer_presentations_must_match_all_draws_before_workload_completes(self):
+        for count in (0, 2, 4):
+            snapshot = drawn_layer_graphics()
+            snapshot["graphics_diagnostics"]["layer_bitmap_presentations"] = count
+            with self.subTest(count=count), self.assertRaisesRegex(InvalidResult, "presentations do not reconcile"):
+                memory.validate_graphics(snapshot, "bitmap-layer-destination")
+        snapshot = drawn_layer_graphics()
+        snapshot["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] = 1
+        with self.assertRaisesRegex(InvalidResult, "presentations do not reconcile"):
+            memory.validate_graphics(snapshot, "bitmap-layer-destination")
+        snapshot["graphics_diagnostics"]["layer_bitmap_presentations"] = 4
+        self.assertTrue(memory.validate_graphics(snapshot, "bitmap-layer-destination")["available"])
+
     def test_popover_animation_flag_requires_explicit_false_and_preserves_legacy_default(self):
         for snapshot in ({}, {"popover_animations_enabled": True}, {"popover_animations_enabled": 0}):
             with self.subTest(snapshot=snapshot), self.assertRaises(InvalidResult):
@@ -140,6 +237,113 @@ class GraphicsTests(unittest.TestCase):
         snapshot["graphics_diagnostics"]["live_canvases"] = 1
         with self.assertRaisesRegex(InvalidResult, "total mismatch"):
             memory.validate_graphics(snapshot, "normal")
+
+
+class WorkloadCPUAndInspectionTests(unittest.TestCase):
+    def evidence(self):
+        points = [{"type": "sample", "process_id": 17, "birth_time_us": 123,
+                   "monotonic_seconds": index / 4,
+                   "cpu_seconds": 3 + index / 100 + (0.2 if index >= 8 else 0),
+                   "physical_footprint_bytes": 1000000, "lifetime_peak_footprint_bytes": 1000000,
+                   "phase": "baseline" if index == 0 else "final" if index == 16
+                            else "control_boundary" if index in (1, 4, 12) else "periodic",
+                   **({"command_id": "collector-handshake"} if index == 1 else {})}
+                  for index in range(17)]
+        events = [{"type": "launched", "pid": 17, "birth_time_us": 123}]
+        for point in points:
+            events.append(point)
+            if point.get("command_id") == "collector-handshake":
+                events.append({"type": "app_event", "monotonic_seconds": point["monotonic_seconds"],
+                               "event": {"type": "ready", "command_id": "collector-handshake", "protocol_version": 1}})
+        events.append({"type": "exited", "status": 0, "final_sample": points[-1]})
+        workload = {"validated": True, "before": {"runner_collector_sample_monotonic_seconds": 1},
+                    "after": {"runner_collector_sample_monotonic_seconds": 3}}
+        return points, events, workload, {"process_id": 17, "birth_time_us": 123}, {"problems": []}
+
+    def test_cpu_uses_exact_workload_boundaries_preserving_bursts_without_counting_startup(self):
+        result = memory.workload_cpu_diagnostic(*self.evidence())
+        self.assertTrue(result["available"])
+        self.assertFalse(result["gate_evaluated"])
+        self.assertEqual(result["elapsed_seconds"], 2)
+        self.assertAlmostEqual(result["cpu_seconds"], 0.28)
+        self.assertAlmostEqual(result["average_cpu_percent"], 14)
+        self.assertAlmostEqual(result["rolling_1s_percent"], 24)
+        self.assertIn("completion/drain overhead", result["interval"])
+
+    def test_cpu_rejects_invalid_timeline_counters_identity_boundaries_and_completion(self):
+        changes = (
+            lambda points, events, workload, identity, validation: points[5].update(cpu_seconds=None),
+            lambda points, events, workload, identity, validation: points[5].update(cpu_seconds=0),
+            lambda points, events, workload, identity, validation: points[5].update(monotonic_seconds=0),
+            lambda points, events, workload, identity, validation: points[5].update(process_id=18),
+            lambda points, events, workload, identity, validation: events[-1].update(status=1),
+            lambda points, events, workload, identity, validation: events[-1].update(final_sample={}),
+            lambda points, events, workload, identity, validation: events.pop(3),
+            lambda points, events, workload, identity, validation: workload.update(validated=False),
+            lambda points, events, workload, identity, validation: workload["before"].update(runner_collector_sample_monotonic_seconds=0),
+            lambda points, events, workload, identity, validation: workload["after"].update(runner_collector_sample_monotonic_seconds=2.9),
+            lambda points, events, workload, identity, validation: workload["after"].update(runner_collector_sample_monotonic_seconds=2.75),
+            lambda points, events, workload, identity, validation: identity.update(birth_time_us=999),
+            lambda points, events, workload, identity, validation: validation.update(problems=["bad final accounting"]),
+        )
+        for change in changes:
+            evidence = self.evidence()
+            change(*evidence)
+            with self.subTest(change=change), self.assertRaises(InvalidResult):
+                memory.workload_cpu_diagnostic(*evidence)
+        evidence = self.evidence()
+        del evidence[0][6:9]
+        with self.assertRaisesRegex(InvalidResult, "sampling gap"):
+            memory.workload_cpu_diagnostic(*evidence)
+
+    def test_no_inspection_preserves_both_checkpoints_without_native_tools_or_zero_categories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "normal", no_native_inspection=True)
+            with mock.patch.object(diagnostic, "checkpoint") as checkpoint, mock.patch.object(diagnostic, "inspect_tool") as inspect:
+                diagnostic.probe("streaming", True, True, 2, heap=True)
+            self.assertEqual(checkpoint.call_args_list, [mock.call("streaming-before-probe", True, True, 2),
+                                                        mock.call("streaming-after-probe", True, True, 2)])
+            inspect.assert_not_called()
+            self.assertFalse(diagnostic.report["native_inspection_enabled"])
+            self.assertEqual(diagnostic.report["probes"], [])
+            self.assertEqual(diagnostic.report["inspection_stages"][0]["status"], "skipped")
+            self.assertFalse(diagnostic.report["workload_cpu"]["available"])
+
+    def test_default_inspection_has_no_cpu_claim_even_after_clean_final_accounting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "normal")
+            points, events, workload, identity, _ = self.evidence()
+            events.insert(-1, {"type": "app_event", "event": {"type": "stopped", "status": "ok"}})
+            diagnostic.identity = identity
+            diagnostic.report["workload"] = workload
+            diagnostic.collector = mock.Mock(samples=points, events=events, storage={}, cleanup_errors=[])
+            with mock.patch.object(memory, "workload_cpu_diagnostic") as cpu:
+                diagnostic.cleanup()
+            cpu.assert_not_called()
+            self.assertEqual(diagnostic.report["errors"], [])
+            self.assertFalse(diagnostic.report["workload_cpu"]["available"])
+            self.assertIn("Native inspection perturbs", diagnostic.report["workload_cpu"]["reason"])
+
+    def test_no_inspection_final_validation_publishes_cpu_and_rejects_bad_final_graphics(self):
+        for bad_graphics in (False, True):
+            with self.subTest(bad_graphics=bad_graphics), tempfile.TemporaryDirectory() as directory:
+                diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "bitmap-layer-destination",
+                                                     no_native_inspection=True)
+                points, events, workload, identity, _ = self.evidence()
+                snapshot = graphics("bitmap-layer-destination")
+                snapshot["graphics_diagnostics"]["layer_bitmap_native_draws"] = int(bad_graphics)
+                events.insert(-1, {"type": "app_event", "event": {"type": "stopped", "status": "ok", "snapshot": snapshot}})
+                diagnostic.identity = identity
+                diagnostic.report["workload"] = workload
+                diagnostic.collector = mock.Mock(samples=points, events=events, storage={}, cleanup_errors=[])
+                diagnostic.cleanup()
+                self.assertEqual(diagnostic.report["workload_cpu"]["available"], not bad_graphics)
+                self.assertEqual(bool(diagnostic.report["errors"]), bad_graphics)
+
+    def test_inspection_flag_is_opt_in(self):
+        arguments = ["--app-binary", "app", "--test-bundle", "tests", "--collector-binary", "collector", "--provenance", "provenance"]
+        self.assertFalse(memory.parser().parse_args(arguments).no_native_inspection)
+        self.assertTrue(memory.parser().parse_args(arguments + ["--no-native-inspection"]).no_native_inspection)
 
 
 class IdentityTests(unittest.TestCase):
