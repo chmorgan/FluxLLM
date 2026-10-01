@@ -76,6 +76,7 @@ final class PerformanceApplicationSessionTests: XCTestCase {
 
     func testFreshSessionHealthRemainsReadyWhenWallClockSamplingStarts() async throws {
         _ = NSApplication.shared
+        defer { XCTAssertNoThrow(try PerformanceGraphicsDiagnostics.shared.disable()) }
         let response = MockOllamaResponse(
             firstBytes: Array(
                 #"{"version":"0.0.0-fixture","models":[{"model":"resource-fixture"}]}"#.utf8))
@@ -117,6 +118,7 @@ final class PerformanceApplicationSessionTests: XCTestCase {
 
     func testPopulatedSessionStartsThroughProductionLifecycleWithoutHiddenSnapshots() async throws {
         _ = NSApplication.shared
+        defer { XCTAssertNoThrow(try PerformanceGraphicsDiagnostics.shared.disable()) }
         let response = MockOllamaResponse(
             firstBytes: Array(
                 #"{"version":"0.0.0-fixture","models":[{"model":"resource-fixture"}]}"#.utf8))

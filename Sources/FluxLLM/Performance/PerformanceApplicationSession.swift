@@ -47,7 +47,8 @@ public final class PerformanceApplicationSession {
 
     public static func start(
         upstream: URL, historyDirectory: URL, preferencesSuite: String,
-        populated: Bool, fixtureEndingAt: Date? = nil
+        populated: Bool, fixtureEndingAt: Date? = nil,
+        graphicsMode: PerformanceGraphicsDiagnostics.Mode = .normal
     ) async throws -> PerformanceApplicationSession {
         guard upstream.scheme == "http", upstream.host == "127.0.0.1",
             let upstreamPort = upstream.port, (1...65535).contains(upstreamPort)
@@ -55,6 +56,9 @@ public final class PerformanceApplicationSession {
         guard let defaults = UserDefaults(suiteName: preferencesSuite),
             defaults.persistentDomain(forName: preferencesSuite) == nil
         else { throw PerformanceSessionError.invalid("Performance preferences must be new") }
+        // Freeze the diagnostic mode before stores, native hosts or chart
+        // canvases can be created. Ordinary launches never enable this path.
+        try PerformanceGraphicsDiagnostics.shared.enable(mode: graphicsMode)
         let settings = AppSettings(defaults: defaults)
         settings.backendSelection = .ollama
         settings.ollamaHost = "127.0.0.1"
@@ -173,6 +177,7 @@ public final class PerformanceApplicationSession {
             "chart_preparations": counters["chart_preparations"] as Any? ?? NSNull(),
             "canvas_draws": counters["canvas_draws"] as Any? ?? NSNull(),
             "metal_frames": counters["metal_frames"] as Any? ?? NSNull(),
+            "graphics_diagnostics": PerformanceGraphicsDiagnostics.shared.snapshot(),
             "raw_samples": store.throughputSampleCount,
             "archive_buckets": store.archivedThroughputBucketCount,
             "connection_state": store.connectionState.rawValue,

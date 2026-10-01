@@ -16,6 +16,7 @@ final class PerformanceControl {
         let protocol_version: Int
         let logging_enabled: Bool?
         let fixture_ending_at_epoch: Double?
+        let graphics_mode: PerformanceGraphicsDiagnostics.Mode?
     }
 
     // Preserve the field names in the performance JSON protocol.
@@ -180,7 +181,8 @@ final class PerformanceControl {
                     preferencesSuite: preferencesSuite,
                     populated: configuration.history == "populated",
                     fixtureEndingAt: configuration.fixture_ending_at_epoch.map(
-                        Date.init(timeIntervalSince1970:)))
+                        Date.init(timeIntervalSince1970:)),
+                    graphicsMode: configuration.graphics_mode ?? .normal)
             }
             startupTask = task
             do {
