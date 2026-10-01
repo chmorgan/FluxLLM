@@ -1,0 +1,665 @@
+"""Bounded, owned-process memory attribution; never a performance-gate pass.
+
+Run via run_performance_checks.py memory with explicit frozen Release products.
+Native inspection perturbs the process. CPU/GPU gates are deliberately not run.
+"""
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import time
+
+import app_performance as app
+from run_performance_checks import interrupted, load_json, number, require, write_json
+
+
+GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "no-blur", "cpu-glow")
+MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+DEADLINE_SECONDS = 90
+CATEGORY_FIELDS = ("dirty", "swapped", "clean", "reclaimable", "wired", "regions")
+SIZE_PATTERN = r"(?:\d+(?:\.\d+)?)(?:[KMGT])?"
+NATIVE_ERROR = re.compile(r"(?im)^\s*(?:error\b|warning\b|(?:footprint|vmmap|heap):\s*(?:error|failed|cannot|unable)|"
+                          r"(?:failed|unable|cannot) (?:to |inspect|read|access)|permission denied|operation not permitted)")
+
+
+def unsigned(value, name):
+    return number(value, name, integer=True)
+
+
+def footprint_group(name):
+    """Disjoint labels over one footprint ledger, not additional allocations."""
+    if name == "Owned physical footprint (unmapped) (graphics)":
+        return "graphics_unmapped"
+    if name.startswith("IOAccelerator"):
+        return "ioaccelerator"
+    if name == "IOSurface":
+        return "iosurface"
+    if name == "CoreAnimation":
+        return "core_animation"
+    if name in ("CG Image", "CG Raster Data", "CoreGraphics", "CoreUI Image Data", "Image IO"):
+        return "image_data"
+    if name.startswith("Malloc"):
+        return "malloc"
+    if name == "Owned physical footprint (unmapped)":
+        return "other_unmapped"
+    return "other_categories"
+
+
+def parse_footprint(value, pid):
+    require(isinstance(value, dict), "footprint JSON must be an object")
+    require(value.get("unit") == "byte" and type(value.get("bytes per unit")) is int
+            and value["bytes per unit"] == 1, "footprint must report exact byte units")
+    for field in ("errors", "warnings"):
+        require(value.get(field) == [], f"footprint {field} are missing or nonempty: {value.get(field)}")
+    processes = value.get("processes")
+    require(isinstance(processes, list) and len(processes) == 1 and isinstance(processes[0], dict),
+            "footprint must describe exactly one process")
+    process = processes[0]
+    require(type(process.get("pid")) is int and process["pid"] == pid, "footprint process PID mismatch")
+    footprint = unsigned(process.get("footprint"), "footprint bytes")
+    auxiliary = process.get("auxiliary")
+    require(isinstance(auxiliary, dict), "footprint auxiliary ledger is missing")
+    require(unsigned(auxiliary.get("phys_footprint"), "auxiliary footprint") == footprint
+            and unsigned(value.get("total footprint"), "total footprint") == footprint,
+            "footprint process, auxiliary, and total ledgers disagree")
+    peak = unsigned(auxiliary.get("phys_footprint_peak"), "footprint peak")
+    require(peak >= footprint, "footprint peak is below current footprint")
+    categories = process.get("categories")
+    require(isinstance(categories, dict) and categories, "footprint categories are missing")
+    groups = {}
+    for name, counters in categories.items():
+        require(isinstance(name, str) and name and isinstance(counters, dict), "Invalid footprint category")
+        group = groups.setdefault(footprint_group(name), {field: 0 for field in CATEGORY_FIELDS})
+        for field in CATEGORY_FIELDS:
+            group[field] += unsigned(counters.get(field), f"footprint {name}.{field}")
+    # footprint(1): Dirty includes (Swapped). Wired and reclaimable overlap
+    # other columns and must not be added to the physical-footprint ledger.
+    require(sum(group["dirty"] for group in groups.values()) == footprint,
+            "footprint category dirty bytes do not reconcile with the physical footprint")
+    return {"process_id": pid, "physical_footprint_bytes": footprint, "lifetime_peak_bytes": peak,
+            "groups": groups, "categories": categories,
+            "accounting": "Exact bytes; dirty includes swapped. Groups partition dirty; wired/reclaimable are not additive."}
+
+
+def display_size(token):
+    require(isinstance(token, str) and re.fullmatch(SIZE_PATTERN, token), f"Unsupported native size: {token!r}")
+    suffix = token[-1] if token[-1].isalpha() else ""
+    numeric = token[:-1] if suffix else token
+    factor = 1024 ** ("KMGT".index(suffix) + 1) if suffix else 1
+    require(suffix or "." not in numeric, "A native byte count without a suffix must be an integer")
+    precision = len(numeric.split(".")[1]) if "." in numeric else 0
+    return {"display": token, "bytes_approximate": float(Decimal(numeric) * factor),
+            "display_resolution_bytes": float(Decimal(10) ** -precision * factor), "exact": not bool(suffix)}
+
+
+def native_header(text, pid, tool):
+    require(isinstance(text, str) and text and not NATIVE_ERROR.search(text), f"{tool} reported an error or warning")
+    identities = re.findall(r"^Process:\s+[^\n]*\[(\d+)\]\s*$", text, re.MULTILINE)
+    require(identities == [str(pid)], f"{tool} requires one matching primary Process PID")
+    require(re.findall(r"^Analysis Tool:\s*(\S+)\s*$", text, re.MULTILINE) == [f"/usr/bin/{tool}"],
+            f"Unexpected {tool} analysis tool")
+    result = {}
+    for label, key in (("Physical footprint", "physical_footprint"), ("Physical footprint (peak)", "lifetime_peak")):
+        values = re.findall(r"^" + re.escape(label) + r":\s*(\S+)\s*$", text, re.MULTILINE)
+        require(len(values) == 1, f"{tool} is missing a unique {label}")
+        result[key] = display_size(values[0])
+    return result
+
+
+def parse_vmmap(text, pid):
+    summary = native_header(text, pid, "vmmap")
+    headers = list(re.finditer(r"^REGION TYPE\s+SIZE\s+SIZE\s+SIZE\s+SIZE\s+SIZE\s+SIZE\s+SIZE\s+COUNT[^\n]*$",
+                               text, re.MULTILINE))
+    require(len(headers) == 1, "vmmap region table header is missing or ambiguous")
+    tail = text[headers[0].end():]
+    rows, total = [], None
+    pattern = re.compile(r"^(.+?)\s+" + (r"(" + SIZE_PATTERN + r")\s+") * 7 +
+                         r"(\d+)(?:\s+(?:see MALLOC ZONE table below|reserved VM address space \(unallocated\)))?\s*$")
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped or set(stripped) <= {"=", " "}:
+            continue
+        if total is not None:
+            break  # The malloc-zone table and minus-reserved total are separate ledgers.
+        match = pattern.fullmatch(stripped)
+        require(match is not None, f"Malformed vmmap region row: {stripped[:160]}")
+        name, *values, regions = match.groups()
+        row = {"name": name, "regions": int(regions)}
+        row.update({field: display_size(value) for field, value in zip(
+            ("virtual", "resident", "dirty", "swapped", "volatile", "nonvolatile", "empty"), values)})
+        if name == "TOTAL":
+            total = row
+        else:
+            rows.append(row)
+    require(rows and total is not None, "vmmap region table is incomplete")
+    require(sum(row["regions"] for row in rows) == total["regions"], "vmmap region counts do not reconcile (possibly truncated)")
+    return {"process_id": pid, **summary, "regions": rows, "region_total": total,
+            "accounting": "Rounded binary sizes. Region dirty excludes swapped; region totals are not the physical-footprint ledger."}
+
+
+def heap_group(description):
+    if description.strip() == "non-object":
+        return "non_object"
+    if any(name in description for name in ("SwiftUI", "AttributeGraph")):
+        return "ui_type_references"
+    if any(name in description for name in ("Metal", "AGX", "QuartzCore", "CoreAnimation", "IOSurface")):
+        return "graphics_type_references"
+    if "FluxLLM." in description:
+        return "app_type_references"
+    return "other_allocations"
+
+
+def parse_heap(text, pid):
+    summary = native_header(text, pid, "heap")
+    require(re.findall(r"^Process (\d+):\s*\d+ zones\s*$", text, re.MULTILINE) == [str(pid)],
+            "heap zone header PID mismatch or missing")
+    totals = re.findall(r"^All zones:\s*(\d+) nodes \((\d+) bytes\)\s*$", text, re.MULTILINE)
+    require(len(totals) == 1, "heap allocation total is missing or ambiguous")
+    count, allocated = map(int, totals[0])
+    headers = list(re.finditer(r"^\s*COUNT\s+BYTES\s+AVG\s+CLASS_NAME\s+TYPE\s+BINARY\s*$", text, re.MULTILINE))
+    require(len(headers) == 1, "heap allocation table header is missing or ambiguous")
+    rows, groups = [], {}
+    for line in text[headers[0].end():].splitlines():
+        if not line.strip() or set(line.strip()) <= {"=", " "}:
+            continue
+        match = re.fullmatch(r"\s*(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)\s+(.*?)\s*", line)
+        require(match is not None, f"Malformed heap allocation row: {line[:160]}")
+        nodes, size, average, description = match.groups()
+        row = {"count": int(nodes), "bytes": int(size), "average_display": average,
+               "description": description}
+        rows.append(row)
+        group = groups.setdefault(heap_group(description), {"count": 0, "bytes": 0})
+        group["count"] += row["count"]
+        group["bytes"] += row["bytes"]
+    require(rows and sum(row["count"] for row in rows) == count and sum(row["bytes"] for row in rows) == allocated,
+            "heap allocation table does not reconcile with All zones (possibly truncated)")
+    return {"process_id": pid, **summary, "allocation_count": count, "allocated_bytes": allocated,
+            "groups": groups, "allocations": rows,
+            "accounting": "Exact allocated bytes, not physical footprint. Groups classify native type-name references, not causal ownership. Descriptions retain ambiguous native class/type/binary columns."}
+
+
+class MemoryDeadline:
+    def __init__(self, seconds=DEADLINE_SECONDS, clock=time.monotonic):
+        require(type(seconds) in (int, float) and 8 < seconds <= DEADLINE_SECONDS, "Memory deadline must be at most 90 seconds")
+        self.clock = clock
+        self.end = clock() + seconds
+        self.cleanup_reserve = 8
+
+    def remaining(self, maximum=None):
+        remaining = self.end - self.clock() - self.cleanup_reserve
+        if remaining <= 0:
+            raise TimeoutError("The 90-second memory diagnostic deadline reached its cleanup reserve")
+        return min(remaining, maximum) if maximum is not None else remaining
+
+    @contextmanager
+    def interrupt_at(self, end):
+        """Bound even file parsing and synchronous helper calls on the main thread."""
+        def expired(_signal, _frame):
+            raise TimeoutError("The 90-second memory diagnostic deadline expired")
+        duration = end - self.clock()
+        require(duration > 0, "No time remains in the memory diagnostic deadline")
+        previous = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, expired)
+        old_timer = signal.setitimer(signal.ITIMER_REAL, duration)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+            if old_timer[0]:
+                signal.setitimer(signal.ITIMER_REAL, *old_timer)
+
+
+def stop_owned_child(process, deadline):
+    """Only a child launched in its own session by this diagnostic is accepted."""
+    try:
+        if process.poll() is None:
+            require(os.getpgid(process.pid) == process.pid, "Diagnostic child no longer owns its process group")
+            os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if process.poll() is None:
+            raise
+    process.wait(timeout=max(0.001, min(1, deadline.end - deadline.clock())))
+
+
+def verify_owned(collector, identity, birth_reader=None):
+    if birth_reader is None:
+        from performance_trace import _birth_time
+        birth_reader = _birth_time
+    pid, birth = identity["process_id"], identity["birth_time_us"]
+    require(type(pid) is int and type(birth) is int and pid > 0 and birth > 0,
+            "Memory inspection requires an authenticated PID and birth time")
+    require(pid == collector.app_pid and birth == collector.app_birth_time_us and not collector.exited
+            and birth_reader(pid) == birth and os.getpgid(pid) == pid, "Owned app identity changed")
+
+
+def authenticate_ready(collector):
+    # The ready record needs a following kernel sample to authenticate the
+    # boundary. The first saved probe failed before this explicit snapshot.
+    collector.snapshot()
+    return app.authenticated_cpu_ready(collector.samples, collector.events)
+
+
+def validate_sample_identities(samples, identity):
+    require(isinstance(samples, list) and len(samples) >= 2, "Memory diagnostics require a complete collector sample sequence")
+    previous = None
+    for sample in samples:
+        require(isinstance(sample, dict) and all(type(sample.get(field)) is int and sample[field] == identity[field]
+                for field in ("process_id", "birth_time_us")), "Memory sample identity changed")
+        timestamp = number(sample.get("monotonic_seconds"), "Memory sample timestamp")
+        require(previous is None or timestamp > previous, "Memory sample timestamps are not strictly increasing")
+        previous = timestamp
+    require(samples[0].get("phase") == "baseline" and samples[-1].get("phase") == "final",
+            "Memory samples do not include the complete baseline-to-final lifetime")
+
+
+def validate_products(args):
+    paths = {"app": args.app_binary.resolve(), "tests": args.test_bundle.resolve(),
+             "collector": args.collector_binary.resolve()}
+    for key, path in paths.items():
+        require(path.exists(), f"Explicit {key} product is missing: {path}")
+        if key != "tests":
+            require(path.is_file() and os.access(path, os.X_OK), f"Explicit {key} must be executable")
+    identity = app.measurement_identity()
+    raw = load_json(args.provenance)
+    require(isinstance(raw, dict), "Explicit provenance must be an object")
+    mode = "baseline" if raw.get("kind") == "reconstructed-pre-optimization" else "check"
+    provenance = app.validated_provenance(args.provenance, paths, mode, identity["sha256"])
+    require(app.path_hash(paths["collector"]) == provenance.get("common_collector", {}).get("sha256"),
+            "Explicit common collector does not match provenance")
+    bundles = provenance.get("resource_bundle_sha256")
+    require(isinstance(bundles, dict) and bundles, "Frozen products require resource-bundle hashes")
+    for name, expected in bundles.items():
+        require(isinstance(name, str) and Path(name).name == name and name.endswith(".bundle"), "Invalid resource bundle path")
+        bundle = paths["app"].parent / name
+        require(bundle.is_dir() and app.path_hash(bundle) == expected, f"Resource bundle differs from provenance: {name}")
+    return paths, provenance, identity
+
+
+def read_native(path):
+    require(path.is_file() and 0 < path.stat().st_size <= MAX_ARTIFACT_BYTES, f"Native report missing, empty, or over 16 MiB: {path}")
+    return path.read_text(encoding="utf-8", errors="strict")
+
+
+def parse_probe(tool, output, json_output, pid):
+    text = read_native(output)
+    require(not NATIVE_ERROR.search(text), f"{tool} reported an error or warning")
+    if tool == "footprint":
+        read_native(json_output)  # Check the size before strict JSON decoding.
+        return parse_footprint(load_json(json_output), pid)
+    return {"vmmap": parse_vmmap, "heap": parse_heap}[tool](text, pid)
+
+
+def validate_graphics(snapshot, mode):
+    value = snapshot.get("graphics_diagnostics")
+    if "graphics_diagnostics" not in snapshot and mode == "normal":
+        return {"available": False, "reason": "This frozen app does not expose graphics diagnostic counters; native and kernel memory evidence remain separate."}
+    require(isinstance(value, dict) and value.get("enabled") is True and value.get("mode") == mode,
+            "App did not acknowledge the requested graphics diagnostic mode")
+    require(unsigned(value.get("invalid_events"), "graphics.invalid_events") == 0,
+            "Graphics diagnostic counters reported invalid lifecycle events")
+    if mode == "cpu-glow":
+        require(unsigned(value.get("cpu_glow_fallbacks"), "graphics.cpu_glow_fallbacks") == 0,
+                "CPU glow used the framework-blur fallback; the comparison is invalid")
+    roles = value.get("roles")
+    require(isinstance(roles, dict) and set(roles) == {"static_chart", "cursor", "rail_bars", "rail_decorations"},
+            "Graphics diagnostic roles are incomplete")
+    fields = ("created", "destroyed", "live", "peak_live", "updates", "renderer_creations", "renderer_updates",
+              "renderer_destructions", "live_renderers", "peak_live_renderers", "draws", "skipped_draws",
+              "current_pixel_area", "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes")
+    for name, role in roles.items():
+        require(isinstance(role, dict), f"Invalid graphics role {name}")
+        for field in fields:
+            unsigned(role.get(field), f"graphics.{name}.{field}")
+        for field in ("max_width_points", "max_height_points", "max_scale"):
+            number(role.get(field), f"graphics.{name}.{field}")
+        require(role["created"] - role["destroyed"] == role["live"]
+                and role["renderer_creations"] - role["renderer_destructions"] == role["live_renderers"],
+                f"Graphics {name} lifecycle counters do not reconcile")
+        for current, peak in (("live", "peak_live"), ("live_renderers", "peak_live_renderers"),
+                              ("current_pixel_area", "peak_pixel_area"), ("current_bitmap_bytes", "peak_bitmap_bytes")):
+            require(role[peak] >= role[current], f"Graphics {name} peak is below current {current}")
+    for global_current, local_current, global_peak, local_peak in (
+            ("live_canvases", "live", "peak_live_canvases", "peak_live"),
+            ("live_renderers", "live_renderers", "peak_live_renderers", "peak_live_renderers"),
+            ("current_pixel_area", "current_pixel_area", "peak_pixel_area", "peak_pixel_area"),
+            ("current_bitmap_bytes", "current_bitmap_bytes", "peak_bitmap_bytes", "peak_bitmap_bytes")):
+        current = unsigned(value.get(global_current), f"graphics.{global_current}")
+        peak = unsigned(value.get(global_peak), f"graphics.{global_peak}")
+        require(current == sum(role[local_current] for role in roles.values()), f"Graphics {global_current} total mismatch")
+        require(current <= peak <= sum(role[local_peak] for role in roles.values()), f"Graphics {global_peak} is inconsistent")
+    return {"available": True, "counters": value}
+
+
+class MemoryDiagnostic:
+    def __init__(self, output, deadline, graphics_mode):
+        self.output, self.deadline, self.graphics_mode = output, deadline, graphics_mode
+        self.collector = self.fixture = self.active_probe = None
+        self.identity = None
+        self.report = {"schema_version": 1, "kind": "memory-attribution-diagnostic", "status": "running",
+                       "regression_passed": False, "comparable_to_regression_cases": False,
+                       "cpu_gate_evaluated": False, "gpu_gate_evaluated": False,
+                       "graphics_mode": graphics_mode, "deadline_seconds": DEADLINE_SECONDS,
+                       "errors": [], "checkpoints": [], "probes": [], "commands": [],
+                       "driver_sha256": app.path_hash(Path(__file__)),
+                       "caveat": "Native VM/heap inspection and graphics modes perturb runtime. These are attribution diagnostics, not CPU/GPU or regression passes. Pixel/bitmap requests are not measured GPU allocations."}
+
+    def save(self):
+        write_json(self.output / "in-progress.json", self.report)
+
+    def verify_identity(self):
+        verify_owned(self.collector, self.identity)
+
+    def checkpoint(self, label, dashboard, popover, active):
+        self.verify_identity()
+        snapshot = self.collector.snapshot()
+        self.verify_identity()
+        timestamp = snapshot.get("runner_collector_sample_monotonic_seconds")
+        matches = [sample for sample in self.collector.samples if sample.get("monotonic_seconds") == timestamp]
+        require(type(timestamp) in (int, float) and len(matches) == 1, "Snapshot lacks one authenticated collector boundary")
+        sample = matches[0]
+        require(sample.get("process_id") == self.identity["process_id"]
+                and sample.get("birth_time_us") == self.identity["birth_time_us"], "Snapshot resource identity differs")
+        entry = {"label": label, "snapshot": snapshot, "resource_sample": sample,
+                 "python_monotonic_seconds": time.monotonic(),
+                 "expected_state": {"dashboard_visible": dashboard, "popover_visible": popover, "active_requests": active}}
+        self.report["checkpoints"].append(entry)
+        self.save()  # Preserve actual UI/counter evidence even when the assertion fails.
+        require(snapshot.get("dashboard_visible") is dashboard and snapshot.get("popover_visible") is popover,
+                f"Wrong native UI state at {label}: dashboard={snapshot.get('dashboard_visible')}, popover={snapshot.get('popover_visible')}")
+        require(type(snapshot.get("active_requests")) is int and snapshot["active_requests"] == active,
+                f"Wrong active stream count at {label}: {snapshot.get('active_requests')}")
+        entry["graphics_validation"] = validate_graphics(snapshot, self.graphics_mode)
+        self.save()
+        return snapshot
+
+    def command(self, name, **fields):
+        self.verify_identity()
+        response = self.collector.command(name, **fields)
+        self.report["commands"].append({"command": name, **fields, "response": response})
+        self.save()
+        require(response.get("status") == "ok", f"App command {name} failed: {response}")
+        return response
+
+    def inspect_tool(self, label, tool):
+        self.verify_identity()
+        pid = self.identity["process_id"]
+        output = self.output / f"{label}-{tool}.txt"
+        json_output = self.output / f"{label}-footprint.json"
+        commands = {
+            "footprint": ["/usr/bin/footprint", "--pid", str(pid), "--format", "bytes", "--swapped", "--wired", "--json", str(json_output)],
+            "vmmap": ["/usr/bin/vmmap", "-summary", "-sortBySize", str(pid)],
+            "heap": ["/usr/bin/heap", "-s", "--noContent", str(pid)]}
+        item = {"label": label, "tool": tool, "command": commands[tool], "output": str(output),
+                "process_id": pid, "birth_time_us": self.identity["birth_time_us"],
+                "started_monotonic_seconds": time.monotonic(), "valid": False, "errors": []}
+        if tool == "footprint":
+            item["json_output"] = str(json_output)
+        self.report["probes"].append(item)
+        limit = time.monotonic() + self.deadline.remaining(12)
+        try:
+            with output.open("wb") as handle:
+                try:
+                    self.active_probe = subprocess.Popen(commands[tool], stdout=handle, stderr=subprocess.STDOUT,
+                                                         start_new_session=True)
+                except OSError as error:
+                    item["errors"].append(f"Cannot start {tool}: {error}")
+                if self.active_probe is not None:
+                    while self.active_probe.poll() is None:
+                        if time.monotonic() >= limit:
+                            item["errors"].append(f"{tool} exceeded its bounded inspection time")
+                            break
+                        if output.stat().st_size > MAX_ARTIFACT_BYTES or (json_output.exists() and json_output.stat().st_size > MAX_ARTIFACT_BYTES):
+                            item["errors"].append(f"{tool} output exceeded 16 MiB")
+                            break
+                        self.collector.receive(min(0.1, max(0.001, limit - time.monotonic())))
+                        require(not self.collector.exited, "App exited during native memory inspection")
+        finally:
+            if self.active_probe is not None:
+                stop_owned_child(self.active_probe, self.deadline)
+                item["exit_code"] = self.active_probe.returncode
+                self.active_probe = None
+            item["ended_monotonic_seconds"] = time.monotonic()
+            item["output_bytes"] = output.stat().st_size if output.exists() else 0
+            self.save()
+        self.verify_identity()
+        item["identity_verified_after"] = True
+        if item.get("exit_code") != 0:
+            item["errors"].append(f"{tool} exit status: {item.get('exit_code')}")
+        if not item["errors"]:
+            try:
+                item["parsed"] = parse_probe(tool, output, json_output, pid)
+                item["valid"] = True
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                item["errors"].append(str(error))
+        self.report["errors"].extend(f"{label}/{tool}: {error}" for error in item["errors"])
+        self.save()
+
+    def probe(self, label, dashboard, popover, active, heap=False):
+        self.checkpoint(label + "-before-probe", dashboard, popover, active)
+        for tool in ("footprint", "vmmap", "heap") if heap else ("footprint", "vmmap"):
+            self.inspect_tool(label, tool)
+        self.checkpoint(label + "-after-probe", dashboard, popover, active)
+
+    def perform(self, paths, provenance, identity):
+        self.report.update(production_provenance=provenance, measurement_identity=identity,
+                           binary_identity={key: {"path": str(path), "sha256": app.path_hash(path)} for key, path in paths.items()})
+        self.fixture, upstream = app.launch_fixture(self.output, timeout=self.deadline.remaining(5))
+        directory = self.output / "owned-app"
+        directory.mkdir()
+        configuration = {"upstream_url": upstream, "history": "populated", "protocol_version": 1,
+                         "logging_enabled": False, "fixture_ending_at_epoch": time.time(), "graphics_mode": self.graphics_mode}
+        write_json(directory / "configuration.json", configuration)
+        self.collector = app.Collector(paths["collector"], paths["app"], configuration, {}, directory, self.deadline,
+                                       {"external_trace": True, "provenance": provenance, "fixture_schema_version": 2})
+        ready = self.collector.ready()
+        self.report["ready"] = ready
+        self.save()
+        seed = ready.get("snapshot", {})
+        require(ready.get("fixture_schema_version") == 2
+                and ready.get("fixture_equivalence_sha256") == provenance.get("fixture_equivalence_sha256", {}).get("populated")
+                and isinstance(ready.get("fixture_equivalence_sha256"), str), "Populated fixture differs from frozen provenance")
+        require(seed.get("history_verified") is True and seed.get("history") == "populated"
+                and (seed.get("seed_persistent_requests"), seed.get("seed_raw_requests"), seed.get("seed_tool_events")) == (19000, 256, 38512),
+                "Populated history dimensions were not verified")
+        self.report["ready_graphics_validation"] = validate_graphics(seed, self.graphics_mode)
+        self.identity = authenticate_ready(self.collector)
+        self.report["owned_identity"] = self.identity
+        logging = self.command("set_logging", enabled=False)
+        require(logging.get("logging_enabled") is False and logging.get("drained") is True, "Logging did not disable and drain")
+        self.collector.wait_until(time.monotonic() + 1)
+        self.probe("01-populated-never-opened", False, False, 0, heap=True)
+        self.command("show_dashboard")
+        self.collector.wait_until(time.monotonic() + 2)
+        self.probe("02-dashboard-only", True, False, 0)
+        self.command("show_popover")
+        self.collector.wait_until(time.monotonic() + 2)
+        self.probe("03-both-visible-idle", True, True, 0, heap=True)
+
+        stage = {"activity": "high-rate", "seconds": 25}
+        before = self.checkpoint("04-before-traffic", True, True, 0)
+        began = time.monotonic()
+        acknowledgment = app.fixture_request(upstream, "/control/start", self.deadline, {
+            "proxy_url": ready["proxy_url"], "duration_seconds": 25, "rate_hz": 200, "concurrency": 2, "cycle": 15000})
+        app.validate_fixture_start(stage, acknowledgment)
+        self.report["workload"] = {"specification": stage, "fixture_start": acknowledgment, "before": before,
+                                   "started_monotonic_seconds": began, "validated": False}
+        self.save()
+        self.collector.wait_until(began + 8)
+        self.probe("05-both-visible-streaming", True, True, 2)
+        self.collector.wait_until(began + 25)
+        status = app.completed_status(self.collector, upstream, self.deadline)
+        after = self.checkpoint("06-after-traffic", True, True, 0)
+        self.report["workload"].update(fixture_status=status, after=after)
+        self.save()
+        work = app.validate_workload(stage, status, before, after, acknowledgment)
+        self.report["workload"].update(validated_work=work, validated=True)
+        self.command("close_popover")
+        self.command("close_dashboard")
+        self.collector.wait_until(time.monotonic() + 2)
+        self.probe("07-both-closed", False, False, 0, heap=True)
+        self.collector.wait_until(time.monotonic() + 5)
+        self.checkpoint("08-closed-after-five-more-seconds", False, False, 0)
+        self.collector.finish()
+
+    def cleanup(self):
+        # Each owned child gets an independent cleanup attempt. A failed native
+        # tool or collector drain must not bypass fixture/process-group cleanup.
+        for label, action in (
+                ("native inspector", lambda: stop_owned_child(self.active_probe, self.deadline) if self.active_probe else None),
+                ("fixture", lambda: stop_owned_child(self.fixture, self.deadline) if self.fixture else None),
+                ("collector", lambda: self.collector.close() if self.collector else None)):
+            try:
+                if label == "collector" and self.collector is not None:
+                    with self.deadline.interrupt_at(min(self.deadline.end - 0.75, self.deadline.clock() + 5.5)):
+                        action()
+                else:
+                    # Always attempt a nonblocking kill, even after another
+                    # cleanup action has consumed its time allocation.
+                    action()
+            except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
+                self.report["errors"].append(f"{label} cleanup failed: {error}")
+                if label == "collector" and self.collector is not None:
+                    self.emergency_collector_cleanup()
+        if self.collector is not None:
+            self.report.update(samples=self.collector.samples, events=self.collector.events, storage=self.collector.storage)
+            self.report["errors"].extend(self.collector.cleanup_errors)
+            try:
+                exits = [event for event in self.collector.events if event.get("type") == "exited"]
+                require(len(exits) == 1 and exits[0].get("status") == 0 and self.collector.samples
+                        and exits[0].get("final_sample") == self.collector.samples[-1], "Missing clean authenticated final exit")
+                final = exits[0]
+                require(self.identity is not None and final["final_sample"].get("process_id") == self.identity["process_id"]
+                        and final["final_sample"].get("birth_time_us") == self.identity["birth_time_us"], "Final exit identity differs")
+                validate_sample_identities(self.collector.samples, self.identity)
+                stopped = [event.get("event", {}) for event in self.collector.events
+                           if event.get("type") == "app_event" and event.get("event", {}).get("type") == "stopped"]
+                require(len(stopped) == 1 and stopped[0].get("status") == "ok", "App shutdown/drain was not acknowledged")
+                with self.deadline.interrupt_at(self.deadline.end - 0.25):
+                    self.report["memory_validation"] = app.memory_evidence(self.collector.samples, final)
+                self.report["errors"].extend(self.report["memory_validation"]["problems"])
+            except (ValueError, KeyError, TypeError, TimeoutError) as error:
+                self.report["errors"].append(str(error))
+
+    def emergency_collector_cleanup(self):
+        """Do not orphan the app if a collector protocol/cleanup call fails."""
+        try:
+            if not self.collector.exited:
+                identity = {"process_id": self.collector.app_pid, "birth_time_us": self.collector.app_birth_time_us}
+                verify_owned(self.collector, identity)
+                os.killpg(identity["process_id"], signal.SIGKILL)
+        except (OSError, ValueError) as error:
+            self.report["errors"].append(f"Emergency app identity/cleanup could not be confirmed: {error}")
+        try:
+            stop_owned_child(self.collector.process, self.deadline)
+        except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
+            self.report["errors"].append(f"Emergency collector cleanup failed: {error}")
+
+
+def summary_markdown(report):
+    lines = ["# Memory attribution diagnostic", "", report["caveat"], "",
+             f"Completion status: see [memory-report.json](memory-report.json). Graphics mode: `{report['graphics_mode']}`. No regression pass is implied.", "",
+             "| Checkpoint | Collector current / lifetime peak (MB) | Footprint (MB) | Graphics unmapped (MB) | Malloc dirty (MB) | Heap allocated (MB) |",
+             "|---|---:|---:|---:|---:|---:|"]
+    def megabytes(value):
+        return f"{value / 1_000_000:.3f}" if type(value) in (int, float) else "unavailable"
+    for checkpoint in report["checkpoints"]:
+        label = checkpoint["label"]
+        if not label.endswith("-after-probe"):
+            continue
+        label = label.removesuffix("-after-probe")
+        probes = {item["tool"]: item for item in report["probes"] if item["label"] == label}
+        footprint = probes.get("footprint", {}).get("parsed", {})
+        heap = probes.get("heap", {}).get("parsed", {})
+        groups = footprint.get("groups", {})
+        sample = checkpoint["resource_sample"]
+        native = lambda field: megabytes(footprint.get(field))
+        # A successfully reconciled complete ledger measures absent categories
+        # as zero. A missing/invalid entire tool report remains unavailable.
+        group_bytes = lambda name: megabytes(groups.get(name, {}).get("dirty", 0)) if footprint else "unavailable"
+        lines.append(f"| {label} | {megabytes(sample.get('physical_footprint_bytes'))} / {megabytes(sample.get('lifetime_peak_footprint_bytes'))} | "
+                     f"{native('physical_footprint_bytes')} | {group_bytes('graphics_unmapped')} | "
+                     f"{group_bytes('malloc')} | {megabytes(heap.get('allocated_bytes'))} |")
+    lines.extend(["", "Decimal MB. Tool snapshots occur at different times. Footprint dirty includes swapped; heap/VM values must not be added to footprint.", "",
+                  "Raw native reports, collector samples, graphics role counters, exact commands, identity checks, and fixture validation are in memory-report.json and adjacent artifacts."])
+    if report["errors"]:
+        lines.extend(["", "Unavailable or invalid evidence:", ""])
+        lines.extend("- " + error.replace("\n", " ") for error in report["errors"])
+    return "\n".join(lines) + "\n"
+
+
+def finalize_report(output, report, deadline):
+    """Commit completion only after every artifact is written successfully."""
+    pending = dict(report, status="diagnostic_incomplete", finalization_pending=True,
+                   errors=[*report["errors"], "Memory report finalization has not completed"])
+    try:
+        with deadline.interrupt_at(deadline.end):
+            # If either later write fails, the authoritative report already
+            # says incomplete. The summary never asserts completion itself.
+            write_json(output / "memory-report.json", pending)
+            (output / "SUMMARY.md").write_text(summary_markdown(report), encoding="utf-8")
+            write_json(output / "memory-report.json", report)
+    except (OSError, ValueError, TimeoutError) as error:
+        report["status"] = "diagnostic_incomplete"
+        report["errors"].append(f"Final memory report could not be completed: {error}")
+        print(report["errors"][-1], file=sys.stderr)
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--app-binary", required=True, type=Path)
+    result.add_argument("--test-bundle", required=True, type=Path)
+    result.add_argument("--collector-binary", required=True, type=Path)
+    result.add_argument("--provenance", required=True, type=Path)
+    result.add_argument("--graphics-mode", choices=GRAPHICS_MODES, default="normal")
+    result.add_argument("--output-dir", type=Path, help="New, nonexisting artifact directory; default .performance-results/memory-UTC-unique")
+    return result
+
+
+def run(argv=None):
+    args = parser().parse_args(argv)
+    output = (args.output_dir or app.ROOT / ".performance-results" /
+              ("memory-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ-") + secrets.token_hex(3))).resolve()
+    try:
+        require(not output.exists(), "Never overwrite memory diagnostic artifacts")
+        require(app.ROOT not in output.parents or app.ROOT / ".performance-results" in output.parents,
+                "In-repository memory artifacts must be inside ignored .performance-results")
+        require(sys.platform == "darwin", "Native memory attribution requires macOS")
+        output.mkdir(parents=True)
+    except (OSError, ValueError) as error:
+        print(f"Memory diagnostic could not start: {error}", file=sys.stderr)
+        return 1
+    started = time.monotonic()
+    deadline = MemoryDeadline()
+    diagnostic = MemoryDiagnostic(output, deadline, args.graphics_mode)
+    try:
+        with deadline.interrupt_at(deadline.end - deadline.cleanup_reserve):
+            paths, provenance, identity = validate_products(args)
+            diagnostic.perform(paths, provenance, identity)
+    except (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        diagnostic.report["errors"].append(str(error) or "Interrupted")
+    finally:
+        diagnostic.cleanup()
+        report = diagnostic.report
+        report["elapsed_seconds"] = time.monotonic() - started
+        if report["elapsed_seconds"] > DEADLINE_SECONDS:
+            report["errors"].append("Memory diagnostic exceeded its hard 90-second deadline")
+        report["status"] = "diagnostic_captured" if not report["errors"] and report.get("workload", {}).get("validated") else "diagnostic_incomplete"
+        finalize_report(output, report, deadline)
+        print(f"Memory diagnostic: {report['status']}. Artifacts: {output}", flush=True)
+    return 0 if report["status"] == "diagnostic_captured" else 1
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, interrupted)
+    raise SystemExit(run())
