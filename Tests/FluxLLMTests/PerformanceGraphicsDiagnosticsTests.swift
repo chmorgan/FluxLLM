@@ -9,11 +9,12 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         typealias Mode = PerformanceGraphicsDiagnostics.Mode
         XCTAssertEqual(Mode.normal.rawValue, "normal")
         XCTAssertEqual(Mode.directHost.rawValue, "direct-host")
+        XCTAssertEqual(Mode.bitmapLayerDestination.rawValue, "bitmap-layer-destination")
         XCTAssertEqual(Mode.noBlur.rawValue, "no-blur")
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 9)
+        XCTAssertEqual(Mode.allCases.count, 10)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -67,6 +68,8 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             "live_renderers", "peak_live_renderers", "current_pixel_area",
             "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes",
             "gradient_substitutions",
+            "layer_bitmap_presentations", "layer_bitmap_failures", "layer_bitmap_native_draws",
+            "current_layer_image_bytes", "peak_layer_image_bytes",
         ] {
             assertCounter(key, in: initial, equals: 0)
         }
@@ -82,6 +85,10 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             diagnostics.canvasDrawn(id)
             diagnostics.drawSkipped(id)
             diagnostics.bitmapBytes(id, bytes: 4_096)
+            diagnostics.layerBitmapPresented(id, imageBytes: 8_192)
+            diagnostics.layerBitmapCleared(id)
+            diagnostics.recordLayerBitmapFailure()
+            diagnostics.recordLayerBitmapNativeDraw()
             diagnostics.rendererDestroyed(id)
             diagnostics.canvasDestroyed(id)
         }
@@ -294,6 +301,132 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         assertCounter("invalid_events", in: finished, equals: 11)
         assertCounter("live_canvases", in: finished, equals: 0)
         assertCounter("destroyed", in: try role(.cursor, in: finished), equals: 1)
+    }
+
+    func testLayerImagesTrackConcurrentOwnershipAndReleaseIndependentlyFromScratchBuffers() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .bitmapLayerDestination)
+        let chart = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
+        let secondChart = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
+        let cursor = try XCTUnwrap(diagnostics.canvasCreated(role: .cursor))
+        diagnostics.bitmapBytes(chart, bytes: 256)
+        diagnostics.layerBitmapPresented(chart, imageBytes: 1_024)
+        diagnostics.layerBitmapPresented(chart, imageBytes: 1_024)
+        diagnostics.layerBitmapPresented(secondChart, imageBytes: 512)
+        diagnostics.layerBitmapPresented(cursor, imageBytes: 2_048)
+        let concurrent = diagnostics.snapshot()
+        assertCounter("layer_bitmap_presentations", in: concurrent, equals: 4)
+        assertCounter("current_layer_image_bytes", in: concurrent, equals: 3_584)
+        assertCounter("peak_layer_image_bytes", in: concurrent, equals: 3_584)
+        assertCounter("current_bitmap_bytes", in: concurrent, equals: 256)
+        assertCounter(
+            "current_layer_image_bytes", in: try role(.staticChart, in: concurrent), equals: 1_536)
+        assertCounter(
+            "peak_layer_image_bytes", in: try role(.staticChart, in: concurrent), equals: 1_536)
+
+        diagnostics.layerBitmapPresented(chart, imageBytes: 128)
+        diagnostics.layerBitmapCleared(secondChart)
+        diagnostics.layerBitmapCleared(secondChart)
+        let replaced = diagnostics.snapshot()
+        assertCounter("layer_bitmap_presentations", in: replaced, equals: 5)
+        assertCounter("current_layer_image_bytes", in: replaced, equals: 2_176)
+        assertCounter("peak_layer_image_bytes", in: replaced, equals: 3_584)
+        assertCounter(
+            "current_layer_image_bytes", in: try role(.staticChart, in: replaced), equals: 128)
+        assertCounter(
+            "peak_layer_image_bytes", in: try role(.staticChart, in: replaced), equals: 1_536)
+
+        diagnostics.canvasDestroyed(chart)
+        diagnostics.canvasDestroyed(secondChart)
+        let afterCharts = diagnostics.snapshot()
+        assertCounter("current_layer_image_bytes", in: afterCharts, equals: 2_048)
+        assertCounter("current_bitmap_bytes", in: afterCharts, equals: 0)
+        diagnostics.canvasDestroyed(cursor)
+        let finished = diagnostics.snapshot()
+        assertCounter("current_layer_image_bytes", in: finished, equals: 0)
+        assertCounter("peak_layer_image_bytes", in: finished, equals: 3_584)
+        assertCounter("invalid_events", in: finished, equals: 0)
+        for canvasRole in PerformanceGraphicsDiagnostics.Role.allCases {
+            assertCounter(
+                "current_layer_image_bytes", in: try role(canvasRole, in: finished), equals: 0)
+        }
+    }
+
+    func testLayerImageOverflowRejectsTheWholePresentationAndPreservesOwnership() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .bitmapLayerDestination)
+        let chart = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
+        let secondChart = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
+        let cursor = try XCTUnwrap(diagnostics.canvasCreated(role: .cursor))
+        diagnostics.layerBitmapPresented(chart, imageBytes: UInt64.max - 5)
+        diagnostics.layerBitmapPresented(cursor, imageBytes: 5)
+        diagnostics.layerBitmapPresented(secondChart, imageBytes: 1)
+        diagnostics.layerBitmapPresented(cursor, imageBytes: 6)
+        let rejected = diagnostics.snapshot()
+        assertCounter("invalid_events", in: rejected, equals: 2)
+        assertCounter("layer_bitmap_presentations", in: rejected, equals: 2)
+        assertCounter("current_layer_image_bytes", in: rejected, equals: UInt64.max)
+        assertCounter("peak_layer_image_bytes", in: rejected, equals: UInt64.max)
+        assertCounter(
+            "current_layer_image_bytes", in: try role(.staticChart, in: rejected),
+            equals: UInt64.max - 5)
+        assertCounter("current_layer_image_bytes", in: try role(.cursor, in: rejected), equals: 5)
+
+        diagnostics.layerBitmapPresented(chart, imageBytes: 0)
+        diagnostics.layerBitmapCleared(cursor)
+        diagnostics.canvasDestroyed(chart)
+        diagnostics.canvasDestroyed(secondChart)
+        diagnostics.canvasDestroyed(cursor)
+        assertCounter("current_layer_image_bytes", in: diagnostics.snapshot(), equals: 0)
+        assertCounter("invalid_events", in: diagnostics.snapshot(), equals: 2)
+    }
+
+    func testLayerDiagnosticEventsAreScopedToTheEnabledCandidateAndReset() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        for mode in PerformanceGraphicsDiagnostics.Mode.allCases {
+            try diagnostics.enable(mode: mode)
+            let id = try XCTUnwrap(diagnostics.canvasCreated(role: .cursor))
+            diagnostics.layerBitmapPresented(id, imageBytes: 1_024)
+            diagnostics.recordLayerBitmapFailure()
+            diagnostics.recordLayerBitmapFailure()
+            diagnostics.recordLayerBitmapNativeDraw()
+            let expected: UInt64 = mode == .bitmapLayerDestination ? 1 : 0
+            let snapshot = diagnostics.snapshot()
+            assertCounter("layer_bitmap_presentations", in: snapshot, equals: expected)
+            assertCounter("layer_bitmap_failures", in: snapshot, equals: expected * 2)
+            assertCounter("layer_bitmap_native_draws", in: snapshot, equals: expected)
+            assertCounter("current_layer_image_bytes", in: snapshot, equals: expected * 1_024)
+            assertCounter("peak_layer_image_bytes", in: snapshot, equals: expected * 1_024)
+            assertCounter("invalid_events", in: snapshot, equals: 0)
+            diagnostics.canvasDestroyed(id)
+        }
+        try diagnostics.enable(mode: .bitmapLayerDestination)
+        diagnostics.recordLayerBitmapFailure()
+        diagnostics.recordLayerBitmapNativeDraw()
+        try diagnostics.disable()
+        XCTAssertEqual(
+            diagnostics.snapshot() as NSDictionary,
+            PerformanceGraphicsDiagnostics().snapshot() as NSDictionary)
+    }
+
+    func testLayerImageNilIDsAreIgnoredAndUnknownOrDestroyedIDsAreRejected() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .bitmapLayerDestination)
+        let id = try XCTUnwrap(diagnostics.canvasCreated(role: .cursor))
+        let initial = diagnostics.snapshot()
+        diagnostics.layerBitmapPresented(nil, imageBytes: 1_024)
+        diagnostics.layerBitmapCleared(nil)
+        XCTAssertEqual(diagnostics.snapshot() as NSDictionary, initial as NSDictionary)
+        diagnostics.layerBitmapPresented(UInt64.max, imageBytes: 1_024)
+        diagnostics.layerBitmapCleared(UInt64.max)
+        diagnostics.canvasDestroyed(id)
+        diagnostics.layerBitmapPresented(id, imageBytes: 1_024)
+        diagnostics.layerBitmapCleared(id)
+        let finished = diagnostics.snapshot()
+        assertCounter("invalid_events", in: finished, equals: 4)
+        assertCounter("layer_bitmap_presentations", in: finished, equals: 0)
+        assertCounter("current_layer_image_bytes", in: finished, equals: 0)
+        assertCounter("peak_layer_image_bytes", in: finished, equals: 0)
     }
 
     private func role(

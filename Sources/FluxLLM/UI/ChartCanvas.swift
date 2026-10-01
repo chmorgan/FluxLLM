@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import QuartzCore
 import SwiftUI
 
 /// Keeps Canvas drawing semantics while rendering through Core Graphics. A native
@@ -107,6 +108,33 @@ struct ChartCanvas: NSViewRepresentable {
         }
     }
 
+    /// A single CPU drawing buffer is admitted only after all arithmetic is
+    /// checked. The retained CGImage may share this storage; Core Animation can
+    /// also retain earlier images until its transactions retire.
+    struct BitmapLayout: Equatable {
+        static let maximumBytes = 32 * 1_024 * 1_024
+        let width: Int
+        let height: Int
+        let bytesPerRow: Int
+        let byteCount: Int
+
+        static func make(size: CGSize, scale: CGFloat) -> Self? {
+            guard size.width.isFinite, size.height.isFinite, scale.isFinite,
+                size.width > 0, size.height > 0, scale > 0,
+                let width = Int(exactly: ceil(size.width * scale)),
+                let height = Int(exactly: ceil(size.height * scale)),
+                width > 0, height > 0
+            else { return nil }
+            let row = width.multipliedReportingOverflow(by: 4)
+            guard !row.overflow else { return nil }
+            let total = row.partialValue.multipliedReportingOverflow(by: height)
+            guard !total.overflow, total.partialValue <= maximumBytes else { return nil }
+            return Self(
+                width: width, height: height,
+                bytesPerRow: row.partialValue, byteCount: total.partialValue)
+        }
+    }
+
     @MainActor
     class DrawingView: NSView {
         private var content: Content?
@@ -130,6 +158,7 @@ struct ChartCanvas: NSViewRepresentable {
 
         required init?(coder: NSCoder) { return nil }
 
+        override var wantsUpdateLayer: Bool { mode == .bitmapLayerDestination }
         override var isOpaque: Bool { false }
         // ImageRenderer maps SwiftUI's top-left coordinates into Quartz itself.
         override var isFlipped: Bool { false }
@@ -140,7 +169,9 @@ struct ChartCanvas: NSViewRepresentable {
             role: PerformanceGraphicsDiagnostics.Role = .staticChart
         ) {
             let diagnostics = PerformanceGraphicsDiagnostics.shared
-            if diagnosticRole != role {
+            let roleChanged = diagnosticRole != role
+            if roleChanged {
+                clearLayerBitmap()
                 diagnostics.canvasDestroyed(diagnosticID)
                 diagnosticID = diagnostics.canvasCreated(role: role)
                 diagnosticRole = role
@@ -149,7 +180,7 @@ struct ChartCanvas: NSViewRepresentable {
             diagnostics.canvasUpdated(diagnosticID)
             let drawingEnvironment = DrawingEnvironment(environment)
             let mode = diagnostics.mode
-            if let revision, self.revision == revision,
+            if !roleChanged, let revision, self.revision == revision,
                 self.drawingEnvironment == drawingEnvironment,
                 self.drawingBounds == drawingBounds, self.mode == mode, content != nil
             {
@@ -159,6 +190,11 @@ struct ChartCanvas: NSViewRepresentable {
             self.drawingEnvironment = drawingEnvironment
             self.drawingBounds = drawingBounds
             self.mode = mode
+            if mode == .bitmapLayerDestination {
+                // Keep AppKit from flattening this view into an ancestor's
+                // native drawing context: this mode supplies finished pixels.
+                canDrawSubviewsIntoLayer = false
+            }
             let content = Content(
                 drawing: drawing, environment: environment,
                 drawingBounds: drawingBounds, empty: mode == .emptyDrawing)
@@ -172,6 +208,7 @@ struct ChartCanvas: NSViewRepresentable {
         }
 
         func clearContent() {
+            clearLayerBitmap()
             rendererObservation?.cancel()
             rendererObservation = nil
             if renderer != nil {
@@ -211,6 +248,11 @@ struct ChartCanvas: NSViewRepresentable {
             let changed = frame.size != newSize
             super.setFrameSize(newSize)
             if changed {
+                if mode == .bitmapLayerDestination,
+                    newSize.width <= 0 || newSize.height <= 0
+                {
+                    clearLayerBitmap()
+                }
                 recordGeometry()
                 needsDisplay = true
             }
@@ -233,7 +275,101 @@ struct ChartCanvas: NSViewRepresentable {
             needsDisplay = true
         }
 
+        /// Build the producer only when a real draw is requested. Both
+        /// destinations retain the same observation and revision semantics.
+        private func drawingRenderer(for content: Content, size: CGSize, scale: CGFloat)
+            -> ImageRenderer<Content>
+        {
+            let renderer: ImageRenderer<Content>
+            if let existing = self.renderer {
+                renderer = existing
+            } else {
+                renderer = ImageRenderer(content: content)
+                renderer.isObservationEnabled = true
+                self.renderer = renderer
+                PerformanceGraphicsDiagnostics.shared.rendererCreated(diagnosticID)
+                rendererObservation = renderer.objectWillChange.sink { [weak self] in
+                    guard let self, !self.isDrawing, self.content != nil else { return }
+                    self.needsDisplay = true
+                }
+            }
+            let proposedSize = ProposedViewSize(size)
+            if renderer.proposedSize != proposedSize { renderer.proposedSize = proposedSize }
+            if renderer.scale != scale { renderer.scale = scale }
+            return renderer
+        }
+
+        private func clearLayerBitmap() {
+            guard mode == .bitmapLayerDestination else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer?.contents = nil
+            CATransaction.commit()
+            PerformanceGraphicsDiagnostics.shared.layerBitmapCleared(diagnosticID)
+        }
+
+        override func updateLayer() {
+            guard mode == .bitmapLayerDestination else { return }
+            let diagnostics = PerformanceGraphicsDiagnostics.shared
+            let size = bounds.size
+            guard let content, size.width != 0, size.height != 0
+            else {
+                clearLayerBitmap()
+                return
+            }
+            let scale = drawingScale
+            guard let layer,
+                let layout = BitmapLayout.make(size: size, scale: scale),
+                let bitmap = CGContext(
+                    data: nil, width: layout.width, height: layout.height,
+                    bitsPerComponent: 8, bytesPerRow: layout.bytesPerRow,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                        | CGBitmapInfo.byteOrder32Big.rawValue)
+            else {
+                diagnostics.recordLayerBitmapFailure()
+                clearLayerBitmap()
+                return
+            }
+            recordGeometry()
+            diagnostics.bitmapBytes(diagnosticID, bytes: UInt64(layout.byteCount))
+            defer { diagnostics.bitmapBytes(diagnosticID, bytes: 0) }
+            isDrawing = true
+            defer { isDrawing = false }
+            let renderer = drawingRenderer(for: content, size: size, scale: scale)
+            bitmap.clear(CGRect(x: 0, y: 0, width: layout.width, height: layout.height))
+            bitmap.scaleBy(x: scale, y: scale)
+            var rendered = false
+            renderer.render(rasterizationScale: scale) { _, render in
+                render(bitmap)
+                rendered = true
+            }
+            guard rendered, let image = bitmap.makeImage() else {
+                diagnostics.recordLayerBitmapFailure()
+                clearLayerBitmap()
+                return
+            }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.contentsScale = scale
+            // Integral pixel buffers can extend by less than one pixel past a
+            // fractional view size. Anchor rather than stretch the image, and
+            // clip that extra right/top edge to preserve chart coordinates.
+            layer.contentsGravity = .bottomLeft
+            layer.masksToBounds = true
+            layer.contents = image
+            CATransaction.commit()
+            diagnostics.layerBitmapPresented(diagnosticID, imageBytes: UInt64(layout.byteCount))
+            diagnostics.canvasDrawn(diagnosticID)
+        }
+
         override func draw(_ dirtyRect: NSRect) {
+            guard mode != .bitmapLayerDestination else {
+                // A native fallback would invalidate the destination experiment.
+                PerformanceGraphicsDiagnostics.shared.recordLayerBitmapNativeDraw()
+                clearLayerBitmap()
+                return
+            }
             let size = bounds.size
             guard size.width.isFinite, size.height.isFinite,
                 size.width > 0, size.height > 0,
@@ -254,26 +390,8 @@ struct ChartCanvas: NSViewRepresentable {
             isDrawing = true
             defer { isDrawing = false }
 
-            let renderer: ImageRenderer<Content>
-            if let existing = self.renderer {
-                renderer = existing
-            } else {
-                // Hosting/layout and updates while hidden never create a renderer.
-                renderer = ImageRenderer(content: content)
-                renderer.isObservationEnabled = true
-                self.renderer = renderer
-                diagnostics.rendererCreated(diagnosticID)
-                rendererObservation = renderer.objectWillChange.sink { [weak self] in
-                    // NSView coalesces display invalidations. The weak subscription
-                    // also covers observable values read only inside the Canvas.
-                    guard let self, !self.isDrawing, self.content != nil else { return }
-                    self.needsDisplay = true
-                }
-            }
             let scale = drawingScale
-            let proposedSize = ProposedViewSize(size)
-            if renderer.proposedSize != proposedSize { renderer.proposedSize = proposedSize }
-            if renderer.scale != scale { renderer.scale = scale }
+            let renderer = drawingRenderer(for: content, size: size, scale: scale)
             context.translateBy(x: bounds.minX, y: bounds.minY)
             if mode == .bitmapDestination {
                 // Diagnostic-only destination A/B: preserve the producer and

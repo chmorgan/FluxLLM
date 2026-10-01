@@ -10,6 +10,7 @@ public final class PerformanceGraphicsDiagnostics {
         case emptyDrawing = "empty-drawing"
         case noRenderer = "no-renderer"
         case bitmapDestination = "bitmap-destination"
+        case bitmapLayerDestination = "bitmap-layer-destination"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -39,6 +40,7 @@ public final class PerformanceGraphicsDiagnostics {
         let role: Role
         var pixelArea: UInt64 = 0
         var bitmapBytes: UInt64 = 0
+        var layerImageBytes: UInt64 = 0
         var hasRenderer = false
     }
 
@@ -59,6 +61,8 @@ public final class PerformanceGraphicsDiagnostics {
         var peakPixelArea: UInt64 = 0
         var bitmapBytes: UInt64 = 0
         var peakBitmapBytes: UInt64 = 0
+        var layerImageBytes: UInt64 = 0
+        var peakLayerImageBytes: UInt64 = 0
         var maxWidth: Double = 0
         var maxHeight: Double = 0
         var maxScale: Double = 0
@@ -74,6 +78,8 @@ public final class PerformanceGraphicsDiagnostics {
                 "draws": draws, "skipped_draws": skippedDraws,
                 "current_pixel_area": pixelArea, "peak_pixel_area": peakPixelArea,
                 "current_bitmap_bytes": bitmapBytes, "peak_bitmap_bytes": peakBitmapBytes,
+                "current_layer_image_bytes": layerImageBytes,
+                "peak_layer_image_bytes": peakLayerImageBytes,
                 "max_width_points": maxWidth, "max_height_points": maxHeight,
                 "max_scale": maxScale,
             ]
@@ -88,6 +94,9 @@ public final class PerformanceGraphicsDiagnostics {
     private var invalidEvents: UInt64 = 0
     private var cpuGlowFallbacks: UInt64 = 0
     private var gradientSubstitutions: UInt64 = 0
+    private var layerBitmapPresentations: UInt64 = 0
+    private var layerBitmapFailures: UInt64 = 0
+    private var layerBitmapNativeDraws: UInt64 = 0
 
     init() {}
 
@@ -113,6 +122,9 @@ public final class PerformanceGraphicsDiagnostics {
         invalidEvents = 0
         cpuGlowFallbacks = 0
         gradientSubstitutions = 0
+        layerBitmapPresentations = 0
+        layerBitmapFailures = 0
+        layerBitmapNativeDraws = 0
     }
 
     public func canvasCreated(role: Role) -> UInt64? {
@@ -135,10 +147,12 @@ public final class PerformanceGraphicsDiagnostics {
         roles[canvas.role]!.live -= 1
         roles[canvas.role]!.pixelArea -= canvas.pixelArea
         roles[canvas.role]!.bitmapBytes -= canvas.bitmapBytes
+        roles[canvas.role]!.layerImageBytes -= canvas.layerImageBytes
         total.destroyed += 1
         total.live -= 1
         total.pixelArea -= canvas.pixelArea
         total.bitmapBytes -= canvas.bitmapBytes
+        total.layerImageBytes -= canvas.layerImageBytes
         canvases.removeValue(forKey: id)
     }
 
@@ -188,6 +202,64 @@ public final class PerformanceGraphicsDiagnostics {
             roles[canvas.role]!.peakBitmapBytes, roles[canvas.role]!.bitmapBytes)
         total.bitmapBytes = next.partialValue
         total.peakBitmapBytes = max(total.peakBitmapBytes, total.bitmapBytes)
+    }
+
+    /// Requested bytes for the image currently owned by a canvas's layer.
+    /// This is separate from CPU scratch buffers and does not measure Core
+    /// Animation's retained copies, allocation pools, or GPU memory.
+    public func layerBitmapPresented(_ id: UInt64?, imageBytes: UInt64) {
+        guard isEnabled, mode == .bitmapLayerDestination,
+            let (id, canvas) = registered(id)
+        else { return }
+        let next = (total.layerImageBytes - canvas.layerImageBytes)
+            .addingReportingOverflow(imageBytes)
+        let nextRole = (roles[canvas.role]!.layerImageBytes - canvas.layerImageBytes)
+            .addingReportingOverflow(imageBytes)
+        let presentations = layerBitmapPresentations.addingReportingOverflow(1)
+        guard !next.overflow, !nextRole.overflow, !presentations.overflow
+        else {
+            invalidEvents += 1
+            return
+        }
+
+        canvases[id]!.layerImageBytes = imageBytes
+        roles[canvas.role]!.layerImageBytes = nextRole.partialValue
+        roles[canvas.role]!.peakLayerImageBytes = max(
+            roles[canvas.role]!.peakLayerImageBytes, nextRole.partialValue)
+        total.layerImageBytes = next.partialValue
+        total.peakLayerImageBytes = max(total.peakLayerImageBytes, next.partialValue)
+        layerBitmapPresentations = presentations.partialValue
+    }
+
+    public func layerBitmapCleared(_ id: UInt64?) {
+        guard isEnabled, mode == .bitmapLayerDestination,
+            let (id, canvas) = registered(id)
+        else { return }
+        roles[canvas.role]!.layerImageBytes -= canvas.layerImageBytes
+        total.layerImageBytes -= canvas.layerImageBytes
+        canvases[id]!.layerImageBytes = 0
+    }
+
+    /// An allocation or rendering failure makes this candidate run invalid.
+    public func recordLayerBitmapFailure() {
+        guard isEnabled, mode == .bitmapLayerDestination else { return }
+        let next = layerBitmapFailures.addingReportingOverflow(1)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return
+        }
+        layerBitmapFailures = next.partialValue
+    }
+
+    /// Records unexpected entry into native window drawing for this candidate.
+    public func recordLayerBitmapNativeDraw() {
+        guard isEnabled, mode == .bitmapLayerDestination else { return }
+        let next = layerBitmapNativeDraws.addingReportingOverflow(1)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return
+        }
+        layerBitmapNativeDraws = next.partialValue
     }
 
     public func canvasUpdated(_ id: UInt64?) {
@@ -271,12 +343,17 @@ public final class PerformanceGraphicsDiagnostics {
             "invalid_events": invalidEvents,
             "cpu_glow_fallbacks": cpuGlowFallbacks,
             "gradient_substitutions": gradientSubstitutions,
+            "layer_bitmap_presentations": layerBitmapPresentations,
+            "layer_bitmap_failures": layerBitmapFailures,
+            "layer_bitmap_native_draws": layerBitmapNativeDraws,
             "live_canvases": total.live, "peak_live_canvases": total.peakLive,
             "live_renderers": total.liveRenderers,
             "peak_live_renderers": total.peakLiveRenderers,
             "current_pixel_area": total.pixelArea, "peak_pixel_area": total.peakPixelArea,
             "current_bitmap_bytes": total.bitmapBytes,
             "peak_bitmap_bytes": total.peakBitmapBytes,
+            "current_layer_image_bytes": total.layerImageBytes,
+            "peak_layer_image_bytes": total.peakLayerImageBytes,
             "roles": Dictionary(
                 uniqueKeysWithValues: Role.allCases.map {
                     ($0.rawValue, (roles[$0] ?? Counters()).snapshot)
