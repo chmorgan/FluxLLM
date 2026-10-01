@@ -12,6 +12,12 @@ public final class PerformanceGraphicsDiagnostics {
         case bitmapDestination = "bitmap-destination"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
+        case noGradients = "no-gradients"
+        case noGradientsOrBlur = "no-gradients-or-blur"
+
+        var omitsGradients: Bool {
+            self == .noGradients || self == .noGradientsOrBlur
+        }
     }
 
     public enum Role: String, CaseIterable, Sendable {
@@ -81,6 +87,7 @@ public final class PerformanceGraphicsDiagnostics {
     private var total = Counters()
     private var invalidEvents: UInt64 = 0
     private var cpuGlowFallbacks: UInt64 = 0
+    private var gradientSubstitutions: UInt64 = 0
 
     init() {}
 
@@ -105,6 +112,7 @@ public final class PerformanceGraphicsDiagnostics {
         total = Counters()
         invalidEvents = 0
         cpuGlowFallbacks = 0
+        gradientSubstitutions = 0
     }
 
     public func canvasCreated(role: Role) -> UInt64? {
@@ -240,6 +248,14 @@ public final class PerformanceGraphicsDiagnostics {
         cpuGlowFallbacks += 1
     }
 
+    /// Confirms the diagnostic replaced an executed gradient with a solid fill.
+    /// Both gradient controls preserve chart geometry and animation schedules.
+    /// Only the combined control also omits the existing filtered series glow.
+    public func recordGradientSubstitution() {
+        guard isEnabled, mode.omitsGradients else { return }
+        gradientSubstitutions += 1
+    }
+
     private func registered(_ id: UInt64?) -> (UInt64, Canvas)? {
         guard isEnabled, let id else { return nil }
         guard let canvas = canvases[id] else {
@@ -254,6 +270,7 @@ public final class PerformanceGraphicsDiagnostics {
             "enabled": isEnabled, "mode": mode.rawValue,
             "invalid_events": invalidEvents,
             "cpu_glow_fallbacks": cpuGlowFallbacks,
+            "gradient_substitutions": gradientSubstitutions,
             "live_canvases": total.live, "peak_live_canvases": total.peakLive,
             "live_renderers": total.liveRenderers,
             "peak_live_renderers": total.peakLiveRenderers,

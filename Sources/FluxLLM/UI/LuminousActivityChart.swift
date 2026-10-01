@@ -464,17 +464,25 @@ struct LuminousActivityChart: View {
             guard let first = segment.points.first else { continue }
             let trace = segment.trace
             if hasEffects, let area = segment.area {
-                context.fill(
-                    area,
-                    with: .linearGradient(
-                        Gradient(stops: [
-                            .init(color: color.opacity(fillOpacity), location: 0),
-                            .init(color: color.opacity(0.01), location: 1),
-                        ]), startPoint: CGPoint(x: 0, y: rect.minY),
-                        endPoint: CGPoint(x: 0, y: rect.maxY)))
+                let graphicsMode = PerformanceGraphicsDiagnostics.shared.mode
+                if graphicsMode.omitsGradients {
+                    // Diagnostic-only: preserve the area path, replacing its
+                    // gradient shading with the first stop's solid color.
+                    PerformanceGraphicsDiagnostics.shared.recordGradientSubstitution()
+                    context.fill(area, with: .color(color.opacity(fillOpacity)))
+                } else {
+                    context.fill(
+                        area,
+                        with: .linearGradient(
+                            Gradient(stops: [
+                                .init(color: color.opacity(fillOpacity), location: 0),
+                                .init(color: color.opacity(0.01), location: 1),
+                            ]), startPoint: CGPoint(x: 0, y: rect.minY),
+                            endPoint: CGPoint(x: 0, y: rect.maxY)))
+                }
                 // Diagnostic-only ablation: preserve the area and primary
                 // stroke, omitting only the filtered series glow pass.
-                if PerformanceGraphicsDiagnostics.shared.mode != .noBlur {
+                if graphicsMode != .noBlur && graphicsMode != .noGradientsOrBlur {
                     let radius: CGFloat = compact ? 2.5 : 3
                     let glowColor = color.opacity(colorScheme == .dark ? 0.35 : 0.24)
                     var drewCPUGlow = false

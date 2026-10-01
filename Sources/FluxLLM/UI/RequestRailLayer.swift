@@ -36,6 +36,7 @@ struct RequestRailBarDrawing {
             at: presentation.assignments[lane.id]?.colorIndex ?? 0, scheme: colorScheme)
     }
 
+    @MainActor
     func draw(
         _ segments: [RequestRailGeometry.Segment],
         overflow: [RequestRailGeometry.OverflowSegment], in context: inout GraphicsContext
@@ -54,6 +55,10 @@ struct RequestRailBarDrawing {
             let color = color(for: segment.lane)
             if contrast == .increased || reduceTransparency {
                 context.fill(shape, with: .color(color))
+            } else if PerformanceGraphicsDiagnostics.shared.mode.omitsGradients {
+                // Diagnostic-only: retain the bar path, using the middle stop.
+                PerformanceGraphicsDiagnostics.shared.recordGradientSubstitution()
+                context.fill(shape, with: .color(color.opacity(segment.isLive ? 1 : 0.83)))
             } else {
                 context.fill(
                     shape,
@@ -433,6 +438,15 @@ private struct RequestRailDecorations: View {
         at point: CGPoint, radius: CGFloat, strength: Double, color: Color,
         in context: inout GraphicsContext
     ) {
+        if PerformanceGraphicsDiagnostics.shared.mode.omitsGradients {
+            // Diagnostic-only: retain the animated halo's size and timing,
+            // replacing radial shading with the existing colored stop.
+            PerformanceGraphicsDiagnostics.shared.recordGradientSubstitution()
+            context.fill(
+                circle(at: point, radius: radius),
+                with: .color(color.opacity(strength * 0.95)))
+            return
+        }
         context.fill(
             circle(at: point, radius: radius),
             with: .radialGradient(

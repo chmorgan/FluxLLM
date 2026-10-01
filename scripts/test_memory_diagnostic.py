@@ -20,6 +20,7 @@ def graphics(mode="normal"):
               "max_width_points", "max_height_points", "max_scale")
     return {"graphics_diagnostics": {
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
+        "gradient_substitutions": 0,
         "live_canvases": 0, "peak_live_canvases": 0, "live_renderers": 0, "peak_live_renderers": 0,
         "current_pixel_area": 0, "peak_pixel_area": 0, "current_bitmap_bytes": 0, "peak_bitmap_bytes": 0,
         "roles": {role: dict.fromkeys(fields, 0) for role in ("static_chart", "cursor", "rail_bars", "rail_decorations")}}}
@@ -66,6 +67,48 @@ class GraphicsTests(unittest.TestCase):
         self.assertFalse(result["available"])
         self.assertIn("does not expose", result["reason"])
         self.assertNotIn("counters", result)
+
+    def test_gradient_controls_require_exact_nonnegative_integer_evidence(self):
+        for mode in memory.GRADIENT_ABLATION_MODES:
+            snapshot = graphics(mode)
+            del snapshot["graphics_diagnostics"]["gradient_substitutions"]
+            with self.subTest(mode=mode, value="missing"), self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, mode)
+            for value in (None, False, True, -1, 0.0, 1.5, "1"):
+                snapshot["graphics_diagnostics"]["gradient_substitutions"] = value
+                with self.subTest(mode=mode, value=value), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, mode)
+            for value in (0, 1, 250):
+                snapshot["graphics_diagnostics"]["gradient_substitutions"] = value
+                self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+
+    def test_gradient_controls_must_execute_before_visible_workload_can_complete(self):
+        for mode in memory.GRADIENT_ABLATION_MODES:
+            snapshot = graphics(mode)
+            self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+            with self.subTest(mode=mode), self.assertRaisesRegex(InvalidResult, "did not execute"):
+                memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+            snapshot["graphics_diagnostics"]["gradient_substitutions"] = 1
+            self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+
+    def test_older_normal_graphics_counters_need_no_gradient_field(self):
+        snapshot = graphics()
+        del snapshot["graphics_diagnostics"]["gradient_substitutions"]
+        self.assertTrue(memory.validate_graphics(snapshot, "normal", completed_visible_workload=True)["available"])
+        self.assertFalse(memory.validate_graphics({}, "normal", completed_visible_workload=True)["available"])
+
+    def test_command_acknowledgments_and_control_snapshots_check_gradient_evidence(self):
+        for mode in memory.GRADIENT_ABLATION_MODES:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), mode)
+                snapshot = graphics(mode)
+                del snapshot["graphics_diagnostics"]["gradient_substitutions"]
+                diagnostic.collector = mock.Mock()
+                diagnostic.collector.command.return_value = {"status": "ok", "snapshot": snapshot}
+                with mock.patch.object(diagnostic, "verify_identity"), self.assertRaises(InvalidResult):
+                    diagnostic.command("show_dashboard")
+                with self.assertRaises(InvalidResult):
+                    diagnostic.validate_control_snapshot(snapshot)
 
     def test_missing_alternate_or_null_normal_counters_rejected(self):
         for mode in memory.GRAPHICS_MODES[1:]:

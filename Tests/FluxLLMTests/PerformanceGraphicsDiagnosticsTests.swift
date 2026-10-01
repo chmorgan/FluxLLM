@@ -11,7 +11,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.directHost.rawValue, "direct-host")
         XCTAssertEqual(Mode.noBlur.rawValue, "no-blur")
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
-        XCTAssertEqual(Mode.allCases.count, 7)
+        XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
+        XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
+        XCTAssertEqual(Mode.allCases.count, 9)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -36,6 +38,25 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         assertCounter("cpu_glow_fallbacks", in: diagnostics.snapshot(), equals: 0)
     }
 
+    func testGradientSubstitutionsAreCountedOnlyForGradientControlsAndReset() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        diagnostics.recordGradientSubstitution()
+        assertCounter("gradient_substitutions", in: diagnostics.snapshot(), equals: 0)
+        for mode in PerformanceGraphicsDiagnostics.Mode.allCases {
+            try diagnostics.enable(mode: mode)
+            let expected = mode == .noGradients || mode == .noGradientsOrBlur
+            XCTAssertEqual(mode.omitsGradients, expected)
+            assertCounter("gradient_substitutions", in: diagnostics.snapshot(), equals: 0)
+            diagnostics.recordGradientSubstitution()
+            diagnostics.recordGradientSubstitution()
+            assertCounter(
+                "gradient_substitutions", in: diagnostics.snapshot(), equals: expected ? 2 : 0)
+        }
+        try diagnostics.disable()
+        diagnostics.recordGradientSubstitution()
+        assertCounter("gradient_substitutions", in: diagnostics.snapshot(), equals: 0)
+    }
+
     func testDisabledDiagnosticsIgnoreAllEvents() {
         let diagnostics = PerformanceGraphicsDiagnostics()
         let initial = diagnostics.snapshot()
@@ -45,6 +66,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             "invalid_events", "live_canvases", "peak_live_canvases",
             "live_renderers", "peak_live_renderers", "current_pixel_area",
             "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes",
+            "gradient_substitutions",
         ] {
             assertCounter(key, in: initial, equals: 0)
         }

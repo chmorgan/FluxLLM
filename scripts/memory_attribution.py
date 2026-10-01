@@ -21,7 +21,8 @@ import app_performance as app
 from run_performance_checks import interrupted, load_json, number, require, write_json
 
 
-GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "no-blur", "cpu-glow")
+GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
+GRADIENT_ABLATION_MODES = ("no-gradients", "no-gradients-or-blur")
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 DEADLINE_SECONDS = 90
 CATEGORY_FIELDS = ("dirty", "swapped", "clean", "reclaimable", "wired", "regions")
@@ -302,7 +303,7 @@ def parse_probe(tool, output, json_output, pid):
     return {"vmmap": parse_vmmap, "heap": parse_heap}[tool](text, pid)
 
 
-def validate_graphics(snapshot, mode):
+def validate_graphics(snapshot, mode, *, completed_visible_workload=False):
     value = snapshot.get("graphics_diagnostics")
     if "graphics_diagnostics" not in snapshot and mode == "normal":
         return {"available": False, "reason": "This frozen app does not expose graphics diagnostic counters; native and kernel memory evidence remain separate."}
@@ -313,6 +314,11 @@ def validate_graphics(snapshot, mode):
     if mode == "cpu-glow":
         require(unsigned(value.get("cpu_glow_fallbacks"), "graphics.cpu_glow_fallbacks") == 0,
                 "CPU glow used the framework-blur fallback; the comparison is invalid")
+    if mode in GRADIENT_ABLATION_MODES:
+        substitutions = unsigned(value.get("gradient_substitutions"), "graphics.gradient_substitutions")
+        if completed_visible_workload:
+            require(substitutions > 0,
+                    "Completed visible workload did not execute any gradient substitutions; the comparison is invalid")
     roles = value.get("roles")
     require(isinstance(roles, dict) and set(roles) == {"static_chart", "cursor", "rail_bars", "rail_decorations"},
             "Graphics diagnostic roles are incomplete")
@@ -405,8 +411,12 @@ class MemoryDiagnostic:
         self.save()
         require(response.get("status") == "ok", f"App command {name} failed: {response}")
         if "snapshot" in response:
-            validate_popover_animation(response["snapshot"], self.no_popover_animation)
+            self.validate_control_snapshot(response["snapshot"])
         return response
+
+    def validate_control_snapshot(self, snapshot):
+        validate_graphics(snapshot, self.graphics_mode)
+        validate_popover_animation(snapshot, self.no_popover_animation)
 
     def inspect_tool(self, label, tool):
         self.verify_identity()
@@ -493,7 +503,7 @@ class MemoryDiagnostic:
                 "Populated history dimensions were not verified")
         self.report["ready_graphics_validation"] = validate_graphics(seed, self.graphics_mode)
         self.report["ready_popover_animation_validation"] = validate_popover_animation(seed, self.no_popover_animation)
-        self.identity = authenticate_ready(self.collector, lambda snapshot: validate_popover_animation(snapshot, self.no_popover_animation))
+        self.identity = authenticate_ready(self.collector, self.validate_control_snapshot)
         self.report["owned_identity"] = self.identity
         logging = self.command("set_logging", enabled=False)
         require(logging.get("logging_enabled") is False and logging.get("drained") is True, "Logging did not disable and drain")
@@ -523,7 +533,8 @@ class MemoryDiagnostic:
         self.report["workload"].update(fixture_status=status, after=after)
         self.save()
         work = app.validate_workload(stage, status, before, after, acknowledgment)
-        self.report["workload"].update(validated_work=work, validated=True)
+        graphics = validate_graphics(after, self.graphics_mode, completed_visible_workload=True)
+        self.report["workload"].update(validated_work=work, graphics_validation=graphics, validated=True)
         self.command("close_popover")
         self.command("close_dashboard")
         self.collector.wait_until(time.monotonic() + 2)
@@ -565,7 +576,7 @@ class MemoryDiagnostic:
                 for envelope in self.collector.events:
                     event = envelope.get("event", {}) if envelope.get("type") == "app_event" else {}
                     if "snapshot" in event:
-                        validate_popover_animation(event["snapshot"], self.no_popover_animation)
+                        self.validate_control_snapshot(event["snapshot"])
                 stopped = [event.get("event", {}) for event in self.collector.events
                            if event.get("type") == "app_event" and event.get("event", {}).get("type") == "stopped"]
                 require(len(stopped) == 1 and stopped[0].get("status") == "ok", "App shutdown/drain was not acknowledged")
