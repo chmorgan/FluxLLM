@@ -15,8 +15,10 @@ struct ToolActivityBucket: Equatable, Sendable {
 /// Count-based tool rates, prepared independently of the generated-token averages.
 struct ToolActivityHistory {
     let interval: TimeInterval
-    let segments: [[ToolActivityBucket]]
+    /// One canonical allocation holds all buckets. Segment boundaries preserve
+    /// gaps without retaining a second copy of every bucket for plotting.
     let buckets: [ToolActivityBucket]
+    private let segmentRanges: [Range<Int>]
     let resultMarkers: [ToolActivityEvent]
     let peak: Double?
     let current: ToolActivityBucket?
@@ -25,12 +27,18 @@ struct ToolActivityHistory {
     private let cutoff: Date
     private let hasValidWindow: Bool
 
+    /// Compatibility view for callers that need owned segment arrays. Rendering
+    /// walks the ranges below directly and never materializes these bucket copies.
+    var segments: [[ToolActivityBucket]] {
+        segmentRanges.map { Array(buckets[$0]) }
+    }
+
     /// Horizontal spans and vertical transitions describe rates without implying
     /// fractional calls between bins. Instantaneous evidence has no measurable rate.
     var plotSegments: [[ChartDisplayPoint]] {
-        segments.compactMap { segment in
+        segmentRanges.compactMap { range in
             var points: [ChartDisplayPoint] = []
-            for bucket in segment where bucket.observedDuration > 0 {
+            for bucket in buckets[range] where bucket.observedDuration > 0 {
                 let start = ChartDisplayPoint(
                     timestamp: max(bucket.start, cutoff), value: bucket.callsPerMinute)
                 if points.last != start { points.append(start) }
@@ -72,7 +80,7 @@ struct ToolActivityHistory {
         self.cutoff = cutoff
         hasValidWindow = observation.isValid
         guard hasValidWindow else {
-            segments = []
+            segmentRanges = []
             buckets = []
             resultMarkers = []
             peak = nil
@@ -145,9 +153,14 @@ struct ToolActivityHistory {
             ])
         }
         displaySegments.sort { $0[0].start < $1[0].start }
-        segments = displaySegments
-        buckets = displaySegments.flatMap { $0 }
-        peak = buckets.filter { $0.observedDuration > 0 }.map(\.callsPerMinute).max()
+        var offset = 0
+        segmentRanges = displaySegments.map { segment in
+            let start = offset
+            offset += segment.count
+            return start..<offset
+        }
+        buckets = displaySegments.count == 1 ? displaySegments[0] : displaySegments.flatMap { $0 }
+        peak = buckets.lazy.filter { $0.observedDuration > 0 }.map(\.callsPerMinute).max()
 
         if let latest = observation.currentTimestamp,
             !pendingCalls.contains(where: { $0.timestamp > latest }),

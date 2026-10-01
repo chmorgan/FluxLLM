@@ -92,6 +92,48 @@ final class ToolActivityChartTests: XCTestCase {
         XCTAssertEqual(ToolActivityChartPresentation.spokenUnit, "tool calls per minute")
     }
 
+    func testCanonicalBucketsPreserveGapsPendingEvidenceAndRepeatedDrawing() throws {
+        let result = event(.resultSubmission, at: 2.25, name: "read")
+        let history = ToolActivityHistory(
+            events: [
+                event(.call, at: 0.25, name: "read"), event(.call, at: 1.5, name: "pending"),
+                event(.call, at: 2.75, name: "search"), result,
+            ],
+            observations: [0.0, 0.5, 1, 2, 2.5, 3, 3.5].map {
+                TimeSeriesPoint(
+                    timestamp: origin.addingTimeInterval($0), value: 0, isAvailable: $0 != 1)
+            }, now: origin.addingTimeInterval(3.5), duration: 60)
+        let retainedBuckets = history.buckets
+        let expectedSegments = history.segments
+        XCTAssertEqual(expectedSegments.map(\.count), [1, 1, 2])
+        XCTAssertEqual(expectedSegments.flatMap { $0 }, retainedBuckets)
+        XCTAssertEqual(retainedBuckets.map(\.callCount), [1, 1, 1, 0])
+        XCTAssertEqual(retainedBuckets.map(\.observedDuration), [0.5, 0, 1, 0.5])
+        XCTAssertEqual(history.peak, 120)
+        XCTAssertEqual(history.current?.callsPerMinute, 0)
+        XCTAssertEqual(history.resultMarkers, [result])
+        XCTAssertNil(history.bucket(at: origin.addingTimeInterval(1)))
+        XCTAssertEqual(history.bucket(at: origin.addingTimeInterval(1.5))?.toolNames, ["pending"])
+        let expectedPlot = history.plotSegments
+        XCTAssertEqual(expectedPlot.count, 2, "Instantaneous evidence cannot connect coverage gaps")
+        XCTAssertEqual(expectedPlot.first?.last?.timestamp, origin.addingTimeInterval(0.5))
+        XCTAssertEqual(expectedPlot.last?.first?.timestamp, origin.addingTimeInterval(2))
+
+        // Keep the original storage alive so a freshly flattened allocation cannot
+        // happen to reuse its address. Querying and drawing must reuse stored buckets.
+        try retainedBuckets.withUnsafeBufferPointer { retained in
+            let address = try XCTUnwrap(retained.baseAddress)
+            for _ in 0..<4 {
+                XCTAssertEqual(history.plotSegments, expectedPlot)
+                XCTAssertFalse(history.zeroFilledPlotSegments.isEmpty)
+                XCTAssertEqual(history.segments, expectedSegments)
+                history.buckets.withUnsafeBufferPointer { current in
+                    XCTAssertEqual(current.baseAddress, address)
+                }
+            }
+        }
+    }
+
     private func makeHistory(events: [ToolActivityEvent]) -> ToolActivityHistory {
         ToolActivityHistory(
             events: events,
