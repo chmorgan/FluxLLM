@@ -11,6 +11,7 @@ public final class PerformanceGraphicsDiagnostics {
         case noRenderer = "no-renderer"
         case bitmapDestination = "bitmap-destination"
         case noBlur = "no-blur"
+        case cpuGlow = "cpu-glow"
     }
 
     public enum Role: String, CaseIterable, Sendable {
@@ -79,6 +80,7 @@ public final class PerformanceGraphicsDiagnostics {
     private var roles: [Role: Counters] = [:]
     private var total = Counters()
     private var invalidEvents: UInt64 = 0
+    private var cpuGlowFallbacks: UInt64 = 0
 
     init() {}
 
@@ -102,6 +104,7 @@ public final class PerformanceGraphicsDiagnostics {
         roles = Dictionary(uniqueKeysWithValues: Role.allCases.map { ($0, Counters()) })
         total = Counters()
         invalidEvents = 0
+        cpuGlowFallbacks = 0
     }
 
     public func canvasCreated(role: Role) -> UInt64? {
@@ -230,6 +233,13 @@ public final class PerformanceGraphicsDiagnostics {
         roles[canvas.role]!.skippedDraws += 1
     }
 
+    /// Any fallback makes a cpu-glow attribution run ineligible: it contains
+    /// work from the original filtered renderer as well as the candidate.
+    public func recordCPUGlowFallback() {
+        guard isEnabled, mode == .cpuGlow else { return }
+        cpuGlowFallbacks += 1
+    }
+
     private func registered(_ id: UInt64?) -> (UInt64, Canvas)? {
         guard isEnabled, let id else { return nil }
         guard let canvas = canvases[id] else {
@@ -243,6 +253,7 @@ public final class PerformanceGraphicsDiagnostics {
         [
             "enabled": isEnabled, "mode": mode.rawValue,
             "invalid_events": invalidEvents,
+            "cpu_glow_fallbacks": cpuGlowFallbacks,
             "live_canvases": total.live, "peak_live_canvases": total.peakLive,
             "live_renderers": total.liveRenderers,
             "peak_live_renderers": total.peakLiveRenderers,

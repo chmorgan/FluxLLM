@@ -109,6 +109,9 @@ final class LuminousChartGeometryCache {
     }
 
     final class Frame {
+        // Allocated only by an actual draw in the cpu-glow diagnostic mode.
+        // Replacing the geometry frame also releases its bounded mask cache.
+        lazy var seriesGlowRasterCache = SeriesGlowRasterCache()
         let key: Key
         let layout: Layout
         let generated: [Segment]

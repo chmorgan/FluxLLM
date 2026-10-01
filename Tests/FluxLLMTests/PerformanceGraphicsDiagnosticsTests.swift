@@ -10,7 +10,8 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.normal.rawValue, "normal")
         XCTAssertEqual(Mode.directHost.rawValue, "direct-host")
         XCTAssertEqual(Mode.noBlur.rawValue, "no-blur")
-        XCTAssertEqual(Mode.allCases.count, 6)
+        XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
+        XCTAssertEqual(Mode.allCases.count, 7)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -19,6 +20,20 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             let encoded = try JSONEncoder().encode(value)
             XCTAssertThrowsError(try JSONDecoder().decode(Mode.self, from: encoded))
         }
+    }
+
+    func testCPUGlowFallbacksAreReportedOnlyForThatEnabledCandidate() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        diagnostics.recordCPUGlowFallback()
+        assertCounter("cpu_glow_fallbacks", in: diagnostics.snapshot(), equals: 0)
+        try diagnostics.enable(mode: .normal)
+        diagnostics.recordCPUGlowFallback()
+        assertCounter("cpu_glow_fallbacks", in: diagnostics.snapshot(), equals: 0)
+        try diagnostics.enable(mode: .cpuGlow)
+        diagnostics.recordCPUGlowFallback()
+        assertCounter("cpu_glow_fallbacks", in: diagnostics.snapshot(), equals: 1)
+        try diagnostics.disable()
+        assertCounter("cpu_glow_fallbacks", in: diagnostics.snapshot(), equals: 0)
     }
 
     func testDisabledDiagnosticsIgnoreAllEvents() {

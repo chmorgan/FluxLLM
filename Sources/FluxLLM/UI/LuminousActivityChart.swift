@@ -223,11 +223,17 @@ struct LuminousActivityChart: View {
                 ChartCanvas(role: .staticChart, revision: staticRevision) { context, _ in
                     PerformancePresentationCounters.shared.record(.canvasDraws)
                     drawGrid(in: &context, layout: layout)
+                    let cpuGlow =
+                        PerformanceGraphicsDiagnostics.shared.mode == .cpuGlow
+                        ? frame.seriesGlowRasterCache : nil
+                    let surfaceBounds = CGRect(origin: .zero, size: frame.key.size)
                     drawSeries(
-                        device, color: gpuColor, fillOpacity: 0.14, in: &context, rect: layout.main)
+                        device, color: gpuColor, fillOpacity: 0.14, in: &context, rect: layout.main,
+                        cpuGlow: cpuGlow, series: 0, surfaceBounds: surfaceBounds)
                     drawSeries(
                         generated, color: generatedColor, fillOpacity: 0.25, in: &context,
-                        rect: layout.main)
+                        rect: layout.main, cpuGlow: cpuGlow, series: 1,
+                        surfaceBounds: surfaceBounds)
                     drawEndpoint(frame.generatedEndpoint, color: generatedColor, in: &context)
                     drawEndpoint(frame.deviceEndpoint, color: gpuColor, in: &context)
                     // Tool tracks retain their request's current appearance.
@@ -451,9 +457,10 @@ struct LuminousActivityChart: View {
 
     private func drawSeries(
         _ segments: [PlotSegment], color: Color, fillOpacity: Double,
-        in context: inout GraphicsContext, rect: CGRect
+        in context: inout GraphicsContext, rect: CGRect,
+        cpuGlow: SeriesGlowRasterCache?, series: Int, surfaceBounds: CGRect
     ) {
-        for segment in segments {
+        for (index, segment) in segments.enumerated() {
             guard let first = segment.points.first else { continue }
             let trace = segment.trace
             if hasEffects, let area = segment.area {
@@ -468,11 +475,35 @@ struct LuminousActivityChart: View {
                 // Diagnostic-only ablation: preserve the area and primary
                 // stroke, omitting only the filtered series glow pass.
                 if PerformanceGraphicsDiagnostics.shared.mode != .noBlur {
-                    context.drawLayer { glow in
-                        glow.addFilter(.blur(radius: compact ? 2.5 : 3))
-                        glow.stroke(
-                            trace, with: .color(color.opacity(colorScheme == .dark ? 0.35 : 0.24)),
-                            style: StrokeStyle(lineWidth: 7, lineCap: .round, lineJoin: .round))
+                    let radius: CGFloat = compact ? 2.5 : 3
+                    let glowColor = color.opacity(colorScheme == .dark ? 0.35 : 0.24)
+                    var drewCPUGlow = false
+                    if let cpuGlow {
+                        do {
+                            let tint = glowColor.resolve(in: context.environment).cgColor
+                            let scale = context.environment.displayScale
+                            try context.withCGContext { cg in
+                                try cpuGlow.forEachMask(
+                                    id: .init(series: series, segment: index), path: trace.cgPath,
+                                    radius: radius, scale: scale, clipBounds: surfaceBounds
+                                ) { mask in
+                                    SeriesGlowRasterCache.composite(mask, color: tint, in: cg)
+                                }
+                            }
+                            drewCPUGlow = true
+                        } catch {
+                            // Preserve the visible effect on diagnostic failure;
+                            // a nonzero counter invalidates the attribution run.
+                            PerformanceGraphicsDiagnostics.shared.recordCPUGlowFallback()
+                        }
+                    }
+                    if !drewCPUGlow {
+                        context.drawLayer { glow in
+                            glow.addFilter(.blur(radius: radius))
+                            glow.stroke(
+                                trace, with: .color(glowColor),
+                                style: StrokeStyle(lineWidth: 7, lineCap: .round, lineJoin: .round))
+                        }
                     }
                 }
             }
