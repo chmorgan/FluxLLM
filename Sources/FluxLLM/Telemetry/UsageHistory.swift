@@ -79,6 +79,24 @@ public final class UsageHistory {
         latestDate = now
     }
 
+    /// Release only rebuildable query storage when no chart is presented.
+    /// Collection, accounting, retention and previously returned values are unchanged;
+    /// the next query reconstructs the ordering it needs from authoritative records.
+    public func releaseQueryCaches() {
+        completedOrder.removeAll(keepingCapacity: false)
+        completedOrderIsDirty = true
+        toolOrder.removeAll(keepingCapacity: false)
+        toolOrderIsDirty = true
+        // The rolling cache's ranges refer to the released tool ordering.
+        cachedToolOwners = nil
+    }
+
+    /// Scalar storage diagnostic; reading it never prepares or copies a cache.
+    var cachedQueryEntryCount: Int {
+        completedOrder.count + toolOrder.count
+            + (cachedToolOwners?.counts.count ?? 0) + (cachedToolOwners?.owners.count ?? 0)
+    }
+
     public func apply(_ event: GenerationEvent, source: String, at date: Date) {
         guard date.timeIntervalSinceReferenceDate.isFinite else { return }
         latestDate = max(latestDate, date)

@@ -282,6 +282,7 @@ public final class MetricsStore {
             // Release snapshots held only for a closed surface; raw history is
             // retained independently and will rebuild immediately on reopening.
             chartPresentation = ChartPresentationSnapshot(timestamp: sampleDate)
+            usageHistory.releaseQueryCaches()
         }
     }
 

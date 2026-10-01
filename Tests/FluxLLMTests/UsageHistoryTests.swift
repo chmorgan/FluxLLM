@@ -43,6 +43,98 @@ final class UsageHistoryTests: XCTestCase {
             source: source ?? self.source, at: date(offset))
     }
 
+    func testReleasedQueryCachesRebuildWithoutChangingHistoryOrLaterCorrections() {
+        let released = UsageHistory(now: origin)
+        let reference = UsageHistory(now: origin)
+        let histories = [released, reference]
+        let completed = GenerationRequest(model: "completed", startedAt: origin)
+        let active = GenerationRequest(model: "active", startedAt: date(2))
+        let other = GenerationRequest(model: "other", startedAt: date(1))
+        let call = ToolActivityEvent(kind: .call, name: "read", callID: "a", timestamp: date(4))
+        let result = ToolActivityEvent(
+            kind: .resultSubmission, name: "read", callID: "a", timestamp: date(5))
+        for history in histories {
+            history.apply(.began(completed), source: source, at: origin)
+            history.apply(.began(active), source: source, at: date(2))
+            history.apply(.began(other), source: "other", at: date(1))
+            history.apply(
+                .toolActivity(requestID: completed.id, events: [call, result]),
+                source: source, at: date(5))
+            update(history, completed, at: 10, output: 12, finished: true)
+            update(history, active, at: 6, output: 4)
+            update(history, other, at: 11, output: 7, finished: true, source: "other")
+        }
+
+        func assertEquivalent(file: StaticString = #filePath, line: UInt = #line) {
+            for owner in [source, "other"] {
+                for (start, end) in [(0.0, 7.0), (4, 5), (5, 11), (10, 13), (0, 30)] {
+                    let interval = DateInterval(start: date(start), end: date(end))
+                    for inclusiveEnd in [false, true] {
+                        XCTAssertEqual(
+                            released.requestLanes(
+                                source: owner, interval: interval, inclusiveEnd: inclusiveEnd),
+                            reference.requestLanes(
+                                source: owner, interval: interval, inclusiveEnd: inclusiveEnd),
+                            file: file, line: line)
+                        XCTAssertEqual(
+                            released.toolEvents(
+                                source: owner, interval: interval, inclusiveEnd: inclusiveEnd),
+                            reference.toolEvents(
+                                source: owner, interval: interval, inclusiveEnd: inclusiveEnd),
+                            file: file, line: line)
+                    }
+                    XCTAssertEqual(
+                        released.requestIDsWithToolEvents(source: owner, interval: interval),
+                        reference.requestIDsWithToolEvents(source: owner, interval: interval),
+                        file: file, line: line)
+                    for scope in UsageScope.allCases {
+                        XCTAssertEqual(
+                            summary(released, scope: scope, start: start, end: end, source: owner),
+                            summary(reference, scope: scope, start: start, end: end, source: owner),
+                            file: file, line: line)
+                    }
+                }
+            }
+        }
+
+        assertEquivalent()
+        let interval = DateInterval(start: origin, end: date(30))
+        let retainedOwners = released.requestIDsWithToolEvents(source: source, interval: interval)
+        XCTAssertGreaterThan(released.cachedQueryEntryCount, 0)
+        let visitedBeforeRelease = released.toolOwnerQueryVisitedEvents
+        released.releaseQueryCaches()
+        released.releaseQueryCaches()
+        XCTAssertEqual(released.cachedQueryEntryCount, 0)
+        XCTAssertEqual(released.toolOwnerQueryVisitedEvents, visitedBeforeRelease)
+        XCTAssertEqual(
+            released.requestIDsWithToolEvents(source: source, interval: interval), retainedOwners)
+        XCTAssertGreaterThan(released.toolOwnerQueryVisitedEvents, visitedBeforeRelease)
+        let visitedAfterRebuild = released.toolOwnerQueryVisitedEvents
+        XCTAssertEqual(
+            released.requestIDsWithToolEvents(source: source, interval: interval), retainedOwners)
+        XCTAssertEqual(released.toolOwnerQueryVisitedEvents, visitedAfterRebuild)
+        assertEquivalent()
+
+        released.releaseQueryCaches()
+        let earlierCall = ToolActivityEvent(
+            kind: .call, name: "search", callID: "earlier", timestamp: date(3))
+        for history in histories {
+            update(
+                history, completed, at: 12, output: 3, input: 2, estimated: false, finished: true)
+            update(history, active, at: 13, output: 6, input: 1, estimated: false, finished: true)
+            history.apply(
+                .toolActivity(requestID: completed.id, events: [earlierCall, call]),
+                source: source, at: date(14))
+        }
+        XCTAssertEqual(
+            released.cachedQueryEntryCount, 0, "Hidden ingestion must not rebuild query caches")
+        assertEquivalent()
+        XCTAssertEqual(summary(released).outputTokens, 9)
+        XCTAssertEqual(summary(released).toolCalls, 2, "Replayed call must remain deduplicated")
+        XCTAssertEqual(
+            retainedOwners, [completed.id], "Previously returned owner values remain valid")
+    }
+
     func testEmptyUsageAndDuplicateBeginDoNotInventOrResetCounts() {
         let history = UsageHistory(now: origin)
         XCTAssertEqual(summary(history).inputTokens, 0)

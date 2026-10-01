@@ -68,7 +68,8 @@ final class ChartPresentationViewportTests: XCTestCase {
     }
 
     func testSimultaneousConsumersUnionTheirRangesThenReleaseHiddenDemand() {
-        let store = makePopulatedStore()
+        let usageHistory = UsageHistory(now: origin)
+        let store = makePopulatedStore(usageHistory: usageHistory)
         let full = store.chartPresentation
         let frozen = DateInterval(start: date(3_000), end: date(3_060))
         let live = DateInterval(start: date(3_540.5), end: full.timestamp)
@@ -87,14 +88,19 @@ final class ChartPresentationViewportTests: XCTestCase {
             prepared.requestTools.isEmpty,
             "Later tool events must preserve a known request's observed zero overlay")
         store.setChartPresentationDemand(false, consumer: .popover)
+        XCTAssertGreaterThan(
+            usageHistory.cachedQueryEntryCount, 0,
+            "Closing one of two charts must preserve query storage needed by the remaining chart")
         XCTAssertEqual(store.chartPresentation.throughput.count, pinnedOnlyCount)
         assertEquivalent(store.chartPresentation, full, interval: frozen)
 
         store.setChartPresentationDemand(false, consumer: .dashboard)
         XCTAssertTrue(store.chartPresentation.throughput.isEmpty)
+        XCTAssertEqual(usageHistory.cachedQueryEntryCount, 0)
         let hiddenID = store.chartPresentation.publicationID
         store.sample(at: date(3_601))
         XCTAssertEqual(store.chartPresentation.publicationID, hiddenID)
+        XCTAssertEqual(usageHistory.cachedQueryEntryCount, 0)
         store.setChartPresentationDemand(true, consumer: .dashboard)
         XCTAssertEqual(store.chartPresentation.timestamp, date(3_601))
         assertEquivalent(store.chartPresentation, full, interval: frozen)
@@ -142,7 +148,9 @@ final class ChartPresentationViewportTests: XCTestCase {
         XCTAssertEqual(navigation.presentationViewport, .live(duration: 45))
     }
 
-    private func makePopulatedStore(archived: Bool = false) -> MetricsStore {
+    private func makePopulatedStore(archived: Bool = false, usageHistory: UsageHistory? = nil)
+        -> MetricsStore
+    {
         let archive = ChartHistoryArchive(now: origin)
         if archived {
             for offset in stride(from: -7_200.0, through: -0.5, by: 0.5) {
@@ -153,7 +161,8 @@ final class ChartPresentationViewportTests: XCTestCase {
                     toolObservation: point)
             }
         }
-        let store = MetricsStore(clock: { self.origin }, chartArchive: archive)
+        let store = MetricsStore(
+            clock: { self.origin }, usageHistory: usageHistory, chartArchive: archive)
         let epoch = UUID()
         store.beginBackendSession(kind: .ollama, epoch: epoch, sourceID: "fixture")
         let request = GenerationRequest(model: "fixture", startedAt: date(-8_000))
