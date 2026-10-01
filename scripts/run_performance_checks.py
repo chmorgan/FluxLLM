@@ -483,6 +483,9 @@ def interrupted(_signal, _frame):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "drawing":
+        from drawing_attribution import run
+        return run(argv[1:])
     if argv and argv[0] == "memory":
         from memory_attribution import run
         return run(argv[1:])

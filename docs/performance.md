@@ -243,6 +243,12 @@ Choose one diagnostic mode per invocation with `--graphics-mode`:
 | `bitmap-destination` | Render through a bounded temporary CPU bitmap before copying into the native destination. |
 | `no-blur` | Keep the renderer and drawing geometry while skipping the main-series Gaussian blur. |
 | `cpu-glow` | Use a bounded CPU raster glow in place of the filtered series-glow pass. |
+| `no-gradients` | Substitute solid fills for the three chart gradient operations, preserving geometry and animation. |
+| `no-gradients-or-blur` | Make the same gradient substitutions and also skip the filtered main-series glow. |
+
+Both gradient controls require valid substitution counters throughout the capture
+and a positive count after the visible workload. They affect the three Canvas
+gradient operations; SwiftUI surface and rim gradients remain unchanged.
 
 Optionally add `--no-popover-animation` independently of the graphics mode to
 disable native popover animation for this diagnostic. The runner verifies the
@@ -277,6 +283,56 @@ counters remain unavailable, never zero; older frozen products can run in normal
 mode without them, while alternate modes require matching mode/counter evidence.
 Use native category tables and authenticated kernel footprint for memory
 attribution, and the separately calibrated process GPU provider for GPU work.
+
+## Isolated drawing attribution
+
+Use the `drawing` command to identify which drawing operation activates expensive
+graphics resources before changing the chart backend:
+
+```sh
+python3 scripts/run_performance_checks.py drawing \
+  --probe-binary /absolute/products/FluxLLMDrawingProbe \
+  --collector-binary /absolute/products/FluxLLMResourceCollector
+```
+
+This command uses prebuilt Release products and has a hard **180-second deadline**
+for its serial cases, inspections, and cleanup. Each case runs in a fresh owned
+process with one 664-by-357-point native window. All backends except the explicitly
+unhosted control use the same minimal SwiftUI host.
+It starts no model traffic, history, popover, or application monitoring. The
+default cases compare an empty drawing and one fixed line through the production
+`ChartCanvas`, that same line through a plain on-screen `Canvas`, and the line
+drawn directly into the native `CGContext`. The production wrapper retains its
+normal `ImageRenderer`; the diagnostic does not change production rendering.
+
+The runner records the blank visible baseline, first drawing, settled drawing,
+100 requested redraws at 30 Hz, post-redraw idle, and released content. Native visibility, dimensions,
+draw callbacks, owned PID and birth identity, and clean process exit must validate.
+Kernel physical footprint and lifetime peak are collected externally; native
+`footprint` and `vmmap` reports identify allocation categories. These diagnostics
+are separate from the CPU/GPU regression gate and never imply that its limits pass.
+
+Use repeatable `--case BACKEND:PRIMITIVE` arguments for the next controlled
+comparison. Backends are `image-renderer`, `canvas`, `core-graphics`,
+`core-graphics-unhosted`, and `bitmap-layer`. The unhosted control attaches the
+native drawing view directly to the window. The bitmap control draws into a
+bounded CPU bitmap and assigns its image directly to `CALayer.contents`; it never
+paints that image into the native window drawing context. Per-buffer allocation
+is capped at 32 MiB, and requested buffer counters are not actual GPU memory.
+The runner rejects bitmap failures or a fallback to native window drawing.
+
+Add `--no-native-inspection --settle-seconds 3` to compare the same operations
+using only external kernel counters and explicit three-second idle intervals.
+This control separates idle reclamation from the possible effects of `footprint`
+and `vmmap`. The settling option accepts one through five seconds and applies
+after the first draw, repeated draws, and close; actual wait durations are saved.
+
+Drawing primitives are `empty`, `line`, `solid-fill`, `linear-gradient`, `radial-gradient`, `text`,
+`clipped-line`, `layer-line`, `with-cg-line`, and `chart-path`. Test the smallest
+reproducer first, then add one operation at a time. Keep first-use, repeated-draw,
+and released memory separate; do not infer a leak or API-wide cost from one peak.
+Results and source/product identities are written to a new ignored artifact
+directory; previous captures are never overwritten.
 
 ## Baselines and comparison artifacts
 

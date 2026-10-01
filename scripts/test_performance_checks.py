@@ -19,6 +19,15 @@ import run_performance_checks as perf
 
 
 class CommandRoutingTests(unittest.TestCase):
+    def test_drawing_dispatch_is_separate_from_the_application_gate(self):
+        module = mock.Mock()
+        module.run.return_value = 6
+        with mock.patch.dict(sys.modules, {"drawing_attribution": module}), \
+                mock.patch.object(perf, "legacy_main") as legacy:
+            self.assertEqual(perf.main(["drawing", "--case", "canvas:line"]), 6)
+        module.run.assert_called_once_with(["--case", "canvas:line"])
+        legacy.assert_not_called()
+
     def test_memory_dispatch_is_separate_and_does_not_build_or_run_the_gate(self):
         module = mock.Mock()
         module.run.return_value = 7
