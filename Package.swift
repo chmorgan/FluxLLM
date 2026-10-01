@@ -39,6 +39,13 @@ let package = Package(
             dependencies: ["FluxLLM"],
             path: "Sources/FluxLLMResourceCollector"
           ),
+          // Opt-in, inherited-pipe drawing isolation. It starts no application
+          // services and is never part of the normal FluxLLM app lifecycle.
+          .executableTarget(
+            name: "FluxLLMDrawingProbe",
+            dependencies: ["FluxLLM"],
+            path: "Sources/FluxLLMDrawingProbe"
+          ),
           .testTarget(
             name: "FluxLLMTests",
             dependencies: ["FluxLLM"],
