@@ -97,6 +97,7 @@ final class PerformanceApplicationSessionTests: XCTestCase {
                 upstream: URL(string: "http://127.0.0.1:\(upstream.port)")!,
                 historyDirectory: directory, preferencesSuite: preferencesSuite, populated: false)
             session = started
+            XCTAssertEqual(started.snapshot()["popover_animations_enabled"] as? Bool, true)
             // Fresh startup must not timestamp its health sample an hour in
             // the past, then immediately expire it on the first real tick.
             started.store.sample()
@@ -138,8 +139,10 @@ final class PerformanceApplicationSessionTests: XCTestCase {
             let startedAt = ContinuousClock.now
             let started = try await PerformanceApplicationSession.start(
                 upstream: URL(string: "http://127.0.0.1:\(upstream.port)")!,
-                historyDirectory: directory, preferencesSuite: preferencesSuite, populated: true)
+                historyDirectory: directory, preferencesSuite: preferencesSuite, populated: true,
+                popoverAnimationsEnabled: false)
             session = started
+            XCTAssertEqual(started.snapshot()["popover_animations_enabled"] as? Bool, false)
             // The broken adapter left the store in standalone publication mode
             // during seeding and exceeded the app harness's 20-second timeout.
             XCTAssertLessThan(startedAt.duration(to: ContinuousClock.now), .seconds(10))

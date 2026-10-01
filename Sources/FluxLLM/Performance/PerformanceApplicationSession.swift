@@ -48,7 +48,8 @@ public final class PerformanceApplicationSession {
     public static func start(
         upstream: URL, historyDirectory: URL, preferencesSuite: String,
         populated: Bool, fixtureEndingAt: Date? = nil,
-        graphicsMode: PerformanceGraphicsDiagnostics.Mode = .normal
+        graphicsMode: PerformanceGraphicsDiagnostics.Mode = .normal,
+        popoverAnimationsEnabled: Bool = true
     ) async throws -> PerformanceApplicationSession {
         guard upstream.scheme == "http", upstream.host == "127.0.0.1",
             let upstreamPort = upstream.port, (1...65535).contains(upstreamPort)
@@ -87,7 +88,8 @@ public final class PerformanceApplicationSession {
             })
         let controller = MenuBarController(
             metricsStore: store, coordinator: coordinator, settings: settings,
-            launchAtLogin: LaunchAtLoginController(service: PerformanceLoginService()))
+            launchAtLogin: LaunchAtLoginController(service: PerformanceLoginService()),
+            popoverAnimationsEnabled: popoverAnimationsEnabled)
         // Match AppDelegate: native hosts register their closed visibility
         // before monitoring or ingestion begins. Otherwise this standalone
         // store prepares thousands of snapshots that no app surface requests.
@@ -178,6 +180,7 @@ public final class PerformanceApplicationSession {
             "canvas_draws": counters["canvas_draws"] as Any? ?? NSNull(),
             "metal_frames": counters["metal_frames"] as Any? ?? NSNull(),
             "graphics_diagnostics": PerformanceGraphicsDiagnostics.shared.snapshot(),
+            "popover_animations_enabled": menuBarController.performancePopoverAnimationsEnabled,
             "raw_samples": store.throughputSampleCount,
             "archive_buckets": store.archivedThroughputBucketCount,
             "connection_state": store.connectionState.rawValue,

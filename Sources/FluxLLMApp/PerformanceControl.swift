@@ -17,6 +17,7 @@ final class PerformanceControl {
         let logging_enabled: Bool?
         let fixture_ending_at_epoch: Double?
         let graphics_mode: PerformanceGraphicsDiagnostics.Mode?
+        let popover_animations_enabled: Bool?
     }
 
     // Preserve the field names in the performance JSON protocol.
@@ -182,7 +183,8 @@ final class PerformanceControl {
                     populated: configuration.history == "populated",
                     fixtureEndingAt: configuration.fixture_ending_at_epoch.map(
                         Date.init(timeIntervalSince1970:)),
-                    graphicsMode: configuration.graphics_mode ?? .normal)
+                    graphicsMode: configuration.graphics_mode ?? .normal,
+                    popoverAnimationsEnabled: configuration.popover_animations_enabled ?? true)
             }
             startupTask = task
             do {

@@ -26,6 +26,34 @@ def graphics(mode="normal"):
 
 
 class GraphicsTests(unittest.TestCase):
+    def test_popover_animation_flag_requires_explicit_false_and_preserves_legacy_default(self):
+        for snapshot in ({}, {"popover_animations_enabled": True}, {"popover_animations_enabled": 0}):
+            with self.subTest(snapshot=snapshot), self.assertRaises(InvalidResult):
+                memory.validate_popover_animation(snapshot, True)
+        self.assertEqual(memory.validate_popover_animation({"popover_animations_enabled": False}, True),
+                         {"available": True, "popover_animations_enabled": False})
+        self.assertFalse(memory.validate_popover_animation({}, False)["available"])
+        for actual in (True, False):
+            self.assertIs(memory.validate_popover_animation({"popover_animations_enabled": actual}, False)["popover_animations_enabled"], actual)
+
+    def test_animation_cli_default_omits_config_override_and_flag_passes_false(self):
+        arguments = ["--app-binary", "app", "--test-bundle", "tests", "--collector-binary", "collector", "--provenance", "provenance"]
+        self.assertFalse(memory.parser().parse_args(arguments).no_popover_animation)
+        self.assertTrue(memory.parser().parse_args(arguments + ["--no-popover-animation"]).no_popover_animation)
+        for requested in (False, True):
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as directory:
+                diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "normal", requested)
+                with mock.patch.object(memory.app, "path_hash", return_value="hash"), \
+                        mock.patch.object(memory.app, "launch_fixture", return_value=(mock.Mock(), "http://127.0.0.1:9999")), \
+                        mock.patch.object(memory.app, "Collector", side_effect=InvalidResult("stop before launch")) as collector:
+                    with self.assertRaisesRegex(InvalidResult, "stop before launch"):
+                        diagnostic.perform({"app": Path("app"), "collector": Path("collector")}, {}, {})
+                config = collector.call_args.args[2]
+                self.assertEqual("popover_animations_enabled" in config, requested)
+                if requested:
+                    self.assertIs(config["popover_animations_enabled"], False)
+                self.assertIs(diagnostic.report["no_popover_animation_requested"], requested)
+
     def test_cpu_glow_requires_proof_that_no_framework_fallback_occurred(self):
         for value in (None, True, -1, 1):
             snapshot = graphics("cpu-glow")
@@ -72,6 +100,13 @@ class GraphicsTests(unittest.TestCase):
 
 
 class IdentityTests(unittest.TestCase):
+    def test_post_ready_snapshot_is_also_checked_for_animation_drift(self):
+        collector = mock.Mock(samples=[], events=[])
+        collector.snapshot.return_value = {"popover_animations_enabled": True}
+        with mock.patch.object(memory.app, "authenticated_cpu_ready") as authenticate, self.assertRaises(InvalidResult):
+            memory.authenticate_ready(collector, lambda snapshot: memory.validate_popover_animation(snapshot, True))
+        authenticate.assert_not_called()
+
     def test_ready_requests_following_sample_before_authentication(self):
         collector = mock.Mock(samples=[], events=[])
         def snapshot():

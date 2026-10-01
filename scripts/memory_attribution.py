@@ -243,10 +243,12 @@ def verify_owned(collector, identity, birth_reader=None):
             and birth_reader(pid) == birth and os.getpgid(pid) == pid, "Owned app identity changed")
 
 
-def authenticate_ready(collector):
+def authenticate_ready(collector, snapshot_validator=None):
     # The ready record needs a following kernel sample to authenticate the
     # boundary. The first saved probe failed before this explicit snapshot.
-    collector.snapshot()
+    snapshot = collector.snapshot()
+    if snapshot_validator is not None:
+        snapshot_validator(snapshot)
     return app.authenticated_cpu_ready(collector.samples, collector.events)
 
 
@@ -341,15 +343,27 @@ def validate_graphics(snapshot, mode):
     return {"available": True, "counters": value}
 
 
+def validate_popover_animation(snapshot, no_animation):
+    if "popover_animations_enabled" not in snapshot:
+        require(not no_animation, "App did not acknowledge disabled popover animations")
+        return {"available": False, "reason": "This frozen app does not expose its native popover animation setting."}
+    actual = snapshot["popover_animations_enabled"]
+    require(type(actual) is bool, "Native popover animation setting must be a Boolean")
+    require(not no_animation or actual is False, "App did not disable native popover animations as requested")
+    return {"available": True, "popover_animations_enabled": actual}
+
+
 class MemoryDiagnostic:
-    def __init__(self, output, deadline, graphics_mode):
+    def __init__(self, output, deadline, graphics_mode, no_popover_animation=False):
         self.output, self.deadline, self.graphics_mode = output, deadline, graphics_mode
+        self.no_popover_animation = no_popover_animation
         self.collector = self.fixture = self.active_probe = None
         self.identity = None
         self.report = {"schema_version": 1, "kind": "memory-attribution-diagnostic", "status": "running",
                        "regression_passed": False, "comparable_to_regression_cases": False,
                        "cpu_gate_evaluated": False, "gpu_gate_evaluated": False,
                        "graphics_mode": graphics_mode, "deadline_seconds": DEADLINE_SECONDS,
+                       "no_popover_animation_requested": no_popover_animation,
                        "errors": [], "checkpoints": [], "probes": [], "commands": [],
                        "driver_sha256": app.path_hash(Path(__file__)),
                        "caveat": "Native VM/heap inspection and graphics modes perturb runtime. These are attribution diagnostics, not CPU/GPU or regression passes. Pixel/bitmap requests are not measured GPU allocations."}
@@ -380,6 +394,7 @@ class MemoryDiagnostic:
         require(type(snapshot.get("active_requests")) is int and snapshot["active_requests"] == active,
                 f"Wrong active stream count at {label}: {snapshot.get('active_requests')}")
         entry["graphics_validation"] = validate_graphics(snapshot, self.graphics_mode)
+        entry["popover_animation_validation"] = validate_popover_animation(snapshot, self.no_popover_animation)
         self.save()
         return snapshot
 
@@ -389,6 +404,8 @@ class MemoryDiagnostic:
         self.report["commands"].append({"command": name, **fields, "response": response})
         self.save()
         require(response.get("status") == "ok", f"App command {name} failed: {response}")
+        if "snapshot" in response:
+            validate_popover_animation(response["snapshot"], self.no_popover_animation)
         return response
 
     def inspect_tool(self, label, tool):
@@ -459,6 +476,8 @@ class MemoryDiagnostic:
         directory.mkdir()
         configuration = {"upstream_url": upstream, "history": "populated", "protocol_version": 1,
                          "logging_enabled": False, "fixture_ending_at_epoch": time.time(), "graphics_mode": self.graphics_mode}
+        if self.no_popover_animation:
+            configuration["popover_animations_enabled"] = False
         write_json(directory / "configuration.json", configuration)
         self.collector = app.Collector(paths["collector"], paths["app"], configuration, {}, directory, self.deadline,
                                        {"external_trace": True, "provenance": provenance, "fixture_schema_version": 2})
@@ -473,7 +492,8 @@ class MemoryDiagnostic:
                 and (seed.get("seed_persistent_requests"), seed.get("seed_raw_requests"), seed.get("seed_tool_events")) == (19000, 256, 38512),
                 "Populated history dimensions were not verified")
         self.report["ready_graphics_validation"] = validate_graphics(seed, self.graphics_mode)
-        self.identity = authenticate_ready(self.collector)
+        self.report["ready_popover_animation_validation"] = validate_popover_animation(seed, self.no_popover_animation)
+        self.identity = authenticate_ready(self.collector, lambda snapshot: validate_popover_animation(snapshot, self.no_popover_animation))
         self.report["owned_identity"] = self.identity
         logging = self.command("set_logging", enabled=False)
         require(logging.get("logging_enabled") is False and logging.get("drained") is True, "Logging did not disable and drain")
@@ -542,6 +562,10 @@ class MemoryDiagnostic:
                 require(self.identity is not None and final["final_sample"].get("process_id") == self.identity["process_id"]
                         and final["final_sample"].get("birth_time_us") == self.identity["birth_time_us"], "Final exit identity differs")
                 validate_sample_identities(self.collector.samples, self.identity)
+                for envelope in self.collector.events:
+                    event = envelope.get("event", {}) if envelope.get("type") == "app_event" else {}
+                    if "snapshot" in event:
+                        validate_popover_animation(event["snapshot"], self.no_popover_animation)
                 stopped = [event.get("event", {}) for event in self.collector.events
                            if event.get("type") == "app_event" and event.get("event", {}).get("type") == "stopped"]
                 require(len(stopped) == 1 and stopped[0].get("status") == "ok", "App shutdown/drain was not acknowledged")
@@ -622,6 +646,8 @@ def parser():
     result.add_argument("--collector-binary", required=True, type=Path)
     result.add_argument("--provenance", required=True, type=Path)
     result.add_argument("--graphics-mode", choices=GRAPHICS_MODES, default="normal")
+    result.add_argument("--no-popover-animation", action="store_true",
+                        help="Diagnostic only: disable native popover animation and verify the app acknowledgment")
     result.add_argument("--output-dir", type=Path, help="New, nonexisting artifact directory; default .performance-results/memory-UTC-unique")
     return result
 
@@ -641,7 +667,7 @@ def run(argv=None):
         return 1
     started = time.monotonic()
     deadline = MemoryDeadline()
-    diagnostic = MemoryDiagnostic(output, deadline, args.graphics_mode)
+    diagnostic = MemoryDiagnostic(output, deadline, args.graphics_mode, args.no_popover_animation)
     try:
         with deadline.interrupt_at(deadline.end - deadline.cleanup_reserve):
             paths, provenance, identity = validate_products(args)

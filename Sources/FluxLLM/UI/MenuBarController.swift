@@ -44,10 +44,12 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
 
     /// Inspect the actual native policy without exposing or replacing its host.
     var popoverBehavior: NSPopover.Behavior { popover.behavior }
+    public var performancePopoverAnimationsEnabled: Bool { popover.animates }
 
     public init(
         metricsStore: MetricsStore, coordinator: MonitoringCoordinator, settings: AppSettings,
-        launchAtLogin: LaunchAtLoginController? = nil
+        launchAtLogin: LaunchAtLoginController? = nil,
+        popoverAnimationsEnabled: Bool = true
     ) {
         self.metricsStore = metricsStore
         self.coordinator = coordinator
@@ -62,7 +64,9 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         popoverPresentation.placeholderSize = NSSize(width: DashboardView.compactWidth, height: 480)
 
         popover.behavior = .transient
-        popover.animates = true
+        // Performance sessions can isolate native transition allocations while
+        // ordinary presentation preserves the established animation policy.
+        popover.animates = popoverAnimationsEnabled
         popover.delegate = self
     }
 
