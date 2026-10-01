@@ -103,7 +103,15 @@ chart preparation. Activity indicators publish only when request membership or
 output availability changes; raw token accounting continues at its normal cadence.
 The retained tool-owner query advances its cached interval boundaries instead of
 rescanning the retained day on every chart publication. Insertions and pruning
-invalidate that bounded cache. Rail decoration ticks do not rebuild the static bars and
+invalidate that bounded cache. Closing the final chart consumer releases the
+rebuildable request/tool ordering indexes and the tool-owner query cache. Raw
+samples, request records, tool events, accounting totals, and retention policies
+remain unchanged; reopening rebuilds indexes on demand. Prepared tool histories
+retain one canonical bucket buffer with segment ranges. Drawing traverses that
+buffer directly, preserving gaps, pending evidence, markers, and inspection
+values without retaining a second flattened copy of the buckets.
+
+Rail decoration ticks do not rebuild the static bars and
 pause between visible effects; hidden surfaces release their hosts and caches.
 Explicit dashboard opening attaches its host before ordering the native window
 front. This avoids the large first-use allocation and writes reproduced when a
@@ -199,6 +207,76 @@ Logging boundaries use acknowledged enable/disable transactions and the writer's
 drain barrier in the collector's clock domain. Only the four exact logger
 destinations are permitted during those intervals. GPU windows are separately
 normalized through paired collector/Mach clock readings.
+
+## Memory attribution diagnostics
+
+Use the separate memory command with frozen Release products and their matching
+provenance. It performs no build:
+
+```sh
+python3 scripts/run_performance_checks.py memory \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json \
+  --graphics-mode normal
+```
+
+The runner verifies product, source, provenance, and resource-bundle hashes. Each
+invocation has its own hard **90-second deadline**, including validation, native
+inspection, workload, and cleanup; eight seconds are reserved for cleanup. It
+launches an owned populated-history process and inspects never-opened,
+dashboard-only, both-visible idle, both-visible streaming, and both-closed
+states. Streaming lasts 25 seconds with two requests at 200 fragments per second
+each. A final checkpoint follows five additional seconds of closed-window
+settling. PID and process birth identity, native visibility, fixture correctness,
+and final accounting are verified.
+
+Choose one diagnostic mode per invocation with `--graphics-mode`:
+
+| Mode | Controlled difference |
+| --- | --- |
+| `normal` (default) | Production presentation and rendering with available diagnostic counters. |
+| `direct-host` | Attach the dashboard host without the initial placeholder, at a fixed diagnostic viewport. |
+| `empty-drawing` | Keep the native canvas and renderer lifecycle but use an empty drawing closure. |
+| `no-renderer` | Keep native canvas layout but skip renderer creation and drawing. |
+| `bitmap-destination` | Render through a bounded temporary CPU bitmap before copying into the native destination. |
+| `no-blur` | Keep the renderer and drawing geometry while skipping the main-series Gaussian blur. |
+| `cpu-glow` | Use a bounded CPU raster glow in place of the filtered series-glow pass. |
+
+Optionally add `--no-popover-animation` independently of the graphics mode to
+disable native popover animation for this diagnostic. The runner verifies the
+disabled setting at ready and in every snapshot; missing or mismatched evidence
+fails the experiment. Without this flag, the app's default is retained and older
+products report an unavailable animation setting instead of an assumed value.
+
+These modes isolate allocation causes; they do not select a production rendering
+policy. Native memory inspection also perturbs runtime. Run them separately from
+CPU/GPU gates and other native workloads. A successful diagnostic is never a
+regression pass and does not alter the normal CPU, memory, GPU, or write limits
+above. Exit zero means `diagnostic_captured`; failed validation, incomplete native
+reports, or timeout produces `diagnostic_incomplete` and a nonzero exit.
+
+Results use a unique ignored `.performance-results/memory-*` directory, or a new
+directory supplied with `--output-dir`. Existing artifacts are never overwritten.
+Keep `memory-report.json`, `SUMMARY.md`, raw `footprint` JSON/text, `vmmap` text,
+selected `heap` text, collector JSONL/stderr, and configuration/storage records.
+The report retains parsed category/allocation tables, exact inspection commands,
+identity checks, graphics counters, and workload validation; `in-progress.json`
+preserves intermediate evidence.
+
+Treat the memory ledgers separately. Footprint categories partition charged dirty
+bytes, which already include swapped bytes. `vmmap` reports rounded binary sizes;
+`heap` reports exact allocated bytes. Live heap, allocator fragmentation, and
+physical footprint are different quantities and must not be added together.
+
+Graphics counters describe canvas/renderer lifecycle and requested pixel areas,
+dimensions, scale, and temporary bitmap bytes, grouped by drawing role. Requested
+backing sizes are **not measured GPU allocations or GPU utilization**. Missing
+counters remain unavailable, never zero; older frozen products can run in normal
+mode without them, while alternate modes require matching mode/counter evidence.
+Use native category tables and authenticated kernel footprint for memory
+attribution, and the separately calibrated process GPU provider for GPU work.
 
 ## Baselines and comparison artifacts
 
