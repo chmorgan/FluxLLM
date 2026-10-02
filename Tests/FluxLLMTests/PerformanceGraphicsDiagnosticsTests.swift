@@ -17,7 +17,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 16)
+        XCTAssertEqual(Mode.allCases.count, 20)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -519,6 +519,15 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 XCTAssertEqual(
                     snapshot["retained_twinkles_enabled"] as? Bool,
                     mode.usesRetainedTwinkles)
+                XCTAssertEqual(
+                    snapshot["incremental_history_ordering"] as? Bool,
+                    mode.usesIncrementalHistoryOrdering)
+                XCTAssertEqual(
+                    snapshot["optimized_chart_preparation"] as? Bool,
+                    mode.usesOptimizedChartPreparation)
+                XCTAssertEqual(
+                    snapshot["lifecycle_effects_enabled"] as? Bool,
+                    !mode.omitsLifecycleEffects)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
             }
@@ -579,19 +588,31 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
 
     func testNativeOptimizationControlsChangeOnlyTheirNamedFeatures() {
         typealias Mode = PerformanceGraphicsDiagnostics.Mode
+        let runtime: [Mode] = [
+            .runtimeNoLifecycle, .runtimeHistoryOrder, .runtimeChartPreparation, .runtimeOptimized,
+        ]
         for mode in Mode.allCases {
             XCTAssertEqual(
                 mode.usesNativeGPUCanvas,
-                [
+                ([
                     .normal, .nativeGPUCanvas, .nativeGPUCoalescedScalars,
                     .nativeGPURetainedTwinkles, .nativeGPUOptimized,
-                ].contains(mode))
+                ] + runtime).contains(mode))
             XCTAssertEqual(
                 mode.usesCoalescedScalarPresentation,
-                [.normal, .nativeGPUCoalescedScalars, .nativeGPUOptimized].contains(mode))
+                ([.normal, .nativeGPUCoalescedScalars, .nativeGPUOptimized] + runtime).contains(
+                    mode))
             XCTAssertEqual(
                 mode.usesRetainedTwinkles,
-                [.normal, .nativeGPURetainedTwinkles, .nativeGPUOptimized].contains(mode))
+                ([.normal, .nativeGPURetainedTwinkles, .nativeGPUOptimized] + runtime).contains(
+                    mode))
+            XCTAssertEqual(
+                mode.usesIncrementalHistoryOrdering,
+                [.runtimeHistoryOrder, .runtimeOptimized, .runtimeNoLifecycle].contains(mode))
+            XCTAssertEqual(
+                mode.usesOptimizedChartPreparation,
+                [.runtimeChartPreparation, .runtimeOptimized, .runtimeNoLifecycle].contains(mode))
+            XCTAssertEqual(mode.omitsLifecycleEffects, mode == .runtimeNoLifecycle)
         }
     }
 

@@ -17,6 +17,10 @@ public final class PerformanceGraphicsDiagnostics {
         case nativeGPUCoalescedScalars = "native-gpu-coalesced-scalars"
         case nativeGPURetainedTwinkles = "native-gpu-retained-twinkles"
         case nativeGPUOptimized = "native-gpu-optimized"
+        case runtimeNoLifecycle = "runtime-no-lifecycle"
+        case runtimeHistoryOrder = "runtime-history-order"
+        case runtimeChartPreparation = "runtime-chart-preparation"
+        case runtimeOptimized = "runtime-optimized"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -38,14 +42,38 @@ public final class PerformanceGraphicsDiagnostics {
         var usesNativeGPUCanvas: Bool {
             self == .normal || self == .nativeGPUCanvas || self == .nativeGPUCoalescedScalars
                 || self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
+                || isRuntimeControl
         }
 
         var usesCoalescedScalarPresentation: Bool {
             self == .normal || self == .nativeGPUCoalescedScalars || self == .nativeGPUOptimized
+                || isRuntimeControl
         }
 
         var usesRetainedTwinkles: Bool {
             self == .normal || self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
+                || isRuntimeControl
+        }
+
+        var isRuntimeControl: Bool {
+            switch self {
+            case .runtimeNoLifecycle, .runtimeHistoryOrder, .runtimeChartPreparation,
+                .runtimeOptimized:
+                true
+            default:
+                false
+            }
+        }
+
+        var omitsLifecycleEffects: Bool { self == .runtimeNoLifecycle }
+
+        var usesIncrementalHistoryOrdering: Bool {
+            self == .runtimeHistoryOrder || self == .runtimeOptimized || self == .runtimeNoLifecycle
+        }
+
+        var usesOptimizedChartPreparation: Bool {
+            self == .runtimeChartPreparation || self == .runtimeOptimized
+                || self == .runtimeNoLifecycle
         }
     }
 
@@ -504,6 +532,9 @@ public final class PerformanceGraphicsDiagnostics {
             result["native_gpu_backend"] = "swiftui-canvas-drawing-group"
             result["scalar_presentation_coalesced"] = mode.usesCoalescedScalarPresentation
             result["retained_twinkles_enabled"] = mode.usesRetainedTwinkles
+            result["incremental_history_ordering"] = mode.usesIncrementalHistoryOrdering
+            result["optimized_chart_preparation"] = mode.usesOptimizedChartPreparation
+            result["lifecycle_effects_enabled"] = !mode.omitsLifecycleEffects
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

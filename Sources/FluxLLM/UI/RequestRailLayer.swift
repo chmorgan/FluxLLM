@@ -139,11 +139,17 @@ private struct RequestRailDecorations: View {
         isLive && !reduceMotion && !reduceTransparency && contrast != .increased && windowVisible
     }
 
+    private var lifecycleEvents: [RequestRailEvent] {
+        // Attribution control: retain live-request eligibility and the normal
+        // twinkle scheduler while omitting arrival/completion preparation.
+        PerformanceGraphicsDiagnostics.shared.mode.omitsLifecycleEffects ? [] : presentation.events
+    }
+
     var body: some View {
         let eligibility = RequestRailAnimationEligibility(
-            segments: segments, events: presentation.events, now: now, duration: duration)
+            segments: segments, events: lifecycleEvents, now: now, duration: duration)
         let work = WorkKey(
-            events: presentation.events.map(EffectKey.init), eligibility: eligibility,
+            events: lifecycleEvents.map(EffectKey.init), eligibility: eligibility,
             duration: duration, enabled: effectsEnabled)
         let decoratedSegments = segments.filter { segment in
             segment.isLive || prepared.contains { $0.key.requestID == segment.lane.id }
@@ -212,7 +218,7 @@ private struct RequestRailDecorations: View {
         }
         let timestamp = Date()
         let cached = Dictionary(uniqueKeysWithValues: prepared.map { ($0.key, $0) })
-        prepared = presentation.events.compactMap { event in
+        prepared = lifecycleEvents.compactMap { event in
             guard event.expiresAt > timestamp,
                 let lane = lanes.first(where: { $0.id == event.requestID }),
                 let assignment = presentation.assignments[lane.id],

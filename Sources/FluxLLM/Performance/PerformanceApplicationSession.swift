@@ -177,6 +177,15 @@ public final class PerformanceApplicationSession {
             "chart_publication_id": store.chartPresentation.publicationID.uuidString,
             "status_updates": counters["status_updates"] as Any? ?? NSNull(),
             "chart_preparations": counters["chart_preparations"] as Any? ?? NSNull(),
+            "optimized_chart_preparations": counters["optimized_chart_preparations"] as Any?
+                ?? NSNull(),
+            "history_tool_order_builds": counters["history_tool_order_builds"] as Any? ?? NSNull(),
+            "history_completed_order_builds": counters["history_completed_order_builds"] as Any?
+                ?? NSNull(),
+            "history_tool_order_insertions": counters["history_tool_order_insertions"] as Any?
+                ?? NSNull(),
+            "history_completed_order_insertions": counters["history_completed_order_insertions"]
+                as Any? ?? NSNull(),
             "canvas_draws": counters["canvas_draws"] as Any? ?? NSNull(),
             "metal_frames": counters["metal_frames"] as Any? ?? NSNull(),
             "graphics_diagnostics": PerformanceGraphicsDiagnostics.shared.snapshot(),

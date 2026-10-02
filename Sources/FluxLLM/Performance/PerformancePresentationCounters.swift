@@ -7,6 +7,11 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
     public enum Metric: String, Sendable {
         case statusUpdates = "status_updates"
         case chartPreparations = "chart_preparations"
+        case optimizedChartPreparations = "optimized_chart_preparations"
+        case historyToolOrderBuilds = "history_tool_order_builds"
+        case historyCompletedOrderBuilds = "history_completed_order_builds"
+        case historyToolOrderInsertions = "history_tool_order_insertions"
+        case historyCompletedOrderInsertions = "history_completed_order_insertions"
         case canvasDraws = "canvas_draws"
         case metalFrames = "metal_frames"
     }
@@ -21,7 +26,12 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
     public func enable() {
         lock.lock()
         defer { lock.unlock() }
-        for metric in [Metric.statusUpdates, .chartPreparations, .canvasDraws] {
+        for metric in [
+            Metric.statusUpdates, .chartPreparations, .canvasDraws,
+            .optimizedChartPreparations, .historyToolOrderBuilds,
+            .historyCompletedOrderBuilds, .historyToolOrderInsertions,
+            .historyCompletedOrderInsertions,
+        ] {
             values[metric.rawValue] = 0
         }
         enabled = true
