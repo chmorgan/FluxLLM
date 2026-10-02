@@ -89,6 +89,21 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {field} counter moved backwards")
         delta[field] = last - first
     require(delta["chart_preparations"] > 0, "Runtime workload did not prepare charts")
+    if (mode == memory.ORDERED_PUBLICATION_MODE or "ordered_chart_publication" in flags
+            or any(field in snapshot for snapshot in (before, after) for field in memory.ORDERED_PUBLICATION_COUNTERS)):
+        require("ordered_chart_publication" in flags, "Ordered-publication counters lack feature metadata")
+        for field in memory.ORDERED_PUBLICATION_COUNTERS:
+            first = memory.unsigned(before.get(field), f"runtime.before.{field}")
+            last = memory.unsigned(after.get(field), f"runtime.after.{field}")
+            require(last >= first, f"Runtime {field} counter moved backwards")
+            delta[field] = last - first
+        if flags["ordered_chart_publication"]:
+            require(delta["ordered_chart_publication_queries"] > 0 and delta["chart_publication_full_sorts"] == 0,
+                    "Ordered chart publication did not execute queries without fallback full sorts")
+        else:
+            require(before["ordered_chart_publication_queries"] == after["ordered_chart_publication_queries"] == 0,
+                    "Nonordered mode executed ordered publication queries")
+            require(delta["chart_publication_full_sorts"] > 0, "Baseline chart publication did not execute fallback full sorts")
     if (mode in memory.CANVAS_CLOCK_MODES or "canvas_frame_clock" in flags
             or any(field in snapshot for snapshot in (before, after) for field in memory.CANVAS_CLOCK_COUNTERS)):
         for field in memory.CANVAS_CLOCK_COUNTERS:

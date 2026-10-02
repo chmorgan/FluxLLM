@@ -24,6 +24,8 @@ def workload_snapshots(mode):
         before[field] = 10
     after = copy.deepcopy(before)
     after["chart_preparations"] += 2
+    if value.get("ordered_chart_publication"):
+        after["ordered_chart_publication_queries"] += 2
     if value.get("canvas_frame_clock"):
         after["rail_frame_clock_ticks"] += 2
     if value.get("shared_chart_preparation"):
@@ -125,7 +127,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock",) if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication") if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -222,6 +224,56 @@ class RuntimeWorkTests(unittest.TestCase):
 
 
 class NextRuntimeWorkTests(unittest.TestCase):
+    def test_ordered_publication_executes_queries_without_workload_fallback_sorts(self):
+        mode = memory.ORDERED_PUBLICATION_MODE
+        before, after = workload_snapshots(mode)
+        self.assertEqual(runtime.validate_runtime_work(before, after, mode)["deltas"]["ordered_chart_publication_queries"], 2)
+        for field in memory.ORDERED_PUBLICATION_COUNTERS:
+            for invalid in (None, True, -1):
+                changed = copy.deepcopy(after)
+                changed[field] = invalid
+                with self.subTest(field=field, value=invalid), self.assertRaises(ValueError):
+                    runtime.validate_runtime_work(before, changed, mode)
+        for queries, sorts in ((0, 0), (2, 1)):
+            changed = copy.deepcopy(after)
+            changed["ordered_chart_publication_queries"] = before["ordered_chart_publication_queries"] + queries
+            changed["chart_publication_full_sorts"] = before["chart_publication_full_sorts"] + sorts
+            with self.subTest(queries=queries, sorts=sorts), self.assertRaisesRegex(ValueError, "without fallback"):
+                runtime.validate_runtime_work(before, changed, mode)
+        # Earlier fallback work is outside the measured workload, not a reason
+        # to reject the fixed-window proof or require globally impossible zeros.
+        before["chart_publication_full_sorts"] = after["chart_publication_full_sorts"] = 12
+        self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
+
+    def test_instrumented_baseline_requires_full_sorts_and_no_ordered_queries(self):
+        before, after = workload_snapshots("runtime-optimized")
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"]["ordered_chart_publication"] = False
+            snapshot.update(ordered_chart_publication_queries=0, chart_publication_full_sorts=0)
+        with self.assertRaisesRegex(ValueError, "did not execute fallback"):
+            runtime.validate_runtime_work(before, after, "runtime-optimized")
+        after["chart_publication_full_sorts"] = 2
+        self.assertTrue(runtime.validate_runtime_work(before, after, "runtime-optimized")["available"])
+        after["ordered_chart_publication_queries"] = 1
+        with self.assertRaisesRegex(ValueError, "Nonordered"):
+            runtime.validate_runtime_work(before, after, "runtime-optimized")
+
+    def test_legacy_shared_ordered_fields_optional_but_new_evidence_is_complete_and_stable(self):
+        for mode in ("runtime-shared-preparation", "runtime-next-optimized"):
+            before, after = workload_snapshots(mode)
+            self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
+            for snapshot in (before, after):
+                snapshot["graphics_diagnostics"]["ordered_chart_publication"] = True
+                snapshot.update(ordered_chart_publication_queries=0, chart_publication_full_sorts=0)
+            after["ordered_chart_publication_queries"] = 2
+            self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
+            del after["graphics_diagnostics"]["ordered_chart_publication"]
+            with self.assertRaisesRegex(ValueError, "stable complete"):
+                runtime.validate_runtime_work(before, after, mode)
+            del before["graphics_diagnostics"]["ordered_chart_publication"]
+            with self.assertRaisesRegex(ValueError, "lack feature metadata"):
+                runtime.validate_runtime_work(before, after, mode)
+
     def test_promoted_normal_requires_executed_stream_clock_and_rendered_work(self):
         before, after = workload_snapshots("runtime-stream-canvas-clock")
         for snapshot in (before, after):
@@ -249,7 +301,7 @@ class NextRuntimeWorkTests(unittest.TestCase):
             self.assertTrue(work["features"]["canvas_frame_clock"])
             self.assertFalse(work["features"]["shared_chart_preparation"])
             self.assertFalse(work["features"]["stable_decoration_hosts"])
-            self.assertEqual(work["features"]["unpromised_stream_body_writes"], mode == "runtime-stream-canvas-clock")
+            self.assertEqual(work["features"]["unpromised_stream_body_writes"], mode != "runtime-canvas-clock")
             args = runtime.parser().parse_args(["compare", "--app-binary", "/app", "--test-bundle", "/tests",
                 "--collector-binary", "/collector", "--provenance", "/provenance", "--controls", mode])
             self.assertEqual(runtime.selected_cases(args)[1], (mode, mode))

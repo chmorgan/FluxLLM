@@ -24,7 +24,9 @@ from run_performance_checks import interrupted, load_json, number, require, writ
 GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "bitmap-layer-destination",
                   "bitmap-layer-bgra", "bitmap-layer-no-decorations", "native-gpu-canvas", "native-gpu-coalesced-scalars",
                   "native-gpu-retained-twinkles", "native-gpu-optimized", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
-CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock")
+ORDERED_PUBLICATION_MODE = "runtime-ordered-publication"
+ORDERED_PUBLICATION_COUNTERS = ("ordered_chart_publication_queries", "chart_publication_full_sorts")
+CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock", ORDERED_PUBLICATION_MODE)
 NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized") + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
 GRAPHICS_MODES += RUNTIME_MODES
@@ -352,14 +354,14 @@ def validate_retained_twinkles(value, mode, *, completed_visible_workload=False,
 
 
 def runtime_feature_contract(value, mode):
-    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock",)):
+    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication")):
         return None
     extras = {}
     promoted_normal = mode == "normal" and value.get("unpromised_stream_body_writes") is True
     if mode in NEXT_RUNTIME_MODES or any(field in value for field in NEXT_RUNTIME_FLAGS):
         expected = {"shared_chart_preparation": mode in ("runtime-shared-preparation", "runtime-next-optimized"),
                     "stable_decoration_hosts": mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"),
-                    "unpromised_stream_body_writes": promoted_normal or mode in ("runtime-stream-writes", "runtime-next-optimized", "runtime-stream-canvas-clock")}
+                    "unpromised_stream_body_writes": promoted_normal or mode in ("runtime-stream-writes", "runtime-next-optimized", "runtime-stream-canvas-clock", ORDERED_PUBLICATION_MODE)}
         for field, enabled in expected.items():
             require(type(value.get(field)) is bool and value[field] is enabled,
                     f"Graphics {field} does not match the requested runtime control")
@@ -368,6 +370,11 @@ def runtime_feature_contract(value, mode):
         require(type(value.get("canvas_frame_clock")) is bool and value["canvas_frame_clock"] is (promoted_normal or mode in CANVAS_CLOCK_MODES),
                 "Graphics canvas_frame_clock does not match the requested runtime control")
         extras["canvas_frame_clock"] = value["canvas_frame_clock"]
+    if mode == ORDERED_PUBLICATION_MODE or "ordered_chart_publication" in value:
+        expected = mode == ORDERED_PUBLICATION_MODE or extras.get("shared_chart_preparation", False)
+        require(type(value.get("ordered_chart_publication")) is bool and value["ordered_chart_publication"] is expected,
+                "Graphics ordered_chart_publication does not match the requested runtime control")
+        extras["ordered_chart_publication"] = value["ordered_chart_publication"]
     if mode == "normal":
         require(all(type(value.get(field)) is bool for field in RUNTIME_FLAGS), "Normal runtime feature metadata is incomplete")
         flags = {field: value[field] for field in RUNTIME_FLAGS}
@@ -404,6 +411,15 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     native_normal = mode == "normal" and "native_gpu_backend" in value
     contract = "native-gpu-optimized" if native_normal or mode in RUNTIME_MODES else mode
     runtime_features = runtime_feature_contract(value, mode)
+    if (mode == ORDERED_PUBLICATION_MODE or "ordered_chart_publication" in value
+            or any(field in snapshot for field in ORDERED_PUBLICATION_COUNTERS)):
+        require("ordered_chart_publication" in value, "Ordered-publication counters lack feature metadata")
+        ordered = {field: unsigned(snapshot.get(field), field) for field in ORDERED_PUBLICATION_COUNTERS}
+        if (runtime_features or {}).get("ordered_chart_publication", False):
+            if completed_visible_workload:
+                require(ordered["ordered_chart_publication_queries"] > 0, "Ordered chart publication did not execute queries")
+        else:
+            require(ordered["ordered_chart_publication_queries"] == 0, "Nonordered mode executed ordered publication queries")
     if (mode in CANVAS_CLOCK_MODES or "canvas_frame_clock" in value
             or any(field in snapshot for field in CANVAS_CLOCK_COUNTERS)):
         clock = {field: unsigned(snapshot.get(field), field) for field in CANVAS_CLOCK_COUNTERS}

@@ -78,6 +78,58 @@ All zones: 9 nodes (1312 bytes)
 
 
 class NextRuntimeContractTests(unittest.TestCase):
+    def test_ordered_publication_requires_complete_typed_metadata_and_query_evidence(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        mode = memory.ORDERED_PUBLICATION_MODE
+        snapshot = drawn_native_gpu_graphics(mode)
+        self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+        for invalid in (None, False, 1):
+            changed = copy.deepcopy(snapshot)
+            changed["graphics_diagnostics"]["ordered_chart_publication"] = invalid
+            with self.subTest(flag=invalid), self.assertRaises(InvalidResult):
+                memory.validate_graphics(changed, mode)
+        for field in memory.ORDERED_PUBLICATION_COUNTERS:
+            for invalid in (None, True, -1):
+                changed = copy.deepcopy(snapshot)
+                changed[field] = invalid
+                with self.subTest(field=field, value=invalid), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(changed, mode)
+        snapshot["ordered_chart_publication_queries"] = 0
+        with self.assertRaisesRegex(InvalidResult, "did not execute queries"):
+            memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+
+    def test_ordered_publication_preserves_legacy_shared_and_nonordered_modes(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        for mode, enabled in (("runtime-shared-preparation", True), ("runtime-next-optimized", True), ("runtime-optimized", False)):
+            snapshot = drawn_native_gpu_graphics(mode)
+            self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+            snapshot["graphics_diagnostics"]["ordered_chart_publication"] = enabled
+            with self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, mode)
+            snapshot.update(ordered_chart_publication_queries=3 if enabled else 0, chart_publication_full_sorts=4)
+            # Fallback counts outside the fixed workload are allowed; only its
+            # authenticated counter delta proves that benchmark avoided sorts.
+            self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+            snapshot["graphics_diagnostics"]["ordered_chart_publication"] = not enabled
+            with self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, mode)
+            del snapshot["graphics_diagnostics"]["ordered_chart_publication"]
+            with self.assertRaisesRegex(InvalidResult, "lack feature metadata"):
+                memory.validate_graphics(snapshot, mode)
+
+    def test_normal_keeps_ordered_publication_disabled(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        snapshot = drawn_native_gpu_graphics("runtime-stream-canvas-clock")
+        snapshot["graphics_diagnostics"].update(mode="normal", ordered_chart_publication=False)
+        snapshot.update(ordered_chart_publication_queries=0, chart_publication_full_sorts=2)
+        self.assertTrue(memory.validate_graphics(snapshot, "normal")["available"])
+        snapshot["ordered_chart_publication_queries"] = 1
+        with self.assertRaisesRegex(InvalidResult, "Nonordered"):
+            memory.validate_graphics(snapshot, "normal")
+        snapshot["graphics_diagnostics"]["ordered_chart_publication"] = True
+        with self.assertRaisesRegex(InvalidResult, "does not match"):
+            memory.validate_graphics(snapshot, "normal")
+
     def test_promoted_normal_requires_paired_paths_and_retains_actual_work_validation(self):
         from test_memory_diagnostic import drawn_native_gpu_graphics
         snapshot = drawn_native_gpu_graphics("runtime-stream-canvas-clock")

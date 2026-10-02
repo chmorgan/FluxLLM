@@ -1091,10 +1091,13 @@ public final class MetricsStore {
         }
         let sharedPreparation = PerformanceGraphicsDiagnostics.shared.mode
             .usesSharedChartPreparation
+        let orderedPublication = PerformanceGraphicsDiagnostics.shared.mode
+            .usesOrderedChartPublication
         let historicalLanes: [RequestLane]
-        if sharedPreparation, historyIntervals.count == 1 {
+        if orderedPublication, historyIntervals.count == 1 {
             // The query already returns unique, ordered lanes. Preserve that
             // order for the common single merged viewport instead of sorting twice.
+            PerformancePresentationCounters.shared.record(.orderedChartPublicationQueries)
             historicalLanes = usageHistory.requestLanes(
                 source: historySource, interval: historyIntervals[0], inclusiveEnd: selection != nil
             )
@@ -1105,13 +1108,15 @@ public final class MetricsStore {
                     source: historySource, interval: interval, inclusiveEnd: selection != nil
                 ) { savedLanes[lane.id] = lane }
             }
+            PerformancePresentationCounters.shared.record(.chartPublicationFullSorts)
             historicalLanes = savedLanes.values.sorted {
                 $0.startedAt == $1.startedAt
                     ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
             }
         }
         let historicalTools: [ToolActivityEvent]
-        if sharedPreparation, toolIntervals.count == 1 {
+        if orderedPublication, toolIntervals.count == 1 {
+            PerformancePresentationCounters.shared.record(.orderedChartPublicationQueries)
             historicalTools = Self.canonicalToolEvents(
                 usageHistory.toolEvents(
                     source: historySource, interval: toolIntervals[0],
@@ -1124,6 +1129,7 @@ public final class MetricsStore {
                     inclusiveEnd: selection != nil && interval.end < date
                 ) { savedTools[event.id] = event }
             }
+            PerformancePresentationCounters.shared.record(.chartPublicationFullSorts)
             historicalTools = savedTools.values.sorted {
                 $0.timestamp == $1.timestamp
                     ? $0.id.uuidString < $1.id.uuidString : $0.timestamp < $1.timestamp

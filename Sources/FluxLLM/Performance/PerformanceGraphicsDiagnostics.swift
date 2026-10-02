@@ -27,6 +27,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeNextOptimized = "runtime-next-optimized"
         case runtimeCanvasClock = "runtime-canvas-clock"
         case runtimeStreamCanvasClock = "runtime-stream-canvas-clock"
+        case runtimeOrderedPublication = "runtime-ordered-publication"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -66,7 +67,8 @@ public final class PerformanceGraphicsDiagnostics {
             case .runtimeNoLifecycle, .runtimeHistoryOrder, .runtimeChartPreparation,
                 .runtimeOptimized,
                 .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
-                .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock:
+                .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
+                .runtimeOrderedPublication:
                 true
             default:
                 false
@@ -83,13 +85,18 @@ public final class PerformanceGraphicsDiagnostics {
             self == .runtimeStableDecorationHosts || self == .runtimeNextOptimized
         }
 
+        var usesOrderedChartPublication: Bool {
+            usesSharedChartPreparation || self == .runtimeOrderedPublication
+        }
+
         var usesUnpromisedStreamBodyWrites: Bool {
             self == .normal || self == .runtimeStreamWrites || self == .runtimeNextOptimized
-                || self == .runtimeStreamCanvasClock
+                || self == .runtimeStreamCanvasClock || self == .runtimeOrderedPublication
         }
 
         var usesCanvasFrameClock: Bool {
             self == .normal || self == .runtimeCanvasClock || self == .runtimeStreamCanvasClock
+                || self == .runtimeOrderedPublication
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -571,6 +578,7 @@ public final class PerformanceGraphicsDiagnostics {
             result["stable_decoration_hosts"] = mode.usesStableDecorationHosts
             result["unpromised_stream_body_writes"] = mode.usesUnpromisedStreamBodyWrites
             result["canvas_frame_clock"] = mode.usesCanvasFrameClock
+            result["ordered_chart_publication"] = mode.usesOrderedChartPublication
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

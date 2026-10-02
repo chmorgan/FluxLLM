@@ -17,7 +17,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 26)
+        XCTAssertEqual(Mode.allCases.count, 27)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -111,6 +111,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertTrue(diagnostics.mode.usesCanvasFrameClock)
         XCTAssertFalse(diagnostics.mode.usesSharedChartPreparation)
         XCTAssertFalse(diagnostics.mode.usesStableDecorationHosts)
+        XCTAssertFalse(diagnostics.mode.usesOrderedChartPublication)
         diagnostics.scalarPresentationPublished()
         XCTAssertNil(diagnostics.retainedTwinkleHostCreated())
         diagnostics.retainedTwinkleHostUpdated(
@@ -546,6 +547,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 XCTAssertEqual(
                     snapshot["canvas_frame_clock"] as? Bool,
                     mode.usesCanvasFrameClock)
+                XCTAssertEqual(
+                    snapshot["ordered_chart_publication"] as? Bool,
+                    mode.usesOrderedChartPublication)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
             }
@@ -609,6 +613,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         let next: [Mode] = [
             .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
             .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
+            .runtimeOrderedPublication,
         ]
         let runtime: [Mode] =
             [
@@ -647,11 +652,20 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 [.runtimeStableDecorationHosts, .runtimeNextOptimized].contains(mode))
             XCTAssertEqual(
                 mode.usesUnpromisedStreamBodyWrites,
-                [.normal, .runtimeStreamWrites, .runtimeNextOptimized, .runtimeStreamCanvasClock]
-                    .contains(mode))
+                [
+                    .normal, .runtimeStreamWrites, .runtimeNextOptimized, .runtimeStreamCanvasClock,
+                    .runtimeOrderedPublication,
+                ].contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
-                [.normal, .runtimeCanvasClock, .runtimeStreamCanvasClock].contains(mode))
+                [
+                    .normal, .runtimeCanvasClock, .runtimeStreamCanvasClock,
+                    .runtimeOrderedPublication,
+                ].contains(mode))
+            XCTAssertEqual(
+                mode.usesOrderedChartPublication,
+                [.runtimeSharedPreparation, .runtimeNextOptimized, .runtimeOrderedPublication]
+                    .contains(mode))
         }
     }
 

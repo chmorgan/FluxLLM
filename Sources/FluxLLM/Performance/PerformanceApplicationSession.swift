@@ -195,6 +195,10 @@ public final class PerformanceApplicationSession {
             "rail_frame_clock_ticks": counters["rail_frame_clock_ticks"] as Any? ?? NSNull(),
             "rail_timeline_content_updates": counters["rail_timeline_content_updates"] as Any?
                 ?? NSNull(),
+            "ordered_chart_publication_queries": counters["ordered_chart_publication_queries"]
+                as Any? ?? NSNull(),
+            "chart_publication_full_sorts": counters["chart_publication_full_sorts"] as Any?
+                ?? NSNull(),
             "history_tool_order_builds": counters["history_tool_order_builds"] as Any? ?? NSNull(),
             "history_completed_order_builds": counters["history_completed_order_builds"] as Any?
                 ?? NSNull(),
