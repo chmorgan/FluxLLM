@@ -13,6 +13,7 @@ public final class PerformanceGraphicsDiagnostics {
         case bitmapLayerDestination = "bitmap-layer-destination"
         case bitmapLayerBGRA = "bitmap-layer-bgra"
         case bitmapLayerNoDecorations = "bitmap-layer-no-decorations"
+        case nativeGPUCanvas = "native-gpu-canvas"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -108,6 +109,7 @@ public final class PerformanceGraphicsDiagnostics {
     private var layerBitmapPresentations: UInt64 = 0
     private var layerBitmapFailures: UInt64 = 0
     private var layerBitmapNativeDraws: UInt64 = 0
+    private var nativeGPUCanvasDraws: UInt64 = 0
 
     init() {}
 
@@ -136,6 +138,7 @@ public final class PerformanceGraphicsDiagnostics {
         layerBitmapPresentations = 0
         layerBitmapFailures = 0
         layerBitmapNativeDraws = 0
+        nativeGPUCanvasDraws = 0
     }
 
     public func canvasCreated(role: Role) -> UInt64? {
@@ -319,6 +322,23 @@ public final class PerformanceGraphicsDiagnostics {
         roles[canvas.role]!.draws += 1
     }
 
+    /// Records an actual SwiftUI Canvas drawing callback for the controlled
+    /// drawing-group backend. This counts CPU callbacks, not GPU executions or
+    /// GPU time. Call instead of canvasDrawn so role and backend totals agree.
+    public func nativeGPUCanvasDrawn(_ id: UInt64?) {
+        guard isEnabled, mode == .nativeGPUCanvas,
+            let (_, canvas) = registered(id)
+        else { return }
+        let next = nativeGPUCanvasDraws.addingReportingOverflow(1)
+        let nextRole = roles[canvas.role]!.draws.addingReportingOverflow(1)
+        guard !next.overflow, !nextRole.overflow else {
+            invalidEvents += 1
+            return
+        }
+        nativeGPUCanvasDraws = next.partialValue
+        roles[canvas.role]!.draws = nextRole.partialValue
+    }
+
     public func drawSkipped(_ id: UInt64?) {
         guard let (_, canvas) = registered(id) else { return }
         roles[canvas.role]!.skippedDraws += 1
@@ -357,6 +377,7 @@ public final class PerformanceGraphicsDiagnostics {
             "layer_bitmap_presentations": layerBitmapPresentations,
             "layer_bitmap_failures": layerBitmapFailures,
             "layer_bitmap_native_draws": layerBitmapNativeDraws,
+            "native_gpu_canvas_draws": nativeGPUCanvasDraws,
             "live_canvases": total.live, "peak_live_canvases": total.peakLive,
             "live_renderers": total.liveRenderers,
             "peak_live_renderers": total.peakLiveRenderers,
@@ -376,6 +397,9 @@ public final class PerformanceGraphicsDiagnostics {
                 ? "bgra8-premultiplied-first" : "rgba8-premultiplied-last"
             result["layer_bitmap_color_space"] = "device-rgb"
             result["rail_decorations_enabled"] = !mode.omitsRailDecorations
+        }
+        if isEnabled, mode == .nativeGPUCanvas {
+            result["native_gpu_backend"] = "swiftui-canvas-drawing-group"
         }
         return result
     }

@@ -160,7 +160,8 @@ private struct RequestRailDecorations: View {
             Color.clear
             if needsSurface && !bounds.isEmpty {
                 TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { clock in
-                    ChartCanvas(role: .railDecorations, drawingBounds: bounds) { context, _ in
+                    ChartDrawingSurface(role: .railDecorations, drawingBounds: bounds) {
+                        context, _ in
                         PerformancePresentationCounters.shared.record(.canvasDraws)
                         // A paused timeline can retain its previous date. Draw
                         // an empty frame after the visible interval has ended.

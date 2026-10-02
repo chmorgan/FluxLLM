@@ -220,7 +220,7 @@ struct LuminousActivityChart: View {
                     lanes: lanes, assignments: requestRails.assignments)
             }
             ZStack(alignment: .topLeading) {
-                ChartCanvas(role: .staticChart, revision: staticRevision) { context, _ in
+                ChartDrawingSurface(role: .staticChart, revision: staticRevision) { context, _ in
                     PerformancePresentationCounters.shared.record(.canvasDraws)
                     drawGrid(in: &context, layout: layout)
                     let cpuGlow =
@@ -276,7 +276,7 @@ struct LuminousActivityChart: View {
                         selected.timestamp, value: 0, in: layout.main, upperBound: 1
                     ).x
                     let bounds = ChartSurfaceBounds.cursor(x: cursorX, plotSize: geometry.size)
-                    ChartCanvas(
+                    ChartDrawingSurface(
                         role: .cursor,
                         revision: CursorDrawingRevision(
                             frame: ObjectIdentifier(frame), timestamp: selected.timestamp),

@@ -12,11 +12,12 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.bitmapLayerDestination.rawValue, "bitmap-layer-destination")
         XCTAssertEqual(Mode.bitmapLayerBGRA.rawValue, "bitmap-layer-bgra")
         XCTAssertEqual(Mode.bitmapLayerNoDecorations.rawValue, "bitmap-layer-no-decorations")
+        XCTAssertEqual(Mode.nativeGPUCanvas.rawValue, "native-gpu-canvas")
         XCTAssertEqual(Mode.noBlur.rawValue, "no-blur")
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 12)
+        XCTAssertEqual(Mode.allCases.count, 13)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -108,6 +109,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             "gradient_substitutions",
             "layer_bitmap_presentations", "layer_bitmap_failures", "layer_bitmap_native_draws",
             "current_layer_image_bytes", "peak_layer_image_bytes",
+            "native_gpu_canvas_draws",
         ] {
             assertCounter(key, in: initial, equals: 0)
         }
@@ -121,6 +123,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             diagnostics.rendererCreated(id)
             diagnostics.rendererUpdated(id)
             diagnostics.canvasDrawn(id)
+            diagnostics.nativeGPUCanvasDrawn(id)
             diagnostics.drawSkipped(id)
             diagnostics.bitmapBytes(id, bytes: 4_096)
             diagnostics.layerBitmapPresented(id, imageBytes: 8_192)
@@ -483,6 +486,80 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         assertCounter("layer_bitmap_presentations", in: finished, equals: 0)
         assertCounter("current_layer_image_bytes", in: finished, equals: 0)
         assertCounter("peak_layer_image_bytes", in: finished, equals: 0)
+    }
+
+    func testNativeGPUCallbacksAreScopedToTheEnabledModeAndMetadataResets() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        XCTAssertNil(diagnostics.snapshot()["native_gpu_backend"])
+        for mode in PerformanceGraphicsDiagnostics.Mode.allCases {
+            try diagnostics.enable(mode: mode)
+            let id = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
+            diagnostics.nativeGPUCanvasDrawn(id)
+            diagnostics.nativeGPUCanvasDrawn(id)
+            let snapshot = diagnostics.snapshot()
+            let expected: UInt64 = mode == .nativeGPUCanvas ? 2 : 0
+            assertCounter("native_gpu_canvas_draws", in: snapshot, equals: expected)
+            assertCounter("draws", in: try role(.staticChart, in: snapshot), equals: expected)
+            assertCounter("invalid_events", in: snapshot, equals: 0)
+            if mode == .nativeGPUCanvas {
+                XCTAssertEqual(
+                    snapshot["native_gpu_backend"] as? String, "swiftui-canvas-drawing-group")
+            } else {
+                XCTAssertNil(snapshot["native_gpu_backend"])
+            }
+            diagnostics.canvasDestroyed(id)
+        }
+        try diagnostics.enable(mode: .nativeGPUCanvas)
+        assertCounter("native_gpu_canvas_draws", in: diagnostics.snapshot(), equals: 0)
+        try diagnostics.disable()
+        XCTAssertEqual(
+            diagnostics.snapshot() as NSDictionary,
+            PerformanceGraphicsDiagnostics().snapshot() as NSDictionary)
+    }
+
+    func testNativeGPUCallbacksRequireLiveOwnersAndReconcileRolesAcrossTheirLifetimes() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .nativeGPUCanvas)
+        let chart = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
+        let decoration = try XCTUnwrap(diagnostics.canvasCreated(role: .railDecorations))
+        let initial = diagnostics.snapshot()
+        diagnostics.nativeGPUCanvasDrawn(nil)
+        XCTAssertEqual(diagnostics.snapshot() as NSDictionary, initial as NSDictionary)
+        diagnostics.nativeGPUCanvasDrawn(UInt64.max)
+        diagnostics.nativeGPUCanvasDrawn(chart)
+        diagnostics.nativeGPUCanvasDrawn(decoration)
+        diagnostics.nativeGPUCanvasDrawn(decoration)
+        diagnostics.canvasDestroyed(chart)
+        diagnostics.nativeGPUCanvasDrawn(chart)
+        let replacement = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
+        XCTAssertNotEqual(chart, replacement)
+        diagnostics.nativeGPUCanvasDrawn(replacement)
+        diagnostics.canvasDestroyed(replacement)
+        diagnostics.canvasDestroyed(decoration)
+
+        let finished = diagnostics.snapshot()
+        assertCounter("native_gpu_canvas_draws", in: finished, equals: 4)
+        assertCounter("draws", in: try role(.staticChart, in: finished), equals: 2)
+        assertCounter("draws", in: try role(.railDecorations, in: finished), equals: 2)
+        assertCounter("invalid_events", in: finished, equals: 2)
+        for key in [
+            "live_canvases", "live_renderers", "peak_live_renderers",
+            "current_bitmap_bytes", "peak_bitmap_bytes",
+            "current_layer_image_bytes", "peak_layer_image_bytes",
+        ] {
+            assertCounter(key, in: finished, equals: 0)
+        }
+        for canvasRole in PerformanceGraphicsDiagnostics.Role.allCases {
+            let counters = try role(canvasRole, in: finished)
+            assertCounter("renderer_creations", in: counters, equals: 0)
+            assertCounter("renderer_updates", in: counters, equals: 0)
+            assertCounter("renderer_destructions", in: counters, equals: 0)
+        }
+
+        try diagnostics.enable(mode: .nativeGPUCanvas)
+        diagnostics.nativeGPUCanvasDrawn(replacement)
+        assertCounter("native_gpu_canvas_draws", in: diagnostics.snapshot(), equals: 0)
+        assertCounter("invalid_events", in: diagnostics.snapshot(), equals: 1)
     }
 
     private var layerModes: [PerformanceGraphicsDiagnostics.Mode] {
