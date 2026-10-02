@@ -155,41 +155,63 @@ private struct RequestRailDecorations: View {
             segment.isLive || prepared.contains { $0.key.requestID == segment.lane.id }
         }
 
-        let retainedTwinkles = PerformanceGraphicsDiagnostics.shared.mode.usesRetainedTwinkles
+        let mode = PerformanceGraphicsDiagnostics.shared.mode
+        let retainedTwinkles = mode.usesRetainedTwinkles
+        let stableHosts = mode.usesStableDecorationHosts
         let lifecycleVisible = prepared.contains {
             eligibility.effectIDs.contains($0.key.eventID)
         }
         let bounds = ChartSurfaceBounds.decorations(rail: rect, plotSize: plotSize)
+        let activeEpisode =
+            effectsEnabled
+            && (!eligibility.liveIDs.isEmpty
+                || !prepared.isEmpty || !twinkles.isEmpty || animating)
         // Keep one native surface throughout an active request/effect episode,
         // including gaps between glints, and release it when genuinely idle.
         let needsSurface =
-            effectsEnabled
-            && (retainedTwinkles
-                ? lifecycleVisible
-                : (!eligibility.liveIDs.isEmpty || !eligibility.effectIDs.isEmpty
-                    || !prepared.isEmpty || animating))
+            stableHosts
+            ? activeEpisode
+            : effectsEnabled
+                && (retainedTwinkles
+                    ? lifecycleVisible
+                    : (!eligibility.liveIDs.isEmpty || !eligibility.effectIDs.isEmpty
+                        || !prepared.isEmpty || animating))
+        let needsRetainedHost =
+            retainedTwinkles
+            && (stableHosts
+                ? activeEpisode
+                : effectsEnabled && !lifecycleVisible
+                    && (!eligibility.liveIDs.isEmpty || !twinkles.isEmpty))
+        let drawsLifecycle = effectsEnabled && animating && (!stableHosts || lifecycleVisible)
         ZStack(alignment: .topLeading) {
             Color.clear
             // During a lifecycle effect, preserve the original per-request
             // ordering of bursts and glints in the existing Canvas. Between
             // effects, the same twinkle instances continue in retained layers.
-            if retainedTwinkles && effectsEnabled && !lifecycleVisible
-                && (!eligibility.liveIDs.isEmpty || !twinkles.isEmpty)
-            {
+            if needsRetainedHost {
                 RetainedRequestRailTwinkles(
                     twinkles: twinkles, segments: segments, now: now, duration: duration,
-                    rail: rect, color: color(for:)
+                    rail: rect, color: color(for:), isPresented: !lifecycleVisible
                 )
                 .frame(width: plotSize.width, height: plotSize.height)
             }
             if needsSurface && !bounds.isEmpty {
-                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { clock in
-                    ChartDrawingSurface(role: .railDecorations, drawingBounds: bounds) {
-                        context, _ in
+                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !drawsLifecycle)) {
+                    clock in
+                    // The experiment keeps this owner mounted between effects.
+                    // Clear once, then ignore ordinary glint publications until
+                    // another effect starts; nil would redraw every update.
+                    let revision: AnyHashable? =
+                        stableHosts && !drawsLifecycle
+                        ? AnyHashable(InactiveDecorationRevision()) : nil
+                    ChartDrawingSurface(
+                        role: .railDecorations, revision: revision,
+                        drawingBounds: bounds
+                    ) { context, _ in
                         PerformancePresentationCounters.shared.record(.canvasDraws)
                         // A paused timeline can retain its previous date. Draw
                         // an empty frame after the visible interval has ended.
-                        if effectsEnabled && animating {
+                        if drawsLifecycle {
                             drawDecorations(decoratedSegments, at: clock.date, in: &context)
                         }
                     }
@@ -205,6 +227,8 @@ private struct RequestRailDecorations: View {
         }
         .onDisappear { animating = false }
     }
+
+    private struct InactiveDecorationRevision: Hashable {}
 
     /// Profiles are cached by receipt identity, so a new telemetry snapshot or a
     /// resized chart cannot change an existing bolt's forks or burst family.

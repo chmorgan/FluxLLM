@@ -285,6 +285,150 @@ final class RetainedRequestRailTwinklesTests: XCTestCase {
             "Animation lifetime must not depend on optional diagnostic registrations")
     }
 
+    func testSuppressionRetainsExistingClockAndDefersNewLayersUntilPresentationResumes() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        try diagnostics.enable(mode: .runtimeStableDecorationHosts)
+        defer { XCTAssertNoThrow(try diagnostics.disable()) }
+        try withVisibleHost { host, _ in
+            let startedAt = Date().addingTimeInterval(-5)
+            let first = liveDescriptor(centerX: 30, startedAt: startedAt)
+            let second = liveDescriptor(centerX: 65, startedAt: startedAt)
+            host.update(descriptors: [first], scale: 2)
+            let layer = try XCTUnwrap(host.layer)
+            let clip = try XCTUnwrap(layer.sublayers?.first)
+            let mark = try XCTUnwrap(clip.sublayers?.last as? CAShapeLayer)
+            let path = mark.path
+            let beginTime = try animation("opacity", on: mark).beginTime
+
+            host.update(descriptors: [first, second], scale: 2, isPresented: false)
+            XCTAssertFalse(host.isHidden)
+            XCTAssertEqual(layer.opacity, 0)
+            XCTAssertNil(
+                layer.animation(forKey: "opacity"), "Handoff must be immediate, without crossfade")
+            XCTAssertEqual(
+                layer.sublayers?.count, 1, "The Canvas owns newly spawned glints during effects")
+            XCTAssertTrue(layer.sublayers?.first === clip)
+            XCTAssertEqual(try animation("opacity", on: mark).beginTime, beginTime)
+            var counters = try twinkleCounters()
+            XCTAssertEqual(counters["hosts_created"], 1)
+            XCTAssertEqual(counters["hosts_destroyed"], 0)
+            XCTAssertEqual(counters["animation_starts"], 4)
+
+            host.update(descriptors: [first, second], scale: 1, isPresented: true)
+            XCTAssertEqual(layer.opacity, 1)
+            XCTAssertEqual(layer.sublayers?.count, 2)
+            XCTAssertTrue(layer.sublayers?.first === clip)
+            XCTAssertTrue(mark.path === path)
+            XCTAssertEqual(try animation("opacity", on: mark).beginTime, beginTime)
+            let resumed = try XCTUnwrap(layer.sublayers?.last?.sublayers?.last as? CAShapeLayer)
+            XCTAssertEqual(
+                try animation("opacity", on: resumed).beginTime, beginTime, accuracy: 0.05,
+                "A glint created by the Canvas resumes at its original age")
+            counters = try twinkleCounters()
+            XCTAssertEqual(counters["hosts_created"], 1)
+            XCTAssertEqual(counters["animation_starts"], 8)
+
+            let expired = RetainedTwinkleDescriptor(
+                twinkle: RequestRailTwinkle(
+                    requestID: first.twinkle.requestID, startedAt: startedAt, duration: 1,
+                    location: first.twinkle.location, size: first.twinkle.size,
+                    angle: first.twinkle.angle, star: first.twinkle.star),
+                placement: first.placement, color: first.color)
+            host.update(descriptors: [expired, second], scale: 1, isPresented: false)
+            XCTAssertEqual(layer.opacity, 0)
+            XCTAssertEqual(layer.sublayers?.count, 1)
+            XCTAssertNil(clip.superlayer)
+            XCTAssertTrue(mark.animationKeys()?.isEmpty ?? true)
+            XCTAssertEqual(try twinkleCounters()["live_instances"], 1)
+        }
+        XCTAssertEqual(try twinkleCounters()["live_hosts"], 0)
+        XCTAssertEqual(try twinkleCounters()["live_instances"], 0)
+    }
+
+    func testSuppressedHostStillReleasesLayersOnOcclusionHidingAndDetachment() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        try diagnostics.enable(mode: .runtimeStableDecorationHosts)
+        defer { XCTAssertNoThrow(try diagnostics.disable()) }
+        try withVisibleHost { host, window in
+            let descriptor = liveDescriptor(centerX: 45, startedAt: Date().addingTimeInterval(-5))
+            host.update(descriptors: [descriptor], scale: 2)
+            let layer = try XCTUnwrap(host.layer)
+            let clip = try XCTUnwrap(layer.sublayers?.first)
+            let mark = try XCTUnwrap(clip.sublayers?.last as? CAShapeLayer)
+            let beginTime = try animation("opacity", on: mark).beginTime
+            host.update(descriptors: [descriptor], scale: 2, isPresented: false)
+
+            window.simulatedOccluded = true
+            NotificationCenter.default.post(
+                name: NSWindow.didChangeOcclusionStateNotification, object: window)
+            XCTAssertTrue(layer.sublayers?.isEmpty ?? true)
+            XCTAssertTrue(mark.animationKeys()?.isEmpty ?? true)
+            XCTAssertEqual(try twinkleCounters()["live_hosts"], 0)
+            window.simulatedOccluded = false
+            NotificationCenter.default.post(
+                name: NSWindow.didChangeOcclusionStateNotification, object: window)
+            XCTAssertTrue(
+                layer.sublayers?.isEmpty ?? true, "Suppressed reappearance installs no animations")
+            XCTAssertEqual(layer.opacity, 0)
+            XCTAssertEqual(try twinkleCounters()["animation_starts"], 4)
+
+            host.update(descriptors: [descriptor], scale: 2, isPresented: true)
+            let resumed = try XCTUnwrap(layer.sublayers?.first?.sublayers?.last as? CAShapeLayer)
+            XCTAssertEqual(
+                try animation("opacity", on: resumed).beginTime, beginTime, accuracy: 0.05)
+            host.update(descriptors: [descriptor], scale: 2, isPresented: false)
+            host.isHidden = true
+            host.viewDidHide()
+            XCTAssertTrue(layer.sublayers?.isEmpty ?? true)
+            XCTAssertEqual(try twinkleCounters()["live_hosts"], 0)
+            host.isHidden = false
+            host.viewDidUnhide()
+            XCTAssertTrue(layer.sublayers?.isEmpty ?? true)
+            host.removeFromSuperview()
+            XCTAssertNil(host.window)
+            XCTAssertEqual(try twinkleCounters()["live_hosts"], 0)
+            host.stop()
+            host.update(descriptors: [descriptor], scale: 2, isPresented: true)
+            XCTAssertTrue(layer.sublayers?.isEmpty ?? true)
+        }
+    }
+
+    private func withVisibleHost(
+        _ body: (RetainedRequestRailTwinkleView, RetainedTwinkleVisibilityWindow) throws -> Void
+    ) throws {
+        _ = NSApplication.shared
+        let frame = CGRect(x: 0, y: 0, width: 100, height: 60)
+        let window = RetainedTwinkleVisibilityWindow(
+            contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let container = NSView(frame: frame)
+        window.contentView = container
+        let host = RetainedRequestRailTwinkleView(frame: frame)
+        defer {
+            host.stop()
+            host.removeFromSuperview()
+            window.close()
+        }
+        container.addSubview(host)
+        try body(host, window)
+    }
+
+    private func liveDescriptor(centerX: CGFloat, startedAt: Date) -> RetainedTwinkleDescriptor {
+        let original = descriptor(centerX: centerX)
+        return RetainedTwinkleDescriptor(
+            twinkle: RequestRailTwinkle(
+                requestID: original.twinkle.requestID, startedAt: startedAt, duration: 60,
+                location: original.twinkle.location, size: original.twinkle.size,
+                angle: original.twinkle.angle, star: original.twinkle.star),
+            placement: original.placement, color: original.color)
+    }
+
+    private func twinkleCounters() throws -> [String: UInt64] {
+        try XCTUnwrap(
+            PerformanceGraphicsDiagnostics.shared.snapshot()["retained_twinkles"]
+                as? [String: UInt64])
+    }
+
     private func descriptor(centerX: CGFloat, star: Bool = true) -> RetainedTwinkleDescriptor {
         let twinkle = RequestRailTwinkle(
             requestID: UUID(), startedAt: origin, duration: 0.5,
