@@ -25,7 +25,9 @@ from run_performance_checks import require, write_json
 
 MAX_SECONDS = 300
 CASE_SECONDS = 54
-PROFILE_SECONDS = 90
+PROFILE_SECONDS = 120
+PROFILE_SAVE_SECONDS = 30
+PROFILE_POST_SAVE_SECONDS = 18
 WORK = {"chunks": 10000, "output_tokens": 20034, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
 COUNTERS = ("optimized_chart_preparations", "history_tool_order_builds", "history_completed_order_builds",
@@ -293,7 +295,7 @@ class RuntimeDiagnostic(memory.MemoryDiagnostic):
         self.verify_identity()
         pid, birth = self.identity["process_id"], self.identity["birth_time_us"]
         require(_birth_time(pid) == birth and os.getpgid(pid) == pid, "Owned app identity changed before profile attachment")
-        require(self.deadline.remaining() >= 55, "Insufficient bounded profile and cleanup time")
+        require(self.deadline.remaining() >= PROFILE_SAVE_SECONDS + 63, "Insufficient bounded profile and cleanup time")
         notice = _Notice()
         command = ["/usr/bin/xcrun", "xctrace", "record", "--template", "Time Profiler", "--attach", str(pid),
                    "--time-limit", "45s", "--notify-tracing-started", notice.name, "--output", str(self.trace), "--no-prompt"]
@@ -322,14 +324,18 @@ class RuntimeDiagnostic(memory.MemoryDiagnostic):
         if self.recorder is None or self.runtime["profiler_status"] in ("captured", "failed"):
             return
         try:
+            require(not emergency, "Profiler capture interrupted; aborting without another save wait")
             require(self.recorder.poll() is None, "Profiler stopped before explicit completion")
             self.runtime["stop_python_monotonic_seconds"] = time.monotonic()
+            self.runtime["profiler_status"] = "stopping"
             self.recorder.send_signal(signal.SIGINT)
-            end = min(self.deadline.end - 8, time.monotonic() + 10)
+            end = min(self.deadline.end - self.deadline.cleanup_reserve - PROFILE_POST_SAVE_SECONDS,
+                      time.monotonic() + PROFILE_SAVE_SECONDS)
+            self.runtime["save_deadline_monotonic_seconds"] = end
             while self.recorder.poll() is None and time.monotonic() < end:
                 self.collector.receive(.1)
             if self.recorder.poll() is None:
-                raise TimeoutError("Profiler did not finalize within ten seconds")
+                raise TimeoutError("Profiler did not finalize within the bounded 30-second save allowance")
             self.runtime["profiler_exit_code"] = self.recorder.returncode
             require(self.recorder.returncode == 0 and not emergency, "Profiler failed or required emergency cleanup")
             issues = read_run_issues(self.trace)
@@ -345,7 +351,11 @@ class RuntimeDiagnostic(memory.MemoryDiagnostic):
                 raise
         finally:
             if self.recorder.poll() is None:
-                app.stop_process_group(self.recorder, grace=0)
+                try:
+                    memory.stop_owned_child(self.recorder, self.deadline)
+                except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
+                    self.runtime["profiler_status"] = "failed"
+                    self.report["errors"].append("Profiler cleanup: " + str(error))
             if self.record_log is not None:
                 self.record_log.close()
                 self.record_log = None
@@ -372,17 +382,32 @@ class RuntimeDiagnostic(memory.MemoryDiagnostic):
     def cleanup(self):
         try:
             self.finish_profile(emergency=True)
+        except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
+            self.report["errors"].append("Profiler cleanup: " + str(error))
         finally:
             try:
-                super().cleanup()
+                # An aborted profile never reached perform()'s normal shutdown.
+                # Attempt the same graceful protocol, preserving time for the
+                # existing identity-checked forced cleanup if it cannot finish.
+                if self.profile_enabled and self.collector is not None and not self.collector.exited:
+                    end = min(self.deadline.end - 4.5, time.monotonic() + 5)
+                    if end > time.monotonic():
+                        try:
+                            with self.deadline.interrupt_at(end):
+                                self.collector.finish()
+                        except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
+                            self.report["errors"].append("Profile app shutdown: " + str(error))
             finally:
-                if self.record_log is not None:
-                    self.record_log.close()
-                    self.record_log = None
-        if self.profile_enabled:
-            self.report["profiled_kernel_cpu"] = self.report.get("workload_cpu")
-            self.report["workload_cpu"] = {"available": False, "gate_evaluated": False,
-                "reason": "Time Profiler perturbs execution; kernel values are attribution cross-checks only"}
+                try:
+                    super().cleanup()
+                finally:
+                    if self.record_log is not None:
+                        self.record_log.close()
+                        self.record_log = None
+                    if self.profile_enabled:
+                        self.report["profiled_kernel_cpu"] = self.report.get("workload_cpu")
+                        self.report["workload_cpu"] = {"available": False, "gate_evaluated": False,
+                            "reason": "Time Profiler perturbs execution; kernel values are attribution cross-checks only"}
 
 
 def capture_case(output, mode, paths, provenance, identity, deadline, *, profile=False):

@@ -229,6 +229,81 @@ class CompletionCounterIntervalTests(unittest.TestCase):
             "end_checkpoint": "completion-end", "start_monotonic_seconds": 100, "end_monotonic_seconds": 129})
 
 
+class ProfilerFinalizationTests(unittest.TestCase):
+    def diagnostic(self, directory, now, seconds=120):
+        diagnostic = runtime.RuntimeDiagnostic(Path(directory),
+            runtime.RuntimeDeadline(seconds, cleanup_reserve=8, clock=lambda: now[0]), "normal", profile=True)
+        diagnostic.recorder = Mock(returncode=0)
+        diagnostic.collector = Mock(exited=False)
+        diagnostic.collector.receive.side_effect = lambda _timeout: now.__setitem__(0, now[0] + .5)
+        diagnostic.runtime["profiler_status"] = "recording"
+        diagnostic.save = Mock()
+        diagnostic.trace.mkdir()
+        return diagnostic
+
+    def test_save_can_finish_after_ten_seconds_without_retry(self):
+        now = [10.0]
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = self.diagnostic(directory, now)
+            diagnostic.recorder.poll.side_effect = lambda: 0 if now[0] >= 25 else None
+            with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), \
+                    patch.object(runtime, "read_run_issues", return_value={"available": True, "lost_events": False, "invalid": []}), \
+                    patch.object(runtime.memory, "stop_owned_child") as stop:
+                diagnostic.finish_profile()
+                diagnostic.finish_profile(emergency=True)
+            self.assertEqual(diagnostic.runtime["profiler_status"], "captured")
+            self.assertEqual(now[0], 25)
+            diagnostic.recorder.send_signal.assert_called_once_with(runtime.signal.SIGINT)
+            stop.assert_not_called()
+
+    def test_save_timeout_preserves_app_shutdown_reserve_and_never_retries(self):
+        for seconds, expected_end in ((120, 40), (32, 16)):
+            now = [10.0]
+            with self.subTest(seconds=seconds), tempfile.TemporaryDirectory() as directory:
+                diagnostic = self.diagnostic(directory, now, seconds)
+                diagnostic.recorder.poll.return_value = None
+                with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), \
+                        patch.object(runtime.memory, "stop_owned_child") as stop:
+                    with self.assertRaisesRegex(TimeoutError, "bounded 30-second"):
+                        diagnostic.finish_profile()
+                    calls = diagnostic.collector.receive.call_count
+                    diagnostic.finish_profile(emergency=True)
+                self.assertEqual(now[0], expected_end)
+                self.assertEqual(diagnostic.collector.receive.call_count, calls)
+                self.assertEqual(diagnostic.runtime["profiler_status"], "failed")
+                stop.assert_called_once_with(diagnostic.recorder, diagnostic.deadline)
+
+    def test_emergency_cleanup_aborts_profiler_without_save_wait(self):
+        now = [10.0]
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = self.diagnostic(directory, now)
+            diagnostic.recorder.poll.return_value = None
+            with patch.object(runtime.memory, "stop_owned_child") as stop:
+                diagnostic.finish_profile(emergency=True)
+            self.assertEqual(diagnostic.runtime["profiler_status"], "failed")
+            diagnostic.collector.receive.assert_not_called()
+            diagnostic.recorder.send_signal.assert_not_called()
+            stop.assert_called_once()
+
+    def test_owned_app_cleanup_runs_despite_profiler_and_graceful_shutdown_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = runtime.RuntimeDiagnostic(Path(directory), runtime.RuntimeDeadline(120), "normal", profile=True)
+            diagnostic.collector = Mock(exited=False)
+            diagnostic.collector.finish.side_effect = TimeoutError("app shutdown timed out")
+            with patch.object(diagnostic, "finish_profile", side_effect=OSError("recorder cleanup failed")), \
+                    patch.object(runtime.memory.MemoryDiagnostic, "cleanup") as cleanup:
+                diagnostic.cleanup()
+            diagnostic.collector.finish.assert_called_once()
+            cleanup.assert_called_once()
+            self.assertTrue(any("recorder cleanup failed" in error for error in diagnostic.report["errors"]))
+            self.assertTrue(any("app shutdown timed out" in error for error in diagnostic.report["errors"]))
+            self.assertFalse(diagnostic.report["workload_cpu"]["available"])
+
+    def test_profile_case_stays_bounded_within_outer_deadline(self):
+        self.assertEqual(runtime.PROFILE_SECONDS, 120)
+        self.assertLess(runtime.PROFILE_SECONDS + 2 * 45 + 30, runtime.MAX_SECONDS)
+
+
 class ComparisonReportingTests(unittest.TestCase):
     def test_drift_requires_both_absolute_and_relative_thresholds(self):
         for left, right, conclusive in ((2, 2.5, True), (2, 2.5001, False), (4, 4.8, True), (.2, .5, True), (0, 0, True)):
