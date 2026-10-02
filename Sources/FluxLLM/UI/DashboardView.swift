@@ -564,7 +564,9 @@ struct DashboardView: View {
             snapshot: store.chartPresentation, duration: chartDuration,
             epoch: store.monitoringEpoch,
             windowEnd: chartInterval.end, isLive: isCompact || currentNavigation.isLive,
-            optimized: PerformanceGraphicsDiagnostics.shared.mode.usesOptimizedChartPreparation
+            optimized: PerformanceGraphicsDiagnostics.shared.mode.usesOptimizedChartPreparation,
+            sharedNormalization: PerformanceGraphicsDiagnostics.shared.mode
+                .usesSharedChartPreparation
         )
     }
     private var gpuIsAvailable: Bool {

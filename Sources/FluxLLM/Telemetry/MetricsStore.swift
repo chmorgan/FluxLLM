@@ -637,7 +637,7 @@ public final class MetricsStore {
             // Never keep another source's trace visible until the next tick.
             // Preserve the TPS trace, time axis, and publication deadline.
             if !chartPresentation.systemGPU.isEmpty {
-                chartPresentation = ChartPresentationSnapshot(
+                var replacement = ChartPresentationSnapshot(
                     timestamp: chartPresentation.timestamp,
                     throughput: chartPresentation.throughput,
                     toolActivity: chartPresentation.toolActivity,
@@ -648,6 +648,8 @@ public final class MetricsStore {
                     historicalRequestLanes: chartPresentation.historicalRequestLanes,
                     historicalToolActivity: chartPresentation.historicalToolActivity,
                     toolActivityRequestIDs: chartPresentation.toolActivityRequestIDs)
+                replacement.sharedPreparationMetadata = chartPresentation.sharedPreparationMetadata
+                chartPresentation = replacement
             }
         }
         let validScope: Bool
@@ -1087,18 +1089,45 @@ public final class MetricsStore {
         let toolIntervals = (sampleIntervals ?? historyIntervals).map {
             DateInterval(start: max(historyStart, $0.start), end: $0.end)
         }
-        var savedLanes: [UUID: RequestLane] = [:]
-        for interval in historyIntervals {
-            for lane in usageHistory.requestLanes(
-                source: historySource, interval: interval, inclusiveEnd: selection != nil
-            ) { savedLanes[lane.id] = lane }
+        let sharedPreparation = PerformanceGraphicsDiagnostics.shared.mode
+            .usesSharedChartPreparation
+        let historicalLanes: [RequestLane]
+        if sharedPreparation, historyIntervals.count == 1 {
+            // The query already returns unique, ordered lanes. Preserve that
+            // order for the common single merged viewport instead of sorting twice.
+            historicalLanes = usageHistory.requestLanes(
+                source: historySource, interval: historyIntervals[0], inclusiveEnd: selection != nil
+            )
+        } else {
+            var savedLanes: [UUID: RequestLane] = [:]
+            for interval in historyIntervals {
+                for lane in usageHistory.requestLanes(
+                    source: historySource, interval: interval, inclusiveEnd: selection != nil
+                ) { savedLanes[lane.id] = lane }
+            }
+            historicalLanes = savedLanes.values.sorted {
+                $0.startedAt == $1.startedAt
+                    ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
+            }
         }
-        var savedTools: [UUID: ToolActivityEvent] = [:]
-        for interval in toolIntervals {
-            for event in usageHistory.toolEvents(
-                source: historySource, interval: interval,
-                inclusiveEnd: selection != nil && interval.end < date
-            ) { savedTools[event.id] = event }
+        let historicalTools: [ToolActivityEvent]
+        if sharedPreparation, toolIntervals.count == 1 {
+            historicalTools = Self.canonicalToolEvents(
+                usageHistory.toolEvents(
+                    source: historySource, interval: toolIntervals[0],
+                    inclusiveEnd: selection != nil && toolIntervals[0].end < date))
+        } else {
+            var savedTools: [UUID: ToolActivityEvent] = [:]
+            for interval in toolIntervals {
+                for event in usageHistory.toolEvents(
+                    source: historySource, interval: interval,
+                    inclusiveEnd: selection != nil && interval.end < date
+                ) { savedTools[event.id] = event }
+            }
+            historicalTools = savedTools.values.sorted {
+                $0.timestamp == $1.timestamp
+                    ? $0.id.uuidString < $1.id.uuidString : $0.timestamp < $1.timestamp
+            }
         }
         let visibleTools = sampleIntervals.map { currentToolEvents(in: $0) } ?? toolActivityEvents
         let knownToolRequests = selection.map { _ in
@@ -1108,7 +1137,7 @@ public final class MetricsStore {
             )
             .union(retainedToolRequestCounts.keys)
         }
-        chartPresentation = ChartPresentationSnapshot(
+        var snapshot = ChartPresentationSnapshot(
             timestamp: date,
             throughput: sampleIntervals.map { throughputSamples.elements(in: $0) } ?? tpsHistory,
             systemGPU: gpuHistoryScope == .system
@@ -1117,16 +1146,40 @@ public final class MetricsStore {
             toolObservation: sampleIntervals.map { toolObservationSamples.elements(in: $0) }
                 ?? toolObservationHistory,
             supportsToolActivity: supportsToolActivity, archive: archived,
-            historicalRequestLanes: savedLanes.values.sorted {
-                $0.startedAt == $1.startedAt
-                    ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
-            },
-            historicalToolActivity: savedTools.values.sorted {
-                $0.timestamp == $1.timestamp
-                    ? $0.id.uuidString < $1.id.uuidString : $0.timestamp < $1.timestamp
-            },
+            historicalRequestLanes: historicalLanes,
+            historicalToolActivity: historicalTools,
             toolActivityRequestIDs: knownToolRequests)
+        if sharedPreparation {
+            snapshot.sharedPreparationMetadata = SharedChartPresentationMetadata(snapshot: snapshot)
+        }
+        chartPresentation = snapshot
         lastChartPublicationAt = date
+    }
+
+    /// History queries already provide timestamp order, but distinct ledger keys
+    /// may reuse an event ID. Preserve the publication's last winner, then order
+    /// only equal-time groups by its deterministic UUID tie break.
+    static func canonicalToolEvents(_ ordered: [ToolActivityEvent]) -> [ToolActivityEvent] {
+        var seen: Set<UUID> = []
+        seen.reserveCapacity(ordered.count)
+        var result: [ToolActivityEvent] = []
+        result.reserveCapacity(ordered.count)
+        for event in ordered.reversed() where seen.insert(event.id).inserted {
+            result.append(event)
+        }
+        result.reverse()
+        var start = 0
+        while start < result.count {
+            var end = start + 1
+            while end < result.count && result[end].timestamp == result[start].timestamp {
+                end += 1
+            }
+            if end - start > 1 {
+                result[start..<end].sort { $0.id.uuidString < $1.id.uuidString }
+            }
+            start = end
+        }
+        return result
     }
 
     private func currentToolEvents(in intervals: [DateInterval]) -> [ToolActivityEvent] {
@@ -1326,6 +1379,9 @@ public struct ChartPresentationSnapshot: Sendable, Equatable {
     public let historicalToolActivity: [ToolActivityEvent]
     /// Known overlays survive a frozen window even if its first tool event is later.
     public let toolActivityRequestIDs: Set<UUID>?
+    /// Derived immutable data shared by visible hosts, bounded by this publication.
+    /// It is excluded from value equality because it does not change the inputs.
+    var sharedPreparationMetadata: SharedChartPresentationMetadata?
 
     public init(
         timestamp: Date, throughput: [TimeSeriesPoint] = [], systemGPU: [TimeSeriesPoint] = [],
