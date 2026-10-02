@@ -86,7 +86,7 @@ public final class PerformanceGraphicsDiagnostics {
         }
 
         var usesOrderedChartPublication: Bool {
-            usesSharedChartPreparation || self == .runtimeOrderedPublication
+            self == .normal || usesSharedChartPreparation || self == .runtimeOrderedPublication
         }
 
         var usesUnpromisedStreamBodyWrites: Bool {

@@ -120,7 +120,8 @@ controls host release after an unsuccessful presentation or later occlusion.
 Production chart surfaces render through SwiftUI `Canvas.drawingGroup`, coalesce
 scalar presentation updates, and retain twinkle animations in Core Animation
 shape layers. Production also uses incremental history ordering, optimized chart
-preparation, the Canvas frame clock, and unpromised eligible stream-body writes.
+preparation, ordered chart publication, the Canvas frame clock, and unpromised
+eligible stream-body writes.
 The explicit ImageRenderer controls remain available for comparing
 the earlier rendering path. Complete application measurements still enforce
 CPU, memory, GPU, and write budgets across first window opening and subsequent
@@ -475,9 +476,10 @@ python3 scripts/run_performance_checks.py runtime compare \
   --baseline-mode runtime-optimized --controls normal
 ```
 
-This runs `runtime-optimized`, the preserved previous default, before and after
-production `normal`. Production enables both history/preparation
-optimizations plus `unpromised_stream_body_writes` and `canvas_frame_clock`;
+This runs `runtime-optimized`, the preserved history/preparation default, before
+and after production `normal`. Production enables both history/preparation
+optimizations plus `ordered_chart_publication`, `unpromised_stream_body_writes`,
+and `canvas_frame_clock`;
 `shared_chart_preparation` and `stable_decoration_hosts` remain disabled.
 Without selection flags, the default sequence is `native-gpu-optimized`,
 `runtime-optimized`, then `native-gpu-optimized` again.
@@ -498,8 +500,8 @@ compares the history and preparation optimizations separately and together again
 | `runtime-stream-writes` | Omit individual body-write promises for eligible ordinary responses, retaining existing immediate flushes and failure cancellation. |
 | `runtime-next-optimized` | Combine shared preparation, stable decoration hosts, and the body-write promise experiment. |
 | `runtime-canvas-clock` | Keep both history and preparation optimizations and drive rail drawing with a dedicated Canvas frame clock. |
-| `runtime-stream-canvas-clock` | Combine the Canvas frame clock with the unpromised body-write path, keeping both history and preparation optimizations; matches current production feature selection. |
-| `runtime-ordered-publication` | Use ordered queries for single-interval chart publication on top of current production behavior. |
+| `runtime-stream-canvas-clock` | Preserve the stream-write and Canvas-clock default before ordered publication, keeping both history and preparation optimizations. |
+| `runtime-ordered-publication` | Combine ordered single-interval chart publication, stream writes, Canvas clock, and both history/preparation optimizations; matches current production feature selection. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -517,13 +519,13 @@ disabled. Only `runtime-stream-canvas-clock` also enables
 The **5% runtime CPU** and **1% GPU** limits remain unchanged; production selection
 does not establish a complete resource-gate pass.
 
-`runtime-ordered-publication` inherits production's history/preparation,
-unpromised stream-write, and Canvas-clock paths. It enables
-`ordered_chart_publication` while leaving shared preparation and stable decoration
-hosts disabled. Compare it with
-`--baseline-mode normal --controls runtime-ordered-publication`.
-The ordered-publication flag is also true for shared-preparation controls and
-remains false for `normal`. This experiment keeps the same deadlines and budgets.
+Production `normal` now enables `ordered_chart_publication` alongside its
+history/preparation, unpromised stream-write, and Canvas-clock paths; shared
+preparation and stable decoration hosts remain disabled. The
+`runtime-ordered-publication` control preserves this selection, and
+shared-preparation controls also enable ordered publication. Older frozen
+`normal` captures may omit the ordered flag or report false. A true ordered flag
+in `normal` requires acknowledgment of the complete current production selection.
 
 The stream-write control keeps promises on response heads and ends, and on
 `HEAD`/`CONNECT` bodies. Its body fast path requires an active downstream channel
@@ -587,7 +589,8 @@ Existing drawing, twinkle lifecycle, visibility, and closed-resource
 checks still apply; selecting a flag alone is
 insufficient evidence that a candidate ran.
 
-The ordered-publication control requires a positive workload delta in top-level
+Ordered publication, including current `normal`, requires a positive workload
+delta in top-level
 `ordered_chart_publication_queries`, counting actual single-interval ordered
 queries, and zero delta in `chart_publication_full_sorts`, counting fallback-sort
 attempts. Instrumented nonordered modes must report zero ordered-query counts

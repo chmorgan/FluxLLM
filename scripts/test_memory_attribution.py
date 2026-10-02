@@ -117,7 +117,7 @@ class NextRuntimeContractTests(unittest.TestCase):
             with self.assertRaisesRegex(InvalidResult, "lack feature metadata"):
                 memory.validate_graphics(snapshot, mode)
 
-    def test_normal_keeps_ordered_publication_disabled(self):
+    def test_normal_accepts_legacy_or_promoted_ordered_publication(self):
         from test_memory_diagnostic import drawn_native_gpu_graphics
         snapshot = drawn_native_gpu_graphics("runtime-stream-canvas-clock")
         snapshot["graphics_diagnostics"].update(mode="normal", ordered_chart_publication=False)
@@ -127,8 +127,37 @@ class NextRuntimeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(InvalidResult, "Nonordered"):
             memory.validate_graphics(snapshot, "normal")
         snapshot["graphics_diagnostics"]["ordered_chart_publication"] = True
-        with self.assertRaisesRegex(InvalidResult, "does not match"):
+        self.assertTrue(memory.validate_graphics(snapshot, "normal", completed_visible_workload=True)["available"])
+        for field in ("unpromised_stream_body_writes", "canvas_frame_clock", "incremental_history_ordering",
+                      "optimized_chart_preparation", "shared_chart_preparation", "stable_decoration_hosts"):
+            for invalid in (None, not snapshot["graphics_diagnostics"][field]):
+                changed = copy.deepcopy(snapshot)
+                if invalid is None:
+                    del changed["graphics_diagnostics"][field]
+                else:
+                    changed["graphics_diagnostics"][field] = invalid
+                with self.subTest(field=field, value=invalid), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(changed, "normal")
+        changed = copy.deepcopy(snapshot)
+        changed["graphics_diagnostics"].update(unpromised_stream_body_writes=False, canvas_frame_clock=False)
+        changed.update(streamed_bodies_without_promises=0, rail_frame_clock_ticks=0)
+        with self.assertRaisesRegex(InvalidResult, "requires stream writes"):
+            memory.validate_graphics(changed, "normal")
+        del snapshot["graphics_diagnostics"]["ordered_chart_publication"]
+        with self.assertRaisesRegex(InvalidResult, "lack feature metadata"):
             memory.validate_graphics(snapshot, "normal")
+
+    def test_normal_ordered_metadata_cannot_disappear_after_acknowledgment(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        snapshot = drawn_native_gpu_graphics(memory.ORDERED_PUBLICATION_MODE)
+        snapshot["graphics_diagnostics"]["mode"] = "normal"
+        diagnostic = memory.MemoryDiagnostic(Path("/unused"), memory.MemoryDeadline(), "normal")
+        diagnostic.validate_graphics_snapshot(snapshot)
+        del snapshot["graphics_diagnostics"]["ordered_chart_publication"]
+        for field in memory.ORDERED_PUBLICATION_COUNTERS:
+            del snapshot[field]
+        with self.assertRaisesRegex(InvalidResult, "changed or disappeared"):
+            diagnostic.validate_graphics_snapshot(snapshot)
 
     def test_promoted_normal_requires_paired_paths_and_retains_actual_work_validation(self):
         from test_memory_diagnostic import drawn_native_gpu_graphics

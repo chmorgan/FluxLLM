@@ -224,6 +224,24 @@ class RuntimeWorkTests(unittest.TestCase):
 
 
 class NextRuntimeWorkTests(unittest.TestCase):
+    def test_promoted_normal_proves_ordered_queries_and_no_workload_full_sorts(self):
+        before, after = workload_snapshots(memory.ORDERED_PUBLICATION_MODE)
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"]["mode"] = "normal"
+        work = runtime.validate_runtime_work(before, after, "normal")
+        self.assertTrue(work["features"]["ordered_chart_publication"])
+        self.assertEqual(work["deltas"]["ordered_chart_publication_queries"], 2)
+        self.assertEqual(work["deltas"]["chart_publication_full_sorts"], 0)
+        for field, amount in (("ordered_chart_publication_queries", 0), ("chart_publication_full_sorts", 1)):
+            changed = copy.deepcopy(after)
+            changed[field] = before[field] + amount
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "without fallback"):
+                runtime.validate_runtime_work(before, changed, "normal")
+        changed = copy.deepcopy(after)
+        changed["graphics_diagnostics"]["ordered_chart_publication"] = False
+        with self.assertRaisesRegex(ValueError, "stable complete"):
+            runtime.validate_runtime_work(before, changed, "normal")
+
     def test_ordered_publication_executes_queries_without_workload_fallback_sorts(self):
         mode = memory.ORDERED_PUBLICATION_MODE
         before, after = workload_snapshots(mode)
@@ -410,7 +428,7 @@ class NextRuntimeWorkTests(unittest.TestCase):
 
 class CanvasClockPhaseTests(unittest.TestCase):
     def test_promoted_normal_requires_zero_steady_and_closed_ticks(self):
-        report = clock_work_report("runtime-stream-canvas-clock")
+        report = clock_work_report(memory.ORDERED_PUBLICATION_MODE)
         for point in report["runtime"]["checkpoints"] + report["checkpoints"]:
             point["snapshot"]["graphics_diagnostics"]["mode"] = "normal"
         proof = runtime.validate_canvas_clock_work(report, "normal")

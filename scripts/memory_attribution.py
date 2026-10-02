@@ -371,7 +371,8 @@ def runtime_feature_contract(value, mode):
                 "Graphics canvas_frame_clock does not match the requested runtime control")
         extras["canvas_frame_clock"] = value["canvas_frame_clock"]
     if mode == ORDERED_PUBLICATION_MODE or "ordered_chart_publication" in value:
-        expected = mode == ORDERED_PUBLICATION_MODE or extras.get("shared_chart_preparation", False)
+        expected = (mode == ORDERED_PUBLICATION_MODE or extras.get("shared_chart_preparation", False)
+                    or mode == "normal" and value.get("ordered_chart_publication") is True)
         require(type(value.get("ordered_chart_publication")) is bool and value["ordered_chart_publication"] is expected,
                 "Graphics ordered_chart_publication does not match the requested runtime control")
         extras["ordered_chart_publication"] = value["ordered_chart_publication"]
@@ -383,6 +384,10 @@ def runtime_feature_contract(value, mode):
         if promoted_normal:
             require(flags["incremental_history_ordering"] and flags["optimized_chart_preparation"],
                     "Promoted normal stream/clock path requires both history and preparation optimizations")
+        if extras.get("ordered_chart_publication", False):
+            require(promoted_normal and extras.get("canvas_frame_clock") is True
+                    and flags["incremental_history_ordering"] and flags["optimized_chart_preparation"],
+                    "Promoted normal ordered publication requires stream writes, Canvas clock, history and preparation optimizations")
         return flags | extras
     expected = {"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle") + NEXT_RUNTIME_MODES,
                 "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle") + NEXT_RUNTIME_MODES,

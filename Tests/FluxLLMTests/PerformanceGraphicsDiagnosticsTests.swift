@@ -111,7 +111,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertTrue(diagnostics.mode.usesCanvasFrameClock)
         XCTAssertFalse(diagnostics.mode.usesSharedChartPreparation)
         XCTAssertFalse(diagnostics.mode.usesStableDecorationHosts)
-        XCTAssertFalse(diagnostics.mode.usesOrderedChartPublication)
+        XCTAssertTrue(diagnostics.mode.usesOrderedChartPublication)
         diagnostics.scalarPresentationPublished()
         XCTAssertNil(diagnostics.retainedTwinkleHostCreated())
         diagnostics.retainedTwinkleHostUpdated(
@@ -664,8 +664,10 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesOrderedChartPublication,
-                [.runtimeSharedPreparation, .runtimeNextOptimized, .runtimeOrderedPublication]
-                    .contains(mode))
+                [
+                    .normal, .runtimeSharedPreparation, .runtimeNextOptimized,
+                    .runtimeOrderedPublication,
+                ].contains(mode))
         }
     }
 
