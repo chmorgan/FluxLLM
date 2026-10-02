@@ -245,6 +245,9 @@ Choose one diagnostic mode per invocation with `--graphics-mode`:
 | `bitmap-layer-bgra` | Use the same layer destination and drawing workload, changing only the bitmap format to BGRA. |
 | `bitmap-layer-no-decorations` | Use the RGBA layer destination while omitting the animated request-rail decoration surface. |
 | `native-gpu-canvas` | Draw through SwiftUI `Canvas.drawingGroup`, bypassing ImageRenderer and the app's CPU bitmap/layer-image path. |
+| `native-gpu-coalesced-scalars` | Keep the native GPU Canvas backend and coalesce scalar presentation updates. |
+| `native-gpu-retained-twinkles` | Keep the native GPU Canvas backend and submit twinkle animations through retained Core Animation shape layers. |
+| `native-gpu-optimized` | Combine scalar presentation coalescing and retained twinkles with the native GPU Canvas backend. |
 | `no-blur` | Keep the renderer and drawing geometry while skipping the main-series Gaussian blur. |
 | `cpu-glow` | Use a bounded CPU raster glow in place of the filtered series-glow pass. |
 | `no-gradients` | Substitute solid fills for the three chart gradient operations, preserving geometry and animation. |
@@ -274,8 +277,8 @@ remain zero, including creation, update, draw, renderer, and image counters.
 The original layer mode accepts older frozen products without format metadata;
 any metadata they do expose must match that mode.
 
-The native GPU Canvas control uses the same frozen binary and fixtures. It keeps
-the chart drawing operations and uses SwiftUI's drawing group without custom
+The four native GPU controls use the same frozen binary and fixtures. They keep
+the chart drawing operations and use SwiftUI's drawing group without custom
 Metal shaders. The runner requires `native_gpu_backend` to identify
 `swiftui-canvas-drawing-group`, actual Canvas callback counts equal to summed role
 draws, positive static-chart drawing after the workload, zero ImageRenderer and
@@ -283,11 +286,35 @@ CPU bitmap/layer-image accounting, and released canvas/geometry counters at
 closed checkpoints. Callback counts prove drawing occurred; they do not prove
 GPU execution or measure its duration.
 
-Compare this control's CPU using `--no-native-inspection`. Measure GPU execution
+Each newer native GPU mode must acknowledge exact Boolean values for
+`scalar_presentation_coalesced` and `retained_twinkles_enabled`. The original
+`native-gpu-canvas` mode accepts older frozen products without these flags, but
+checks any supplied flag. Coalesced modes also require a positive
+`scalar_presentation_publications` count after the visible workload, proving
+that changed presentation values were published. Other modes require that count
+to remain zero when exposed.
+
+Retained modes must identify `core-animation-shape-layers` and expose host,
+instance, and submitted-animation counters. Created minus destroyed counts must
+equal live counts, peak counts must be consistent, live instances must not exceed
+twice the live host count, and closed checkpoints must have zero live hosts and
+instances. Visible work must create instances and submit animations. Modes
+without retained twinkles reject any such activity when counters are exposed.
+These counters prove layer-animation submission, not GPU execution.
+
+Select any native GPU mode through the existing automated
+`run_performance_checks.py memory --graphics-mode MODE --no-native-inspection`
+command, supplying the frozen product paths shown above. The runner applies the
+same populated fixture, 25-second traffic sequence, visibility checkpoints, and
+shutdown checks for each mode; no manual load generation or UI sequence is
+needed. The separate scalar and retained modes isolate each change, while
+`native-gpu-optimized` measures their combination.
+
+Compare these controls' CPU using `--no-native-inspection`. Measure GPU execution
 separately through the bounded, calibrated Instruments provider; neither the
 backend name nor a low CPU reading establishes GPU usage. Memory remains a
 reported diagnostic in this CPU experiment. The global strict peak-footprint
-budget remains below 64,000,000 bytes, and this mode grants no performance pass.
+budget remains below 64,000,000 bytes, and these modes grant no performance pass.
 
 Optionally add `--no-popover-animation` independently of the graphics mode to
 disable native popover animation for this diagnostic. The runner verifies the

@@ -22,8 +22,14 @@ from run_performance_checks import interrupted, load_json, number, require, writ
 
 
 GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "bitmap-layer-destination",
-                  "bitmap-layer-bgra", "bitmap-layer-no-decorations", "native-gpu-canvas", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
+                  "bitmap-layer-bgra", "bitmap-layer-no-decorations", "native-gpu-canvas", "native-gpu-coalesced-scalars",
+                  "native-gpu-retained-twinkles", "native-gpu-optimized", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
 LAYER_DESTINATION_MODES = ("bitmap-layer-destination", "bitmap-layer-bgra", "bitmap-layer-no-decorations")
+NATIVE_GPU_MODES = ("native-gpu-canvas", "native-gpu-coalesced-scalars", "native-gpu-retained-twinkles", "native-gpu-optimized")
+COALESCED_SCALAR_MODES = ("native-gpu-coalesced-scalars", "native-gpu-optimized")
+RETAINED_TWINKLE_MODES = ("native-gpu-retained-twinkles", "native-gpu-optimized")
+RETAINED_TWINKLE_FIELDS = ("hosts_created", "hosts_destroyed", "live_hosts", "peak_hosts",
+                          "instances_created", "instances_destroyed", "live_instances", "peak_instances", "animation_starts")
 GRADIENT_ABLATION_MODES = ("no-gradients", "no-gradients-or-blur")
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 DEADLINE_SECONDS = 90
@@ -305,6 +311,37 @@ def parse_probe(tool, output, json_output, pid):
     return {"vmmap": parse_vmmap, "heap": parse_heap}[tool](text, pid)
 
 
+def validate_retained_twinkles(value, mode, *, completed_visible_workload=False, expected_closed=False):
+    retained = mode in RETAINED_TWINKLE_MODES
+    if not retained and "retained_twinkles" not in value:
+        return
+    counters = value.get("retained_twinkles")
+    require(isinstance(counters, dict), "Retained twinkle lifecycle counters are missing")
+    for field in RETAINED_TWINKLE_FIELDS:
+        unsigned(counters.get(field), f"graphics.retained_twinkles.{field}")
+    if not retained:
+        require(all(counters[field] == 0 for field in RETAINED_TWINKLE_FIELDS),
+                "Retained twinkle activity occurred outside a retained-twinkle mode")
+        return
+    require(value.get("retained_twinkle_backend") == "core-animation-shape-layers",
+            "App did not acknowledge the retained twinkle shape-layer backend")
+    for kind in ("hosts", "instances"):
+        created, destroyed = counters[f"{kind}_created"], counters[f"{kind}_destroyed"]
+        current, peak = counters[f"live_{kind}"], counters[f"peak_{kind}"]
+        require(created - destroyed == current, f"Retained twinkle {kind} lifecycle counters do not reconcile")
+        require(current <= peak <= created and (created == 0 or peak > 0),
+                f"Retained twinkle {kind} peak is inconsistent")
+    require(counters["live_instances"] <= 2 * counters["live_hosts"]
+            and counters["peak_instances"] <= 2 * counters["peak_hosts"],
+            "Retained twinkle instances exceed two per host")
+    if completed_visible_workload:
+        require(counters["instances_created"] > 0 and counters["animation_starts"] > 0,
+                "Completed visible workload did not submit retained twinkle animations")
+    if expected_closed:
+        require(counters["live_hosts"] == 0 and counters["live_instances"] == 0,
+                "Retained twinkle resources remain live at a closed checkpoint")
+
+
 def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False):
     value = snapshot.get("graphics_diagnostics")
     if "graphics_diagnostics" not in snapshot and mode == "normal":
@@ -313,6 +350,13 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             "App did not acknowledge the requested graphics diagnostic mode")
     require(unsigned(value.get("invalid_events"), "graphics.invalid_events") == 0,
             "Graphics diagnostic counters reported invalid lifecycle events")
+    coalesced_scalars = mode in COALESCED_SCALAR_MODES
+    if coalesced_scalars or "scalar_presentation_publications" in value:
+        publications = unsigned(value.get("scalar_presentation_publications"), "graphics.scalar_presentation_publications")
+        if coalesced_scalars and completed_visible_workload:
+            require(publications > 0, "Completed visible workload did not publish coalesced scalar presentation values")
+        elif not coalesced_scalars:
+            require(publications == 0, "Coalesced scalar publications occurred outside a coalesced-scalar mode")
     if mode == "cpu-glow":
         require(unsigned(value.get("cpu_glow_fallbacks"), "graphics.cpu_glow_fallbacks") == 0,
                 "CPU glow used the framework-blur fallback; the comparison is invalid")
@@ -327,8 +371,13 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     fields = ("created", "destroyed", "live", "peak_live", "updates", "renderer_creations", "renderer_updates",
               "renderer_destructions", "live_renderers", "peak_live_renderers", "draws", "skipped_draws",
               "current_pixel_area", "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes")
-    native_gpu = mode == "native-gpu-canvas"
+    native_gpu = mode in NATIVE_GPU_MODES
     if native_gpu:
+        for field, expected in (("scalar_presentation_coalesced", mode in COALESCED_SCALAR_MODES),
+                                ("retained_twinkles_enabled", mode in RETAINED_TWINKLE_MODES)):
+            if mode != "native-gpu-canvas" or field in value:
+                require(type(value.get(field)) is bool and value[field] is expected,
+                        f"Graphics {field} does not match the requested native GPU control")
         require(value.get("native_gpu_backend") == "swiftui-canvas-drawing-group",
                 "App did not acknowledge the native GPU Canvas drawing-group backend")
         native_gpu_draws = unsigned(value.get("native_gpu_canvas_draws"), "graphics.native_gpu_canvas_draws")
@@ -341,6 +390,8 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
         if expected_closed:
             require(value.get("live_canvases") == 0 and value.get("current_pixel_area") == 0,
                     "Native GPU Canvas resources remain live at a closed checkpoint")
+    validate_retained_twinkles(value, mode, completed_visible_workload=completed_visible_workload,
+                              expected_closed=expected_closed)
     layer_destination = mode in LAYER_DESTINATION_MODES
     if layer_destination:
         metadata = {

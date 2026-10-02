@@ -22,7 +22,14 @@ def graphics(mode="normal"):
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
         **({"native_gpu_backend": "swiftui-canvas-drawing-group", "native_gpu_canvas_draws": 0}
-           if mode == "native-gpu-canvas" else {}),
+           if mode in memory.NATIVE_GPU_MODES else {}),
+        **({"scalar_presentation_coalesced": mode in memory.COALESCED_SCALAR_MODES,
+            "retained_twinkles_enabled": mode in memory.RETAINED_TWINKLE_MODES}
+           if mode in memory.NATIVE_GPU_MODES and mode != "native-gpu-canvas" else {}),
+        **({"scalar_presentation_publications": 0} if mode in memory.COALESCED_SCALAR_MODES else {}),
+        **({"retained_twinkle_backend": "core-animation-shape-layers",
+            "retained_twinkles": dict.fromkeys(memory.RETAINED_TWINKLE_FIELDS, 0)}
+           if mode in memory.RETAINED_TWINKLE_MODES else {}),
         **({"layer_bitmap_presentations": 0, "layer_bitmap_failures": 0, "layer_bitmap_native_draws": 0,
             "current_layer_image_bytes": 0, "peak_layer_image_bytes": 0} if mode in memory.LAYER_DESTINATION_MODES else {}),
         **({"layer_bitmap_pixel_format": "bgra8-premultiplied-first" if mode == "bitmap-layer-bgra" else "rgba8-premultiplied-last",
@@ -45,17 +52,164 @@ def drawn_layer_graphics(mode="bitmap-layer-destination"):
     return snapshot
 
 
-def drawn_native_gpu_graphics():
-    snapshot = graphics("native-gpu-canvas")
+def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
+    snapshot = graphics(mode)
     value = snapshot["graphics_diagnostics"]
     value.update(native_gpu_canvas_draws=3, live_canvases=1, peak_live_canvases=1,
                  current_pixel_area=400, peak_pixel_area=400)
     value["roles"]["static_chart"].update(created=1, live=1, peak_live=1, draws=3,
         current_pixel_area=400, peak_pixel_area=400, max_width_points=10, max_height_points=10, max_scale=2)
+    if mode in memory.COALESCED_SCALAR_MODES:
+        value["scalar_presentation_publications"] = 2
+    if mode in memory.RETAINED_TWINKLE_MODES:
+        value["retained_twinkles"].update(hosts_created=1, live_hosts=1, peak_hosts=1,
+                                          instances_created=2, live_instances=2, peak_instances=2, animation_starts=2)
     return snapshot
 
 
 class GraphicsTests(unittest.TestCase):
+    def test_coalesced_modes_require_actual_integer_publications_and_other_modes_reject_them(self):
+        for mode in memory.GRAPHICS_MODES:
+            snapshot = drawn_native_gpu_graphics(mode) if mode in memory.NATIVE_GPU_MODES else graphics(mode)
+            snapshot["graphics_diagnostics"]["scalar_presentation_publications"] = 0
+            self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+            if mode in memory.COALESCED_SCALAR_MODES:
+                with self.subTest(mode=mode, zero_publications=True), self.assertRaisesRegex(InvalidResult, "did not publish"):
+                    memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+                del snapshot["graphics_diagnostics"]["scalar_presentation_publications"]
+                with self.subTest(mode=mode, missing=True), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, mode)
+            else:
+                snapshot["graphics_diagnostics"]["scalar_presentation_publications"] = 1
+                with self.subTest(mode=mode, unexpected_publication=True), self.assertRaisesRegex(InvalidResult, "outside a coalesced-scalar mode"):
+                    memory.validate_graphics(snapshot, mode)
+            for wrong in (None, True, -1, 1.0, "1"):
+                snapshot["graphics_diagnostics"]["scalar_presentation_publications"] = wrong
+                with self.subTest(mode=mode, invalid=wrong), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, mode)
+
+    def test_native_gpu_optimization_flags_are_exact_and_only_baseline_allows_omission(self):
+        for mode in memory.NATIVE_GPU_MODES:
+            expected = {"scalar_presentation_coalesced": mode in memory.COALESCED_SCALAR_MODES,
+                        "retained_twinkles_enabled": mode in memory.RETAINED_TWINKLE_MODES}
+            snapshot = drawn_native_gpu_graphics(mode)
+            snapshot["graphics_diagnostics"].update(expected)
+            self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+            for field, correct in expected.items():
+                missing = copy.deepcopy(snapshot)
+                del missing["graphics_diagnostics"][field]
+                if mode == "native-gpu-canvas":
+                    self.assertTrue(memory.validate_graphics(missing, mode)["available"])
+                else:
+                    with self.subTest(mode=mode, field=field, missing=True), self.assertRaisesRegex(InvalidResult, field):
+                        memory.validate_graphics(missing, mode)
+                for wrong in (None, 0, 1, "false", not correct):
+                    invalid = copy.deepcopy(snapshot)
+                    invalid["graphics_diagnostics"][field] = wrong
+                    with self.subTest(mode=mode, field=field, wrong=wrong), self.assertRaisesRegex(InvalidResult, field):
+                        memory.validate_graphics(invalid, mode)
+
+    def test_all_native_gpu_variants_keep_canvas_backend_draw_and_fallback_requirements(self):
+        changes = (
+            lambda value: value.update(native_gpu_backend="image-renderer"),
+            lambda value: value.update(native_gpu_canvas_draws=2),
+            lambda value: value.update(peak_bitmap_bytes=1),
+            lambda value: value.update(peak_layer_image_bytes=1),
+            lambda value: value["roles"]["static_chart"].update(renderer_creations=1),
+        )
+        for mode in memory.NATIVE_GPU_MODES:
+            self.assertTrue(memory.validate_graphics(drawn_native_gpu_graphics(mode), mode, completed_visible_workload=True)["available"])
+            for change in changes:
+                snapshot = drawn_native_gpu_graphics(mode)
+                change(snapshot["graphics_diagnostics"])
+                with self.subTest(mode=mode, change=change), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, mode)
+
+    def test_retained_twinkles_require_exact_backend_and_complete_integer_counters(self):
+        for mode in memory.RETAINED_TWINKLE_MODES:
+            for wrong in (None, True, "canvas", "core-animation"):
+                snapshot = graphics(mode)
+                snapshot["graphics_diagnostics"]["retained_twinkle_backend"] = wrong
+                with self.subTest(mode=mode, backend=wrong), self.assertRaisesRegex(InvalidResult, "shape-layer backend"):
+                    memory.validate_graphics(snapshot, mode)
+            for container in (None, "missing", []):
+                snapshot = graphics(mode)
+                if container == "missing":
+                    del snapshot["graphics_diagnostics"]["retained_twinkles"]
+                else:
+                    snapshot["graphics_diagnostics"]["retained_twinkles"] = container
+                with self.subTest(mode=mode, counters=container), self.assertRaisesRegex(InvalidResult, "counters are missing"):
+                    memory.validate_graphics(snapshot, mode)
+            for field in memory.RETAINED_TWINKLE_FIELDS:
+                for wrong in (None, True, -1, 0.0, "0"):
+                    snapshot = graphics(mode)
+                    snapshot["graphics_diagnostics"]["retained_twinkles"][field] = wrong
+                    with self.subTest(mode=mode, field=field, wrong=wrong), self.assertRaises(InvalidResult):
+                        memory.validate_graphics(snapshot, mode)
+                snapshot = graphics(mode)
+                del snapshot["graphics_diagnostics"]["retained_twinkles"][field]
+                with self.subTest(mode=mode, field=field, missing=True), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, mode)
+
+    def test_retained_twinkle_lifecycle_and_two_instance_bound_reject_impossible_evidence(self):
+        changes = (
+            {"hosts_destroyed": 1}, {"instances_destroyed": 1},
+            {"peak_hosts": 0}, {"peak_instances": 1},
+            {"peak_hosts": 2}, {"peak_instances": 3},
+            {"instances_created": 3, "live_instances": 3, "peak_instances": 3},
+            {"instances_created": 3, "instances_destroyed": 1, "peak_instances": 3},
+            {"hosts_destroyed": 1, "live_hosts": 0},
+        )
+        for mode in memory.RETAINED_TWINKLE_MODES:
+            for change in changes:
+                snapshot = drawn_native_gpu_graphics(mode)
+                snapshot["graphics_diagnostics"]["retained_twinkles"].update(change)
+                with self.subTest(mode=mode, change=change), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, mode)
+            snapshot = drawn_native_gpu_graphics(mode)
+            value = snapshot["graphics_diagnostics"]
+            value["live_canvases"] = value["current_pixel_area"] = 0
+            value["roles"]["static_chart"].update(destroyed=1, live=0, current_pixel_area=0)
+            with self.subTest(mode=mode), self.assertRaisesRegex(InvalidResult, "Retained twinkle resources remain live"):
+                memory.validate_graphics(snapshot, mode, expected_closed=True)
+            value["retained_twinkles"].update(hosts_destroyed=1, live_hosts=0, instances_destroyed=2, live_instances=0)
+            self.assertTrue(memory.validate_graphics(snapshot, mode, expected_closed=True, completed_visible_workload=True)["available"])
+
+    def test_retained_modes_must_create_instances_and_submit_animations_during_visible_work(self):
+        for mode in memory.RETAINED_TWINKLE_MODES:
+            snapshot = drawn_native_gpu_graphics(mode)
+            snapshot["graphics_diagnostics"]["retained_twinkles"]["animation_starts"] = 0
+            with self.subTest(mode=mode, zero_animation_starts=True), self.assertRaisesRegex(InvalidResult, "did not submit"):
+                memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+            snapshot["graphics_diagnostics"]["retained_twinkles"] = dict.fromkeys(memory.RETAINED_TWINKLE_FIELDS, 0)
+            self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+            with self.subTest(mode=mode, zero_instances=True), self.assertRaisesRegex(InvalidResult, "did not submit"):
+                memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+
+    def test_nonretained_modes_reject_any_retained_activity_when_counters_are_exposed(self):
+        for mode in set(memory.GRAPHICS_MODES) - set(memory.RETAINED_TWINKLE_MODES):
+            snapshot = graphics(mode)
+            snapshot["graphics_diagnostics"]["retained_twinkles"] = dict.fromkeys(memory.RETAINED_TWINKLE_FIELDS, 0)
+            self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+            for field in memory.RETAINED_TWINKLE_FIELDS:
+                invalid = copy.deepcopy(snapshot)
+                invalid["graphics_diagnostics"]["retained_twinkles"][field] = 1
+                with self.subTest(mode=mode, field=field), self.assertRaisesRegex(InvalidResult, "outside a retained-twinkle mode"):
+                    memory.validate_graphics(invalid, mode)
+
+    def test_retained_evidence_is_checked_in_command_and_control_snapshots(self):
+        for mode in memory.RETAINED_TWINKLE_MODES:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), mode)
+                snapshot = drawn_native_gpu_graphics(mode)
+                snapshot["graphics_diagnostics"]["retained_twinkles"]["hosts_destroyed"] = 1
+                diagnostic.collector = mock.Mock()
+                diagnostic.collector.command.return_value = {"status": "ok", "snapshot": snapshot}
+                with mock.patch.object(diagnostic, "verify_identity"), self.assertRaises(InvalidResult):
+                    diagnostic.command("show_dashboard")
+                with self.assertRaises(InvalidResult):
+                    diagnostic.validate_control_snapshot(snapshot)
+
     def test_native_gpu_requires_exact_backend_and_integer_callback_evidence(self):
         mode = "native-gpu-canvas"
         self.assertTrue(memory.validate_graphics(graphics(mode), mode)["available"])
