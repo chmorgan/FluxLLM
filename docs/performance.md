@@ -466,7 +466,9 @@ The default sequence is `native-gpu-optimized`, `runtime-optimized`, then
 cases. `--controls` accepts one through three distinct controls, for at most five
 cases within the same 300-second deadline. For example,
 `--controls runtime-history-order runtime-chart-preparation runtime-optimized`
-compares each optimization separately and together.
+compares each optimization separately and together. Use `--controls normal` to
+compare the actual production default against the preserved `native-gpu-optimized`
+baseline before and after it; production `normal` enables both CPU optimizations.
 
 | Runtime control | Behavior |
 |---|---|
@@ -482,6 +484,14 @@ at one-second intervals. Product hashes and measurement sources must remain
 unchanged. Missing visibility, stalled progress, changed identity, incomplete
 forwarding, invalid counters, or an unfinished trace/export produce an incomplete
 diagnostic rather than a usable comparison.
+
+The performance session assigns deterministic synthetic request IDs in namespace
+7 from the fixture's `perf_index` (`cycle * 32 + ordinal`) and uses a fixed twinkle
+RNG seed. Real clocks remain unchanged. Comparisons require acknowledgment of
+`synthetic_request_identity.policy = 'fixture-index-v1'` and
+`synthetic_animation_policy = 'fixture-index-and-fixed-twinkle-seed-v1'`, exactly
+two request IDs matching the fixture, zero invalid requests, and stable snapshot
+metadata. These controls make the visual workload comparable across cases.
 
 Unprofiled reports show CPU averaged across the whole contiguous runtime and its
 maximum rolling one-second CPU, normalized to one core. An explicit CPU
@@ -499,7 +509,9 @@ no full order rebuilds and must record positive tool and completed-record
 insertions. Comparisons require the complete feature/counter contract in every
 case. A frozen older `normal` profile may omit that metadata and records it as
 unavailable; supplied flags are validated, and new runtime controls always
-require the full contract.
+require the full contract. Older frozen profiles without the synthetic identity
+and animation policies remain attribution-only, with full visual-comparison
+evidence unavailable.
 
 Each command writes `runtime-report.json`, `SUMMARY.md`, per-case raw evidence,
 and a hashed measurement-source capsule to a unique ignored

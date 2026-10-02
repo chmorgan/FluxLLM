@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
 import app_performance as app
 import memory_attribution as memory
@@ -107,6 +108,59 @@ def validate_runtime_work(before, after, mode, *, required=True):
     if not flags["lifecycle_effects_enabled"]:
         require(delta["rail_decorations_draws"] == 0, "No-lifecycle control still drew lifecycle decorations")
     return {"available": True, "features": flags, "deltas": delta}
+
+
+def validate_visual_work(report, *, required):
+    """Authenticate deterministic effect selection without changing its clocks."""
+    points = report["runtime"]["checkpoints"]
+    snapshots = [point["snapshot"] for point in points]
+    extra = [report.get("ready", {}).get("snapshot")]
+    extra += [entry.get("snapshot") for entry in report.get("checkpoints", [])]
+    extra += [entry.get("event", {}).get("snapshot") for entry in report.get("events", [])
+              if entry.get("type") == "app_event"]
+    snapshots += [snapshot for snapshot in extra if isinstance(snapshot, dict)]
+    fields = ("synthetic_request_identity", "synthetic_animation_policy")
+    if not required and all(not any(field in snapshot for field in fields) for snapshot in snapshots):
+        return {"available": False, "visual_comparison_eligible": False,
+                "reason": "Frozen profile predates deterministic request identities and twinkle seeding"}
+    acknowledgement = report["workload"]["fixture_start"]
+    indices = acknowledgement.get("expected_request_indices")
+    streams = report["workload"]["fixture_status"].get("timing", {}).get("streams", [])
+    require(isinstance(indices, list) and len(indices) == 2
+            and all(type(index) is int and 0 <= index <= 32_000_032 for index in indices)
+            and len(set(indices)) == 2
+            and sorted(stream.get("request_index") for stream in streams) == sorted(indices),
+            "Synthetic visual identities lack both acknowledged fixture streams")
+    expected = {index: str(uuid.UUID(bytes=bytes([0x52, 0x45, 0x53, 0x46, 0, 0, 0, 7])
+                                    + index.to_bytes(8, "big"))).upper() for index in indices}
+    def requests(snapshot):
+        value = snapshot.get("synthetic_request_identity")
+        require(isinstance(value, dict) and value.get("policy") == "fixture-index-v1"
+                and type(value.get("invalid_requests")) is int and value["invalid_requests"] == 0,
+                "Synthetic request identity policy is missing, changed, or recorded invalid requests")
+        require(snapshot.get("synthetic_animation_policy") == "fixture-index-and-fixed-twinkle-seed-v1",
+                "Synthetic animation seeding policy is missing or changed")
+        rows = value.get("requests")
+        require(isinstance(rows, list) and len(rows) <= 2
+                and all(isinstance(row, dict) and type(row.get("index")) is int
+                        and row["index"] in expected and row.get("id") == expected[row["index"]] for row in rows),
+                "Synthetic request UUID does not match the fixture index")
+        actual = [row["index"] for row in rows]
+        require(actual == sorted(set(actual)), "Synthetic request identities are duplicated or unsorted")
+        return set(actual)
+    for snapshot in snapshots:
+        requests(snapshot)
+    require(not requests(points[0]["snapshot"]), "Synthetic workload already had live request identities before traffic")
+    previous = set()
+    for point in points:
+        current = requests(point["snapshot"])
+        require(previous <= current, "Synthetic request identity disappeared during runtime")
+        previous = current
+    require(previous == set(indices), "Synthetic workload did not record both expected request identities")
+    return {"available": True, "visual_comparison_eligible": True,
+            "identity_policy": "fixture-index-v1", "animation_policy": "fixture-index-and-fixed-twinkle-seed-v1",
+            "requests": [{"index": index, "id": expected[index]} for index in sorted(indices)],
+            "invalid_requests": 0, "real_time_clocks_preserved": True}
 
 
 def phase_windows(report):
@@ -353,6 +407,7 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
             workload["specification"], workload["fixture_status"], workload["before"], workload["after"], workload["fixture_start"]) == WORK,
             "Runtime workload differs from the fixed two-stream 25-second fixture")
         report["phase_windows"] = phase_windows(report)
+        report["visual_work"] = validate_visual_work(report, required=not profile or mode in memory.RUNTIME_MODES)
         points = report["runtime"]["checkpoints"]
         report["runtime_work"] = validate_runtime_work(points[0]["snapshot"], points[-1]["snapshot"], mode, required=not profile)
         report["runtime_work"]["interval"] = {
@@ -422,7 +477,7 @@ def parser():
         result.add_argument("--" + name, required=True, type=Path)
     result.add_argument("--graphics-mode", choices=BASELINES + memory.RUNTIME_MODES, default="normal")
     result.add_argument("--baseline-mode", choices=BASELINES, default="native-gpu-optimized")
-    result.add_argument("--controls", nargs="+", choices=memory.RUNTIME_MODES)
+    result.add_argument("--controls", nargs="+", choices=memory.RUNTIME_MODES + ("normal",))
     result.add_argument("--output-dir", type=Path)
     return result
 
@@ -476,6 +531,7 @@ def _run(args, deadline):
             row = {"label": label, "mode": mode, "status": case["status"], "report_path": str(directory / "runtime-case.json"),
                    "report_sha256": app.path_hash(directory / "runtime-case.json"), "workload_cpu": case.get("workload_cpu"),
                    "phase_cpu": case.get("phase_cpu"), "runtime_work": case.get("runtime_work"),
+                   "visual_work": case.get("visual_work"),
                    "runtime_cpu_target": case.get("runtime_cpu_target"),
                    "peak_footprint_bytes": (case.get("samples") or [{}])[-1].get("lifetime_peak_footprint_bytes")}
             report["cases"].append(row)
@@ -484,6 +540,9 @@ def _run(args, deadline):
                   (" (profiled attribution only)" if args.operation == "profile" else ""), flush=True)
             write_json(output / "runtime-report.json", report)
             require(case["status"] == "diagnostic_captured", f"Runtime case {label} is incomplete: {case['errors']}")
+            if args.operation == "compare":
+                require(row["visual_work"] == report["cases"][0]["visual_work"],
+                        "Runtime comparison cases did not execute identical deterministic visual requests")
             if args.operation == "profile":
                 from runtime_time_profile import analyze_trace
                 runtime = case["runtime"]

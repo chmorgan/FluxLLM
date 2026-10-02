@@ -237,7 +237,8 @@ private struct RequestRailDecorations: View {
         }
         let liveIDs = work.eligibility.liveIDs
         twinkles.removeAll { $0.endsAt <= timestamp || !liveIDs.contains($0.requestID) }
-        var sequence = UInt64(max(0, timestamp.timeIntervalSinceReferenceDate * 1_000))
+        var sequence = PerformanceAnimationRandomness.initialTwinkleSequence(
+            at: timestamp, deterministic: PerformanceGraphicsDiagnostics.shared.isEnabled)
         var nextTwinkleAt: Date? = liveIDs.isEmpty ? nil : timestamp
 
         while !Task.isCancelled {

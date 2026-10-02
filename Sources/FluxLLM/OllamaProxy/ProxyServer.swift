@@ -17,6 +17,7 @@ public final class ProxyManager: ObservableObject {
     private var ollamaPort: Int
     private weak var metricsStore: MetricsStore?
     private let eventEpoch: UUID?
+    private let requestIDFactory: (@Sendable (Data) -> UUID)?
 
     private var serverChannel: Channel?
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
@@ -36,7 +37,8 @@ public final class ProxyManager: ObservableObject {
         ollamaHost: String = "localhost",
         ollamaPort: Int = 11434,
         metricsStore: MetricsStore? = nil,
-        eventEpoch: UUID? = nil
+        eventEpoch: UUID? = nil,
+        requestIDFactory: (@Sendable (Data) -> UUID)? = nil
     ) {
         self.listenHost = listenHost
         self.listenPort = listenPort
@@ -44,6 +46,7 @@ public final class ProxyManager: ObservableObject {
         self.ollamaPort = ollamaPort
         self.metricsStore = metricsStore
         self.eventEpoch = eventEpoch
+        self.requestIDFactory = requestIDFactory
         let inbox = GenerationEventInbox()
         eventInbox = inbox
         eventConsumer = Task { @MainActor [weak metricsStore] in
@@ -158,6 +161,7 @@ public final class ProxyManager: ObservableObject {
             }
             let upstreamHost = configuration.upstreamHost
             let upstreamPort = ollamaPort
+            let requestIDFactory = self.requestIDFactory
 
             let bootstrap = ServerBootstrap(group: group)
                 .serverChannelOption(
@@ -185,7 +189,8 @@ public final class ProxyManager: ObservableObject {
                             try channel.pipeline.syncOperations.addHandler(
                                 RequestForwarder(
                                     ollamaHost: upstreamHost, ollamaPort: upstreamPort,
-                                    registry: registry, eventSink: sink))
+                                    registry: registry, eventSink: sink,
+                                    requestIDFactory: requestIDFactory))
                         }
                     }
                 }
@@ -378,17 +383,20 @@ private final class RequestForwarder: ChannelInboundHandler {
     private let ollamaPort: Int
     private let registry: ProxyChannelRegistry
     private let eventSink: @Sendable (GenerationEvent) -> Void
+    private let requestIDFactory: (@Sendable (Data) -> UUID)?
     private var hasForwardedRequest = false
     private var requestRelay: GenerationRelay?
 
     init(
         ollamaHost: String, ollamaPort: Int, registry: ProxyChannelRegistry,
-        eventSink: @escaping @Sendable (GenerationEvent) -> Void
+        eventSink: @escaping @Sendable (GenerationEvent) -> Void,
+        requestIDFactory: (@Sendable (Data) -> UUID)?
     ) {
         self.ollamaHost = ollamaHost
         self.ollamaPort = ollamaPort
         self.registry = registry
         self.eventSink = eventSink
+        self.requestIDFactory = requestIDFactory
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -398,11 +406,14 @@ private final class RequestForwarder: ChannelInboundHandler {
         let body = request.body ?? ByteBuffer()
         let serverChannel = context.channel
         let isGeneration = StreamTapper.isGenerationRequest(path: request.head.uri, body: body)
+        let bodyData = Data(body.readableBytesView)
         let model =
-            (try? JSONSerialization.jsonObject(with: Data(body.readableBytesView)))
+            (try? JSONSerialization.jsonObject(with: bodyData))
             .flatMap { $0 as? [String: Any] }?["model"] as? String
         let relay = GenerationRelay(
-            request: isGeneration ? GenerationRequest(model: model) : nil, sink: eventSink)
+            request: isGeneration
+                ? GenerationRequest(id: requestIDFactory?(bodyData) ?? UUID(), model: model) : nil,
+            sink: eventSink)
         if isGeneration {
             relay.toolActivity(
                 ToolCallParser.resultSubmissions(path: request.head.uri, body: body, at: Date()))

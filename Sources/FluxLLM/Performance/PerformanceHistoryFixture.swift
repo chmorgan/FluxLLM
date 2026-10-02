@@ -272,7 +272,7 @@ public enum PerformanceHistoryFixture {
 
     /// Stable fixture identities; namespaces distinguish older session requests,
     /// raw requests, and each kind of tool event without sharing dedupe keys.
-    public static func fixedID(namespace: UInt16, index: Int) -> UUID {
+    nonisolated public static func fixedID(namespace: UInt16, index: Int) -> UUID {
         precondition(index >= 0)
         let value = UInt64(index)
         return UUID(

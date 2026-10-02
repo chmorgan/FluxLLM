@@ -21,6 +21,7 @@ public final class PerformanceApplicationSession {
     private let clock: PerformanceWorkloadClock
     private let defaults: UserDefaults
     private let rawEnd: Date
+    private let requestIdentity: PerformanceRequestIdentity
     private var stopped = false
 
     private init(
@@ -29,7 +30,8 @@ public final class PerformanceApplicationSession {
         historyDirectory: URL, preferencesSuite: String,
         historyKind: String, proxyPort: Int, clock: PerformanceWorkloadClock,
         defaults: UserDefaults, rawEnd: Date,
-        fixtureManifest: PerformanceHistoryFixture.EquivalenceManifest
+        fixtureManifest: PerformanceHistoryFixture.EquivalenceManifest,
+        requestIdentity: PerformanceRequestIdentity
     ) {
         self.store = store
         self.coordinator = coordinator
@@ -43,6 +45,7 @@ public final class PerformanceApplicationSession {
         self.defaults = defaults
         self.rawEnd = rawEnd
         self.fixtureManifest = fixtureManifest
+        self.requestIdentity = requestIdentity
     }
 
     public static func start(
@@ -74,6 +77,7 @@ public final class PerformanceApplicationSession {
         let store = MetricsStore(
             clock: { clock.now }, usageHistory: seeded?.usage, chartArchive: seeded?.archive)
         let proxyHolder = PerformanceProxyHolder()
+        let requestIdentity = PerformanceRequestIdentity()
         let coordinator = MonitoringCoordinator(
             settings: settings, store: store,
             client: PerformanceBackendClient(upstream: upstream, clock: clock),
@@ -82,7 +86,8 @@ public final class PerformanceApplicationSession {
                 let proxy = ProxyManager(
                     listenPort: 0, ollamaHost: "127.0.0.1",
                     ollamaPort: configuration.baseURL.port!, metricsStore: store,
-                    eventEpoch: epoch)
+                    eventEpoch: epoch,
+                    requestIDFactory: { requestIdentity.requestID(for: $0) })
                 proxyHolder.proxy = proxy
                 return proxy
             })
@@ -146,7 +151,7 @@ public final class PerformanceApplicationSession {
             settings: settings, historyDirectory: historyDirectory,
             preferencesSuite: preferencesSuite, historyKind: populated ? "populated" : "fresh",
             proxyPort: proxyPort, clock: clock, defaults: defaults, rawEnd: rawEnd,
-            fixtureManifest: manifest)
+            fixtureManifest: manifest, requestIdentity: requestIdentity)
     }
 
     /// Compact scalar snapshots avoid copying chart histories over the pipe.
@@ -159,6 +164,9 @@ public final class PerformanceApplicationSession {
             "fixture_schema_version": PerformanceHistoryFixture.schemaVersion,
             "fixture_equivalence_sha256": fixtureManifest.sha256,
             "fixture_component_sha256": fixtureManifest.components,
+            "synthetic_request_identity": requestIdentity.snapshot(),
+            "synthetic_animation_policy": PerformanceAnimationRandomness.policy(
+                deterministic: PerformanceGraphicsDiagnostics.shared.isEnabled),
             "requests": usage.requests,
             "completed_requests": usage.requests - usage.activeRequests,
             "output_tokens": usage.outputTokens,

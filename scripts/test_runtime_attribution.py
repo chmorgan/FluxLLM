@@ -68,6 +68,14 @@ class CaseSelectionTests(unittest.TestCase):
         self.assertEqual(runtime.selected_cases(options(controls=controls, baseline_mode="normal")),
                          [("baseline-before", "normal"), *[(mode, mode) for mode in controls], ("baseline-after", "normal")])
 
+    def test_normal_control_exercises_the_production_default_between_baselines(self):
+        args = runtime.parser().parse_args(["compare", "--app-binary", "/app", "--test-bundle", "/tests",
+            "--collector-binary", "/collector", "--provenance", "/provenance", "--controls", "normal"])
+        self.assertEqual(runtime.selected_cases(args), [("baseline-before", "native-gpu-optimized"),
+            ("normal", "normal"), ("baseline-after", "native-gpu-optimized")])
+        with self.assertRaisesRegex(ValueError, "distinct runtime controls"):
+            runtime.selected_cases(options(controls=["normal", "normal"]))
+
     def test_more_than_three_or_duplicate_controls_rejected(self):
         for controls in (list(memory.RUNTIME_MODES), ["runtime-optimized", "runtime-optimized"]):
             with self.subTest(controls=controls), self.assertRaisesRegex(ValueError, "distinct runtime controls"):
@@ -191,6 +199,7 @@ class CompletionCounterIntervalTests(unittest.TestCase):
         with patch.object(runtime, "RuntimeDiagnostic", return_value=diagnostic), \
                 patch.object(runtime.app, "validate_workload", return_value=runtime.WORK), \
                 patch.object(runtime, "phase_windows", return_value={"whole_contiguous_runtime": window}), \
+                patch.object(runtime, "validate_visual_work", return_value={"available": True}), \
                 patch.object(runtime, "phase_cpu", return_value={"whole_contiguous_runtime": {"rolling_1s_percent": 4}}):
             return runtime.capture_case(Path(directory) / "case", "runtime-optimized", {}, {}, {}, runtime.RuntimeDeadline())
 
