@@ -119,7 +119,9 @@ host is inserted into an already visible empty window. Native visibility still
 controls host release after an unsuccessful presentation or later occlusion.
 Production chart surfaces render through SwiftUI `Canvas.drawingGroup`, coalesce
 scalar presentation updates, and retain twinkle animations in Core Animation
-shape layers. The explicit ImageRenderer controls remain available for comparing
+shape layers. Production also uses incremental history ordering, optimized chart
+preparation, the Canvas frame clock, and unpromised eligible stream-body writes.
+The explicit ImageRenderer controls remain available for comparing
 the earlier rendering path. Complete application measurements still enforce
 CPU, memory, GPU, and write budgets across first window opening and subsequent
 UI rendering; selecting the improved path is not a performance-gate pass.
@@ -469,46 +471,50 @@ python3 scripts/run_performance_checks.py runtime compare \
   --app-binary /absolute/products/FluxLLMApp \
   --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
   --collector-binary /absolute/products/FluxLLMResourceCollector \
-  --provenance /absolute/products/provenance.json
+  --provenance /absolute/products/provenance.json \
+  --baseline-mode runtime-optimized --controls normal
 ```
 
-The default sequence is `native-gpu-optimized`, `runtime-optimized`, then
-`native-gpu-optimized` again. Use `--baseline-mode normal` to change both baseline
-cases. `--controls` accepts one through three distinct controls, for at most five
+This runs `runtime-optimized`, the preserved previous default, before and after
+production `normal`. Production enables both history/preparation
+optimizations plus `unpromised_stream_body_writes` and `canvas_frame_clock`;
+`shared_chart_preparation` and `stable_decoration_hosts` remain disabled.
+Without selection flags, the default sequence is `native-gpu-optimized`,
+`runtime-optimized`, then `native-gpu-optimized` again.
+`--controls` accepts one through three distinct controls, for at most five
 cases within the same 300-second deadline. For example,
 `--controls runtime-history-order runtime-chart-preparation runtime-optimized`
-compares each optimization separately and together. Use `--controls normal` to
-compare the actual production default against the preserved `native-gpu-optimized`
-baseline before and after it; production `normal` enables both CPU optimizations.
+compares the history and preparation optimizations separately and together against
+`native-gpu-optimized`.
 
 | Runtime control | Behavior |
 |---|---|
 | `runtime-history-order` | Maintain history ordering incrementally. |
 | `runtime-chart-preparation` | Use the optimized chart preparation path. |
-| `runtime-optimized` | Enable both history ordering and chart preparation optimizations. |
+| `runtime-optimized` | Preserve the previous production default: history ordering and chart preparation optimizations, without stream-write or Canvas-clock changes. |
 | `runtime-no-lifecycle` | Enable both optimizations and remove arrival/completion effects; active retained twinkles remain enabled. |
 | `runtime-shared-preparation` | Share immutable metadata after resolving corrected records across chart consumers, and preserve ordered publication inputs where applicable. |
 | `runtime-stable-decoration-hosts` | Keep Canvas and retained twinkle owners stable during active episodes, suppressing inactive drawing without restarting animation clocks. |
 | `runtime-stream-writes` | Omit individual body-write promises for eligible ordinary responses, retaining existing immediate flushes and failure cancellation. |
 | `runtime-next-optimized` | Combine shared preparation, stable decoration hosts, and the body-write promise experiment. |
 | `runtime-canvas-clock` | Keep both history and preparation optimizations and drive rail drawing with a dedicated Canvas frame clock. |
-| `runtime-stream-canvas-clock` | Combine the Canvas frame clock with the body-write promise experiment, keeping both history and preparation optimizations. |
+| `runtime-stream-canvas-clock` | Combine the Canvas frame clock with the unpromised body-write path, keeping both history and preparation optimizations; matches current production feature selection. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
-the existing history and preparation optimizations. They remain experiments:
-`normal` still uses those two established optimizations. Compare individual candidates with
-`--baseline-mode normal --controls runtime-shared-preparation runtime-stable-decoration-hosts runtime-stream-writes`,
+the existing history and preparation optimizations. Compare individual candidates
+against the preserved previous default with
+`--baseline-mode runtime-optimized --controls runtime-shared-preparation runtime-stable-decoration-hosts runtime-stream-writes`,
 then use a separate comparison with
-`--baseline-mode normal --controls runtime-next-optimized` for their combination.
+`--baseline-mode runtime-optimized --controls runtime-next-optimized` for their combination.
 These selections keep the same five-case maximum and 300-second command deadline.
 
-The two Canvas-clock controls are isolated experiments with
+The two Canvas-clock controls remain available for isolated comparisons with
 `canvas_frame_clock = true` and shared preparation and stable decoration hosts
 disabled. Only `runtime-stream-canvas-clock` also enables
 `unpromised_stream_body_writes`. Compare them with
-`--baseline-mode normal --controls runtime-canvas-clock runtime-stream-canvas-clock`.
-Production `normal` enables none of these experimental paths; the **5% runtime
-CPU** and **1% GPU** limits remain unchanged.
+`--baseline-mode runtime-optimized --controls runtime-canvas-clock runtime-stream-canvas-clock`.
+The **5% runtime CPU** and **1% GPU** limits remain unchanged; production selection
+does not establish a complete resource-gate pass.
 
 The stream-write control keeps promises on response heads and ends, and on
 `HEAD`/`CONNECT` bodies. Its body fast path requires an active downstream channel

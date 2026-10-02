@@ -355,16 +355,17 @@ def runtime_feature_contract(value, mode):
     if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock",)):
         return None
     extras = {}
+    promoted_normal = mode == "normal" and value.get("unpromised_stream_body_writes") is True
     if mode in NEXT_RUNTIME_MODES or any(field in value for field in NEXT_RUNTIME_FLAGS):
         expected = {"shared_chart_preparation": mode in ("runtime-shared-preparation", "runtime-next-optimized"),
                     "stable_decoration_hosts": mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"),
-                    "unpromised_stream_body_writes": mode in ("runtime-stream-writes", "runtime-next-optimized", "runtime-stream-canvas-clock")}
+                    "unpromised_stream_body_writes": promoted_normal or mode in ("runtime-stream-writes", "runtime-next-optimized", "runtime-stream-canvas-clock")}
         for field, enabled in expected.items():
             require(type(value.get(field)) is bool and value[field] is enabled,
                     f"Graphics {field} does not match the requested runtime control")
         extras = {field: value[field] for field in NEXT_RUNTIME_FLAGS}
-    if mode in CANVAS_CLOCK_MODES or "canvas_frame_clock" in value:
-        require(type(value.get("canvas_frame_clock")) is bool and value["canvas_frame_clock"] is (mode in CANVAS_CLOCK_MODES),
+    if promoted_normal or mode in CANVAS_CLOCK_MODES or "canvas_frame_clock" in value:
+        require(type(value.get("canvas_frame_clock")) is bool and value["canvas_frame_clock"] is (promoted_normal or mode in CANVAS_CLOCK_MODES),
                 "Graphics canvas_frame_clock does not match the requested runtime control")
         extras["canvas_frame_clock"] = value["canvas_frame_clock"]
     if mode == "normal":
@@ -372,6 +373,9 @@ def runtime_feature_contract(value, mode):
         flags = {field: value[field] for field in RUNTIME_FLAGS}
         require(flags["lifecycle_effects_enabled"] and flags["incremental_history_ordering"] == flags["optimized_chart_preparation"],
                 "Normal runtime feature metadata does not identify the baseline or combined production path")
+        if promoted_normal:
+            require(flags["incremental_history_ordering"] and flags["optimized_chart_preparation"],
+                    "Promoted normal stream/clock path requires both history and preparation optimizations")
         return flags | extras
     expected = {"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle") + NEXT_RUNTIME_MODES,
                 "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle") + NEXT_RUNTIME_MODES,

@@ -222,6 +222,27 @@ class RuntimeWorkTests(unittest.TestCase):
 
 
 class NextRuntimeWorkTests(unittest.TestCase):
+    def test_promoted_normal_requires_executed_stream_clock_and_rendered_work(self):
+        before, after = workload_snapshots("runtime-stream-canvas-clock")
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"]["mode"] = "normal"
+        result = runtime.validate_runtime_work(before, after, "normal")
+        self.assertTrue(result["features"]["unpromised_stream_body_writes"])
+        self.assertTrue(result["features"]["canvas_frame_clock"])
+        for field in ("streamed_bodies_without_promises", "rail_frame_clock_ticks"):
+            changed = copy.deepcopy(after)
+            changed[field] = before[field]
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                runtime.validate_runtime_work(before, changed, "normal")
+        changed = copy.deepcopy(after)
+        changed["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] = before["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"]
+        with self.assertRaisesRegex(ValueError, "sufficient native decoration draws"):
+            runtime.validate_runtime_work(before, changed, "normal")
+        changed = copy.deepcopy(after)
+        changed["graphics_diagnostics"].update(unpromised_stream_body_writes=False, canvas_frame_clock=False)
+        with self.assertRaisesRegex(ValueError, "stable complete"):
+            runtime.validate_runtime_work(before, changed, "normal")
+
     def test_canvas_clock_controls_select_isolated_paths(self):
         for mode in memory.CANVAS_CLOCK_MODES:
             work = runtime.validate_runtime_work(*workload_snapshots(mode), mode)
@@ -336,6 +357,20 @@ class NextRuntimeWorkTests(unittest.TestCase):
 
 
 class CanvasClockPhaseTests(unittest.TestCase):
+    def test_promoted_normal_requires_zero_steady_and_closed_ticks(self):
+        report = clock_work_report("runtime-stream-canvas-clock")
+        for point in report["runtime"]["checkpoints"] + report["checkpoints"]:
+            point["snapshot"]["graphics_diagnostics"]["mode"] = "normal"
+        proof = runtime.validate_canvas_clock_work(report, "normal")
+        self.assertEqual(proof["steady"]["deltas"]["rail_frame_clock_ticks"], 0)
+        self.assertEqual(proof["closed"]["rail_frame_clock_ticks_delta"], 0)
+        for phase, index in (("runtime", 2), ("closed", 1)):
+            changed = copy.deepcopy(report)
+            points = changed["runtime"]["checkpoints"] if phase == "runtime" else changed["checkpoints"]
+            points[index]["snapshot"]["rail_frame_clock_ticks"] += 1
+            with self.subTest(phase=phase), self.assertRaises(ValueError):
+                runtime.validate_canvas_clock_work(changed, "normal")
+
     def test_steady_and_closed_proof_uses_authenticated_interior_checkpoints(self):
         for mode in memory.CANVAS_CLOCK_MODES:
             report = clock_work_report(mode)

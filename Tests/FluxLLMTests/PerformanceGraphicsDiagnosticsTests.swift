@@ -107,6 +107,10 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertTrue(diagnostics.mode.usesRetainedTwinkles)
         XCTAssertTrue(diagnostics.mode.usesIncrementalHistoryOrdering)
         XCTAssertTrue(diagnostics.mode.usesOptimizedChartPreparation)
+        XCTAssertTrue(diagnostics.mode.usesUnpromisedStreamBodyWrites)
+        XCTAssertTrue(diagnostics.mode.usesCanvasFrameClock)
+        XCTAssertFalse(diagnostics.mode.usesSharedChartPreparation)
+        XCTAssertFalse(diagnostics.mode.usesStableDecorationHosts)
         diagnostics.scalarPresentationPublished()
         XCTAssertNil(diagnostics.retainedTwinkleHostCreated())
         diagnostics.retainedTwinkleHostUpdated(
@@ -643,11 +647,11 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 [.runtimeStableDecorationHosts, .runtimeNextOptimized].contains(mode))
             XCTAssertEqual(
                 mode.usesUnpromisedStreamBodyWrites,
-                [.runtimeStreamWrites, .runtimeNextOptimized, .runtimeStreamCanvasClock].contains(
-                    mode))
+                [.normal, .runtimeStreamWrites, .runtimeNextOptimized, .runtimeStreamCanvasClock]
+                    .contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
-                [.runtimeCanvasClock, .runtimeStreamCanvasClock].contains(mode))
+                [.normal, .runtimeCanvasClock, .runtimeStreamCanvasClock].contains(mode))
         }
     }
 

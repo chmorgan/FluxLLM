@@ -78,6 +78,47 @@ All zones: 9 nodes (1312 bytes)
 
 
 class NextRuntimeContractTests(unittest.TestCase):
+    def test_promoted_normal_requires_paired_paths_and_retains_actual_work_validation(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        snapshot = drawn_native_gpu_graphics("runtime-stream-canvas-clock")
+        snapshot["graphics_diagnostics"]["mode"] = "normal"
+        validated = memory.validate_graphics(snapshot, "normal", completed_visible_workload=True)
+        self.assertTrue(validated["runtime_feature_contract"]["unpromised_stream_body_writes"])
+        self.assertTrue(validated["runtime_feature_contract"]["canvas_frame_clock"])
+        for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock",):
+            for replacement in (None, not snapshot["graphics_diagnostics"][field]):
+                changed = copy.deepcopy(snapshot)
+                if replacement is None:
+                    del changed["graphics_diagnostics"][field]
+                else:
+                    changed["graphics_diagnostics"][field] = replacement
+                with self.subTest(field=field, value=replacement), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(changed, "normal", completed_visible_workload=True)
+        for field in ("streamed_bodies_without_promises", "rail_frame_clock_ticks"):
+            changed = copy.deepcopy(snapshot)
+            changed[field] = 0
+            with self.subTest(counter=field), self.assertRaises(InvalidResult):
+                memory.validate_graphics(changed, "normal", completed_visible_workload=True)
+        changed = copy.deepcopy(snapshot)
+        changed["graphics_diagnostics"].update(incremental_history_ordering=False, optimized_chart_preparation=False)
+        with self.assertRaisesRegex(InvalidResult, "requires both"):
+            memory.validate_graphics(changed, "normal")
+
+    def test_normal_preserves_legacy_pair_and_rejects_mid_capture_downgrade(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        promoted = drawn_native_gpu_graphics("runtime-stream-canvas-clock")
+        promoted["graphics_diagnostics"]["mode"] = "normal"
+        legacy = copy.deepcopy(promoted)
+        legacy["graphics_diagnostics"].update(unpromised_stream_body_writes=False, canvas_frame_clock=False)
+        legacy.update(streamed_bodies_without_promises=0, rail_frame_clock_ticks=0)
+        self.assertTrue(memory.validate_graphics(legacy, "normal")["available"])
+        del legacy["graphics_diagnostics"]["canvas_frame_clock"]
+        self.assertTrue(memory.validate_graphics(legacy, "normal")["available"])
+        diagnostic = memory.MemoryDiagnostic(Path("/unused"), memory.MemoryDeadline(), "normal")
+        diagnostic.validate_graphics_snapshot(promoted)
+        with self.assertRaisesRegex(InvalidResult, "changed or disappeared"):
+            diagnostic.validate_graphics_snapshot(legacy)
+
     def test_canvas_clock_modes_require_flag_counters_and_actual_ticks(self):
         from test_memory_diagnostic import drawn_native_gpu_graphics
         for mode in memory.CANVAS_CLOCK_MODES:

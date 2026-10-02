@@ -84,12 +84,12 @@ public final class PerformanceGraphicsDiagnostics {
         }
 
         var usesUnpromisedStreamBodyWrites: Bool {
-            self == .runtimeStreamWrites || self == .runtimeNextOptimized
+            self == .normal || self == .runtimeStreamWrites || self == .runtimeNextOptimized
                 || self == .runtimeStreamCanvasClock
         }
 
         var usesCanvasFrameClock: Bool {
-            self == .runtimeCanvasClock || self == .runtimeStreamCanvasClock
+            self == .normal || self == .runtimeCanvasClock || self == .runtimeStreamCanvasClock
         }
 
         var usesIncrementalHistoryOrdering: Bool {
