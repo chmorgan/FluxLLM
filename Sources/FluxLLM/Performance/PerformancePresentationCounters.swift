@@ -17,6 +17,8 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
         case chartPublicationFullSorts = "chart_publication_full_sorts"
         case directToolPlotBuilds = "direct_tool_plot_builds"
         case legacyToolPlotBuilds = "legacy_tool_plot_builds"
+        case ungroupedNativeCanvasDraws = "ungrouped_native_canvas_draws"
+        case groupedNativeCanvasDraws = "grouped_native_canvas_draws"
         case historyToolOrderBuilds = "history_tool_order_builds"
         case historyCompletedOrderBuilds = "history_completed_order_builds"
         case historyToolOrderInsertions = "history_tool_order_insertions"
@@ -44,6 +46,7 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
             .railFrameClockTicks, .railTimelineContentUpdates,
             .orderedChartPublicationQueries, .chartPublicationFullSorts,
             .directToolPlotBuilds, .legacyToolPlotBuilds,
+            .ungroupedNativeCanvasDraws, .groupedNativeCanvasDraws,
         ] {
             values[metric.rawValue] = 0
         }

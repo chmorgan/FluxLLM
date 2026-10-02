@@ -503,6 +503,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-stream-canvas-clock` | Preserve the stream-write and Canvas-clock default before ordered publication, keeping both history and preparation optimizations. |
 | `runtime-ordered-publication` | Combine ordered single-interval chart publication, stream writes, Canvas clock, and both history/preparation optimizations; matches current production feature selection. |
 | `runtime-direct-tool-plot` | Build request-tool plot geometry directly on top of current production behavior. |
+| `runtime-ungrouped-canvas` | Omit `drawingGroup` around native Canvas surfaces while retaining current production behavior elsewhere. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -533,6 +534,17 @@ paths and enables `direct_tool_plot`. Shared preparation and stable decoration
 hosts remain disabled; `normal` keeps `direct_tool_plot = false`. Compare the
 candidate with `--baseline-mode normal --controls runtime-direct-tool-plot`.
 All workload, visibility, clock, deadline, and resource-budget checks still apply.
+
+`runtime-ungrouped-canvas` isolates the cost of `drawingGroup` with
+`ungrouped_native_canvas = true`. It inherits production's ordered publication,
+stream-write, Canvas-clock, and history/preparation paths; direct tool plotting,
+shared preparation, and stable decoration hosts remain disabled. Compare it with
+`--baseline-mode normal --controls runtime-ungrouped-canvas`. Production `normal`
+keeps `ungrouped_native_canvas = false`; no measured benefit is established yet.
+The backend acknowledgment is exactly `swiftui-canvas` for this experiment and
+`swiftui-canvas-drawing-group` for grouped native rendering.
+Existing path, drawing-fidelity, visibility, clock, budget, and deadline checks
+remain in force.
 
 The stream-write control keeps promises on response heads and ends, and on
 `HEAD`/`CONNECT` bodies. Its body fast path requires an active downstream channel
@@ -613,6 +625,16 @@ direct control requires a positive direct-build delta and zero legacy-build delt
 during the fixed workload. Instrumented nondirect modes require zero total direct
 builds and a positive legacy-build delta. Older frozen products may omit the
 entire group; partial or incorrectly typed evidence is rejected.
+
+Ungrouped-Canvas instrumentation requires the boolean `ungrouped_native_canvas`
+flag and nonnegative integer counters `ungrouped_native_canvas_draws` and
+`grouped_native_canvas_draws`, counted at accepted native Canvas draw callbacks.
+The candidate requires a positive ungrouped-draw delta and zero grouped-draw
+delta. Instrumented native baselines require zero ungrouped draws and a positive
+grouped-draw delta. The two deltas must sum to the native GPU draw delta and the
+verified sum of role draw deltas. The new mode requires this complete group;
+older modes may omit the entire group, but partial or incorrectly typed evidence
+is rejected.
 
 A frozen older `normal` profile may omit that metadata and records it as
 unavailable; supplied flags are validated, and new runtime controls always

@@ -28,7 +28,9 @@ ORDERED_PUBLICATION_MODE = "runtime-ordered-publication"
 ORDERED_PUBLICATION_COUNTERS = ("ordered_chart_publication_queries", "chart_publication_full_sorts")
 DIRECT_TOOL_PLOT_MODE = "runtime-direct-tool-plot"
 DIRECT_TOOL_PLOT_COUNTERS = ("direct_tool_plot_builds", "legacy_tool_plot_builds")
-ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE)
+UNGROUPED_CANVAS_MODE = "runtime-ungrouped-canvas"
+NATIVE_CANVAS_GROUP_COUNTERS = ("ungrouped_native_canvas_draws", "grouped_native_canvas_draws")
+ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE)
 CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + ORDERED_PUBLICATION_MODES
 NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized") + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
@@ -357,7 +359,7 @@ def validate_retained_twinkles(value, mode, *, completed_visible_workload=False,
 
 
 def runtime_feature_contract(value, mode):
-    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot")):
+    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas")):
         return None
     extras = {}
     promoted_normal = mode == "normal" and value.get("unpromised_stream_body_writes") is True
@@ -379,10 +381,14 @@ def runtime_feature_contract(value, mode):
         require(type(value.get("ordered_chart_publication")) is bool and value["ordered_chart_publication"] is expected,
                 "Graphics ordered_chart_publication does not match the requested runtime control")
         extras["ordered_chart_publication"] = value["ordered_chart_publication"]
-    if mode == DIRECT_TOOL_PLOT_MODE or "direct_tool_plot" in value:
+    if mode in (DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE) or "direct_tool_plot" in value:
         require(type(value.get("direct_tool_plot")) is bool and value["direct_tool_plot"] is (mode == DIRECT_TOOL_PLOT_MODE),
                 "Graphics direct_tool_plot does not match the requested runtime control")
         extras["direct_tool_plot"] = value["direct_tool_plot"]
+    if mode == UNGROUPED_CANVAS_MODE or "ungrouped_native_canvas" in value:
+        require(type(value.get("ungrouped_native_canvas")) is bool and value["ungrouped_native_canvas"] is (mode == UNGROUPED_CANVAS_MODE),
+                "Graphics ungrouped_native_canvas does not match the requested runtime control")
+        extras["ungrouped_native_canvas"] = value["ungrouped_native_canvas"]
     if mode == "normal":
         require(all(type(value.get(field)) is bool for field in RUNTIME_FLAGS), "Normal runtime feature metadata is incomplete")
         flags = {field: value[field] for field in RUNTIME_FLAGS}
@@ -423,7 +429,21 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     native_normal = mode == "normal" and "native_gpu_backend" in value
     contract = "native-gpu-optimized" if native_normal or mode in RUNTIME_MODES else mode
     runtime_features = runtime_feature_contract(value, mode)
-    if (mode == DIRECT_TOOL_PLOT_MODE or "direct_tool_plot" in value
+    if (mode == UNGROUPED_CANVAS_MODE or "ungrouped_native_canvas" in value
+            or any(field in snapshot for field in NATIVE_CANVAS_GROUP_COUNTERS)):
+        require("ungrouped_native_canvas" in value, "Native Canvas grouping counters lack feature metadata")
+        grouping = {field: unsigned(snapshot.get(field), field) for field in NATIVE_CANVAS_GROUP_COUNTERS}
+        if contract in NATIVE_GPU_MODES:
+            callbacks = unsigned(value.get("native_gpu_canvas_draws"), "graphics.native_gpu_canvas_draws")
+        else:
+            callbacks = 0
+        require(sum(grouping.values()) == callbacks, "Native Canvas grouping counters do not reconcile with native callbacks")
+        if (runtime_features or {}).get("ungrouped_native_canvas", False):
+            if completed_visible_workload:
+                require(grouping["ungrouped_native_canvas_draws"] > 0, "Ungrouped native Canvas did not execute drawing callbacks")
+        else:
+            require(grouping["ungrouped_native_canvas_draws"] == 0, "Grouped native Canvas mode executed ungrouped callbacks")
+    if (mode in (DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE) or "direct_tool_plot" in value
             or any(field in snapshot for field in DIRECT_TOOL_PLOT_COUNTERS)):
         require("direct_tool_plot" in value, "Tool-plot counters lack feature metadata")
         tool_plot = {field: unsigned(snapshot.get(field), field) for field in DIRECT_TOOL_PLOT_COUNTERS}
@@ -507,8 +527,9 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             if contract != "native-gpu-canvas" or field in value:
                 require(type(value.get(field)) is bool and value[field] is expected,
                         f"Graphics {field} does not match the requested native GPU control")
-        require(value.get("native_gpu_backend") == "swiftui-canvas-drawing-group",
-                "App did not acknowledge the native GPU Canvas drawing-group backend")
+        expected_backend = "swiftui-canvas" if mode == UNGROUPED_CANVAS_MODE else "swiftui-canvas-drawing-group"
+        require(value.get("native_gpu_backend") == expected_backend,
+                "App did not acknowledge the requested native GPU Canvas backend")
         native_gpu_draws = unsigned(value.get("native_gpu_canvas_draws"), "graphics.native_gpu_canvas_draws")
         for field in ("live_renderers", "peak_live_renderers", "current_bitmap_bytes", "peak_bitmap_bytes",
                       "current_layer_image_bytes", "peak_layer_image_bytes", "layer_bitmap_presentations",

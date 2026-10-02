@@ -201,6 +201,10 @@ public final class PerformanceApplicationSession {
                 ?? NSNull(),
             "direct_tool_plot_builds": counters["direct_tool_plot_builds"] as Any? ?? NSNull(),
             "legacy_tool_plot_builds": counters["legacy_tool_plot_builds"] as Any? ?? NSNull(),
+            "ungrouped_native_canvas_draws": counters["ungrouped_native_canvas_draws"] as Any?
+                ?? NSNull(),
+            "grouped_native_canvas_draws": counters["grouped_native_canvas_draws"] as Any?
+                ?? NSNull(),
             "history_tool_order_builds": counters["history_tool_order_builds"] as Any? ?? NSNull(),
             "history_completed_order_builds": counters["history_completed_order_builds"] as Any?
                 ?? NSNull(),

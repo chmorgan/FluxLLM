@@ -28,6 +28,8 @@ def workload_snapshots(mode):
         after["ordered_chart_publication_queries"] += 2
     if value.get("direct_tool_plot"):
         after["direct_tool_plot_builds"] += 2
+    elif "direct_tool_plot" in value:
+        after["legacy_tool_plot_builds"] += 2
     if value.get("canvas_frame_clock"):
         after["rail_frame_clock_ticks"] += 2
     if value.get("shared_chart_preparation"):
@@ -46,6 +48,9 @@ def workload_snapshots(mode):
     after["graphics_diagnostics"]["roles"]["static_chart"]["draws"] += 2
     if value["lifecycle_effects_enabled"]:
         after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 1
+    if value.get("ungrouped_native_canvas"):
+        total = sum(role["draws"] for role in after["graphics_diagnostics"]["roles"].values())
+        after["graphics_diagnostics"]["native_gpu_canvas_draws"] = after["ungrouped_native_canvas_draws"] = total
     return before, after
 
 
@@ -129,7 +134,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot") if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas") if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -223,6 +228,65 @@ class RuntimeWorkTests(unittest.TestCase):
             after["graphics_diagnostics"]["roles"][role]["draws"] = 9
             with self.subTest(role=role), self.assertRaisesRegex(ValueError, "drawing counter moved backwards"):
                 runtime.validate_runtime_work(before, after, "runtime-optimized")
+
+
+class NativeCanvasGroupingWorkTests(unittest.TestCase):
+    def test_ungrouped_callbacks_cover_role_draws_and_keep_existing_paths(self):
+        mode = memory.UNGROUPED_CANVAS_MODE
+        before, after = workload_snapshots(mode)
+        work = runtime.validate_runtime_work(before, after, mode)
+        self.assertEqual(work["deltas"]["ungrouped_native_canvas_draws"], 3)
+        self.assertEqual(work["deltas"]["grouped_native_canvas_draws"], 0)
+        self.assertFalse(work["features"]["direct_tool_plot"])
+        self.assertEqual(work["deltas"]["direct_tool_plot_builds"], 0)
+        self.assertGreater(work["deltas"]["legacy_tool_plot_builds"], 0)
+        self.assertTrue(work["features"]["ordered_chart_publication"] and work["features"]["canvas_frame_clock"])
+
+    def test_mixed_callbacks_counter_only_proof_and_missing_fields_are_rejected(self):
+        mode = memory.UNGROUPED_CANVAS_MODE
+        for field in memory.NATIVE_CANVAS_GROUP_COUNTERS:
+            for invalid in (None, True, -1):
+                before, after = workload_snapshots(mode)
+                after[field] = invalid
+                with self.subTest(field=field, value=invalid), self.assertRaises(ValueError):
+                    runtime.validate_runtime_work(before, after, mode)
+        for mutation in ("mixed", "native-total", "role-total", "metadata"):
+            before, after = workload_snapshots(mode)
+            if mutation == "mixed":
+                after["ungrouped_native_canvas_draws"] -= 1
+                after["grouped_native_canvas_draws"] += 1
+            elif mutation == "native-total":
+                after["ungrouped_native_canvas_draws"] += 1
+            elif mutation == "role-total":
+                after["ungrouped_native_canvas_draws"] += 1
+                after["graphics_diagnostics"]["native_gpu_canvas_draws"] += 1
+            else:
+                del after["graphics_diagnostics"]["ungrouped_native_canvas"]
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                runtime.validate_runtime_work(before, after, mode)
+
+    def test_grouped_normal_requires_real_callbacks_and_rejects_partial_new_evidence(self):
+        before, after = workload_snapshots(memory.ORDERED_PUBLICATION_MODE)
+        for snapshot in (before, after):
+            value = snapshot["graphics_diagnostics"]
+            value.update(mode="normal", ungrouped_native_canvas=False)
+            count = sum(role["draws"] for role in value["roles"].values())
+            value["native_gpu_canvas_draws"] = count
+            snapshot.update(ungrouped_native_canvas_draws=0, grouped_native_canvas_draws=count)
+        self.assertEqual(runtime.validate_runtime_work(before, after, "normal")["deltas"]["grouped_native_canvas_draws"], 3)
+        changed = copy.deepcopy(after)
+        changed["ungrouped_native_canvas_draws"] += 1
+        changed["grouped_native_canvas_draws"] -= 1
+        with self.assertRaisesRegex(ValueError, "Grouped native Canvas mode"):
+            runtime.validate_runtime_work(before, changed, "normal")
+        for snapshot in (before, after):
+            del snapshot["graphics_diagnostics"]["ungrouped_native_canvas"]
+        with self.assertRaisesRegex(ValueError, "lack feature metadata"):
+            runtime.validate_runtime_work(before, after, "normal")
+        for snapshot in (before, after):
+            for field in memory.NATIVE_CANVAS_GROUP_COUNTERS:
+                del snapshot[field]
+        self.assertTrue(runtime.validate_runtime_work(before, after, "normal")["available"])
 
 
 class DirectToolPlotWorkTests(unittest.TestCase):
@@ -406,6 +470,9 @@ class NextRuntimeWorkTests(unittest.TestCase):
             before, after = workload_snapshots(mode)
             after["rail_frame_clock_ticks"] = before["rail_frame_clock_ticks"] + 20
             after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 13
+            if mode == memory.UNGROUPED_CANVAS_MODE:
+                total = sum(role["draws"] for role in after["graphics_diagnostics"]["roles"].values())
+                after["graphics_diagnostics"]["native_gpu_canvas_draws"] = after["ungrouped_native_canvas_draws"] = total
             self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
 
     def test_legacy_clock_counters_optional_but_contract_cannot_disappear(self):

@@ -77,6 +77,70 @@ All zones: 9 nodes (1312 bytes)
 """
 
 
+class NativeCanvasGroupingContractTests(unittest.TestCase):
+    def test_backend_exactly_identifies_requested_grouping(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        for mode, wrong_backend in ((memory.UNGROUPED_CANVAS_MODE, "swiftui-canvas-drawing-group"),
+                                     (memory.ORDERED_PUBLICATION_MODE, "swiftui-canvas")):
+            snapshot = drawn_native_gpu_graphics(mode)
+            snapshot["graphics_diagnostics"]["native_gpu_backend"] = wrong_backend
+            with self.subTest(mode=mode), self.assertRaisesRegex(InvalidResult, "requested native GPU Canvas backend"):
+                memory.validate_graphics(snapshot, mode)
+
+    def test_ungrouped_mode_requires_complete_typed_group_and_callback_reconciliation(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        mode = memory.UNGROUPED_CANVAS_MODE
+        snapshot = drawn_native_gpu_graphics(mode)
+        self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+        for invalid in (None, False, 1):
+            changed = copy.deepcopy(snapshot)
+            changed["graphics_diagnostics"]["ungrouped_native_canvas"] = invalid
+            with self.subTest(flag=invalid), self.assertRaises(InvalidResult):
+                memory.validate_graphics(changed, mode)
+        for field in memory.NATIVE_CANVAS_GROUP_COUNTERS:
+            for invalid in (None, True, -1):
+                changed = copy.deepcopy(snapshot)
+                changed[field] = invalid
+                with self.subTest(field=field, value=invalid), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(changed, mode)
+        for field in ("ungrouped_native_canvas_draws", "grouped_native_canvas_draws"):
+            changed = copy.deepcopy(snapshot)
+            changed[field] += 1
+            with self.subTest(field=field), self.assertRaisesRegex(InvalidResult, "do not reconcile"):
+                memory.validate_graphics(changed, mode)
+        snapshot.update(ungrouped_native_canvas_draws=0, grouped_native_canvas_draws=3)
+        with self.assertRaisesRegex(InvalidResult, "did not execute drawing"):
+            memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+
+    def test_instrumented_normal_keeps_grouping_and_legacy_absence_valid(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        snapshot = drawn_native_gpu_graphics(memory.ORDERED_PUBLICATION_MODE)
+        snapshot["graphics_diagnostics"]["mode"] = "normal"
+        self.assertTrue(memory.validate_graphics(snapshot, "normal")["available"])
+        snapshot["graphics_diagnostics"]["ungrouped_native_canvas"] = False
+        with self.assertRaises(InvalidResult):
+            memory.validate_graphics(snapshot, "normal")
+        snapshot.update(ungrouped_native_canvas_draws=0, grouped_native_canvas_draws=3)
+        self.assertTrue(memory.validate_graphics(snapshot, "normal", completed_visible_workload=True)["available"])
+        snapshot.update(ungrouped_native_canvas_draws=1, grouped_native_canvas_draws=2)
+        with self.assertRaisesRegex(InvalidResult, "Grouped native Canvas mode"):
+            memory.validate_graphics(snapshot, "normal")
+        del snapshot["graphics_diagnostics"]["ungrouped_native_canvas"]
+        with self.assertRaisesRegex(InvalidResult, "lack feature metadata"):
+            memory.validate_graphics(snapshot, "normal")
+
+    def test_nonnative_controls_accept_only_zero_grouping_counters(self):
+        from test_memory_diagnostic import graphics
+        for mode in ("no-renderer", "empty-drawing", "bitmap-destination"):
+            snapshot = graphics(mode)
+            snapshot["graphics_diagnostics"]["ungrouped_native_canvas"] = False
+            snapshot.update(ungrouped_native_canvas_draws=0, grouped_native_canvas_draws=0)
+            self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+            snapshot["grouped_native_canvas_draws"] = 1
+            with self.subTest(mode=mode), self.assertRaisesRegex(InvalidResult, "do not reconcile"):
+                memory.validate_graphics(snapshot, mode)
+
+
 class DirectToolPlotContractTests(unittest.TestCase):
     def test_candidate_requires_complete_typed_group_and_executed_builds(self):
         from test_memory_diagnostic import drawn_native_gpu_graphics

@@ -29,6 +29,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeStreamCanvasClock = "runtime-stream-canvas-clock"
         case runtimeOrderedPublication = "runtime-ordered-publication"
         case runtimeDirectToolPlot = "runtime-direct-tool-plot"
+        case runtimeUngroupedCanvas = "runtime-ungrouped-canvas"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -69,7 +70,7 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeOptimized,
                 .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
                 .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
-                .runtimeOrderedPublication, .runtimeDirectToolPlot:
+                .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas:
                 true
             default:
                 false
@@ -89,20 +90,25 @@ public final class PerformanceGraphicsDiagnostics {
         var usesOrderedChartPublication: Bool {
             self == .normal || usesSharedChartPreparation || self == .runtimeOrderedPublication
                 || self == .runtimeDirectToolPlot
+                || self == .runtimeUngroupedCanvas
         }
 
         var usesDirectToolPlot: Bool { self == .runtimeDirectToolPlot }
+
+        var usesUngroupedNativeCanvas: Bool { self == .runtimeUngroupedCanvas }
 
         var usesUnpromisedStreamBodyWrites: Bool {
             self == .normal || self == .runtimeStreamWrites || self == .runtimeNextOptimized
                 || self == .runtimeStreamCanvasClock || self == .runtimeOrderedPublication
                 || self == .runtimeDirectToolPlot
+                || self == .runtimeUngroupedCanvas
         }
 
         var usesCanvasFrameClock: Bool {
             self == .normal || self == .runtimeCanvasClock || self == .runtimeStreamCanvasClock
                 || self == .runtimeOrderedPublication
                 || self == .runtimeDirectToolPlot
+                || self == .runtimeUngroupedCanvas
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -574,7 +580,9 @@ public final class PerformanceGraphicsDiagnostics {
             result["rail_decorations_enabled"] = !mode.omitsRailDecorations
         }
         if isEnabled, mode.usesNativeGPUCanvas {
-            result["native_gpu_backend"] = "swiftui-canvas-drawing-group"
+            result["native_gpu_backend"] =
+                mode.usesUngroupedNativeCanvas
+                ? "swiftui-canvas" : "swiftui-canvas-drawing-group"
             result["scalar_presentation_coalesced"] = mode.usesCoalescedScalarPresentation
             result["retained_twinkles_enabled"] = mode.usesRetainedTwinkles
             result["incremental_history_ordering"] = mode.usesIncrementalHistoryOrdering
@@ -586,6 +594,7 @@ public final class PerformanceGraphicsDiagnostics {
             result["canvas_frame_clock"] = mode.usesCanvasFrameClock
             result["ordered_chart_publication"] = mode.usesOrderedChartPublication
             result["direct_tool_plot"] = mode.usesDirectToolPlot
+            result["ungrouped_native_canvas"] = mode.usesUngroupedNativeCanvas
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

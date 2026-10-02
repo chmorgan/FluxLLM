@@ -89,7 +89,33 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {field} counter moved backwards")
         delta[field] = last - first
     require(delta["chart_preparations"] > 0, "Runtime workload did not prepare charts")
-    if (mode == memory.DIRECT_TOOL_PLOT_MODE or "direct_tool_plot" in flags
+    if (mode == memory.UNGROUPED_CANVAS_MODE or "ungrouped_native_canvas" in flags
+            or any(field in snapshot for snapshot in (before, after) for field in memory.NATIVE_CANVAS_GROUP_COUNTERS)):
+        require("ungrouped_native_canvas" in flags, "Native Canvas grouping counters lack feature metadata")
+        callback_counts = []
+        for snapshot in (before, after):
+            value = snapshot["graphics_diagnostics"]
+            callbacks = memory.unsigned(value.get("native_gpu_canvas_draws"), "graphics.native_gpu_canvas_draws")
+            require(set(value["roles"]) == {"static_chart", "cursor", "rail_bars", "rail_decorations"}
+                    and callbacks == sum(memory.unsigned(role.get("draws"), "graphics.role.draws") for role in value["roles"].values()),
+                    "Native Canvas callbacks do not reconcile with drawn role frames")
+            require(callbacks == sum(memory.unsigned(snapshot.get(field), field) for field in memory.NATIVE_CANVAS_GROUP_COUNTERS),
+                    "Native Canvas grouping counters do not reconcile with native callbacks")
+            callback_counts.append(callbacks)
+        for field in memory.NATIVE_CANVAS_GROUP_COUNTERS:
+            first, last = before[field], after[field]
+            require(last >= first, f"Runtime {field} counter moved backwards")
+            delta[field] = last - first
+        require(sum(delta[field] for field in memory.NATIVE_CANVAS_GROUP_COUNTERS) == callback_counts[1] - callback_counts[0],
+                "Native Canvas grouping deltas do not reconcile with callback work")
+        if flags["ungrouped_native_canvas"]:
+            require(delta["ungrouped_native_canvas_draws"] > 0 and delta["grouped_native_canvas_draws"] == 0,
+                    "Ungrouped native Canvas did not execute callbacks without grouped fallback")
+        else:
+            require(before["ungrouped_native_canvas_draws"] == after["ungrouped_native_canvas_draws"] == 0,
+                    "Grouped native Canvas mode executed ungrouped callbacks")
+            require(delta["grouped_native_canvas_draws"] > 0, "Baseline native Canvas did not execute grouped callbacks")
+    if (mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE) or "direct_tool_plot" in flags
             or any(field in snapshot for snapshot in (before, after) for field in memory.DIRECT_TOOL_PLOT_COUNTERS)):
         require("direct_tool_plot" in flags, "Tool-plot counters lack feature metadata")
         for field in memory.DIRECT_TOOL_PLOT_COUNTERS:

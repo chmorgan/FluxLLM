@@ -17,7 +17,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 28)
+        XCTAssertEqual(Mode.allCases.count, 29)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -113,6 +113,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertFalse(diagnostics.mode.usesStableDecorationHosts)
         XCTAssertTrue(diagnostics.mode.usesOrderedChartPublication)
         XCTAssertFalse(diagnostics.mode.usesDirectToolPlot)
+        XCTAssertFalse(diagnostics.mode.usesUngroupedNativeCanvas)
         diagnostics.scalarPresentationPublished()
         XCTAssertNil(diagnostics.retainedTwinkleHostCreated())
         diagnostics.retainedTwinkleHostUpdated(
@@ -520,7 +521,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             assertCounter("invalid_events", in: snapshot, equals: 0)
             if mode.usesNativeGPUCanvas {
                 XCTAssertEqual(
-                    snapshot["native_gpu_backend"] as? String, "swiftui-canvas-drawing-group")
+                    snapshot["native_gpu_backend"] as? String,
+                    mode.usesUngroupedNativeCanvas
+                        ? "swiftui-canvas" : "swiftui-canvas-drawing-group")
                 XCTAssertEqual(
                     snapshot["scalar_presentation_coalesced"] as? Bool,
                     mode.usesCoalescedScalarPresentation)
@@ -554,6 +557,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 XCTAssertEqual(
                     snapshot["direct_tool_plot"] as? Bool,
                     mode.usesDirectToolPlot)
+                XCTAssertEqual(
+                    snapshot["ungrouped_native_canvas"] as? Bool,
+                    mode.usesUngroupedNativeCanvas)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
             }
@@ -617,7 +623,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         let next: [Mode] = [
             .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
             .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
-            .runtimeOrderedPublication, .runtimeDirectToolPlot,
+            .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
         ]
         let runtime: [Mode] =
             [
@@ -658,21 +664,22 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 mode.usesUnpromisedStreamBodyWrites,
                 [
                     .normal, .runtimeStreamWrites, .runtimeNextOptimized, .runtimeStreamCanvasClock,
-                    .runtimeOrderedPublication, .runtimeDirectToolPlot,
+                    .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
                 [
                     .normal, .runtimeCanvasClock, .runtimeStreamCanvasClock,
-                    .runtimeOrderedPublication, .runtimeDirectToolPlot,
+                    .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesOrderedChartPublication,
                 [
                     .normal, .runtimeSharedPreparation, .runtimeNextOptimized,
-                    .runtimeOrderedPublication, .runtimeDirectToolPlot,
+                    .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                 ].contains(mode))
             XCTAssertEqual(mode.usesDirectToolPlot, mode == .runtimeDirectToolPlot)
+            XCTAssertEqual(mode.usesUngroupedNativeCanvas, mode == .runtimeUngroupedCanvas)
         }
     }
 

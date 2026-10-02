@@ -33,8 +33,8 @@ struct ChartDrawingSurface: View {
     }
 }
 
-/// Direct on-screen Canvas with a native drawing group. Production code in this
-/// path never constructs ImageRenderer, a CGContext, or a CPU bitmap. A live
+/// Direct on-screen Canvas, with an optional diagnostic omission of its drawing
+/// group. This path never constructs ImageRenderer, a CGContext, or a CPU bitmap. A live
 /// native capture must still establish actual GPU execution; the view structure
 /// and its draw counter alone do not measure GPU utilization.
 struct NativeGPUChartCanvas: View {
@@ -42,24 +42,28 @@ struct NativeGPUChartCanvas: View {
     let revision: AnyHashable?
     let drawingBounds: CGRect?
     let drawing: ChartCanvas.Drawing
+    let ungrouped: Bool
     @Environment(\.self) private var environment
     @StateObject private var owner = NativeGPUChartCanvasOwner()
 
     init(
         role: PerformanceGraphicsDiagnostics.Role = .staticChart,
         revision: AnyHashable? = nil, drawingBounds: CGRect? = nil,
+        ungrouped: Bool? = nil,
         renderer: @escaping ChartCanvas.Drawing
     ) {
         self.role = role
         self.revision = revision
         self.drawingBounds = drawingBounds
         drawing = renderer
+        self.ungrouped =
+            ungrouped ?? PerformanceGraphicsDiagnostics.shared.mode.usesUngroupedNativeCanvas
     }
 
     var body: some View {
         Content(
             role: role, revision: revision, drawingBounds: drawingBounds,
-            drawing: drawing, environment: environment,
+            drawing: drawing, ungrouped: ungrouped, environment: environment,
             drawingEnvironment: DrawingEnvironment(environment), owner: owner,
             presentationGeneration: owner.presentationGeneration
         )
@@ -108,6 +112,7 @@ struct NativeGPUChartCanvas: View {
         let revision: AnyHashable?
         let drawingBounds: CGRect?
         let drawing: ChartCanvas.Drawing
+        let ungrouped: Bool
         let environment: EnvironmentValues
         let drawingEnvironment: DrawingEnvironment
         let owner: NativeGPUChartCanvasOwner
@@ -117,6 +122,7 @@ struct NativeGPUChartCanvas: View {
             guard let revision = lhs.revision else { return false }
             return rhs.revision == revision && lhs.role == rhs.role
                 && lhs.drawingBounds == rhs.drawingBounds
+                && lhs.ungrouped == rhs.ungrouped
                 && lhs.drawingEnvironment == rhs.drawingEnvironment
                 && lhs.owner === rhs.owner
                 && lhs.presentationGeneration == rhs.presentationGeneration
@@ -126,7 +132,8 @@ struct NativeGPUChartCanvas: View {
             // This is update accounting, not a rendered frame. The only frame
             // counter is inside the real Canvas callback below.
             owner.contentUpdated(role: role)
-            return Canvas(opaque: false, colorMode: .nonLinear, rendersAsynchronously: false) {
+            let canvas = Canvas(opaque: false, colorMode: .nonLinear, rendersAsynchronously: false)
+            {
                 context, size in
                 guard
                     owner.beginDraw(
@@ -139,10 +146,18 @@ struct NativeGPUChartCanvas: View {
                     context.translateBy(x: -drawingBounds.minX, y: -drawingBounds.minY)
                 }
                 drawing(&context, size)
+                PerformancePresentationCounters.shared.record(
+                    ungrouped ? .ungroupedNativeCanvasDraws : .groupedNativeCanvasDraws)
                 owner.didDraw(generation: presentationGeneration)
             }
             .environment(\.self, environment)
-            .drawingGroup(opaque: false, colorMode: .nonLinear)
+            return Group {
+                if ungrouped {
+                    canvas
+                } else {
+                    canvas.drawingGroup(opaque: false, colorMode: .nonLinear)
+                }
+            }
             .onAppear { owner.appeared(role: role) }
             .onDisappear { owner.disappeared() }
         }
