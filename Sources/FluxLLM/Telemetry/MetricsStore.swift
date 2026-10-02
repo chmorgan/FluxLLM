@@ -49,14 +49,20 @@ public final class MetricsStore {
     }
     public var historyRange: HistoryRange = .automatic {
         didSet {
-            guard historyRange != oldValue, presentationDemandIsManaged,
+            guard historyRange != oldValue else { return }
+            defer { publishDashboardScalarPresentation() }
+            guard presentationDemandIsManaged,
                 presentationConsumers.contains(.dashboard),
                 presentationViewports[.dashboard, default: .historyRange] == .historyRange
             else { return }
             refreshChartPresentation()
         }
     }
-    public var usageScope: UsageScope = .sinceLaunch
+    public var usageScope: UsageScope = .sinceLaunch {
+        didSet {
+            if usageScope != oldValue { publishDashboardScalarPresentation() }
+        }
+    }
     public private(set) var historySource = BackendKind.ollama.rawValue
     private var usageRevision: UInt64 = 0
     @ObservationIgnored private let usageHistory: UsageHistory
@@ -169,6 +175,9 @@ public final class MetricsStore {
     /// All chart series and their time axis advance together once per second.
     /// The raw half-second histories above retain every captured peak and gap.
     public private(set) var chartPresentation: ChartPresentationSnapshot
+    /// Diagnostic candidate: scalar views observe this one immutable value,
+    /// while public raw metrics and exact usage queries retain their semantics.
+    private(set) var dashboardScalarPresentation = DashboardScalarPresentation.empty
 
     public static let chartWindow: TimeInterval = 3600
     public static let maxHistorySamples = 7201
@@ -267,6 +276,7 @@ public final class MetricsStore {
     public func setChartPresentationDemand(
         _ enabled: Bool, consumer: ChartPresentationConsumer
     ) {
+        defer { publishDashboardScalarPresentation() }
         let wasActive = !presentationDemandIsManaged || !presentationConsumers.isEmpty
         presentationDemandIsManaged = true
         let previousConsumers = presentationConsumers
@@ -295,6 +305,7 @@ public final class MetricsStore {
             presentationViewports[consumer]
             ?? (consumer == .popover ? .live(duration: 60) : .historyRange)
         guard previous != viewport else { return }
+        defer { publishDashboardScalarPresentation() }
         presentationViewports[consumer] = viewport
         if presentationDemandIsManaged && presentationConsumers.contains(consumer) {
             refreshChartPresentation()
@@ -328,7 +339,19 @@ public final class MetricsStore {
         guard epoch == nil || epoch == monitoringEpoch,
             backendKind == nil || backendKind == .ollama
         else { return }
-        defer { refreshObservedProxyActivity() }
+        defer {
+            refreshObservedProxyActivity()
+            // All request boundaries must flush aggregate usage, including an
+            // older concurrent request that returns before the owning UI path.
+            switch event {
+            case .updated(_, let snapshot) where !snapshot.finished && snapshot.error == nil:
+                break
+            case .toolActivity:
+                break
+            default:
+                publishDashboardScalarPresentation()
+            }
+        }
         if diagnosticLogger.isEnabled {
             switch event {
             case .began(let request):
@@ -497,6 +520,7 @@ public final class MetricsStore {
 
     /// Changing sources never joins unrelated rates into one continuous trace.
     public func beginBackendSession(kind: BackendKind?, epoch: UUID, sourceID: String? = nil) {
+        defer { publishDashboardScalarPresentation() }
         let now = clock()
         usageHistory.finishOpenRequests(source: historySource, at: now)
         chartArchive.endSession(source: historySource, at: now)
@@ -857,6 +881,48 @@ public final class MetricsStore {
                 isAvailable: supportsToolActivity && proxyState == .listening
                     && (backendKind == nil || connectionState == .ready)))
         publishChartPresentationIfDue(at: date)
+        publishDashboardScalarPresentation()
+    }
+
+    /// Uses the existing half-second sampling loop. Hidden sessions retain no
+    /// display summaries or rebuilt query caches; explicit presentation, scope,
+    /// and lifecycle changes publish immediately without scheduling a timer.
+    private func publishDashboardScalarPresentation() {
+        guard PerformanceGraphicsDiagnostics.shared.mode.usesCoalescedScalarPresentation else {
+            return
+        }
+        guard !presentationDemandIsManaged || !presentationConsumers.isEmpty else {
+            if dashboardScalarPresentation != .empty {
+                dashboardScalarPresentation = .empty
+                PerformanceGraphicsDiagnostics.shared.scalarPresentationPublished()
+            }
+            return
+        }
+        let dashboardVisible =
+            !presentationDemandIsManaged || presentationConsumers.contains(.dashboard)
+        // The scalar cadence is twice the chart cadence. Selected-period usage
+        // must still use the chart's held endpoint, including a pinned viewport
+        // when a simultaneous popover displays a different live interval.
+        let interval = presentationViewports[.dashboard, default: .historyRange].interval(
+            at: chartPresentation.timestamp, range: historyRange, historyAge: chartHistoryAge)
+        let usage =
+            dashboardVisible
+            ? usageHistory.summary(
+                scope: usageScope, source: historySource, interval: interval, now: sampleDate)
+            : DashboardScalarPresentation.empty.usage
+        let next = DashboardScalarPresentation(
+            latestResponse: activeGeneration.map {
+                DashboardScalarPresentation.LatestResponse(
+                    requestID: $0.id, outputTokens: outputTokens,
+                    outputIsEstimated: outputIsEstimated)
+            },
+            usage: usage, usageScope: usageScope,
+            selectedInterval: dashboardVisible && usageScope == .selectedPeriod ? interval : nil,
+            historyPersistenceError: usageHistory.persistenceError ?? chartArchive.persistenceError)
+        if next != dashboardScalarPresentation {
+            dashboardScalarPresentation = next
+            PerformanceGraphicsDiagnostics.shared.scalarPresentationPublished()
+        }
     }
 
     /// Sampling continues while idle so completed activity ages off the chart.

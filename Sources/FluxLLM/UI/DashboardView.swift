@@ -365,7 +365,7 @@ struct DashboardView: View {
     private func dashboardDetails(narrow: Bool, density: DashboardHeightPolicy) -> some View {
         VStack(alignment: .leading, spacing: density.value(8, 5)) {
             if store.backendKind == .ollama {
-                let totals = store.usageSummary(in: chartInterval)
+                let totals = displayedUsageSummary
                 HStack(spacing: 8) {
                     Text("Usage").font(.system(size: 11, weight: .semibold))
                     Picker("Usage scope", selection: usageScope) {
@@ -418,7 +418,7 @@ struct DashboardView: View {
                     summaryValue("Requests", requestCountLabel, density: density)
                 }
             }
-            if let error = store.historyPersistenceError {
+            if let error = displayedHistoryPersistenceError {
                 Label("History storage unavailable", systemImage: "exclamationmark.triangle")
                     .font(.system(size: 10)).foregroundStyle(.secondary).help(error)
             }
@@ -591,8 +591,26 @@ struct DashboardView: View {
         return model
     }
     private var responseTokensLabel: String {
-        store.activeGeneration == nil
+        if PerformanceGraphicsDiagnostics.shared.mode.usesCoalescedScalarPresentation {
+            guard let response = store.dashboardScalarPresentation.latestResponse else {
+                return "—"
+            }
+            return (response.outputIsEstimated ? "~" : "") + response.outputTokens.formatted()
+        }
+        return store.activeGeneration == nil
             ? "—" : (store.outputIsEstimated ? "~" : "") + store.outputTokens.formatted()
+    }
+    private var displayedUsageSummary: UsageSummary {
+        if PerformanceGraphicsDiagnostics.shared.mode.usesCoalescedScalarPresentation {
+            return store.dashboardScalarPresentation.usage
+        }
+        return store.usageSummary(in: chartInterval)
+    }
+    private var displayedHistoryPersistenceError: String? {
+        if PerformanceGraphicsDiagnostics.shared.mode.usesCoalescedScalarPresentation {
+            return store.dashboardScalarPresentation.historyPersistenceError
+        }
+        return store.historyPersistenceError
     }
     private var requestCountLabel: String {
         guard let running = store.runningRequests else { return "—" }
