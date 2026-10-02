@@ -6,6 +6,7 @@ final class PreparedDashboardCharts {
     let duration: TimeInterval
     let windowEnd: Date
     let isLive: Bool
+    let optimized: Bool
     let throughput: ChartDisplayHistory
     let gpu: ChartDisplayHistory
     let toolActivity: ToolActivityHistory?
@@ -15,27 +16,46 @@ final class PreparedDashboardCharts {
     let requestTools: [UUID: ToolActivityHistory]
     let omittedRequestCount: Int
 
+    struct LaneSelection {
+        let rendered: [RequestLane]
+        let omittedCount: Int
+    }
+
     init(
         snapshot: ChartPresentationSnapshot, duration: TimeInterval,
-        requestRails: RequestRailPresentation? = nil, windowEnd: Date? = nil, isLive: Bool = true
+        requestRails: RequestRailPresentation? = nil, windowEnd: Date? = nil, isLive: Bool = true,
+        optimized: Bool = false, laneSelection: LaneSelection? = nil
     ) {
         PerformancePresentationCounters.shared.record(.chartPreparations)
+        if optimized { PerformancePresentationCounters.shared.record(.optimizedChartPreparations) }
         publicationID = snapshot.publicationID
         self.duration = duration
         let end = min(windowEnd ?? snapshot.timestamp, snapshot.timestamp)
         self.windowEnd = end
         self.isLive = isLive
+        self.optimized = optimized
         throughput = ChartDisplayHistory(
             samples: snapshot.throughput, now: end, duration: duration,
             archivedSegments: snapshot.archive.throughput)
         gpu = ChartDisplayHistory(
             samples: GPUActivityPresentation.chartSamples(snapshot.systemGPU),
             now: end, duration: duration, archivedSegments: snapshot.archive.systemGPU)
-        var eventsByID: [UUID: ToolActivityEvent] = [:]
-        for event in snapshot.historicalToolActivity + snapshot.toolActivity {
-            eventsByID[event.id] = event
+        let events: [ToolActivityEvent]
+        let knownToolRequests: Set<UUID>
+        if optimized {
+            let tools = PreparedDashboardToolEvents(snapshot: snapshot, through: end)
+            events = tools.events
+            knownToolRequests = tools.knownRequestIDs
+        } else {
+            var eventsByID: [UUID: ToolActivityEvent] = [:]
+            for event in snapshot.historicalToolActivity + snapshot.toolActivity {
+                eventsByID[event.id] = event
+            }
+            events = ToolActivityHistory.normalizedEvents(Array(eventsByID.values), through: end)
+            knownToolRequests =
+                snapshot.toolActivityRequestIDs
+                ?? Set(eventsByID.values.compactMap(\.requestID))
         }
-        let events = ToolActivityHistory.normalizedEvents(Array(eventsByID.values), through: end)
         let toolObservation = ToolActivityObservation(
             observations: snapshot.toolObservation, now: end, duration: duration,
             archivedSegments: snapshot.archive.toolObservation)
@@ -46,11 +66,19 @@ final class PreparedDashboardCharts {
 
         // A retained allocator keeps request identity separate from the reused
         // track. Range changes and history expiry never renumber existing hues.
-        let visible = Self.visibleLanes(snapshot: snapshot, end: end, duration: duration)
-        // Totals retain every request; bounded rails keep long busy periods responsive.
-        let rendered = Self.renderedLanes(visible)
+        let rendered: [RequestLane]
+        if optimized {
+            let selection =
+                laneSelection
+                ?? Self.optimizedLaneSelection(snapshot: snapshot, end: end, duration: duration)
+            rendered = selection.rendered
+            omittedRequestCount = selection.omittedCount
+        } else {
+            let visible = Self.visibleLanes(snapshot: snapshot, end: end, duration: duration)
+            rendered = Self.renderedLanes(visible)
+            omittedRequestCount = visible.count - rendered.count
+        }
         lanes = rendered
-        omittedRequestCount = visible.count - rendered.count
         let rails =
             requestRails
             ?? RequestRailState().update(
@@ -64,9 +92,6 @@ final class PreparedDashboardCharts {
         let renderedIDs = Set(rendered.map(\.id))
         // A frozen window can precede a request's first tool event. Keep its
         // empty overlay (and observed zero-rate spans) just as in live history.
-        let knownToolRequests =
-            snapshot.toolActivityRequestIDs
-            ?? Set(eventsByID.values.compactMap(\.requestID))
         for id in knownToolRequests where renderedIDs.contains(id) { grouped[id] = [] }
         for event in events {
             guard let id = event.requestID, renderedIDs.contains(id) else { continue }
@@ -76,6 +101,39 @@ final class PreparedDashboardCharts {
             grouped.mapValues {
                 ToolActivityHistory(preparedEvents: $0, observation: toolObservation)
             }
+    }
+
+    /// Select once for both rendering and retained rail lifecycles. The visible
+    /// order already contains the start-time/identity ordering that drawing needs.
+    static func optimizedLaneSelection(
+        snapshot: ChartPresentationSnapshot, end: Date, duration: TimeInterval
+    ) -> LaneSelection {
+        var byID: [UUID: RequestLane] = [:]
+        byID.reserveCapacity(
+            max(snapshot.historicalRequestLanes.count, snapshot.requestLanes.count))
+        for lane in snapshot.historicalRequestLanes { byID[lane.id] = lane }
+        for lane in snapshot.requestLanes { byID[lane.id] = lane }
+        let start = end.addingTimeInterval(-duration)
+        let visible = byID.values.filter {
+            $0.startedAt <= end && ($0.endedAt ?? snapshot.timestamp) >= start
+        }.sorted {
+            $0.startedAt == $1.startedAt
+                ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
+        }
+        let openCount = visible.reduce(0) {
+            $0 + (!$1.terminal && $1.endedAt == nil ? 1 : 0)
+        }
+        let omittedCount = max(0, visible.count - max(256, openCount))
+        var remainingToOmit = omittedCount
+        let rendered = visible.filter { lane in
+            if !lane.terminal && lane.endedAt == nil { return true }
+            if remainingToOmit > 0 {
+                remainingToOmit -= 1
+                return false
+            }
+            return true
+        }
+        return LaneSelection(rendered: rendered, omittedCount: omittedCount)
     }
 
     static func renderedLanes(_ visible: [RequestLane]) -> [RequestLane] {
@@ -103,6 +161,96 @@ final class PreparedDashboardCharts {
     }
 }
 
+/// Merge immutable source publications without discarding their usual timestamp
+/// order. Winner indexes preserve corrections without copying event values into a
+/// dictionary or deduplicating them a second time during normalization.
+private struct PreparedDashboardToolEvents {
+    let events: [ToolActivityEvent]
+    let knownRequestIDs: Set<UUID>
+
+    init(snapshot: ChartPresentationSnapshot, through end: Date) {
+        let historical = snapshot.historicalToolActivity
+        let current = snapshot.toolActivity
+        var winnerIndexes: [UUID: Int] = [:]
+        winnerIndexes.reserveCapacity(max(historical.count, current.count))
+        for (index, event) in historical.enumerated() { winnerIndexes[event.id] = index }
+        var historicalWinnerCount = winnerIndexes.count
+        for (index, event) in current.enumerated() {
+            if let previous = winnerIndexes.updateValue(historical.count + index, forKey: event.id),
+                previous < historical.count
+            {
+                historicalWinnerCount -= 1
+            }
+        }
+
+        var knownRequests = snapshot.toolActivityRequestIDs ?? []
+        let deriveKnownRequests = snapshot.toolActivityRequestIDs == nil
+        func survivors(
+            _ source: [ToolActivityEvent], offset: Int, capacity: Int
+        ) -> (events: [ToolActivityEvent], ordered: Bool) {
+            var result: [ToolActivityEvent] = []
+            result.reserveCapacity(capacity)
+            var ordered = true
+            for (index, event) in source.enumerated() {
+                guard winnerIndexes[event.id] == offset + index else { continue }
+                // Resolve winners before filtering: an invalid/future correction
+                // suppresses the old copy, while still identifying its overlay.
+                if deriveKnownRequests, let requestID = event.requestID {
+                    knownRequests.insert(requestID)
+                }
+                guard event.timestamp.timeIntervalSince1970.isFinite, event.timestamp <= end else {
+                    continue
+                }
+                if let previous = result.last, event.timestamp < previous.timestamp {
+                    ordered = false
+                }
+                result.append(event)
+            }
+            return (result, ordered)
+        }
+        let saved = survivors(historical, offset: 0, capacity: historicalWinnerCount)
+        let live = survivors(
+            current, offset: historical.count, capacity: winnerIndexes.count - historicalWinnerCount
+        )
+        knownRequestIDs = knownRequests
+        if saved.ordered && live.ordered {
+            if saved.events.isEmpty {
+                events = live.events
+                return
+            }
+            if live.events.isEmpty {
+                events = saved.events
+                return
+            }
+            var merged: [ToolActivityEvent] = []
+            merged.reserveCapacity(saved.events.count + live.events.count)
+            var savedIndex = 0
+            var liveIndex = 0
+            while savedIndex < saved.events.count && liveIndex < live.events.count {
+                // Equal timestamps retain source order, including historical
+                // evidence before current evidence at the same instant.
+                if saved.events[savedIndex].timestamp <= live.events[liveIndex].timestamp {
+                    merged.append(saved.events[savedIndex])
+                    savedIndex += 1
+                } else {
+                    merged.append(live.events[liveIndex])
+                    liveIndex += 1
+                }
+            }
+            merged.append(contentsOf: saved.events[savedIndex...])
+            merged.append(contentsOf: live.events[liveIndex...])
+            events = merged
+        } else {
+            // Imported/test publications can be unordered. Keep the same stable
+            // timestamp normalization without assuming ingestion ordering.
+            events = (saved.events + live.events).enumerated().sorted {
+                $0.element.timestamp == $1.element.timestamp
+                    ? $0.offset < $1.offset : $0.element.timestamp < $1.element.timestamp
+            }.map(\.element)
+        }
+    }
+}
+
 /// Keeps history preparation publication-bound while request identities survive range changes.
 final class DashboardChartPreparation {
     private var prepared: PreparedDashboardCharts?
@@ -125,7 +273,7 @@ final class DashboardChartPreparation {
 
     func histories(
         snapshot: ChartPresentationSnapshot, duration: TimeInterval, epoch: UUID? = nil,
-        windowEnd: Date? = nil, isLive: Bool? = nil
+        windowEnd: Date? = nil, isLive: Bool? = nil, optimized: Bool = false
     ) -> PreparedDashboardCharts {
         let end = min(windowEnd ?? snapshot.timestamp, snapshot.timestamp)
         let followingLive = isLive ?? (windowEnd == nil)
@@ -140,16 +288,22 @@ final class DashboardChartPreparation {
         }
         if let prepared, prepared.publicationID == snapshot.publicationID,
             prepared.duration == duration, prepared.windowEnd == end,
-            prepared.isLive == followingLive
+            prepared.isLive == followingLive, prepared.optimized == optimized
         {
             return prepared
         }
+        let selection =
+            optimized
+            ? PreparedDashboardCharts.optimizedLaneSelection(
+                snapshot: snapshot, end: end, duration: duration) : nil
         if railPublicationID != snapshot.publicationID || railWindow != window {
-            let lanes = PreparedDashboardCharts.visibleLanes(
-                snapshot: snapshot, end: end, duration: duration)
+            let rendered =
+                selection?.rendered
+                ?? PreparedDashboardCharts.renderedLanes(
+                    PreparedDashboardCharts.visibleLanes(
+                        snapshot: snapshot, end: end, duration: duration))
             var tracked = Dictionary(
-                uniqueKeysWithValues:
-                    PreparedDashboardCharts.renderedLanes(lanes).map { ($0.id, $0) })
+                uniqueKeysWithValues: rendered.map { ($0.id, $0) })
             // Keep receiving current lifecycles while the viewport is pinned in
             // the past; otherwise an unseen completion could strand an open rail.
             for lane in snapshot.requestLanes { tracked[lane.id] = lane }
@@ -165,7 +319,7 @@ final class DashboardChartPreparation {
             : requestRails
         let prepared = PreparedDashboardCharts(
             snapshot: snapshot, duration: duration, requestRails: rails, windowEnd: end,
-            isLive: followingLive)
+            isLive: followingLive, optimized: optimized, laneSelection: selection)
         self.prepared = prepared
         return prepared
     }
