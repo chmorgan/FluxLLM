@@ -17,7 +17,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 13)
+        XCTAssertEqual(Mode.allCases.count, 16)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -497,13 +497,19 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             diagnostics.nativeGPUCanvasDrawn(id)
             diagnostics.nativeGPUCanvasDrawn(id)
             let snapshot = diagnostics.snapshot()
-            let expected: UInt64 = mode == .nativeGPUCanvas ? 2 : 0
+            let expected: UInt64 = mode.usesNativeGPUCanvas ? 2 : 0
             assertCounter("native_gpu_canvas_draws", in: snapshot, equals: expected)
             assertCounter("draws", in: try role(.staticChart, in: snapshot), equals: expected)
             assertCounter("invalid_events", in: snapshot, equals: 0)
-            if mode == .nativeGPUCanvas {
+            if mode.usesNativeGPUCanvas {
                 XCTAssertEqual(
                     snapshot["native_gpu_backend"] as? String, "swiftui-canvas-drawing-group")
+                XCTAssertEqual(
+                    snapshot["scalar_presentation_coalesced"] as? Bool,
+                    mode.usesCoalescedScalarPresentation)
+                XCTAssertEqual(
+                    snapshot["retained_twinkles_enabled"] as? Bool,
+                    mode.usesRetainedTwinkles)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
             }
@@ -560,6 +566,107 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         diagnostics.nativeGPUCanvasDrawn(replacement)
         assertCounter("native_gpu_canvas_draws", in: diagnostics.snapshot(), equals: 0)
         assertCounter("invalid_events", in: diagnostics.snapshot(), equals: 1)
+    }
+
+    func testNativeOptimizationControlsChangeOnlyTheirNamedFeatures() {
+        typealias Mode = PerformanceGraphicsDiagnostics.Mode
+        for mode in Mode.allCases {
+            XCTAssertEqual(
+                mode.usesNativeGPUCanvas,
+                [
+                    .nativeGPUCanvas, .nativeGPUCoalescedScalars,
+                    .nativeGPURetainedTwinkles, .nativeGPUOptimized,
+                ].contains(mode))
+            XCTAssertEqual(
+                mode.usesCoalescedScalarPresentation,
+                [.nativeGPUCoalescedScalars, .nativeGPUOptimized].contains(mode))
+            XCTAssertEqual(
+                mode.usesRetainedTwinkles,
+                [.nativeGPURetainedTwinkles, .nativeGPUOptimized].contains(mode))
+        }
+    }
+
+    func testRetainedTwinklesAccountForReplacementAndReleaseAcrossHosts() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .nativeGPURetainedTwinkles)
+        let first = try XCTUnwrap(diagnostics.retainedTwinkleHostCreated())
+        let second = try XCTUnwrap(diagnostics.retainedTwinkleHostCreated())
+        diagnostics.retainedTwinkleHostUpdated(first, instances: ["a", "b"], animationsStarted: 8)
+        diagnostics.retainedTwinkleHostUpdated(second, instances: ["a"], animationsStarted: 4)
+        // Updating geometry must not claim new instances or new animations.
+        diagnostics.retainedTwinkleHostUpdated(first, instances: ["a", "b"], animationsStarted: 0)
+        diagnostics.retainedTwinkleHostUpdated(first, instances: ["b", "c"], animationsStarted: 4)
+        let live = try XCTUnwrap(diagnostics.snapshot()["retained_twinkles"] as? [String: UInt64])
+        XCTAssertEqual(live["instances_created"], 4)
+        XCTAssertEqual(live["instances_destroyed"], 1)
+        XCTAssertEqual(live["live_instances"], 3)
+        XCTAssertEqual(live["peak_instances"], 3)
+        XCTAssertEqual(live["animation_starts"], 16)
+        XCTAssertThrowsError(try diagnostics.disable())
+        diagnostics.retainedTwinkleHostDestroyed(first)
+        diagnostics.retainedTwinkleHostDestroyed(second)
+        let closed = try XCTUnwrap(diagnostics.snapshot()["retained_twinkles"] as? [String: UInt64])
+        XCTAssertEqual(closed["live_hosts"], 0)
+        XCTAssertEqual(closed["live_instances"], 0)
+        XCTAssertEqual(closed["hosts_destroyed"], 2)
+        XCTAssertEqual(closed["instances_destroyed"], 4)
+        try diagnostics.disable()
+        XCTAssertEqual(
+            diagnostics.snapshot() as NSDictionary,
+            PerformanceGraphicsDiagnostics().snapshot() as NSDictionary)
+    }
+
+    func testRetainedTwinklesRejectStaleOwnersOverCapacityAndOverflowAtomically() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .nativeGPUOptimized)
+        let host = try XCTUnwrap(diagnostics.retainedTwinkleHostCreated())
+        diagnostics.retainedTwinkleHostUpdated(host, instances: [1], animationsStarted: 4)
+        let before = diagnostics.snapshot()["retained_twinkles"] as? [String: UInt64]
+        diagnostics.retainedTwinkleHostUpdated(host, instances: [1, 2, 3], animationsStarted: 8)
+        diagnostics.retainedTwinkleHostUpdated(host, instances: [2], animationsStarted: .max)
+        XCTAssertEqual(diagnostics.snapshot()["retained_twinkles"] as? [String: UInt64], before)
+        diagnostics.retainedTwinkleHostDestroyed(host)
+        let closed = diagnostics.snapshot()["retained_twinkles"] as? [String: UInt64]
+        diagnostics.retainedTwinkleHostUpdated(host, instances: [2], animationsStarted: 4)
+        diagnostics.retainedTwinkleHostDestroyed(host)
+        diagnostics.retainedTwinkleHostUpdated(nil, instances: [2], animationsStarted: 4)
+        diagnostics.retainedTwinkleHostDestroyed(nil)
+        XCTAssertEqual(diagnostics.snapshot()["retained_twinkles"] as? [String: UInt64], closed)
+        assertCounter("invalid_events", in: diagnostics.snapshot(), equals: 4)
+    }
+
+    func testRetainedTwinkleEvidenceIsScopedToRequestedBackend() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        for mode in PerformanceGraphicsDiagnostics.Mode.allCases {
+            try diagnostics.enable(mode: mode)
+            let host = diagnostics.retainedTwinkleHostCreated()
+            XCTAssertEqual(host != nil, mode.usesRetainedTwinkles)
+            diagnostics.retainedTwinkleHostUpdated(host, instances: [1], animationsStarted: 4)
+            diagnostics.retainedTwinkleHostDestroyed(host)
+            let snapshot = diagnostics.snapshot()
+            XCTAssertEqual(
+                snapshot["retained_twinkle_backend"] as? String,
+                mode.usesRetainedTwinkles ? "core-animation-shape-layers" : nil)
+            let counters = try XCTUnwrap(snapshot["retained_twinkles"] as? [String: UInt64])
+            XCTAssertEqual(counters["animation_starts"], mode.usesRetainedTwinkles ? 4 : 0)
+            assertCounter("invalid_events", in: snapshot, equals: 0)
+        }
+    }
+
+    func testScalarPublicationsAreScopedAndReset() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        diagnostics.scalarPresentationPublished()
+        assertCounter("scalar_presentation_publications", in: diagnostics.snapshot(), equals: 0)
+        for mode in PerformanceGraphicsDiagnostics.Mode.allCases {
+            try diagnostics.enable(mode: mode)
+            diagnostics.scalarPresentationPublished()
+            diagnostics.scalarPresentationPublished()
+            assertCounter(
+                "scalar_presentation_publications", in: diagnostics.snapshot(),
+                equals: mode.usesCoalescedScalarPresentation ? 2 : 0)
+        }
+        try diagnostics.disable()
+        assertCounter("scalar_presentation_publications", in: diagnostics.snapshot(), equals: 0)
     }
 
     private var layerModes: [PerformanceGraphicsDiagnostics.Mode] {

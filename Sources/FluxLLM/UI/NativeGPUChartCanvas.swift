@@ -21,7 +21,7 @@ struct ChartDrawingSurface: View {
     }
 
     var body: some View {
-        if PerformanceGraphicsDiagnostics.shared.mode == .nativeGPUCanvas {
+        if PerformanceGraphicsDiagnostics.shared.mode.usesNativeGPUCanvas {
             NativeGPUChartCanvas(
                 role: role, revision: revision, drawingBounds: drawingBounds,
                 renderer: drawing)

@@ -14,6 +14,9 @@ public final class PerformanceGraphicsDiagnostics {
         case bitmapLayerBGRA = "bitmap-layer-bgra"
         case bitmapLayerNoDecorations = "bitmap-layer-no-decorations"
         case nativeGPUCanvas = "native-gpu-canvas"
+        case nativeGPUCoalescedScalars = "native-gpu-coalesced-scalars"
+        case nativeGPURetainedTwinkles = "native-gpu-retained-twinkles"
+        case nativeGPUOptimized = "native-gpu-optimized"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -31,6 +34,19 @@ public final class PerformanceGraphicsDiagnostics {
         var usesBGRA: Bool { self == .bitmapLayerBGRA }
 
         var omitsRailDecorations: Bool { self == .bitmapLayerNoDecorations }
+
+        var usesNativeGPUCanvas: Bool {
+            self == .nativeGPUCanvas || self == .nativeGPUCoalescedScalars
+                || self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
+        }
+
+        var usesCoalescedScalarPresentation: Bool {
+            self == .nativeGPUCoalescedScalars || self == .nativeGPUOptimized
+        }
+
+        var usesRetainedTwinkles: Bool {
+            self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
+        }
     }
 
     public enum Role: String, CaseIterable, Sendable {
@@ -110,20 +126,46 @@ public final class PerformanceGraphicsDiagnostics {
     private var layerBitmapFailures: UInt64 = 0
     private var layerBitmapNativeDraws: UInt64 = 0
     private var nativeGPUCanvasDraws: UInt64 = 0
+    private var scalarPresentationPublications: UInt64 = 0
+    private var twinkleHosts: [UInt64: Set<AnyHashable>] = [:]
+    private var twinkleCounters = TwinkleCounters()
+
+    private struct TwinkleCounters {
+        var hostsCreated: UInt64 = 0
+        var hostsDestroyed: UInt64 = 0
+        var peakHosts: UInt64 = 0
+        var instancesCreated: UInt64 = 0
+        var instancesDestroyed: UInt64 = 0
+        var peakInstances: UInt64 = 0
+        var animationStarts: UInt64 = 0
+
+        var liveHosts: UInt64 { hostsCreated - hostsDestroyed }
+        var liveInstances: UInt64 { instancesCreated - instancesDestroyed }
+
+        var snapshot: [String: UInt64] {
+            [
+                "hosts_created": hostsCreated, "hosts_destroyed": hostsDestroyed,
+                "live_hosts": liveHosts, "peak_hosts": peakHosts,
+                "instances_created": instancesCreated, "instances_destroyed": instancesDestroyed,
+                "live_instances": liveInstances, "peak_instances": peakInstances,
+                "animation_starts": animationStarts,
+            ]
+        }
+    }
 
     init() {}
 
     /// Must be selected before native views are created. Keeping live tokens
     /// across a mode change would make lifecycle and backing comparisons false.
     public func enable(mode: Mode = .normal) throws {
-        guard canvases.isEmpty else { throw ConfigurationError.liveCanvases }
+        guard canvases.isEmpty, twinkleHosts.isEmpty else { throw ConfigurationError.liveCanvases }
         reset()
         self.mode = mode
         isEnabled = true
     }
 
     public func disable() throws {
-        guard canvases.isEmpty else { throw ConfigurationError.liveCanvases }
+        guard canvases.isEmpty, twinkleHosts.isEmpty else { throw ConfigurationError.liveCanvases }
         reset()
         mode = .normal
         isEnabled = false
@@ -139,6 +181,8 @@ public final class PerformanceGraphicsDiagnostics {
         layerBitmapFailures = 0
         layerBitmapNativeDraws = 0
         nativeGPUCanvasDraws = 0
+        scalarPresentationPublications = 0
+        twinkleCounters = TwinkleCounters()
     }
 
     public func canvasCreated(role: Role) -> UInt64? {
@@ -326,7 +370,7 @@ public final class PerformanceGraphicsDiagnostics {
     /// drawing-group backend. This counts CPU callbacks, not GPU executions or
     /// GPU time. Call instead of canvasDrawn so role and backend totals agree.
     public func nativeGPUCanvasDrawn(_ id: UInt64?) {
-        guard isEnabled, mode == .nativeGPUCanvas,
+        guard isEnabled, mode.usesNativeGPUCanvas,
             let (_, canvas) = registered(id)
         else { return }
         let next = nativeGPUCanvasDraws.addingReportingOverflow(1)
@@ -337,6 +381,62 @@ public final class PerformanceGraphicsDiagnostics {
         }
         nativeGPUCanvasDraws = next.partialValue
         roles[canvas.role]!.draws = nextRole.partialValue
+    }
+
+    /// Bounded lifecycle evidence for retained Core Animation shapes. These
+    /// count installed animations, never displayed frames or GPU execution time.
+    func retainedTwinkleHostCreated() -> UInt64? {
+        guard isEnabled, mode.usesRetainedTwinkles else { return nil }
+        nextID += 1
+        twinkleHosts[nextID] = []
+        twinkleCounters.hostsCreated += 1
+        twinkleCounters.peakHosts = max(twinkleCounters.peakHosts, twinkleCounters.liveHosts)
+        return nextID
+    }
+
+    func scalarPresentationPublished() {
+        guard isEnabled, mode.usesCoalescedScalarPresentation else { return }
+        let next = scalarPresentationPublications.addingReportingOverflow(1)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return
+        }
+        scalarPresentationPublications = next.partialValue
+    }
+
+    func retainedTwinkleHostUpdated(
+        _ id: UInt64?, instances: Set<AnyHashable>, animationsStarted: UInt64
+    ) {
+        guard isEnabled, mode.usesRetainedTwinkles, let id else { return }
+        guard let previous = twinkleHosts[id], instances.count <= 2 else {
+            invalidEvents += 1
+            return
+        }
+        let created = twinkleCounters.instancesCreated.addingReportingOverflow(
+            UInt64(instances.subtracting(previous).count))
+        let destroyed = twinkleCounters.instancesDestroyed.addingReportingOverflow(
+            UInt64(previous.subtracting(instances).count))
+        let animations = twinkleCounters.animationStarts.addingReportingOverflow(animationsStarted)
+        guard !created.overflow, !destroyed.overflow, !animations.overflow else {
+            invalidEvents += 1
+            return
+        }
+        twinkleHosts[id] = instances
+        twinkleCounters.instancesCreated = created.partialValue
+        twinkleCounters.instancesDestroyed = destroyed.partialValue
+        twinkleCounters.animationStarts = animations.partialValue
+        twinkleCounters.peakInstances = max(
+            twinkleCounters.peakInstances, twinkleCounters.liveInstances)
+    }
+
+    func retainedTwinkleHostDestroyed(_ id: UInt64?) {
+        guard isEnabled, mode.usesRetainedTwinkles, let id else { return }
+        guard let instances = twinkleHosts.removeValue(forKey: id) else {
+            invalidEvents += 1
+            return
+        }
+        twinkleCounters.hostsDestroyed += 1
+        twinkleCounters.instancesDestroyed += UInt64(instances.count)
     }
 
     public func drawSkipped(_ id: UInt64?) {
@@ -378,6 +478,8 @@ public final class PerformanceGraphicsDiagnostics {
             "layer_bitmap_failures": layerBitmapFailures,
             "layer_bitmap_native_draws": layerBitmapNativeDraws,
             "native_gpu_canvas_draws": nativeGPUCanvasDraws,
+            "scalar_presentation_publications": scalarPresentationPublications,
+            "retained_twinkles": twinkleCounters.snapshot,
             "live_canvases": total.live, "peak_live_canvases": total.peakLive,
             "live_renderers": total.liveRenderers,
             "peak_live_renderers": total.peakLiveRenderers,
@@ -398,8 +500,13 @@ public final class PerformanceGraphicsDiagnostics {
             result["layer_bitmap_color_space"] = "device-rgb"
             result["rail_decorations_enabled"] = !mode.omitsRailDecorations
         }
-        if isEnabled, mode == .nativeGPUCanvas {
+        if isEnabled, mode.usesNativeGPUCanvas {
             result["native_gpu_backend"] = "swiftui-canvas-drawing-group"
+            result["scalar_presentation_coalesced"] = mode.usesCoalescedScalarPresentation
+            result["retained_twinkles_enabled"] = mode.usesRetainedTwinkles
+        }
+        if isEnabled, mode.usesRetainedTwinkles {
+            result["retained_twinkle_backend"] = "core-animation-shape-layers"
         }
         return result
     }
