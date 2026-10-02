@@ -32,6 +32,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeUngroupedCanvas = "runtime-ungrouped-canvas"
         case runtimeNoArrivalEffects = "runtime-no-arrival-effects"
         case runtimeCompactToolPaths = "runtime-compact-tool-paths"
+        case runtimeDeferredToolGeometry = "runtime-deferred-tool-geometry"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -73,7 +74,7 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
                 .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
                 .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
-                .runtimeNoArrivalEffects, .runtimeCompactToolPaths:
+                .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry:
                 true
             default:
                 false
@@ -97,11 +98,14 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeUngroupedCanvas
                 || self == .runtimeNoArrivalEffects
                 || self == .runtimeCompactToolPaths
+                || self == .runtimeDeferredToolGeometry
         }
 
         var usesDirectToolPlot: Bool { self == .runtimeDirectToolPlot }
 
         var usesCompactToolPaths: Bool { self == .runtimeCompactToolPaths }
+
+        var usesDeferredToolGeometry: Bool { self == .runtimeDeferredToolGeometry }
 
         var usesUngroupedNativeCanvas: Bool { self == .runtimeUngroupedCanvas }
 
@@ -112,6 +116,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeUngroupedCanvas
                 || self == .runtimeNoArrivalEffects
                 || self == .runtimeCompactToolPaths
+                || self == .runtimeDeferredToolGeometry
         }
 
         var usesCanvasFrameClock: Bool {
@@ -121,6 +126,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeUngroupedCanvas
                 || self == .runtimeNoArrivalEffects
                 || self == .runtimeCompactToolPaths
+                || self == .runtimeDeferredToolGeometry
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -610,6 +616,7 @@ public final class PerformanceGraphicsDiagnostics {
             result["arrival_effects_enabled"] =
                 !mode.omitsLifecycleEffects && !mode.omitsArrivalEffects
             result["compact_tool_paths_enabled"] = mode.usesCompactToolPaths
+            result["deferred_tool_geometry_enabled"] = mode.usesDeferredToolGeometry
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

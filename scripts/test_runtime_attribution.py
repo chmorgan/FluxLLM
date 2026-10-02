@@ -29,6 +29,9 @@ def workload_snapshots(mode):
     if mode == memory.COMPACT_TOOL_PATHS_MODE:
         after["tool_path_input_points"] += 100
         after["tool_path_output_points"] += 30
+    if mode == memory.DEFERRED_TOOL_GEOMETRY_MODE:
+        after["tool_path_input_points"] += 100
+        after["tool_path_output_points"] += 100
     if value.get("ordered_chart_publication"):
         after["ordered_chart_publication_queries"] += 2
     if value.get("direct_tool_plot"):
@@ -149,7 +152,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled") if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled") if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -387,6 +390,51 @@ class NativeCanvasGroupingWorkTests(unittest.TestCase):
         for snapshot in (before, after):
             for field in memory.NATIVE_CANVAS_GROUP_COUNTERS:
                 del snapshot[field]
+        self.assertTrue(runtime.validate_runtime_work(before, after, "normal")["available"])
+
+
+class DeferredToolGeometryWorkTests(unittest.TestCase):
+    def test_candidate_uses_actual_positive_uncompacted_construction_and_preserves_cadence(self):
+        mode = memory.DEFERRED_TOOL_GEOMETRY_MODE
+        before, after = workload_snapshots(mode)
+        candidate = runtime.validate_runtime_work(before, after, mode)
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"].update(mode="normal", deferred_tool_geometry_enabled=False)
+        baseline = runtime.validate_runtime_work(before, after, "normal")
+        self.assertEqual(candidate["features"], baseline["features"] | {"deferred_tool_geometry_enabled": True})
+        self.assertEqual(candidate["deltas"], baseline["deltas"])
+        self.assertEqual(candidate["deltas"]["tool_path_input_points"], 100)
+        self.assertEqual(candidate["deltas"]["tool_path_output_points"], 100)
+        self.assertEqual(candidate["deltas"]["legacy_tool_plot_builds"], 2)
+        self.assertEqual(candidate["deltas"]["static_chart_draws"], 2)
+
+    def test_zero_construction_missing_flag_and_compaction_cannot_claim_deferred_work(self):
+        mode = memory.DEFERRED_TOOL_GEOMETRY_MODE
+        for fault in ("zero-points", "zero-builds", "missing-flag", "compaction", "partial-pair"):
+            before, after = workload_snapshots(mode)
+            if fault == "zero-points":
+                after.update({field: before[field] for field in memory.TOOL_PATH_POINT_COUNTERS})
+            elif fault == "zero-builds":
+                after["legacy_tool_plot_builds"] = before["legacy_tool_plot_builds"]
+            elif fault == "missing-flag":
+                del after["graphics_diagnostics"]["deferred_tool_geometry_enabled"]
+            elif fault == "compaction":
+                after["tool_path_output_points"] -= 1
+            else:
+                del after["tool_path_output_points"]
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                runtime.validate_runtime_work(before, after, mode)
+
+    def test_deferred_comparison_brackets_normal_and_old_normal_may_omit_only_new_flag(self):
+        mode = memory.DEFERRED_TOOL_GEOMETRY_MODE
+        arguments = ["compare", "--app-binary", "/app", "--test-bundle", "/tests", "--collector-binary", "/collector",
+                     "--provenance", "/provenance", "--baseline-mode", "normal", "--controls", mode]
+        self.assertEqual(runtime.selected_cases(runtime.parser().parse_args(arguments)), [
+            ("baseline-before", "normal"), (mode, mode), ("baseline-after", "normal")])
+        before, after = workload_snapshots(mode)
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"]["mode"] = "normal"
+            del snapshot["graphics_diagnostics"]["deferred_tool_geometry_enabled"]
         self.assertTrue(runtime.validate_runtime_work(before, after, "normal")["available"])
 
 

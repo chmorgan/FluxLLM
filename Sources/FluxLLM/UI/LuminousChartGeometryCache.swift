@@ -21,16 +21,18 @@ final class LuminousChartGeometryCache {
     func frame(
         for key: Key, throughput: ChartDisplayHistory, gpu: ChartDisplayHistory,
         requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false,
-        compactToolPaths: Bool = false
+        compactToolPaths: Bool = false, deferredToolGeometry: Bool = false
     ) -> Frame {
         if let retained, retained.key == key, retained.directToolPlot == directToolPlot,
-            retained.compactToolPaths == compactToolPaths
+            retained.compactToolPaths == compactToolPaths,
+            retained.deferredToolGeometry == deferredToolGeometry
         {
             return retained
         }
         let frame = Frame(
             key: key, throughput: throughput, gpu: gpu, requestTools: requestTools,
-            directToolPlot: directToolPlot, compactToolPaths: compactToolPaths)
+            directToolPlot: directToolPlot, compactToolPaths: compactToolPaths,
+            deferredToolGeometry: deferredToolGeometry)
         retained = frame
         return frame
     }
@@ -153,21 +155,49 @@ final class LuminousChartGeometryCache {
         let key: Key
         let directToolPlot: Bool
         let compactToolPaths: Bool
+        let deferredToolGeometry: Bool
         let layout: Layout
         let generated: [Segment]
         let device: [Segment]
         let generatedEndpoint: CGPoint?
         let deviceEndpoint: CGPoint?
-        let requestTools: [UUID: ToolTrack]
+        private let toolGeometry: ToolGeometryHolder
+        var requestTools: [UUID: ToolTrack] { toolGeometry.value() }
+
+        /// Canvas may first read a frame from its drawing callback. Keep that
+        /// construction one-shot even when readers arrive on different threads.
+        /// The pending factory holds only immutable inputs, never its Frame.
+        private final class ToolGeometryHolder {
+            private let lock = NSLock()
+            private var pendingFactory: (() -> [UUID: ToolTrack])?
+            private var prepared: [UUID: ToolTrack]?
+
+            init(factory: @escaping () -> [UUID: ToolTrack]) {
+                pendingFactory = factory
+            }
+
+            func value() -> [UUID: ToolTrack] {
+                lock.lock()
+                defer { lock.unlock() }
+                if let prepared { return prepared }
+                // The factory is removed only after its result is retained,
+                // under this same lock, including an empty track dictionary.
+                let result = pendingFactory!()
+                prepared = result
+                pendingFactory = nil
+                return result
+            }
+        }
 
         init(
             key: Key, throughput: ChartDisplayHistory, gpu: ChartDisplayHistory,
             requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false,
-            compactToolPaths: Bool = false
+            compactToolPaths: Bool = false, deferredToolGeometry: Bool = false
         ) {
             self.key = key
             self.directToolPlot = directToolPlot
             self.compactToolPaths = compactToolPaths
+            self.deferredToolGeometry = deferredToolGeometry
             let layout = Layout(size: key.size, hasTools: key.hasTools, compact: key.compact)
             self.layout = layout
             generated = Self.segments(
@@ -181,20 +211,33 @@ final class LuminousChartGeometryCache {
                 Self.project(
                     $0.timestamp, value: $0.value, key: key, rect: layout.main, upperBound: 100)
             }
+            let toolGeometry = ToolGeometryHolder {
+                [requestTools, key, toolRect = layout.tools, directToolPlot, compactToolPaths] in
+                Self.makeToolTracks(
+                    requestTools, key: key, rect: toolRect,
+                    directToolPlot: directToolPlot, compactToolPaths: compactToolPaths)
+            }
+            self.toolGeometry = toolGeometry
+            if !deferredToolGeometry { _ = toolGeometry.value() }
+        }
+
+        private static func makeToolTracks(
+            _ requestTools: [UUID: ToolActivityHistory], key: Key, rect: CGRect,
+            directToolPlot: Bool, compactToolPaths: Bool
+        ) -> [UUID: ToolTrack] {
             var toolPathInputPoints: UInt64 = 0
             var toolPathOutputPoints: UInt64 = 0
-            self.requestTools = requestTools.mapValues { history in
+            let tracks = requestTools.mapValues { history in
                 PerformancePresentationCounters.shared.record(
                     directToolPlot ? .directToolPlotBuilds : .legacyToolPlotBuilds)
                 let plotSegments =
                     directToolPlot
                     ? history.directZeroFilledPlotSegments : history.zeroFilledPlotSegments
                 let points = history.resultMarkers.map {
-                    Self.project(
-                        $0.timestamp, value: 0, key: key, rect: layout.tools, upperBound: 1)
+                    Self.project($0.timestamp, value: 0, key: key, rect: rect, upperBound: 1)
                 }
                 let segments = Self.segments(
-                    plotSegments, key: key, rect: layout.tools,
+                    plotSegments, key: key, rect: rect,
                     upperBound: key.toolUpperBound, smoothed: false,
                     compactToolPaths: compactToolPaths)
                 for segment in segments {
@@ -220,6 +263,7 @@ final class LuminousChartGeometryCache {
                 PerformancePresentationCounters.shared.record(
                     .toolPathOutputPoints, by: toolPathOutputPoints)
             }
+            return tracks
         }
 
         private static func segments(

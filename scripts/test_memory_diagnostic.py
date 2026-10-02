@@ -22,10 +22,10 @@ def graphics(mode="normal"):
                if mode in memory.NEXT_RUNTIME_MODES else {}),
             **(dict.fromkeys(memory.CANVAS_CLOCK_COUNTERS, 0) if mode in memory.CANVAS_CLOCK_MODES else {}),
             **(dict.fromkeys(memory.ORDERED_PUBLICATION_COUNTERS, 0) if mode in memory.ORDERED_PUBLICATION_MODES else {}),
-            **(dict.fromkeys(memory.DIRECT_TOOL_PLOT_COUNTERS, 0) if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) else {}),
-            **(dict.fromkeys(memory.NATIVE_CANVAS_GROUP_COUNTERS, 0) if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) else {}),
-            **(dict.fromkeys(memory.TOOL_PATH_POINT_COUNTERS, 0) if mode == memory.COMPACT_TOOL_PATHS_MODE else {}),
-            **({"suppressed_arrival_effects": 0} if mode in (memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) else {}), "graphics_diagnostics": {
+            **(dict.fromkeys(memory.DIRECT_TOOL_PLOT_COUNTERS, 0) if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.DEFERRED_TOOL_GEOMETRY_MODE) else {}),
+            **(dict.fromkeys(memory.NATIVE_CANVAS_GROUP_COUNTERS, 0) if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.DEFERRED_TOOL_GEOMETRY_MODE) else {}),
+            **(dict.fromkeys(memory.TOOL_PATH_POINT_COUNTERS, 0) if mode in (memory.COMPACT_TOOL_PATHS_MODE, memory.DEFERRED_TOOL_GEOMETRY_MODE) else {}),
+            **({"suppressed_arrival_effects": 0} if mode in (memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.DEFERRED_TOOL_GEOMETRY_MODE) else {}), "graphics_diagnostics": {
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
         **({"shared_chart_preparation": mode in ("runtime-shared-preparation", "runtime-next-optimized"),
@@ -34,10 +34,11 @@ def graphics(mode="normal"):
            if mode in memory.NEXT_RUNTIME_MODES else {}),
         **({"canvas_frame_clock": True} if mode in memory.CANVAS_CLOCK_MODES else {}),
         **({"ordered_chart_publication": True} if mode in memory.ORDERED_PUBLICATION_MODES else {}),
-        **({"direct_tool_plot": mode == memory.DIRECT_TOOL_PLOT_MODE} if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) else {}),
-        **({"ungrouped_native_canvas": mode == memory.UNGROUPED_CANVAS_MODE} if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) else {}),
-        **({"arrival_effects_enabled": mode != memory.NO_ARRIVAL_MODE} if mode in (memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) else {}),
-        **({"compact_tool_paths_enabled": True} if mode == memory.COMPACT_TOOL_PATHS_MODE else {}),
+        **({"direct_tool_plot": mode == memory.DIRECT_TOOL_PLOT_MODE} if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.DEFERRED_TOOL_GEOMETRY_MODE) else {}),
+        **({"ungrouped_native_canvas": mode == memory.UNGROUPED_CANVAS_MODE} if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.DEFERRED_TOOL_GEOMETRY_MODE) else {}),
+        **({"arrival_effects_enabled": mode != memory.NO_ARRIVAL_MODE} if mode in (memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.DEFERRED_TOOL_GEOMETRY_MODE) else {}),
+        **({"compact_tool_paths_enabled": mode == memory.COMPACT_TOOL_PATHS_MODE} if mode in (memory.COMPACT_TOOL_PATHS_MODE, memory.DEFERRED_TOOL_GEOMETRY_MODE) else {}),
+        **({"deferred_tool_geometry_enabled": True} if mode == memory.DEFERRED_TOOL_GEOMETRY_MODE else {}),
         **({"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
             "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
             "lifecycle_effects_enabled": mode != "runtime-no-lifecycle"} if mode in memory.RUNTIME_MODES else {}),
@@ -94,6 +95,9 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
     if mode == memory.COMPACT_TOOL_PATHS_MODE:
         snapshot.update(grouped_native_canvas_draws=3, legacy_tool_plot_builds=3,
                         tool_path_input_points=30, tool_path_output_points=10)
+    if mode == memory.DEFERRED_TOOL_GEOMETRY_MODE:
+        snapshot.update(grouped_native_canvas_draws=3, legacy_tool_plot_builds=3,
+                        tool_path_input_points=30, tool_path_output_points=30)
     if mode in memory.CANVAS_CLOCK_MODES:
         snapshot["rail_frame_clock_ticks"] = 3
     if mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"):
@@ -111,6 +115,55 @@ def native_normal_graphics(*, drawn=False):
     snapshot = drawn_native_gpu_graphics("native-gpu-optimized") if drawn else graphics("native-gpu-optimized")
     snapshot["graphics_diagnostics"]["mode"] = "normal"
     return snapshot
+
+
+class DeferredToolGeometryGraphicsTests(unittest.TestCase):
+    def test_candidate_inherits_current_normal_without_compaction(self):
+        mode = memory.DEFERRED_TOOL_GEOMETRY_MODE
+        snapshot = drawn_native_gpu_graphics(mode)
+        flags = memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["runtime_feature_contract"]
+        self.assertTrue(all(flags[field] for field in memory.RUNTIME_FLAGS +
+                            ("unpromised_stream_body_writes", "canvas_frame_clock", "ordered_chart_publication",
+                             "arrival_effects_enabled", "deferred_tool_geometry_enabled")))
+        self.assertTrue(all(flags[field] is False for field in
+                            ("shared_chart_preparation", "stable_decoration_hosts", "direct_tool_plot",
+                             "ungrouped_native_canvas", "compact_tool_paths_enabled")))
+        for field in flags:
+            changed = copy.deepcopy(snapshot)
+            changed["graphics_diagnostics"][field] = not flags[field]
+            with self.subTest(field=field), self.assertRaises(InvalidResult):
+                memory.validate_graphics(changed, mode)
+
+    def test_deferred_flag_is_required_typed_and_forbidden_on_other_modes(self):
+        mode = memory.DEFERRED_TOOL_GEOMETRY_MODE
+        for invalid in (None, False, 0, "true"):
+            snapshot = drawn_native_gpu_graphics(mode)
+            if invalid is None:
+                del snapshot["graphics_diagnostics"]["deferred_tool_geometry_enabled"]
+            else:
+                snapshot["graphics_diagnostics"]["deferred_tool_geometry_enabled"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(InvalidResult, "deferred_tool_geometry_enabled"):
+                memory.validate_graphics(snapshot, mode)
+        snapshot = drawn_native_gpu_graphics(mode)
+        snapshot["graphics_diagnostics"].update(mode="normal", deferred_tool_geometry_enabled=False)
+        self.assertTrue(memory.validate_graphics(snapshot, "normal")["available"])
+        del snapshot["graphics_diagnostics"]["deferred_tool_geometry_enabled"]
+        self.assertTrue(memory.validate_graphics(snapshot, "normal")["available"])
+        snapshot["graphics_diagnostics"]["deferred_tool_geometry_enabled"] = True
+        with self.assertRaisesRegex(InvalidResult, "deferred_tool_geometry_enabled"):
+            memory.validate_graphics(snapshot, "normal")
+
+    def test_deferred_paths_keep_complete_equal_vertex_counts(self):
+        mode = memory.DEFERRED_TOOL_GEOMETRY_MODE
+        for field in memory.TOOL_PATH_POINT_COUNTERS:
+            snapshot = drawn_native_gpu_graphics(mode)
+            del snapshot[field]
+            with self.subTest(missing=field), self.assertRaisesRegex(InvalidResult, "complete UInt64"):
+                memory.validate_graphics(snapshot, mode)
+        snapshot = drawn_native_gpu_graphics(mode)
+        snapshot["tool_path_output_points"] -= 1
+        with self.assertRaisesRegex(InvalidResult, "Noncompact"):
+            memory.validate_graphics(snapshot, mode)
 
 
 class CompactToolPathGraphicsTests(unittest.TestCase):

@@ -541,6 +541,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-ungrouped-canvas` | Omit `drawingGroup` around native Canvas surfaces while retaining current production behavior elsewhere. |
 | `runtime-no-arrival-effects` | Suppress request-arrival effects while preserving completion effects and active retained twinkles. |
 | `runtime-compact-tool-paths` | Enable tool-path compaction on top of current production behavior. |
+| `runtime-deferred-tool-geometry` | Construct request-tool paths on their first access from a render callback. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -599,6 +600,16 @@ it `false`. Use the existing `runtime compare` command with
 normal/candidate/normal comparison. The 300-second deadline, fixed workload,
 publication cadence, 5% CPU limit, and separate 1% GPU limit remain unchanged.
 This experiment has no established performance gain and is not promoted.
+
+
+`runtime-deferred-tool-geometry` is opt-in and inherits all current `normal`
+features, including `compact_tool_paths_enabled = false`. Only this candidate
+sets `deferred_tool_geometry_enabled = true`: request-tool path construction is
+deferred until the first access from a render callback. Compare the same frozen
+binary with `--baseline-mode normal --controls runtime-deferred-tool-geometry`
+using the existing `runtime compare` command. The normal/candidate/normal order,
+fixed workload, publication cadence, 300-second deadline, and CPU/GPU budgets
+remain unchanged. No performance gain or production promotion is established.
 
 The stream-write control keeps promises on response heads and ends, and on
 `HEAD`/`CONNECT` bodies. Its body fast path requires an active downstream channel
@@ -716,6 +727,16 @@ than its input-point delta; instrumented `normal` requires equal input/output
 deltas. These counts prove the selected construction path executed; they do not
 establish a CPU or GPU improvement. Older frozen products may omit the entire
 flag/counter group; supplied partial evidence is rejected.
+
+
+Deferred-geometry execution uses the existing `legacy_tool_plot_builds`,
+`tool_path_input_points`, and `tool_path_output_points` counters at actual path
+construction. The candidate must show positive construction work and equal
+input/output point deltas: it does not compact paths. The new mode requires
+`deferred_tool_geometry_enabled = true`; supplied flags in all other modes must
+be `false`. Older frozen products in other modes may omit the new flag.
+Actual construction evidence supplements the unchanged workload, cadence,
+visibility, and closed-state checks; selecting the mode alone is insufficient.
 
 Non-native memory diagnostics export the same top-level counters without native
 feature flags. Complete typed fallback counts for full sorts, legacy tool plots,

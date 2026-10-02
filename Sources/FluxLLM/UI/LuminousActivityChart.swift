@@ -196,7 +196,9 @@ struct LuminousActivityChart: View {
                     tokenUpperBound: tokenScale.upperBound, toolUpperBound: toolScale.upperBound),
                 throughput: throughput, gpu: gpu, requestTools: requestTools,
                 directToolPlot: PerformanceGraphicsDiagnostics.shared.mode.usesDirectToolPlot,
-                compactToolPaths: PerformanceGraphicsDiagnostics.shared.mode.usesCompactToolPaths)
+                compactToolPaths: PerformanceGraphicsDiagnostics.shared.mode.usesCompactToolPaths,
+                deferredToolGeometry: PerformanceGraphicsDiagnostics.shared.mode
+                    .usesDeferredToolGeometry)
             let layout = frame.layout
             let generated = frame.generated
             let device = frame.device
@@ -239,8 +241,9 @@ struct LuminousActivityChart: View {
                     drawEndpoint(frame.generatedEndpoint, color: generatedColor, in: &context)
                     drawEndpoint(frame.deviceEndpoint, color: gpuColor, in: &context)
                     // Tool tracks retain their request's current appearance.
+                    let toolTracks = frame.requestTools
                     for lane in lanes {
-                        if let track = frame.requestTools[lane.id] {
+                        if let track = toolTracks[lane.id] {
                             drawTools(track, in: &context, color: laneColor(lane))
                         }
                     }
