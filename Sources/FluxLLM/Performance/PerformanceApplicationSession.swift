@@ -205,6 +205,8 @@ public final class PerformanceApplicationSession {
                 ?? NSNull(),
             "grouped_native_canvas_draws": counters["grouped_native_canvas_draws"] as Any?
                 ?? NSNull(),
+            "suppressed_arrival_effects": counters["suppressed_arrival_effects"] as Any?
+                ?? NSNull(),
             "history_tool_order_builds": counters["history_tool_order_builds"] as Any? ?? NSNull(),
             "history_completed_order_builds": counters["history_completed_order_builds"] as Any?
                 ?? NSNull(),

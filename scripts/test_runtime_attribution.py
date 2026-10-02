@@ -24,6 +24,8 @@ def workload_snapshots(mode):
         before[field] = 10
     after = copy.deepcopy(before)
     after["chart_preparations"] += 2
+    if mode == memory.NO_ARRIVAL_MODE:
+        after["suppressed_arrival_effects"] += 2
     if value.get("ordered_chart_publication"):
         after["ordered_chart_publication_queries"] += 2
     if value.get("direct_tool_plot"):
@@ -48,9 +50,10 @@ def workload_snapshots(mode):
     after["graphics_diagnostics"]["roles"]["static_chart"]["draws"] += 2
     if value["lifecycle_effects_enabled"]:
         after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 1
-    if value.get("ungrouped_native_canvas"):
+    if "ungrouped_native_canvas" in value:
         total = sum(role["draws"] for role in after["graphics_diagnostics"]["roles"].values())
-        after["graphics_diagnostics"]["native_gpu_canvas_draws"] = after["ungrouped_native_canvas_draws"] = total
+        field = "ungrouped_native_canvas_draws" if value["ungrouped_native_canvas"] else "grouped_native_canvas_draws"
+        after["graphics_diagnostics"]["native_gpu_canvas_draws"] = after[field] = total
     return before, after
 
 
@@ -68,15 +71,24 @@ def clock_work_report(mode="runtime-canvas-clock"):
             role["draws"] for role in snapshot["graphics_diagnostics"]["roles"].values())
         return {"label": label, "snapshot": snapshot, "resource_sample": sample}
     steady = copy.deepcopy(before)
-    steady["rail_frame_clock_ticks"] += 1
-    points = [point("before-traffic", 0, before, 0), point("during-6", 6, steady, 2),
-              point("during-19", 19, steady, 2), point("completion-end", 29, after, 0)]
+    points = [point("before-traffic", 0, before, 0)]
+    if mode == memory.NO_ARRIVAL_MODE:
+        steady["suppressed_arrival_effects"] = after["suppressed_arrival_effects"]
+        points.append(point("after-arrival", 2.5, steady, 2))
+    else:
+        steady["rail_frame_clock_ticks"] += 1
+    points += [point("during-6", 6, steady, 2), point("during-19", 19, steady, 2)]
+    if mode == memory.NO_ARRIVAL_MODE:
+        points += [point("completion-begin", 25.1, steady, 0), point("during-completion", 27, after, 0)]
+    points.append(point("completion-end", 29, after, 0))
     closed = [point("07-both-closed-after-probe", 32, after, 0, False),
               point("08-closed-after-five-more-seconds", 37, after, 0, False)]
     return {"runtime": {"checkpoints": points, "mach_clock_start": {"absolute_minus_monotonic_seconds": 900},
                         "mach_clock_end": {"absolute_minus_monotonic_seconds": 900}},
             "checkpoints": closed, "samples": samples, "owned_identity": {"process_id": 123, "birth_time_us": 456},
-            "phase_windows": {"steady": {"start_monotonic_seconds": 105, "end_monotonic_seconds": 120},
+            "phase_windows": {"arrival": {"start_monotonic_seconds": 100.1, "end_monotonic_seconds": 102.1},
+                              "steady": {"start_monotonic_seconds": 105, "end_monotonic_seconds": 120},
+                              "completion": {"start_monotonic_seconds": 125, "end_monotonic_seconds": 128},
                               "whole_contiguous_runtime": {"start_monotonic_seconds": 100, "end_monotonic_seconds": 129}}}
 
 
@@ -134,7 +146,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas") if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled") if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -228,6 +240,92 @@ class RuntimeWorkTests(unittest.TestCase):
             after["graphics_diagnostics"]["roles"][role]["draws"] = 9
             with self.subTest(role=role), self.assertRaisesRegex(ValueError, "drawing counter moved backwards"):
                 runtime.validate_runtime_work(before, after, "runtime-optimized")
+
+
+class NoArrivalWorkTests(unittest.TestCase):
+    def test_zero_traffic_ticks_do_not_satisfy_whole_runtime_completion_work(self):
+        before, completion = workload_snapshots(memory.NO_ARRIVAL_MODE)
+        before["rail_frame_clock_ticks"] = 0
+        completion["rail_frame_clock_ticks"] = 58
+        completion["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] = 59
+        total = sum(role["draws"] for role in completion["graphics_diagnostics"]["roles"].values())
+        completion["graphics_diagnostics"]["native_gpu_canvas_draws"] = completion["grouped_native_canvas_draws"] = total
+        self.assertTrue(runtime.validate_runtime_work(before, completion, memory.NO_ARRIVAL_MODE)["available"])
+        traffic_ack = copy.deepcopy(completion)
+        traffic_ack["rail_frame_clock_ticks"] = 0
+        traffic_ack["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] = 0
+        total = sum(role["draws"] for role in traffic_ack["graphics_diagnostics"]["roles"].values())
+        traffic_ack["graphics_diagnostics"]["native_gpu_canvas_draws"] = traffic_ack["grouped_native_canvas_draws"] = total
+        self.assertTrue(memory.validate_graphics(traffic_ack, memory.NO_ARRIVAL_MODE, completed_visible_workload=True)["available"])
+        with self.assertRaisesRegex(ValueError, "did not execute frame ticks"):
+            runtime.validate_runtime_work(before, traffic_ack, memory.NO_ARRIVAL_MODE)
+
+    def test_no_arrival_work_proves_suppression_and_preserves_other_production_paths(self):
+        before, after = workload_snapshots(memory.NO_ARRIVAL_MODE)
+        work = runtime.validate_runtime_work(before, after, memory.NO_ARRIVAL_MODE)
+        self.assertGreater(work["deltas"]["suppressed_arrival_effects"], 0)
+        self.assertFalse(work["features"]["arrival_effects_enabled"])
+        self.assertTrue(work["features"]["lifecycle_effects_enabled"])
+        self.assertEqual(work["deltas"]["ungrouped_native_canvas_draws"], 0)
+        self.assertGreater(work["deltas"]["grouped_native_canvas_draws"], 0)
+        self.assertEqual(work["deltas"]["direct_tool_plot_builds"], 0)
+        self.assertGreater(work["deltas"]["legacy_tool_plot_builds"], 0)
+        for invalid in (None, True, -1, before["suppressed_arrival_effects"]):
+            changed = copy.deepcopy(after)
+            changed["suppressed_arrival_effects"] = invalid
+            with self.subTest(value=invalid), self.assertRaises(ValueError):
+                runtime.validate_runtime_work(before, changed, memory.NO_ARRIVAL_MODE)
+
+    def test_baseline_and_whole_lifecycle_control_require_zero_suppression_if_instrumented(self):
+        for mode in (memory.ORDERED_PUBLICATION_MODE, "runtime-no-lifecycle"):
+            before, after = workload_snapshots(mode)
+            self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
+            for snapshot in (before, after):
+                snapshot["graphics_diagnostics"]["arrival_effects_enabled"] = mode != "runtime-no-lifecycle"
+                snapshot["suppressed_arrival_effects"] = 0
+            self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
+            after["suppressed_arrival_effects"] = 1
+            with self.assertRaisesRegex(ValueError, "unexpectedly suppressed"):
+                runtime.validate_runtime_work(before, after, mode)
+            for snapshot in (before, after):
+                del snapshot["graphics_diagnostics"]["arrival_effects_enabled"]
+            with self.assertRaisesRegex(ValueError, "lacks feature metadata"):
+                runtime.validate_runtime_work(before, after, mode)
+
+    def test_phase_proof_brackets_arrival_and_preserves_measured_completion_activity(self):
+        report = clock_work_report(memory.NO_ARRIVAL_MODE)
+        proof = runtime.validate_canvas_clock_work(report, memory.NO_ARRIVAL_MODE)["arrival_effects"]
+        self.assertEqual(proof["arrival"]["deltas"]["rail_frame_clock_ticks"], 0)
+        self.assertEqual(proof["arrival"]["deltas"]["rail_decorations_draws"], 0)
+        self.assertGreater(proof["arrival"]["deltas"]["suppressed_arrival_effects"], 0)
+        self.assertLessEqual(proof["arrival"]["start_monotonic_seconds"], report["phase_windows"]["arrival"]["start_monotonic_seconds"])
+        self.assertGreaterEqual(proof["arrival"]["end_monotonic_seconds"], report["phase_windows"]["arrival"]["end_monotonic_seconds"])
+        self.assertGreater(proof["completion"]["deltas"]["rail_frame_clock_ticks"], 0)
+        self.assertGreater(proof["completion"]["deltas"]["rail_decorations_draws"], 0)
+
+    def test_global_activity_cannot_substitute_for_zero_arrival_and_positive_completion_proof(self):
+        for mutation in ("arrival-clock", "arrival-draw", "suppression", "completion-clock", "completion-draw",
+                         "arrival-boundary", "completion-boundary"):
+            report = clock_work_report(memory.NO_ARRIVAL_MODE)
+            points = report["runtime"]["checkpoints"]
+            by_label = {point["label"]: point for point in points}
+            if mutation == "arrival-clock":
+                for point in points[1:] + report["checkpoints"]:
+                    point["snapshot"]["rail_frame_clock_ticks"] += 1
+            elif mutation == "arrival-draw":
+                by_label["after-arrival"]["snapshot"]["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 1
+            elif mutation == "suppression":
+                by_label["after-arrival"]["snapshot"]["suppressed_arrival_effects"] = points[0]["snapshot"]["suppressed_arrival_effects"]
+            elif mutation == "completion-clock":
+                by_label["completion-begin"]["snapshot"]["rail_frame_clock_ticks"] = by_label["during-completion"]["snapshot"]["rail_frame_clock_ticks"]
+            elif mutation == "completion-draw":
+                by_label["during-completion"]["snapshot"]["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] = 0
+            elif mutation == "arrival-boundary":
+                points.remove(by_label["after-arrival"])
+            else:
+                points.remove(by_label["during-completion"])
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                runtime.validate_canvas_clock_work(report, memory.NO_ARRIVAL_MODE)
 
 
 class NativeCanvasGroupingWorkTests(unittest.TestCase):
@@ -470,9 +568,10 @@ class NextRuntimeWorkTests(unittest.TestCase):
             before, after = workload_snapshots(mode)
             after["rail_frame_clock_ticks"] = before["rail_frame_clock_ticks"] + 20
             after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 13
-            if mode == memory.UNGROUPED_CANVAS_MODE:
+            if "ungrouped_native_canvas" in after["graphics_diagnostics"]:
                 total = sum(role["draws"] for role in after["graphics_diagnostics"]["roles"].values())
-                after["graphics_diagnostics"]["native_gpu_canvas_draws"] = after["ungrouped_native_canvas_draws"] = total
+                field = "ungrouped_native_canvas_draws" if after["graphics_diagnostics"]["ungrouped_native_canvas"] else "grouped_native_canvas_draws"
+                after["graphics_diagnostics"]["native_gpu_canvas_draws"] = after[field] = total
             self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
 
     def test_legacy_clock_counters_optional_but_contract_cannot_disappear(self):

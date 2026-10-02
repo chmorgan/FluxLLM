@@ -89,7 +89,17 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {field} counter moved backwards")
         delta[field] = last - first
     require(delta["chart_preparations"] > 0, "Runtime workload did not prepare charts")
-    if (mode == memory.UNGROUPED_CANVAS_MODE or "ungrouped_native_canvas" in flags
+    if mode == memory.NO_ARRIVAL_MODE or "arrival_effects_enabled" in flags or any("suppressed_arrival_effects" in snapshot for snapshot in (before, after)):
+        require("arrival_effects_enabled" in flags, "Arrival suppression counter lacks feature metadata")
+        first = memory.unsigned(before.get("suppressed_arrival_effects"), "runtime.before.suppressed_arrival_effects")
+        last = memory.unsigned(after.get("suppressed_arrival_effects"), "runtime.after.suppressed_arrival_effects")
+        require(last >= first, "Runtime suppressed_arrival_effects counter moved backwards")
+        delta["suppressed_arrival_effects"] = last - first
+        if mode == memory.NO_ARRIVAL_MODE:
+            require(delta["suppressed_arrival_effects"] > 0, "No-arrival mode did not suppress arrival effects during the workload")
+        else:
+            require(first == last == 0, "Baseline mode unexpectedly suppressed arrival effects")
+    if (mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE) or "ungrouped_native_canvas" in flags
             or any(field in snapshot for snapshot in (before, after) for field in memory.NATIVE_CANVAS_GROUP_COUNTERS)):
         require("ungrouped_native_canvas" in flags, "Native Canvas grouping counters lack feature metadata")
         callback_counts = []
@@ -115,7 +125,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
             require(before["ungrouped_native_canvas_draws"] == after["ungrouped_native_canvas_draws"] == 0,
                     "Grouped native Canvas mode executed ungrouped callbacks")
             require(delta["grouped_native_canvas_draws"] > 0, "Baseline native Canvas did not execute grouped callbacks")
-    if (mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE) or "direct_tool_plot" in flags
+    if (mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE) or "direct_tool_plot" in flags
             or any(field in snapshot for snapshot in (before, after) for field in memory.DIRECT_TOOL_PLOT_COUNTERS)):
         require("direct_tool_plot" in flags, "Tool-plot counters lack feature metadata")
         for field in memory.DIRECT_TOOL_PLOT_COUNTERS:
@@ -334,6 +344,46 @@ def validate_canvas_clock_work(report, mode):
                 "Canvas frame clock continued ticking after both windows closed")
         result["closed"] = {"start_checkpoint": closed[0][0]["label"], "end_checkpoint": closed[1][0]["label"],
             "start_monotonic_seconds": closed[0][1], "end_monotonic_seconds": closed[1][1], "rail_frame_clock_ticks_delta": 0}
+    if mode == memory.NO_ARRIVAL_MODE:
+        arrival = report["phase_windows"]["arrival"]
+        ends = [(point, timestamp) for point, timestamp in zip(points, timestamps)
+                if arrival["end_monotonic_seconds"] <= timestamp < window["start_monotonic_seconds"]]
+        require(timestamps[0] <= arrival["start_monotonic_seconds"] and ends
+                and ends[0][0]["snapshot"].get("active_requests") == 2,
+                "No-arrival drawing evidence does not bracket the complete arrival phase")
+
+        def effect_delta(first, last):
+            def draws(point):
+                return memory.unsigned(point["snapshot"]["graphics_diagnostics"]["roles"]["rail_decorations"].get("draws"),
+                                       "graphics.rail_decorations.draws")
+            return {"rail_frame_clock_ticks": last["snapshot"]["rail_frame_clock_ticks"] - first["snapshot"]["rail_frame_clock_ticks"],
+                    "rail_decorations_draws": draws(last) - draws(first)}
+
+        arrival_delta = effect_delta(points[0], ends[0][0])
+        suppressed_first = memory.unsigned(points[0]["snapshot"].get("suppressed_arrival_effects"), "arrival.start.suppressed_arrival_effects")
+        suppressed_last = memory.unsigned(ends[0][0]["snapshot"].get("suppressed_arrival_effects"), "arrival.end.suppressed_arrival_effects")
+        arrival_delta["suppressed_arrival_effects"] = suppressed_last - suppressed_first
+        require(arrival_delta["rail_frame_clock_ticks"] == arrival_delta["rail_decorations_draws"] == 0
+                and arrival_delta["suppressed_arrival_effects"] > 0,
+                "No-arrival control did not suppress arrival drawing and clock work")
+        completion = report["phase_windows"]["completion"]
+        began = [(point, timestamp) for point, timestamp in zip(points, timestamps) if point["label"] == "completion-begin"]
+        require(len(began) == 1 and completion["start_monotonic_seconds"] <= began[0][1] < completion["end_monotonic_seconds"],
+                "No-arrival control lacks an authenticated completion-start checkpoint inside the phase")
+        completed = [(point, timestamp) for point, timestamp in zip(points, timestamps)
+                     if began[0][1] <= timestamp <= completion["end_monotonic_seconds"]]
+        require(len(completed) >= 2 and all(point["snapshot"].get("active_requests") == 0 for point, _ in completed),
+                "No-arrival control lacks interior completion drawing checkpoints")
+        completion_delta = effect_delta(completed[0][0], completed[-1][0])
+        require(completion_delta["rail_frame_clock_ticks"] > 0 and completion_delta["rail_decorations_draws"] > 0,
+                "No-arrival control did not preserve completion drawing and clock work")
+        result["arrival_effects"] = {
+            "arrival": {"start_checkpoint": points[0]["label"], "end_checkpoint": ends[0][0]["label"],
+                "start_monotonic_seconds": timestamps[0], "end_monotonic_seconds": ends[0][1], "deltas": arrival_delta,
+                "scope": "Authenticated checkpoint superset of the complete first-output through +2s arrival phase"},
+            "completion": {"start_checkpoint": completed[0][0]["label"], "end_checkpoint": completed[-1][0]["label"],
+                "start_monotonic_seconds": completed[0][1], "end_monotonic_seconds": completed[-1][1], "deltas": completion_delta,
+                "scope": "Authenticated checkpoint interval inside the three-second completion phase"}}
     return result
 
 

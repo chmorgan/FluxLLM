@@ -22,8 +22,9 @@ def graphics(mode="normal"):
                if mode in memory.NEXT_RUNTIME_MODES else {}),
             **(dict.fromkeys(memory.CANVAS_CLOCK_COUNTERS, 0) if mode in memory.CANVAS_CLOCK_MODES else {}),
             **(dict.fromkeys(memory.ORDERED_PUBLICATION_COUNTERS, 0) if mode in memory.ORDERED_PUBLICATION_MODES else {}),
-            **(dict.fromkeys(memory.DIRECT_TOOL_PLOT_COUNTERS, 0) if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE) else {}),
-            **(dict.fromkeys(memory.NATIVE_CANVAS_GROUP_COUNTERS, 0) if mode == memory.UNGROUPED_CANVAS_MODE else {}), "graphics_diagnostics": {
+            **(dict.fromkeys(memory.DIRECT_TOOL_PLOT_COUNTERS, 0) if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE) else {}),
+            **(dict.fromkeys(memory.NATIVE_CANVAS_GROUP_COUNTERS, 0) if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE) else {}),
+            **({"suppressed_arrival_effects": 0} if mode == memory.NO_ARRIVAL_MODE else {}), "graphics_diagnostics": {
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
         **({"shared_chart_preparation": mode in ("runtime-shared-preparation", "runtime-next-optimized"),
@@ -32,8 +33,9 @@ def graphics(mode="normal"):
            if mode in memory.NEXT_RUNTIME_MODES else {}),
         **({"canvas_frame_clock": True} if mode in memory.CANVAS_CLOCK_MODES else {}),
         **({"ordered_chart_publication": True} if mode in memory.ORDERED_PUBLICATION_MODES else {}),
-        **({"direct_tool_plot": mode == memory.DIRECT_TOOL_PLOT_MODE} if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE) else {}),
-        **({"ungrouped_native_canvas": True} if mode == memory.UNGROUPED_CANVAS_MODE else {}),
+        **({"direct_tool_plot": mode == memory.DIRECT_TOOL_PLOT_MODE} if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE) else {}),
+        **({"ungrouped_native_canvas": mode == memory.UNGROUPED_CANVAS_MODE} if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE) else {}),
+        **({"arrival_effects_enabled": False} if mode == memory.NO_ARRIVAL_MODE else {}),
         **({"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
             "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
             "lifecycle_effects_enabled": mode != "runtime-no-lifecycle"} if mode in memory.RUNTIME_MODES else {}),
@@ -85,6 +87,8 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
         snapshot["direct_tool_plot_builds"] = 3
     if mode == memory.UNGROUPED_CANVAS_MODE:
         snapshot.update(ungrouped_native_canvas_draws=3, legacy_tool_plot_builds=3)
+    if mode == memory.NO_ARRIVAL_MODE:
+        snapshot.update(grouped_native_canvas_draws=3, legacy_tool_plot_builds=3, suppressed_arrival_effects=2)
     if mode in memory.CANVAS_CLOCK_MODES:
         snapshot["rail_frame_clock_ticks"] = 3
     if mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"):

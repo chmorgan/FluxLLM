@@ -116,6 +116,107 @@ struct RequestRailBarDrawing {
     }
 }
 
+/// Receipt selection happens before drawing eligibility and profile creation,
+/// so an omitted arrival cannot acquire a Canvas or an animation deadline.
+enum RequestRailLifecycleEffects {
+    struct Key: Hashable {
+        let requestID: UUID
+        let completion: Bool
+        let startedAt: Date
+        let seed: UInt64
+
+        var eventID: RequestRailEvent.ID {
+            RequestRailEvent.ID(requestID: requestID, kind: completion ? .completion : .arrival)
+        }
+
+        init(_ event: RequestRailEvent) {
+            requestID = event.requestID
+            completion = event.kind == .completion
+            startedAt = event.startedAt
+            seed = event.seed
+        }
+    }
+
+    struct Prepared {
+        let key: Key
+        let startedAt: Date
+        let expiresAt: Date
+        let profile: RequestRailEffectProfile
+
+        var visibleUntil: Date {
+            min(expiresAt, startedAt.addingTimeInterval(profile.visibleDuration))
+        }
+    }
+
+    struct WorkKey: Hashable {
+        let events: [Key]
+        let eligibility: RequestRailAnimationEligibility
+        let duration: TimeInterval
+        let enabled: Bool
+    }
+
+    static func selecting(
+        _ events: [RequestRailEvent], omitsArrivals: Bool
+    ) -> [RequestRailEvent] {
+        omitsArrivals ? events.filter { $0.kind != .arrival } : events
+    }
+
+    static func prepare(
+        _ events: [RequestRailEvent], lanes: [RequestLane],
+        assignments: [UUID: RequestRailAssignment], now: Date, timestamp: Date,
+        previous: [Prepared]
+    ) -> [Prepared] {
+        let cached = Dictionary(uniqueKeysWithValues: previous.map { ($0.key, $0) })
+        return events.compactMap { event in
+            guard event.expiresAt > timestamp,
+                let lane = lanes.first(where: { $0.id == event.requestID }),
+                let assignment = assignments[lane.id],
+                (0..<RequestRailState.individualTrackCount).contains(assignment.track)
+            else { return nil }
+            let key = Key(event)
+            let effect =
+                cached[key]
+                ?? Prepared(
+                    key: key, startedAt: event.startedAt, expiresAt: event.expiresAt,
+                    profile: RequestRailEffectProfile(
+                        seed: event.seed,
+                        requestDuration: (lane.endedAt ?? now).timeIntervalSince(lane.startedAt),
+                        completion: event.kind == .completion))
+            return effect.visibleUntil > timestamp ? effect : nil
+        }
+    }
+}
+
+/// Diagnostic receipt accounting retains only identities still present in the
+/// unexpired publication. It creates no profiles, deadlines, or cleanup timer.
+struct RequestRailArrivalSuppression {
+    private var counted: Set<RequestRailLifecycleEffects.Key> = []
+
+    var retainedReceiptCount: Int { counted.count }
+
+    mutating func update(
+        events: [RequestRailEvent], eligibleIDs: [RequestRailEvent.ID],
+        lanes: [RequestLane], assignments: [UUID: RequestRailAssignment],
+        timestamp: Date, enabled: Bool
+    ) -> Int {
+        let arrivals = events.filter { $0.kind == .arrival && $0.expiresAt > timestamp }
+        counted.formIntersection(Set(arrivals.map(RequestRailLifecycleEffects.Key.init)))
+        guard enabled else { return 0 }
+        var newlySuppressed = 0
+        for event in arrivals {
+            guard eligibleIDs.contains(event.id),
+                lanes.contains(where: { $0.id == event.requestID }),
+                let assignment = assignments[event.requestID],
+                (0..<RequestRailState.individualTrackCount).contains(assignment.track)
+            else { continue }
+            if counted.insert(RequestRailLifecycleEffects.Key(event)).inserted {
+                newlySuppressed += 1
+            }
+        }
+        return newlySuppressed
+    }
+}
+
 private struct RequestRailDecorations: View {
     let lanes: [RequestLane]
     let segments: [RequestRailGeometry.Segment]
@@ -131,7 +232,8 @@ private struct RequestRailDecorations: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var windowVisible = false
-    @State private var prepared: [PreparedEffect] = []
+    @State private var prepared: [RequestRailLifecycleEffects.Prepared] = []
+    @State private var arrivalSuppression = RequestRailArrivalSuppression()
     @State private var twinkles: [RequestRailTwinkle] = []
     @State private var animating = false
     @State private var frameClock = RequestRailFrameClock()
@@ -140,23 +242,38 @@ private struct RequestRailDecorations: View {
         isLive && !reduceMotion && !reduceTransparency && contrast != .increased && windowVisible
     }
 
-    private var lifecycleEvents: [RequestRailEvent] {
+    private var sourceLifecycleEvents: [RequestRailEvent] {
         // Attribution control: retain live-request eligibility and the normal
         // twinkle scheduler while omitting arrival/completion preparation.
         PerformanceGraphicsDiagnostics.shared.mode.omitsLifecycleEffects ? [] : presentation.events
     }
 
+    private var lifecycleEvents: [RequestRailEvent] {
+        RequestRailLifecycleEffects.selecting(
+            sourceLifecycleEvents,
+            omitsArrivals: PerformanceGraphicsDiagnostics.shared.mode.omitsArrivalEffects)
+    }
+
     var body: some View {
+        let mode = PerformanceGraphicsDiagnostics.shared.mode
         let eligibility = RequestRailAnimationEligibility(
             segments: segments, events: lifecycleEvents, now: now, duration: duration)
-        let work = WorkKey(
-            events: lifecycleEvents.map(EffectKey.init), eligibility: eligibility,
+        let sourceEligibility =
+            mode.omitsArrivalEffects
+            ? RequestRailAnimationEligibility(
+                segments: segments, events: sourceLifecycleEvents, now: now, duration: duration)
+            : eligibility
+        let work = RequestRailLifecycleEffects.WorkKey(
+            // Preserve the reference scheduler's publication identity. Arrival
+            // omission changes effect work, not live-twinkle restart timing or
+            // the retry when a previously empty layout becomes visible.
+            events: sourceLifecycleEvents.map(RequestRailLifecycleEffects.Key.init),
+            eligibility: sourceEligibility,
             duration: duration, enabled: effectsEnabled)
         let decoratedSegments = segments.filter { segment in
             segment.isLive || prepared.contains { $0.key.requestID == segment.lane.id }
         }
 
-        let mode = PerformanceGraphicsDiagnostics.shared.mode
         let retainedTwinkles = mode.usesRetainedTwinkles
         let stableHosts = mode.usesStableDecorationHosts
         let lifecycleVisible = prepared.contains {
@@ -260,32 +377,26 @@ private struct RequestRailDecorations: View {
     /// Profiles are cached by receipt identity, so a new telemetry snapshot or a
     /// resized chart cannot change an existing bolt's forks or burst family.
     @MainActor
-    private func runDecorations(work: WorkKey) async {
+    private func runDecorations(work: RequestRailLifecycleEffects.WorkKey) async {
+        let timestamp = Date()
+        if PerformanceGraphicsDiagnostics.shared.mode.omitsArrivalEffects {
+            let count = arrivalSuppression.update(
+                events: sourceLifecycleEvents, eligibleIDs: work.eligibility.effectIDs,
+                lanes: lanes, assignments: presentation.assignments,
+                timestamp: timestamp, enabled: work.enabled)
+            for _ in 0..<count {
+                PerformancePresentationCounters.shared.record(.suppressedArrivalEffects)
+            }
+        }
         guard work.enabled else {
             animating = false
             prepared = []
             twinkles = []
             return
         }
-        let timestamp = Date()
-        let cached = Dictionary(uniqueKeysWithValues: prepared.map { ($0.key, $0) })
-        prepared = lifecycleEvents.compactMap { event in
-            guard event.expiresAt > timestamp,
-                let lane = lanes.first(where: { $0.id == event.requestID }),
-                let assignment = presentation.assignments[lane.id],
-                (0..<RequestRailState.individualTrackCount).contains(assignment.track)
-            else { return nil }
-            let key = EffectKey(event)
-            let effect =
-                cached[key]
-                ?? PreparedEffect(
-                    key: key, startedAt: event.startedAt, expiresAt: event.expiresAt,
-                    profile: RequestRailEffectProfile(
-                        seed: event.seed,
-                        requestDuration: (lane.endedAt ?? now).timeIntervalSince(lane.startedAt),
-                        completion: event.kind == .completion))
-            return effect.visibleUntil > timestamp ? effect : nil
-        }
+        prepared = RequestRailLifecycleEffects.prepare(
+            lifecycleEvents, lanes: lanes, assignments: presentation.assignments,
+            now: now, timestamp: timestamp, previous: prepared)
         let liveIDs = work.eligibility.liveIDs
         twinkles.removeAll { $0.endsAt <= timestamp || !liveIDs.contains($0.requestID) }
         var sequence = PerformanceAnimationRandomness.initialTwinkleSequence(
@@ -547,41 +658,6 @@ private struct RequestRailDecorations: View {
             for point in points.dropFirst() { path.addLine(to: point) }
         }
         return path
-    }
-
-    private struct EffectKey: Hashable {
-        let requestID: UUID
-        let completion: Bool
-        let startedAt: Date
-        let seed: UInt64
-
-        var eventID: RequestRailEvent.ID {
-            RequestRailEvent.ID(requestID: requestID, kind: completion ? .completion : .arrival)
-        }
-
-        init(_ event: RequestRailEvent) {
-            requestID = event.requestID
-            completion = event.kind == .completion
-            startedAt = event.startedAt
-            seed = event.seed
-        }
-    }
-
-    private struct WorkKey: Hashable {
-        let events: [EffectKey]
-        let eligibility: RequestRailAnimationEligibility
-        let duration: TimeInterval
-        let enabled: Bool
-    }
-
-    private struct PreparedEffect {
-        let key: EffectKey
-        let startedAt: Date
-        let expiresAt: Date
-        let profile: RequestRailEffectProfile
-        var visibleUntil: Date {
-            min(expiresAt, startedAt.addingTimeInterval(profile.visibleDuration))
-        }
     }
 
 }

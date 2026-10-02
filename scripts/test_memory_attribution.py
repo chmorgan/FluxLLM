@@ -82,7 +82,7 @@ class NonNativeFeatureCounterTests(unittest.TestCase):
         from test_memory_diagnostic import graphics
         snapshot = graphics(mode)
         fields = (memory.NEXT_RUNTIME_COUNTERS + memory.CANVAS_CLOCK_COUNTERS + memory.ORDERED_PUBLICATION_COUNTERS
-                  + memory.DIRECT_TOOL_PLOT_COUNTERS + memory.NATIVE_CANVAS_GROUP_COUNTERS)
+                  + memory.DIRECT_TOOL_PLOT_COUNTERS + memory.NATIVE_CANVAS_GROUP_COUNTERS + ("suppressed_arrival_effects",))
         snapshot.update(dict.fromkeys(fields, 0))
         snapshot.update(chart_publication_full_sorts=7, legacy_tool_plot_builds=21, rail_timeline_content_updates=3)
         snapshot["graphics_diagnostics"]["native_gpu_canvas_draws"] = 0
@@ -99,7 +99,7 @@ class NonNativeFeatureCounterTests(unittest.TestCase):
     def test_non_native_counter_exports_reject_fast_path_activity_and_bad_or_partial_groups(self):
         snapshot = self.full_counter_snapshot("empty-drawing")
         disabled = (memory.NEXT_RUNTIME_COUNTERS + ("rail_frame_clock_ticks", "ordered_chart_publication_queries",
-                    "direct_tool_plot_builds") + memory.NATIVE_CANVAS_GROUP_COUNTERS)
+                    "direct_tool_plot_builds", "suppressed_arrival_effects") + memory.NATIVE_CANVAS_GROUP_COUNTERS)
         for field in disabled:
             changed = copy.deepcopy(snapshot)
             changed[field] = 1
@@ -112,6 +112,61 @@ class NonNativeFeatureCounterTests(unittest.TestCase):
                 changed[field] = invalid
                 with self.subTest(field=field, invalid=invalid), self.assertRaises(InvalidResult):
                     memory.validate_graphics(changed, "empty-drawing")
+
+
+class NoArrivalContractTests(unittest.TestCase):
+    def test_network_acknowledgment_can_precede_all_completion_frame_ticks(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        mode = memory.NO_ARRIVAL_MODE
+        traffic_ack = drawn_native_gpu_graphics(mode)
+        traffic_ack.update(active_requests=0, dashboard_visible=True, popover_visible=True, rail_frame_clock_ticks=0)
+        self.assertEqual(traffic_ack["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"], 0)
+        self.assertTrue(memory.validate_graphics(traffic_ack, mode, completed_visible_workload=True)["available"])
+
+        completion = copy.deepcopy(traffic_ack)
+        completion["rail_frame_clock_ticks"] = 58
+        value = completion["graphics_diagnostics"]
+        decoration = copy.deepcopy(value["roles"]["static_chart"])
+        decoration["draws"] = 59
+        value["roles"]["rail_decorations"] = decoration
+        value.update(native_gpu_canvas_draws=62, live_canvases=2, peak_live_canvases=2,
+                     current_pixel_area=800, peak_pixel_area=800)
+        completion["grouped_native_canvas_draws"] = 62
+        self.assertTrue(memory.validate_graphics(completion, mode, completed_visible_workload=True)["available"])
+
+    def test_new_mode_requires_typed_suppression_evidence_and_keeps_completion_features(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        mode = memory.NO_ARRIVAL_MODE
+        snapshot = drawn_native_gpu_graphics(mode)
+        result = memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+        self.assertFalse(result["runtime_feature_contract"]["arrival_effects_enabled"])
+        self.assertTrue(result["runtime_feature_contract"]["lifecycle_effects_enabled"])
+        for field, invalid in (("arrival_effects_enabled", None), ("arrival_effects_enabled", True),
+                               ("arrival_effects_enabled", 0), ("suppressed_arrival_effects", None),
+                               ("suppressed_arrival_effects", True), ("suppressed_arrival_effects", -1),
+                               ("suppressed_arrival_effects", 0)):
+            changed = copy.deepcopy(snapshot)
+            target = changed["graphics_diagnostics"] if field == "arrival_effects_enabled" else changed
+            target[field] = invalid
+            with self.subTest(field=field, value=invalid), self.assertRaises(InvalidResult):
+                memory.validate_graphics(changed, mode, completed_visible_workload=True)
+
+    def test_legacy_absence_and_whole_lifecycle_control_do_not_claim_arrival_suppression(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        for mode in (memory.ORDERED_PUBLICATION_MODE, "runtime-no-lifecycle"):
+            snapshot = drawn_native_gpu_graphics(mode)
+            self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+            snapshot["graphics_diagnostics"]["arrival_effects_enabled"] = mode != "runtime-no-lifecycle"
+            with self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, mode)
+            snapshot["suppressed_arrival_effects"] = 0
+            self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+            snapshot["suppressed_arrival_effects"] = 1
+            with self.assertRaisesRegex(InvalidResult, "unexpectedly suppressed"):
+                memory.validate_graphics(snapshot, mode)
+            del snapshot["graphics_diagnostics"]["arrival_effects_enabled"]
+            with self.assertRaisesRegex(InvalidResult, "lacks feature metadata"):
+                memory.validate_graphics(snapshot, mode)
 
 
 class NativeCanvasGroupingContractTests(unittest.TestCase):
@@ -360,8 +415,11 @@ class NextRuntimeContractTests(unittest.TestCase):
                     with self.subTest(mode=mode, field=field, value=invalid), self.assertRaises(InvalidResult):
                         memory.validate_graphics(changed, mode)
             snapshot["rail_frame_clock_ticks"] = 0
-            with self.assertRaisesRegex(InvalidResult, "did not execute"):
-                memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+            if mode == memory.NO_ARRIVAL_MODE:
+                self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+            else:
+                with self.assertRaisesRegex(InvalidResult, "did not execute"):
+                    memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
             snapshot["rail_frame_clock_ticks"] = 3
             snapshot["rail_timeline_content_updates"] = 1
             with self.assertRaisesRegex(InvalidResult, "Timeline"):

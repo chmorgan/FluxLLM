@@ -30,6 +30,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeOrderedPublication = "runtime-ordered-publication"
         case runtimeDirectToolPlot = "runtime-direct-tool-plot"
         case runtimeUngroupedCanvas = "runtime-ungrouped-canvas"
+        case runtimeNoArrivalEffects = "runtime-no-arrival-effects"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -70,7 +71,8 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeOptimized,
                 .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
                 .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
-                .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas:
+                .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
+                .runtimeNoArrivalEffects:
                 true
             default:
                 false
@@ -78,6 +80,7 @@ public final class PerformanceGraphicsDiagnostics {
         }
 
         var omitsLifecycleEffects: Bool { self == .runtimeNoLifecycle }
+        var omitsArrivalEffects: Bool { self == .runtimeNoArrivalEffects }
 
         var usesSharedChartPreparation: Bool {
             self == .runtimeSharedPreparation || self == .runtimeNextOptimized
@@ -91,6 +94,7 @@ public final class PerformanceGraphicsDiagnostics {
             self == .normal || usesSharedChartPreparation || self == .runtimeOrderedPublication
                 || self == .runtimeDirectToolPlot
                 || self == .runtimeUngroupedCanvas
+                || self == .runtimeNoArrivalEffects
         }
 
         var usesDirectToolPlot: Bool { self == .runtimeDirectToolPlot }
@@ -102,6 +106,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeStreamCanvasClock || self == .runtimeOrderedPublication
                 || self == .runtimeDirectToolPlot
                 || self == .runtimeUngroupedCanvas
+                || self == .runtimeNoArrivalEffects
         }
 
         var usesCanvasFrameClock: Bool {
@@ -109,6 +114,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeOrderedPublication
                 || self == .runtimeDirectToolPlot
                 || self == .runtimeUngroupedCanvas
+                || self == .runtimeNoArrivalEffects
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -595,6 +601,8 @@ public final class PerformanceGraphicsDiagnostics {
             result["ordered_chart_publication"] = mode.usesOrderedChartPublication
             result["direct_tool_plot"] = mode.usesDirectToolPlot
             result["ungrouped_native_canvas"] = mode.usesUngroupedNativeCanvas
+            result["arrival_effects_enabled"] =
+                !mode.omitsLifecycleEffects && !mode.omitsArrivalEffects
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

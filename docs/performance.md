@@ -504,6 +504,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-ordered-publication` | Combine ordered single-interval chart publication, stream writes, Canvas clock, and both history/preparation optimizations; matches current production feature selection. |
 | `runtime-direct-tool-plot` | Build request-tool plot geometry directly on top of current production behavior. |
 | `runtime-ungrouped-canvas` | Omit `drawingGroup` around native Canvas surfaces while retaining current production behavior elsewhere. |
+| `runtime-no-arrival-effects` | Suppress request-arrival effects while preserving completion effects and active retained twinkles. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -545,6 +546,14 @@ The backend acknowledgment is exactly `swiftui-canvas` for this experiment and
 `swiftui-canvas-drawing-group` for grouped native rendering.
 Existing path, drawing-fidelity, visibility, clock, budget, and deadline checks
 remain in force.
+
+`runtime-no-arrival-effects` inherits production's ordered publication,
+stream-write, Canvas-clock, and history/preparation paths, with grouped Canvas
+and legacy tool plotting. Shared preparation and stable decoration hosts remain
+disabled. It keeps `lifecycle_effects_enabled = true` and sets
+`arrival_effects_enabled = false`; compare it with
+`--baseline-mode normal --controls runtime-no-arrival-effects`. Production
+`normal` continues to show arrival effects; this diagnostic makes no CPU-gain claim.
 
 The stream-write control keeps promises on response heads and ends, and on
 `HEAD`/`CONNECT` bodies. Its body fast path requires an active downstream channel
@@ -607,6 +616,23 @@ ticks. The completion endpoint itself is not assumed animation-free.
 Existing drawing, twinkle lifecycle, visibility, and closed-resource
 checks still apply; selecting a flag alone is
 insufficient evidence that a candidate ran.
+
+The arrival-effects control requires the boolean `arrival_effects_enabled` flag
+and a nonnegative integer top-level `suppressed_arrival_effects` counter, with a
+positive workload delta. Every other mode requires zero suppressions when
+instrumented, including `runtime-no-lifecycle`, which disables the whole lifecycle.
+The arrival flag is false only for these two controls and true for all other modes.
+Older frozen products may omit the entire group; supplied evidence must be complete
+and valid. The new control must prove zero arrival frame ticks and rail-decoration
+draws, plus positive completion ticks and draws. Whole-runtime, steady, closed,
+visibility, fidelity, CPU/GPU limits, and deadline checks remain unchanged.
+Existing authenticated checkpoints bracket the full two-second arrival phase;
+the counter interval may extend into the following effect-free gap. Completion
+evidence uses checkpoints from the acknowledged end of both streams inside the
+three-second completion phase. Counter values are never interpolated.
+The traffic acknowledgment may correctly contain zero frame ticks in this mode;
+generic snapshot validation defers tick positivity to the required whole-runtime
+and authenticated completion-phase proofs.
 
 Ordered publication, including current `normal`, requires a positive workload
 delta in top-level
