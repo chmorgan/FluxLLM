@@ -1050,7 +1050,8 @@ public final class MetricsStore {
 
     private func publishChartPresentationIfDue(at date: Date) {
         guard !presentationDemandIsManaged || !presentationConsumers.isEmpty else { return }
-        guard lastChartPublicationAt.map({ date.timeIntervalSince($0) >= 1 }) ?? true else {
+        let interval = PerformanceGraphicsDiagnostics.shared.mode.chartPublicationIntervalSeconds
+        guard lastChartPublicationAt.map({ date.timeIntervalSince($0) >= interval }) ?? true else {
             return
         }
         let firstRaw =

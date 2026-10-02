@@ -33,8 +33,10 @@ NATIVE_CANVAS_GROUP_COUNTERS = ("ungrouped_native_canvas_draws", "grouped_native
 NO_ARRIVAL_MODE = "runtime-no-arrival-effects"
 COMPACT_TOOL_PATHS_MODE = "runtime-compact-tool-paths"
 DEFERRED_TOOL_GEOMETRY_MODE = "runtime-deferred-tool-geometry"
+DEFERRED_TOOL_GEOMETRY_2HZ_MODE = "runtime-deferred-tool-geometry-2hz"
+DEFERRED_TOOL_GEOMETRY_MODES = (DEFERRED_TOOL_GEOMETRY_MODE, DEFERRED_TOOL_GEOMETRY_2HZ_MODE)
 TOOL_PATH_POINT_COUNTERS = ("tool_path_input_points", "tool_path_output_points")
-ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, DEFERRED_TOOL_GEOMETRY_MODE)
+ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE) + DEFERRED_TOOL_GEOMETRY_MODES
 CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + ORDERED_PUBLICATION_MODES
 NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized") + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
@@ -385,27 +387,27 @@ def runtime_feature_contract(value, mode):
         require(type(value.get("ordered_chart_publication")) is bool and value["ordered_chart_publication"] is expected,
                 "Graphics ordered_chart_publication does not match the requested runtime control")
         extras["ordered_chart_publication"] = value["ordered_chart_publication"]
-    if mode in (DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, DEFERRED_TOOL_GEOMETRY_MODE) or "direct_tool_plot" in value:
+    if mode in (DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "direct_tool_plot" in value:
         require(type(value.get("direct_tool_plot")) is bool and value["direct_tool_plot"] is (mode == DIRECT_TOOL_PLOT_MODE),
                 "Graphics direct_tool_plot does not match the requested runtime control")
         extras["direct_tool_plot"] = value["direct_tool_plot"]
-    if mode in (UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, DEFERRED_TOOL_GEOMETRY_MODE) or "ungrouped_native_canvas" in value:
+    if mode in (UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "ungrouped_native_canvas" in value:
         require(type(value.get("ungrouped_native_canvas")) is bool and value["ungrouped_native_canvas"] is (mode == UNGROUPED_CANVAS_MODE),
                 "Graphics ungrouped_native_canvas does not match the requested runtime control")
         extras["ungrouped_native_canvas"] = value["ungrouped_native_canvas"]
-    if mode in (NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, DEFERRED_TOOL_GEOMETRY_MODE) or "arrival_effects_enabled" in value:
+    if mode in (NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "arrival_effects_enabled" in value:
         expected = mode not in (NO_ARRIVAL_MODE, "runtime-no-lifecycle")
         require(type(value.get("arrival_effects_enabled")) is bool and value["arrival_effects_enabled"] is expected,
                 "Graphics arrival_effects_enabled does not match the requested runtime control")
         extras["arrival_effects_enabled"] = value["arrival_effects_enabled"]
-    if mode in (COMPACT_TOOL_PATHS_MODE, DEFERRED_TOOL_GEOMETRY_MODE) or "compact_tool_paths_enabled" in value:
+    if mode in (COMPACT_TOOL_PATHS_MODE,) + DEFERRED_TOOL_GEOMETRY_MODES or "compact_tool_paths_enabled" in value:
         require(type(value.get("compact_tool_paths_enabled")) is bool
                 and value["compact_tool_paths_enabled"] is (mode == COMPACT_TOOL_PATHS_MODE),
                 "Graphics compact_tool_paths_enabled does not match the requested runtime control")
         extras["compact_tool_paths_enabled"] = value["compact_tool_paths_enabled"]
-    if mode == DEFERRED_TOOL_GEOMETRY_MODE or "deferred_tool_geometry_enabled" in value:
+    if mode in DEFERRED_TOOL_GEOMETRY_MODES or "deferred_tool_geometry_enabled" in value:
         require(type(value.get("deferred_tool_geometry_enabled")) is bool
-                and value["deferred_tool_geometry_enabled"] is (mode == DEFERRED_TOOL_GEOMETRY_MODE),
+                and value["deferred_tool_geometry_enabled"] is (mode in DEFERRED_TOOL_GEOMETRY_MODES),
                 "Graphics deferred_tool_geometry_enabled does not match the requested runtime control")
         extras["deferred_tool_geometry_enabled"] = value["deferred_tool_geometry_enabled"]
     if mode == "normal":
@@ -440,6 +442,19 @@ def tool_path_point_counts(snapshot):
     return counts
 
 
+def chart_publication_interval(value, mode):
+    field = "chart_publication_interval_seconds"
+    if field not in value and mode != DEFERRED_TOOL_GEOMETRY_2HZ_MODE:
+        return None
+    interval = value.get(field)
+    expected = .5 if mode == DEFERRED_TOOL_GEOMETRY_2HZ_MODE else 1.0
+    # Exact equality to finite protocol constants also rejects NaN/infinity and
+    # huge integers without converting them to float; bool must not equal 1.
+    require(type(interval) in (int, float) and interval == expected,
+            "Graphics chart_publication_interval_seconds does not match the requested cadence")
+    return interval
+
+
 def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False,
                       require_native_normal=False):
     value = snapshot.get("graphics_diagnostics")
@@ -452,12 +467,13 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             "App did not acknowledge the requested graphics diagnostic mode")
     require(unsigned(value.get("invalid_events"), "graphics.invalid_events") == 0,
             "Graphics diagnostic counters reported invalid lifecycle events")
+    publication_interval = chart_publication_interval(value, mode)
     # Keep the requested mode acknowledgment while applying the complete
     # combined contract to newer production binaries that identify this backend.
     native_normal = mode == "normal" and "native_gpu_backend" in value
     contract = "native-gpu-optimized" if native_normal or mode in RUNTIME_MODES else mode
     runtime_features = runtime_feature_contract(value, mode)
-    if (mode in (COMPACT_TOOL_PATHS_MODE, DEFERRED_TOOL_GEOMETRY_MODE) or "compact_tool_paths_enabled" in value
+    if (mode in (COMPACT_TOOL_PATHS_MODE,) + DEFERRED_TOOL_GEOMETRY_MODES or "compact_tool_paths_enabled" in value
             or any(field in snapshot for field in TOOL_PATH_POINT_COUNTERS)):
         require("compact_tool_paths_enabled" in value or contract not in NATIVE_GPU_MODES,
                 "Tool-path point counters lack feature metadata")
@@ -469,7 +485,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
         else:
             require(points["tool_path_output_points"] == points["tool_path_input_points"],
                     "Noncompact tool paths changed the input vertex count")
-    if mode in (NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, DEFERRED_TOOL_GEOMETRY_MODE) or "arrival_effects_enabled" in value or "suppressed_arrival_effects" in snapshot:
+    if mode in (NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "arrival_effects_enabled" in value or "suppressed_arrival_effects" in snapshot:
         require("arrival_effects_enabled" in value or contract not in NATIVE_GPU_MODES,
                 "Arrival suppression counter lacks feature metadata")
         suppressed = unsigned(snapshot.get("suppressed_arrival_effects"), "suppressed_arrival_effects")
@@ -478,7 +494,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
                 require(suppressed > 0, "No-arrival mode did not suppress arrival effects")
         else:
             require(suppressed == 0, "Baseline mode unexpectedly suppressed arrival effects")
-    if (mode in (UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, DEFERRED_TOOL_GEOMETRY_MODE) or "ungrouped_native_canvas" in value
+    if (mode in (UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "ungrouped_native_canvas" in value
             or any(field in snapshot for field in NATIVE_CANVAS_GROUP_COUNTERS)):
         require("ungrouped_native_canvas" in value or contract not in NATIVE_GPU_MODES,
                 "Native Canvas grouping counters lack feature metadata")
@@ -493,7 +509,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
                 require(grouping["ungrouped_native_canvas_draws"] > 0, "Ungrouped native Canvas did not execute drawing callbacks")
         else:
             require(grouping["ungrouped_native_canvas_draws"] == 0, "Grouped native Canvas mode executed ungrouped callbacks")
-    if (mode in (DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, DEFERRED_TOOL_GEOMETRY_MODE) or "direct_tool_plot" in value
+    if (mode in (DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "direct_tool_plot" in value
             or any(field in snapshot for field in DIRECT_TOOL_PLOT_COUNTERS)):
         require("direct_tool_plot" in value or contract not in NATIVE_GPU_MODES,
                 "Tool-plot counters lack feature metadata")
@@ -677,6 +693,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             require(native_gpu_draws > 0 and roles["static_chart"]["draws"] > 0,
                     "Completed visible workload did not execute native GPU static-chart drawing")
     return {"available": True, "counters": value,
+            **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {}),
             **({"runtime_feature_contract": runtime_features} if runtime_features is not None else {}),
             **({"normal_rendering_contract": "native-gpu-optimized" if native_normal else "legacy"}
                if mode == "normal" else {})}
@@ -731,6 +748,8 @@ class MemoryDiagnostic:
         self.no_native_inspection = no_native_inspection
         self.require_native_normal = False
         self.runtime_feature_contract = None
+        self.publication_interval_checked = False
+        self.chart_publication_interval_seconds = None
         self.collector = self.fixture = self.active_probe = None
         self.identity = None
         self.report = {"schema_version": 1, "kind": "memory-attribution-diagnostic", "status": "running",
@@ -792,6 +811,15 @@ class MemoryDiagnostic:
     def validate_graphics_snapshot(self, snapshot, *, completed_visible_workload=False, expected_closed=False):
         result = validate_graphics(snapshot, self.graphics_mode, completed_visible_workload=completed_visible_workload,
                                    expected_closed=expected_closed, require_native_normal=self.require_native_normal)
+        interval = result.get("chart_publication_interval_seconds")
+        if self.publication_interval_checked:
+            require(interval == self.chart_publication_interval_seconds,
+                    "Chart publication interval metadata changed or disappeared during the capture")
+        else:
+            self.publication_interval_checked = True
+            self.chart_publication_interval_seconds = interval
+            if interval is not None:
+                self.report["chart_publication_interval_seconds"] = interval
         contract = result.get("runtime_feature_contract")
         if self.runtime_feature_contract is not None:
             require(contract == self.runtime_feature_contract, "Runtime feature metadata changed or disappeared during the capture")

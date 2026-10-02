@@ -82,6 +82,9 @@ def validate_runtime_work(before, after, mode, *, required=True):
         return {"available": False, "reason": "Frozen normal predates runtime-control counters"}
     require(flags is not None and set(memory.RUNTIME_FLAGS) <= set(flags) and flags == initial,
             "Runtime workload lacks a stable complete feature contract")
+    publication_interval = memory.chart_publication_interval(after.get("graphics_diagnostics", {}), mode)
+    require(publication_interval == memory.chart_publication_interval(before.get("graphics_diagnostics", {}), mode),
+            "Runtime chart publication interval metadata changed or disappeared")
     delta = {}
     for field in COUNTERS:
         first = memory.unsigned(before.get(field), f"runtime.before.{field}")
@@ -89,7 +92,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {field} counter moved backwards")
         delta[field] = last - first
     require(delta["chart_preparations"] > 0, "Runtime workload did not prepare charts")
-    if (mode in (memory.COMPACT_TOOL_PATHS_MODE, memory.DEFERRED_TOOL_GEOMETRY_MODE) or "compact_tool_paths_enabled" in flags
+    if (mode in (memory.COMPACT_TOOL_PATHS_MODE,) + memory.DEFERRED_TOOL_GEOMETRY_MODES or "compact_tool_paths_enabled" in flags
             or any(field in snapshot for snapshot in (before, after) for field in memory.TOOL_PATH_POINT_COUNTERS)):
         require("compact_tool_paths_enabled" in flags, "Tool-path point counters lack feature metadata")
         first, last = memory.tool_path_point_counts(before), memory.tool_path_point_counts(after)
@@ -103,7 +106,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
             require(first["tool_path_output_points"] == first["tool_path_input_points"]
                     and last["tool_path_output_points"] == last["tool_path_input_points"],
                     "Noncompact tool paths changed the input vertex count")
-            if mode in ("normal", memory.DEFERRED_TOOL_GEOMETRY_MODE):
+            if mode in ("normal",) + memory.DEFERRED_TOOL_GEOMETRY_MODES:
                 require(delta["tool_path_input_points"] > 0, "Noncompact tool paths did not execute vertex construction")
     if mode == memory.NO_ARRIVAL_MODE or "arrival_effects_enabled" in flags or any("suppressed_arrival_effects" in snapshot for snapshot in (before, after)):
         require("arrival_effects_enabled" in flags, "Arrival suppression counter lacks feature metadata")
@@ -240,7 +243,8 @@ def validate_runtime_work(before, after, mode, *, required=True):
                 "Canvas frame ticks did not produce sufficient native decoration draws")
     if not flags["lifecycle_effects_enabled"]:
         require(delta["rail_decorations_draws"] == 0, "No-lifecycle control still drew lifecycle decorations")
-    return {"available": True, "features": flags, "deltas": delta}
+    return {"available": True, "features": flags, "deltas": delta,
+            **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {})}
 
 
 def validate_visual_work(report, *, required):

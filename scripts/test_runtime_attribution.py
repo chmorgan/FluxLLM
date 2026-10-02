@@ -29,7 +29,7 @@ def workload_snapshots(mode):
     if mode == memory.COMPACT_TOOL_PATHS_MODE:
         after["tool_path_input_points"] += 100
         after["tool_path_output_points"] += 30
-    if mode == memory.DEFERRED_TOOL_GEOMETRY_MODE:
+    if mode in memory.DEFERRED_TOOL_GEOMETRY_MODES:
         after["tool_path_input_points"] += 100
         after["tool_path_output_points"] += 100
     if value.get("ordered_chart_publication"):
@@ -391,6 +391,54 @@ class NativeCanvasGroupingWorkTests(unittest.TestCase):
             for field in memory.NATIVE_CANVAS_GROUP_COUNTERS:
                 del snapshot[field]
         self.assertTrue(runtime.validate_runtime_work(before, after, "normal")["available"])
+
+
+class DeferredToolGeometryCadenceWorkTests(unittest.TestCase):
+    def test_two_hz_reports_real_preparations_queries_and_draws_without_one_hz_count_gate(self):
+        mode = memory.DEFERRED_TOOL_GEOMETRY_2HZ_MODE
+        before, after = workload_snapshots(mode)
+        for field in ("chart_preparations", "optimized_chart_preparations", "ordered_chart_publication_queries"):
+            after[field] += 2
+        after["graphics_diagnostics"]["roles"]["static_chart"]["draws"] += 2
+        after["graphics_diagnostics"]["native_gpu_canvas_draws"] += 2
+        after["grouped_native_canvas_draws"] += 2
+        result = runtime.validate_runtime_work(before, after, mode)
+        self.assertEqual(result["chart_publication_interval_seconds"], .5)
+        self.assertNotIn("chart_publication_interval_seconds", result["features"])
+        for field in ("chart_preparations", "optimized_chart_preparations", "ordered_chart_publication_queries", "static_chart_draws"):
+            self.assertEqual(result["deltas"][field], 4)
+        self.assertEqual(result["deltas"]["tool_path_input_points"], result["deltas"]["tool_path_output_points"])
+
+    def test_two_hz_rejects_missing_or_wrong_interval_at_either_boundary(self):
+        mode = memory.DEFERRED_TOOL_GEOMETRY_2HZ_MODE
+        for boundary in (0, 1):
+            for invalid in (None, True, 1.0, float("nan"), float("inf")):
+                snapshots = workload_snapshots(mode)
+                value = snapshots[boundary]["graphics_diagnostics"]
+                if invalid is None:
+                    del value["chart_publication_interval_seconds"]
+                else:
+                    value["chart_publication_interval_seconds"] = invalid
+                with self.subTest(boundary=boundary, invalid=invalid), self.assertRaisesRegex(ValueError, "publication_interval"):
+                    runtime.validate_runtime_work(*snapshots, mode)
+
+    def test_legacy_pair_may_omit_cadence_but_mixed_presence_is_invalid(self):
+        mode = memory.DEFERRED_TOOL_GEOMETRY_MODE
+        before, after = workload_snapshots(mode)
+        self.assertNotIn("chart_publication_interval_seconds", runtime.validate_runtime_work(before, after, mode))
+        after["graphics_diagnostics"]["chart_publication_interval_seconds"] = 1.0
+        with self.assertRaisesRegex(ValueError, "interval metadata changed"):
+            runtime.validate_runtime_work(before, after, mode)
+        before["graphics_diagnostics"]["chart_publication_interval_seconds"] = 1.0
+        self.assertEqual(runtime.validate_runtime_work(before, after, mode)["chart_publication_interval_seconds"], 1.0)
+
+    def test_four_case_cli_is_bracketed_without_changing_global_deadline(self):
+        controls = list(memory.DEFERRED_TOOL_GEOMETRY_MODES)
+        arguments = ["compare", "--app-binary", "/app", "--test-bundle", "/tests", "--collector-binary", "/collector",
+                     "--provenance", "/provenance", "--baseline-mode", "normal", "--controls", *controls]
+        self.assertEqual(runtime.selected_cases(runtime.parser().parse_args(arguments)), [
+            ("baseline-before", "normal"), *[(mode, mode) for mode in controls], ("baseline-after", "normal")])
+        self.assertEqual(runtime.MAX_SECONDS, 300)
 
 
 class DeferredToolGeometryWorkTests(unittest.TestCase):

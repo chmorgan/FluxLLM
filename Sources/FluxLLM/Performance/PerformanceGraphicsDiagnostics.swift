@@ -33,6 +33,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeNoArrivalEffects = "runtime-no-arrival-effects"
         case runtimeCompactToolPaths = "runtime-compact-tool-paths"
         case runtimeDeferredToolGeometry = "runtime-deferred-tool-geometry"
+        case runtimeDeferredToolGeometry2Hz = "runtime-deferred-tool-geometry-2hz"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -74,7 +75,8 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
                 .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
                 .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
-                .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry:
+                .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
+                .runtimeDeferredToolGeometry2Hz:
                 true
             default:
                 false
@@ -98,14 +100,22 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeUngroupedCanvas
                 || self == .runtimeNoArrivalEffects
                 || self == .runtimeCompactToolPaths
-                || self == .runtimeDeferredToolGeometry
+                || usesDeferredToolGeometry
         }
 
         var usesDirectToolPlot: Bool { self == .runtimeDirectToolPlot }
 
         var usesCompactToolPaths: Bool { self == .runtimeCompactToolPaths }
 
-        var usesDeferredToolGeometry: Bool { self == .runtimeDeferredToolGeometry }
+        var usesDeferredToolGeometry: Bool {
+            self == .runtimeDeferredToolGeometry || self == .runtimeDeferredToolGeometry2Hz
+        }
+
+        /// Chart data publication is independent of metrics sampling and the
+        /// animation frame clock. Keep the faster cadence diagnostic-only until measured.
+        var chartPublicationIntervalSeconds: TimeInterval {
+            self == .runtimeDeferredToolGeometry2Hz ? 0.5 : 1
+        }
 
         var usesUngroupedNativeCanvas: Bool { self == .runtimeUngroupedCanvas }
 
@@ -116,7 +126,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeUngroupedCanvas
                 || self == .runtimeNoArrivalEffects
                 || self == .runtimeCompactToolPaths
-                || self == .runtimeDeferredToolGeometry
+                || usesDeferredToolGeometry
         }
 
         var usesCanvasFrameClock: Bool {
@@ -126,7 +136,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeUngroupedCanvas
                 || self == .runtimeNoArrivalEffects
                 || self == .runtimeCompactToolPaths
-                || self == .runtimeDeferredToolGeometry
+                || usesDeferredToolGeometry
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -617,6 +627,7 @@ public final class PerformanceGraphicsDiagnostics {
                 !mode.omitsLifecycleEffects && !mode.omitsArrivalEffects
             result["compact_tool_paths_enabled"] = mode.usesCompactToolPaths
             result["deferred_tool_geometry_enabled"] = mode.usesDeferredToolGeometry
+            result["chart_publication_interval_seconds"] = mode.chartPublicationIntervalSeconds
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"
