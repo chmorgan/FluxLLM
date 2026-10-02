@@ -132,7 +132,7 @@ private struct RequestRailDecorations: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var windowVisible = false
     @State private var prepared: [PreparedEffect] = []
-    @State private var twinkles: [Twinkle] = []
+    @State private var twinkles: [RequestRailTwinkle] = []
     @State private var animating = false
 
     private var effectsEnabled: Bool {
@@ -149,15 +149,33 @@ private struct RequestRailDecorations: View {
             segment.isLive || prepared.contains { $0.key.requestID == segment.lane.id }
         }
 
+        let retainedTwinkles = PerformanceGraphicsDiagnostics.shared.mode.usesRetainedTwinkles
+        let lifecycleVisible = prepared.contains {
+            eligibility.effectIDs.contains($0.key.eventID)
+        }
         let bounds = ChartSurfaceBounds.decorations(rail: rect, plotSize: plotSize)
         // Keep one native surface throughout an active request/effect episode,
         // including gaps between glints, and release it when genuinely idle.
         let needsSurface =
             effectsEnabled
-            && (!eligibility.liveIDs.isEmpty || !eligibility.effectIDs.isEmpty
-                || !prepared.isEmpty || animating)
+            && (retainedTwinkles
+                ? lifecycleVisible
+                : (!eligibility.liveIDs.isEmpty || !eligibility.effectIDs.isEmpty
+                    || !prepared.isEmpty || animating))
         ZStack(alignment: .topLeading) {
             Color.clear
+            // During a lifecycle effect, preserve the original per-request
+            // ordering of bursts and glints in the existing Canvas. Between
+            // effects, the same twinkle instances continue in retained layers.
+            if retainedTwinkles && effectsEnabled && !lifecycleVisible
+                && (!eligibility.liveIDs.isEmpty || !twinkles.isEmpty)
+            {
+                RetainedRequestRailTwinkles(
+                    twinkles: twinkles, segments: segments, now: now, duration: duration,
+                    rail: rect, color: color(for:)
+                )
+                .frame(width: plotSize.width, height: plotSize.height)
+            }
             if needsSurface && !bounds.isEmpty {
                 TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { clock in
                     ChartDrawingSurface(role: .railDecorations, drawingBounds: bounds) {
@@ -233,7 +251,7 @@ private struct RequestRailDecorations: View {
                     segments.first(where: { $0.lane.id == id })?.lane.startedAt ?? timestamp,
                     timestamp.addingTimeInterval(-duration))
                 let fraction = 0.08 + requestRandom.unit() * 0.84
-                let twinkle = Twinkle(
+                let twinkle = RequestRailTwinkle(
                     requestID: id, startedAt: timestamp,
                     duration: 0.43 + requestRandom.unit() * 0.16,
                     location: start.addingTimeInterval(
@@ -254,7 +272,10 @@ private struct RequestRailDecorations: View {
                 at: timestamp,
                 visibleUntil: visibleEffects.map(\.visibleUntil) + currentTwinkles.map(\.endsAt),
                 nextTwinkleAt: nextTwinkleAt, retainedUntil: prepared.map(\.visibleUntil))
-            if animating != schedule.isAnimating { animating = schedule.isAnimating }
+            let needsTimeline =
+                PerformanceGraphicsDiagnostics.shared.mode.usesRetainedTwinkles
+                ? !visibleEffects.isEmpty : schedule.isAnimating
+            if animating != needsTimeline { animating = needsTimeline }
             guard let nextUpdate = schedule.nextUpdate else { return }
             do {
                 try await Task.sleep(for: .seconds(max(0, nextUpdate.timeIntervalSinceNow)))
@@ -305,40 +326,12 @@ private struct RequestRailDecorations: View {
             }
             if segment.isLive {
                 for twinkle in twinkles where twinkle.requestID == segment.lane.id {
-                    drawTwinkle(
-                        twinkle, segment: segment, at: timestamp, color: color, in: &context)
+                    twinkle.draw(
+                        segment: segment, now: now, duration: duration, rail: rect,
+                        timestamp: timestamp, color: color, in: &context)
                 }
             }
         }
-    }
-
-    private func drawTwinkle(
-        _ twinkle: Twinkle, segment: RequestRailGeometry.Segment, at timestamp: Date,
-        color: Color, in context: inout GraphicsContext
-    ) {
-        let p = timestamp.timeIntervalSince(twinkle.startedAt) / twinkle.duration
-        guard p > 0, p < 1 else { return }
-        let strength = pow(sin(.pi * p), 2)
-        let size = CGFloat(twinkle.size * (0.7 + 0.3 * strength))
-        let bar = segment.rect
-        let x =
-            rect.minX + twinkle.location.timeIntervalSince(now.addingTimeInterval(-duration))
-            / duration * rect.width
-        guard x >= bar.minX, x <= bar.maxX else { return }
-        let point = CGPoint(x: x, y: bar.midY)
-        var clipped = context
-        clipped.clip(
-            to: Path(roundedRect: bar, cornerRadius: segment.cornerRadius, style: .circular))
-        clipped.fill(
-            Path(
-                ellipseIn: CGRect(
-                    x: point.x - size * 2.1, y: bar.minY, width: size * 4.2, height: bar.height)),
-            with: .color(color.opacity(strength * 0.32)))
-        let mark =
-            twinkle.star
-            ? star(at: point, size: size, angle: twinkle.angle)
-            : circle(at: point, radius: size * 0.56)
-        clipped.fill(mark, with: .color(.white.opacity(strength)))
     }
 
     private func drawBurst(
@@ -533,16 +526,6 @@ private struct RequestRailDecorations: View {
         }
     }
 
-    private struct Twinkle: Equatable {
-        let requestID: UUID
-        let startedAt: Date
-        let duration: TimeInterval
-        let location: Date
-        let size: Double
-        let angle: Double
-        let star: Bool
-        var endsAt: Date { startedAt.addingTimeInterval(duration) }
-    }
 }
 
 /// Dashboard windows are hosted by AppKit rather than a SwiftUI scene. Observe
