@@ -18,11 +18,16 @@ def graphics(mode="normal"):
               "renderer_destructions", "live_renderers", "peak_live_renderers", "draws", "skipped_draws",
               "current_pixel_area", "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes",
               "max_width_points", "max_height_points", "max_scale")
-    return {"graphics_diagnostics": {
+    return {**({"shared_chart_normalization_builds": 0, "shared_chart_preparations": 0, "streamed_bodies_without_promises": 0, "chart_preparations": 0}
+               if mode in memory.NEXT_RUNTIME_MODES else {}), "graphics_diagnostics": {
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
-        **({"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle"),
-            "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle"),
+        **({"shared_chart_preparation": mode in ("runtime-shared-preparation", "runtime-next-optimized"),
+            "stable_decoration_hosts": mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"),
+            "unpromised_stream_body_writes": mode in ("runtime-stream-writes", "runtime-next-optimized")}
+           if mode in memory.NEXT_RUNTIME_MODES else {}),
+        **({"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
+            "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
             "lifecycle_effects_enabled": mode != "runtime-no-lifecycle"} if mode in memory.RUNTIME_MODES else {}),
         **({"native_gpu_backend": "swiftui-canvas-drawing-group", "native_gpu_canvas_draws": 0}
            if mode in memory.NATIVE_GPU_MODES else {}),
@@ -62,6 +67,13 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
                  current_pixel_area=400, peak_pixel_area=400)
     value["roles"]["static_chart"].update(created=1, live=1, peak_live=1, draws=3,
         current_pixel_area=400, peak_pixel_area=400, max_width_points=10, max_height_points=10, max_scale=2)
+    if mode in ("runtime-shared-preparation", "runtime-next-optimized"):
+        snapshot.update(shared_chart_normalization_builds=1, shared_chart_preparations=3, chart_preparations=3)
+    if mode in ("runtime-stream-writes", "runtime-next-optimized"):
+        snapshot["streamed_bodies_without_promises"] = 3
+    if mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"):
+        value.update(live_canvases=2, peak_live_canvases=2)
+        value["roles"]["rail_decorations"].update(created=1, live=1, peak_live=1)
     if mode in memory.COALESCED_SCALAR_MODES:
         value["scalar_presentation_publications"] = 2
     if mode in memory.RETAINED_TWINKLE_MODES:
@@ -318,7 +330,8 @@ class GraphicsTests(unittest.TestCase):
             snapshot = drawn_native_gpu_graphics(mode)
             value = snapshot["graphics_diagnostics"]
             value["live_canvases"] = value["current_pixel_area"] = 0
-            value["roles"]["static_chart"].update(destroyed=1, live=0, current_pixel_area=0)
+            for role in value["roles"].values():
+                role.update(destroyed=role["created"], live=0, current_pixel_area=0)
             with self.subTest(mode=mode), self.assertRaisesRegex(InvalidResult, "Retained twinkle resources remain live"):
                 memory.validate_graphics(snapshot, mode, expected_closed=True)
             value["retained_twinkles"].update(hosts_destroyed=1, live_hosts=0, instances_destroyed=2, live_instances=0)

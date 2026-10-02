@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import io
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -23,6 +24,11 @@ def workload_snapshots(mode):
         before[field] = 10
     after = copy.deepcopy(before)
     after["chart_preparations"] += 2
+    if value.get("shared_chart_preparation"):
+        after["shared_chart_preparations"] += 2
+        after["shared_chart_normalization_builds"] += 1
+    if value.get("unpromised_stream_body_writes"):
+        after["streamed_bodies_without_promises"] += 2
     if value["optimized_chart_preparation"]:
         after["optimized_chart_preparations"] += 2
     if value["incremental_history_ordering"]:
@@ -91,7 +97,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -185,6 +191,114 @@ class RuntimeWorkTests(unittest.TestCase):
             after["graphics_diagnostics"]["roles"][role]["draws"] = 9
             with self.subTest(role=role), self.assertRaisesRegex(ValueError, "drawing counter moved backwards"):
                 runtime.validate_runtime_work(before, after, "runtime-optimized")
+
+
+class NextRuntimeWorkTests(unittest.TestCase):
+    def test_old_optimized_mode_can_be_the_preserved_baseline(self):
+        args = runtime.parser().parse_args(["compare", "--app-binary", "/app", "--test-bundle", "/tests",
+            "--collector-binary", "/collector", "--provenance", "/provenance", "--baseline-mode", "runtime-optimized",
+            "--controls", "runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-next-optimized"])
+        cases = runtime.selected_cases(args)
+        self.assertEqual(len(cases), 5)
+        self.assertEqual(cases[0][1], "runtime-optimized")
+
+    def test_shared_work_requires_complete_positive_bounded_execution(self):
+        for build_delta, preparation_delta in ((0, 2), (3, 2), (1, 1), (1, 3)):
+            before, after = workload_snapshots("runtime-shared-preparation")
+            after["shared_chart_normalization_builds"] = before["shared_chart_normalization_builds"] + build_delta
+            after["shared_chart_preparations"] = before["shared_chart_preparations"] + preparation_delta
+            with self.subTest(builds=build_delta, preparations=preparation_delta), self.assertRaisesRegex(ValueError, "Shared normalization"):
+                runtime.validate_runtime_work(before, after, "runtime-shared-preparation")
+
+    def test_new_modes_require_shared_counter_schema_and_old_modes_may_omit(self):
+        for mode in memory.NEXT_RUNTIME_MODES:
+            for field in memory.NEXT_RUNTIME_COUNTERS:
+                for invalid in (None, True, -1):
+                    before, after = workload_snapshots(mode)
+                    after[field] = invalid
+                    with self.subTest(mode=mode, field=field, invalid=invalid), self.assertRaises(ValueError):
+                        runtime.validate_runtime_work(before, after, mode)
+        before, after = workload_snapshots("runtime-optimized")
+        self.assertTrue(runtime.validate_runtime_work(before, after, "runtime-optimized")["available"])
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"].update(shared_chart_preparation=False, stable_decoration_hosts=False, unpromised_stream_body_writes=False)
+        with self.assertRaises(ValueError):
+            runtime.validate_runtime_work(before, after, "runtime-optimized")
+        for snapshot in (before, after):
+            snapshot.update(dict.fromkeys(memory.NEXT_RUNTIME_COUNTERS, 0))
+        self.assertTrue(runtime.validate_runtime_work(before, after, "runtime-optimized")["available"])
+        before["shared_chart_preparations"] = after["shared_chart_preparations"] = 1
+        with self.assertRaisesRegex(ValueError, "Nonshared"):
+            runtime.validate_runtime_work(before, after, "runtime-optimized")
+
+    def test_stable_host_requires_creation_but_inactive_zero_frame_is_valid(self):
+        before, after = workload_snapshots("runtime-stable-decoration-hosts")
+        role = after["graphics_diagnostics"]["roles"]["rail_decorations"]
+        role["draws"] = before["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"]
+        self.assertEqual(role["current_pixel_area"], 0)
+        self.assertTrue(runtime.validate_runtime_work(before, after, "runtime-stable-decoration-hosts")["available"])
+        role["created"] = 0
+        with self.assertRaisesRegex(ValueError, "did not create"):
+            runtime.validate_runtime_work(before, after, "runtime-stable-decoration-hosts")
+
+    def test_stream_write_candidate_requires_execution_without_assuming_http_fragment_count(self):
+        before, after = workload_snapshots("runtime-stream-writes")
+        for amount in (1, 10001):
+            after["streamed_bodies_without_promises"] = before["streamed_bodies_without_promises"] + amount
+            self.assertEqual(runtime.validate_runtime_work(before, after, "runtime-stream-writes")["deltas"]["streamed_bodies_without_promises"], amount)
+        after["streamed_bodies_without_promises"] = before["streamed_bodies_without_promises"]
+        with self.assertRaisesRegex(ValueError, "did not execute"):
+            runtime.validate_runtime_work(before, after, "runtime-stream-writes")
+        before, after = workload_snapshots("runtime-shared-preparation")
+        before["streamed_bodies_without_promises"] = after["streamed_bodies_without_promises"] = 1
+        with self.assertRaisesRegex(ValueError, "Promised-write"):
+            runtime.validate_runtime_work(before, after, "runtime-shared-preparation")
+
+    def test_extra_metadata_cannot_change_or_disappear(self):
+        before, after = workload_snapshots("runtime-next-optimized")
+        del after["graphics_diagnostics"]["stable_decoration_hosts"]
+        with self.assertRaises(ValueError):
+            runtime.validate_runtime_work(before, after, "runtime-next-optimized")
+
+
+class ProfileReadinessGuardTests(unittest.TestCase):
+    def test_profile_guard_pumps_half_second_and_validates_visible_idle_windows(self):
+        now = [10.0]
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = runtime.RuntimeDiagnostic(Path(directory), runtime.RuntimeDeadline(120), "normal", profile=True)
+            diagnostic.collector = Mock()
+            diagnostic.collector.snapshot.return_value = {"dashboard_visible": True, "popover_visible": True, "active_requests": 0}
+            diagnostic.collector.wait_until.side_effect = lambda end: now.__setitem__(0, end)
+            with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), \
+                    patch.object(diagnostic, "verify_identity") as identity, \
+                    patch.object(diagnostic, "validate_control_snapshot") as validate, patch.object(diagnostic, "save"):
+                diagnostic.profile_readiness_guard()
+            diagnostic.collector.wait_until.assert_called_once_with(10.5)
+            self.assertEqual(identity.call_count, 4)
+            self.assertEqual(validate.call_count, 2)
+            self.assertEqual(diagnostic.runtime["pre_workload_profile_guard"]["end_monotonic_seconds"], 10.5)
+            self.assertEqual(diagnostic.runtime["checkpoints"], [])
+
+    def test_hidden_guard_window_fails_before_traffic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = runtime.RuntimeDiagnostic(Path(directory), runtime.RuntimeDeadline(120), "normal", profile=True)
+            diagnostic.collector = Mock()
+            diagnostic.collector.snapshot.return_value = {"dashboard_visible": False, "popover_visible": True, "active_requests": 0}
+            with patch.object(diagnostic, "verify_identity"), self.assertRaisesRegex(ValueError, "guard lost"):
+                diagnostic.profile_readiness_guard()
+            diagnostic.collector.wait_until.assert_not_called()
+
+    def test_guard_is_profile_only_before_first_measured_checkpoint(self):
+        for profile in (False, True):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                diagnostic = runtime.RuntimeDiagnostic(Path(directory), runtime.RuntimeDeadline(120), "normal", profile=profile)
+                order = []
+                with patch.object(runtime, "_mach_clock", return_value={}), \
+                        patch.object(diagnostic, "begin_profile", side_effect=lambda: order.append("ready")), \
+                        patch.object(diagnostic, "profile_readiness_guard", side_effect=lambda: order.append("guard")), \
+                        patch.object(diagnostic, "runtime_checkpoint", side_effect=lambda label: order.append(label)):
+                    diagnostic.begin_runtime()
+                self.assertEqual(order, (["ready", "guard"] if profile else []) + ["before-traffic"])
 
 
 class CompletionCounterIntervalTests(unittest.TestCase):
@@ -302,6 +416,82 @@ class ProfilerFinalizationTests(unittest.TestCase):
     def test_profile_case_stays_bounded_within_outer_deadline(self):
         self.assertEqual(runtime.PROFILE_SECONDS, 120)
         self.assertLess(runtime.PROFILE_SECONDS + 2 * 45 + 30, runtime.MAX_SECONDS)
+
+
+class ProfileAnalysisStatusTests(unittest.TestCase):
+    def analysis(self, directory, *, mismatch):
+        import runtime_time_profile as profile
+        from test_runtime_time_profile import PID, anchor, kernel_samples, table_xml, toc_xml
+        toc, table = Path(directory) / "toc.xml", Path(directory) / "table.xml"
+        toc.write_text(toc_xml())
+        table.write_text(table_xml().replace('fmt="1.00 ms">1000000', 'fmt="100.00 ms">100000000') if mismatch else table_xml())
+        samples = kernel_samples()
+        if mismatch:
+            for sample in samples:
+                sample["cpu_seconds"] *= 50
+        return profile.analyze_exports(toc, table, PID,
+            {"arrival": {"start_monotonic_seconds": 102, "end_monotonic_seconds": 104}}, anchor(), samples)
+
+    def run_profile(self, directory, attribution):
+        output = Path(directory) / "output"
+        captured = {"status": "diagnostic_captured", "errors": [], "owned_identity": {"process_id": 1234},
+            "runtime": {"clock_anchor": {}, "mach_clock_start": {}, "mach_clock_end": {}},
+            "phase_windows": {}, "samples": [], "phase_cpu": {},
+            "runtime_cpu_target": {"evaluated": False, "within_limit": None}}
+        def capture(path, *_args, **_kwargs):
+            path.mkdir()
+            runtime.write_json(path / "runtime-case.json", captured)
+            return copy.deepcopy(captured)
+        args = ["profile", "--app-binary", "/app", "--test-bundle", "/tests",
+                "--collector-binary", "/collector", "--provenance", "/provenance", "--output-dir", str(output)]
+        with patch.object(runtime.sys, "platform", "darwin"), \
+                patch.object(runtime, "runtime_source_identity", return_value={}), \
+                patch.object(runtime.memory, "validate_products", return_value=({}, {}, {})), \
+                patch.object(runtime, "capture_case", side_effect=capture), \
+                patch("runtime_time_profile.analyze_trace", return_value=attribution), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = runtime.run(args)
+        return code, json.loads((output / "runtime-report.json").read_text()), (output / "SUMMARY.md").read_text()
+
+    def test_real_sample_kernel_mismatch_stays_pending_while_native_capture_is_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            attribution = self.analysis(directory, mismatch=True)
+            code, report, summary = self.run_profile(directory, attribution)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "analysis_pending")
+        self.assertTrue(report["native_capture_complete"])
+        self.assertEqual(report["cases"][0]["status"], "diagnostic_captured")
+        self.assertEqual(report["attribution"], attribution)
+        self.assertEqual(report["errors"], [])
+        self.assertIn("arrival", report["analysis_pending_reasons"][0])
+        self.assertIn("analysis_pending", summary)
+        self.assertIn("Quantitative CPU attribution is unavailable", summary)
+        self.assertNotIn("10.000%", summary)
+        self.assertEqual(report["attribution"]["phases"][0]["total"]["weight_ns"], 200_000_000)
+
+    def test_healthy_analysis_completes_without_claiming_unprofiled_cpu_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            attribution = self.analysis(directory, mismatch=False)
+            code, report, summary = self.run_profile(directory, attribution)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "diagnostic_captured")
+        self.assertTrue(report["native_capture_complete"])
+        self.assertEqual(report["attribution_status"], "profiled_phase_attribution_available")
+        self.assertEqual(report["attribution"], attribution)
+        self.assertNotIn("analysis_pending_reasons", report)
+        self.assertIn("not evaluated", summary)
+        self.assertFalse(report["regression_passed"])
+
+    def test_conflicting_status_and_quality_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            attribution = self.analysis(directory, mismatch=False)
+            attribution["analysis_quality"]["quantitative_attribution_usable"] = False
+            code, report, _ = self.run_profile(directory, attribution)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "diagnostic_incomplete")
+        self.assertTrue(report["native_capture_complete"])
+        self.assertEqual(report["attribution"], attribution)
+        self.assertTrue(any("quality disagree" in error for error in report["errors"]))
 
 
 class ComparisonReportingTests(unittest.TestCase):

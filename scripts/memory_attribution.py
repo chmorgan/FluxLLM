@@ -24,9 +24,13 @@ from run_performance_checks import interrupted, load_json, number, require, writ
 GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "bitmap-layer-destination",
                   "bitmap-layer-bgra", "bitmap-layer-no-decorations", "native-gpu-canvas", "native-gpu-coalesced-scalars",
                   "native-gpu-retained-twinkles", "native-gpu-optimized", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
-RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized")
+NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized")
+RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
 GRAPHICS_MODES += RUNTIME_MODES
 RUNTIME_FLAGS = ("incremental_history_ordering", "optimized_chart_preparation", "lifecycle_effects_enabled")
+NEXT_RUNTIME_FLAGS = ("shared_chart_preparation", "stable_decoration_hosts", "unpromised_stream_body_writes")
+SHARED_PREPARATION_COUNTERS = ("shared_chart_normalization_builds", "shared_chart_preparations")
+NEXT_RUNTIME_COUNTERS = SHARED_PREPARATION_COUNTERS + ("streamed_bodies_without_promises",)
 LAYER_DESTINATION_MODES = ("bitmap-layer-destination", "bitmap-layer-bgra", "bitmap-layer-no-decorations")
 NATIVE_GPU_MODES = ("native-gpu-canvas", "native-gpu-coalesced-scalars", "native-gpu-retained-twinkles", "native-gpu-optimized") + RUNTIME_MODES
 COALESCED_SCALAR_MODES = ("native-gpu-coalesced-scalars", "native-gpu-optimized") + RUNTIME_MODES
@@ -346,22 +350,31 @@ def validate_retained_twinkles(value, mode, *, completed_visible_workload=False,
 
 
 def runtime_feature_contract(value, mode):
-    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS):
+    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS):
         return None
+    extras = {}
+    if mode in NEXT_RUNTIME_MODES or any(field in value for field in NEXT_RUNTIME_FLAGS):
+        expected = {"shared_chart_preparation": mode in ("runtime-shared-preparation", "runtime-next-optimized"),
+                    "stable_decoration_hosts": mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"),
+                    "unpromised_stream_body_writes": mode in ("runtime-stream-writes", "runtime-next-optimized")}
+        for field, enabled in expected.items():
+            require(type(value.get(field)) is bool and value[field] is enabled,
+                    f"Graphics {field} does not match the requested runtime control")
+        extras = {field: value[field] for field in NEXT_RUNTIME_FLAGS}
     if mode == "normal":
         require(all(type(value.get(field)) is bool for field in RUNTIME_FLAGS), "Normal runtime feature metadata is incomplete")
         flags = {field: value[field] for field in RUNTIME_FLAGS}
         require(flags["lifecycle_effects_enabled"] and flags["incremental_history_ordering"] == flags["optimized_chart_preparation"],
                 "Normal runtime feature metadata does not identify the baseline or combined production path")
-        return flags
-    expected = {"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle"),
-                "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle"),
+        return flags | extras
+    expected = {"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle") + NEXT_RUNTIME_MODES,
+                "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle") + NEXT_RUNTIME_MODES,
                 "lifecycle_effects_enabled": mode != "runtime-no-lifecycle"}
     for field, enabled in expected.items():
         if mode in RUNTIME_MODES or field in value:
             require(type(value.get(field)) is bool and value[field] is enabled,
                     f"Graphics {field} does not match the requested runtime control")
-    return {field: value[field] for field in RUNTIME_FLAGS if field in value}
+    return {field: value[field] for field in RUNTIME_FLAGS if field in value} | extras
 
 
 def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False,
@@ -381,6 +394,25 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     native_normal = mode == "normal" and "native_gpu_backend" in value
     contract = "native-gpu-optimized" if native_normal or mode in RUNTIME_MODES else mode
     runtime_features = runtime_feature_contract(value, mode)
+    if (mode in NEXT_RUNTIME_MODES or (runtime_features and any(field in runtime_features for field in NEXT_RUNTIME_FLAGS))
+            or any(field in snapshot for field in SHARED_PREPARATION_COUNTERS)):
+        shared = {field: unsigned(snapshot.get(field), field) for field in SHARED_PREPARATION_COUNTERS}
+        if not (runtime_features or {}).get("shared_chart_preparation", False):
+            require(not any(shared.values()), "Nonshared mode executed shared chart preparation")
+        elif completed_visible_workload:
+            total = unsigned(snapshot.get("chart_preparations"), "chart_preparations")
+            require(0 < shared["shared_chart_normalization_builds"] <= shared["shared_chart_preparations"] == total,
+                    "Shared chart preparation lacks complete executed work")
+    if (mode in NEXT_RUNTIME_MODES or (runtime_features and any(field in runtime_features for field in NEXT_RUNTIME_FLAGS))
+            or "streamed_bodies_without_promises" in snapshot):
+        bodies = unsigned(snapshot.get("streamed_bodies_without_promises"), "streamed_bodies_without_promises")
+        if not (runtime_features or {}).get("unpromised_stream_body_writes", False):
+            require(bodies == 0, "Promised-write mode executed unpromised stream body writes")
+        elif completed_visible_workload:
+            require(bodies > 0, "Unpromised-write mode did not execute stream body writes")
+    if completed_visible_workload and (runtime_features or {}).get("stable_decoration_hosts"):
+        require(unsigned(value.get("roles", {}).get("rail_decorations", {}).get("created"), "stable decoration hosts created") > 0,
+                "Stable decoration-host mode did not create a decoration host")
     if mode == "normal" and not native_normal:
         for field in ("scalar_presentation_coalesced", "retained_twinkles_enabled"):
             if field in value:

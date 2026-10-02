@@ -48,6 +48,34 @@ def table_xml():
     return ET.tostring(root, encoding="unicode")
 
 
+# Reduced from the native 2026-10-02 r3 export: tagged-backtrace owns frames
+# directly, with shared binary references. IDs are normalized and unrelated
+# frames are omitted; the direct-frame structure is preserved rather than
+# synthesized from the older nested-backtrace fixture above.
+ACTUAL_DIRECT_STACK = '''<tagged-backtrace id="stack">
+  <frame id="leaf" name="AG::Graph::UpdateStack::update()" addr="0x1c93fdef7">
+    <binary id="attributegraph" name="AttributeGraph" arch="arm64e"/>
+  </frame>
+  <frame id="graph" name="GraphHost.flushTransactions()" addr="0x233b160cb">
+    <binary id="swiftuicore" name="SwiftUICore" arch="arm64e"/>
+  </frame>
+  <frame name="closure #1 in closure #1 in closure #1 in NSHostingView.beginTransaction()" addr="0x1c84907f7">
+    <binary id="swiftui" name="SwiftUI" arch="arm64e"/>
+  </frame>
+  <frame name="ViewGraphRootValueUpdater._updateViewGraph&lt;A&gt;(body:)" addr="0x234071553">
+    <binary ref="swiftuicore"/>
+  </frame>
+</tagged-backtrace>'''
+
+
+def direct_table_xml():
+    root = ET.fromstring(table_xml())
+    first = root.find("node/row")
+    first.remove(first.find("tagged-backtrace"))
+    first.append(ET.fromstring(ACTUAL_DIRECT_STACK))
+    return ET.tostring(root, encoding="unicode")
+
+
 def anchor():
     def bridge(mono):
         return {"mach_ticks": (mono + 10) * 1_000_000_000, "numer": 1, "denom": 1,
@@ -57,12 +85,13 @@ def anchor():
             "wall_time_ns": profile.epoch_ns(START), "mach_clock_start": bridge(99), "mach_clock_end": bridge(111)}
 
 
-def kernel_samples():
+def kernel_samples(*, cpu_percent=.1):
+    """Fixed clock domains with an explicit, independently selectable CPU rate."""
     result = []
     for index in range(21):
         mono = 100 + index / 2
         result.append({"process_id": PID, "birth_time_us": 123456,
-                       "monotonic_seconds": 500 + index / 2, "cpu_seconds": index * .005,
+                       "monotonic_seconds": 500 + index / 2, "cpu_seconds": index * cpu_percent / 200,
                        "mach_absolute_ticks": int((mono + 10) * 1e9), "mach_timebase_numer": 1,
                        "mach_timebase_denom": 1, "mach_absolute_seconds": mono + 10,
                        "clock_read_uncertainty_seconds": .0000001})
@@ -97,11 +126,156 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(phase["total"]["weight_ns"], 2_000_000)
         self.assertEqual(phase["top_inclusive_symbols"][0]["weight_ns"], 2_000_000)
         self.assertEqual(phase["top_leaf_symbols"][0]["sample_count"], 2)
-        self.assertAlmostEqual(phase["kernel_cpu_same_window"]["cpu_seconds"], .02)
-        self.assertAlmostEqual(phase["kernel_cpu_same_window"]["rolling_1s_percent"], 1)
+        self.assertAlmostEqual(phase["kernel_cpu_same_window"]["cpu_seconds"], .002)
+        self.assertAlmostEqual(phase["kernel_cpu_same_window"]["rolling_1s_percent"], .1)
         self.assertFalse(phase["kernel_cpu_same_window"]["acceptance_eligible"])
         self.assertEqual(phase["window_mach_absolute_seconds"], [112, 114])
         self.assertAlmostEqual(phase["total"]["cpu_percent_one_core"], .1)
+        self.assertTrue(result["analysis_quality"]["quantitative_attribution_usable"])
+        self.assertTrue(phase["sample_kernel_agreement"]["within_tolerance"])
+
+    def test_material_sample_kernel_disagreement_is_pending_without_rescaling(self):
+        # The frame weights claim 10% of one core, but kernel counters say 5%.
+        self.table.write_text(table_xml().replace('fmt="1.00 ms">1000000', 'fmt="100.00 ms">100000000'))
+        for sample in self.samples:
+            sample["cpu_seconds"] *= 50
+        result = self.analyze()
+        phase = result["phases"][0]
+        self.assertEqual(result["status"], "analysis_pending")
+        self.assertFalse(result["regression_passed"])
+        self.assertFalse(result["analysis_quality"]["quantitative_attribution_usable"])
+        self.assertEqual(result["analysis_quality"]["sample_kernel_mismatch_phases"], ["arrival"])
+        self.assertAlmostEqual(phase["sample_kernel_agreement"]["absolute_difference_percentage_points"], 5)
+        self.assertAlmostEqual(phase["sample_kernel_agreement"]["relative_difference_of_kernel"], 1)
+        self.assertEqual(phase["total"]["weight_ns"], 200_000_000)
+        self.assertEqual(phase["top_inclusive_symbols"][0]["weight_ns"], 200_000_000)
+        self.assertAlmostEqual(phase["kernel_cpu_same_window"]["average_cpu_percent"], 5)
+
+    def test_mismatch_requires_both_absolute_and_relative_thresholds(self):
+        for weight_ns, kernel_multiplier in ((1_000_000, 4), (100_000_000, 110)):
+            # 0.1% vs 0.4% fails only the relative check; 10% vs 11% only absolute.
+            with self.subTest(weight_ns=weight_ns):
+                self.table.write_text(table_xml().replace('fmt="1.00 ms">1000000',
+                    f'fmt="{weight_ns / 1e6:.2f} ms">{weight_ns}'))
+                self.samples = kernel_samples()
+                for sample in self.samples:
+                    sample["cpu_seconds"] *= kernel_multiplier
+                result = self.analyze()
+                self.assertEqual(result["status"], "profiled_phase_attribution_available")
+                self.assertTrue(result["phases"][0]["sample_kernel_agreement"]["within_tolerance"])
+
+    def test_zero_kernel_cpu_is_pending_without_infinite_json_values(self):
+        self.table.write_text(table_xml().replace('fmt="1.00 ms">1000000', 'fmt="10.00 ms">10000000'))
+        for sample in self.samples:
+            sample["cpu_seconds"] = 0
+        result = self.analyze()
+        phase = result["phases"][0]
+        self.assertEqual(result["status"], "analysis_pending")
+        self.assertTrue(phase["sample_kernel_agreement"]["kernel_counter_is_zero"])
+        self.assertIsNone(phase["sample_kernel_agreement"]["relative_difference_of_kernel"])
+        self.assertIsNone(phase["sampled_minus_kernel_percent_of_kernel"])
+        import json
+        json.dumps(result, allow_nan=False)
+
+    def test_actual_direct_frame_export_and_stack_references(self):
+        self.table.write_text(direct_table_xml())
+        result = self.analyze()
+        phase = result["phases"][0]
+        self.assertEqual(result["recording_quality"]["stack_schemas"], {"direct-frames": 4})
+        self.assertEqual(phase["quality"]["missing_stack_weight_ns"], 0)
+        graph = next(row for row in phase["inclusive"] if row["execution"] == "SwiftUI graph transactions")
+        self.assertEqual(graph["weight_ns"], 2_000_000)
+        self.assertEqual(phase["top_leaf_symbols"][0]["symbol"], "AG::Graph::UpdateStack::update()")
+        self.assertEqual(phase["total"]["sample_count"], 2)
+
+    def test_direct_recursive_frame_references_count_once(self):
+        self.table.write_text(direct_table_xml())
+        self.mutate_table(lambda root: ET.SubElement(root.find("node/row/tagged-backtrace"), "frame", ref="graph"))
+        result = self.analyze()
+        graph = next(row for row in result["phases"][0]["top_inclusive_symbols"] if row["symbol"] == "GraphHost.flushTransactions()")
+        self.assertEqual(graph["weight_ns"], 2_000_000)
+
+    def test_nested_backtrace_references_still_supported(self):
+        def change(root):
+            root.find("node/row/tagged-backtrace/backtrace").set("id", "nested")
+            row = root.findall("node/row")[2]
+            row.remove(row.find("tagged-backtrace"))
+            ET.SubElement(ET.SubElement(row, "tagged-backtrace"), "backtrace", ref="nested")
+        self.mutate_table(change)
+        result = self.analyze()
+        self.assertEqual(result["recording_quality"]["stack_schemas"], {"nested-backtrace": 4})
+        self.assertEqual(result["phases"][0]["quality"]["missing_stack_weight_ns"], 0)
+
+    def test_direct_missing_frame_reference_rejected(self):
+        self.table.write_text(direct_table_xml())
+        self.mutate_table(lambda root: ET.SubElement(root.find("node/row/tagged-backtrace"), "frame", ref="absent"))
+        with self.assertRaisesRegex(ValueError, "missing XML reference"):
+            self.analyze()
+
+    def test_direct_frame_reference_cannot_change_type(self):
+        self.table.write_text(direct_table_xml())
+        self.mutate_table(lambda root: ET.SubElement(root.find("node/row/tagged-backtrace"), "frame", ref="swiftui"))
+        with self.assertRaisesRegex(ValueError, "value type"):
+            self.analyze()
+
+    def test_unknown_mixed_empty_and_incomplete_stacks_rejected(self):
+        variants = (
+            ('<tagged-backtrace id="stack"><stack-frame name="unknown"/></tagged-backtrace>', "frame schema"),
+            ('<tagged-backtrace id="stack"><frame name="a"/><backtrace><frame name="b"/></backtrace></tagged-backtrace>', "mixed"),
+            ('<tagged-backtrace id="stack"><backtrace/><backtrace/></tagged-backtrace>', "mixed"),
+            ('<tagged-backtrace id="stack"/>', "empty"),
+            ('<tagged-backtrace id="stack"><backtrace/></tagged-backtrace>', "empty"),
+            ('<tagged-backtrace id="stack"><frame/></tagged-backtrace>', "Incomplete"),
+            ('<tagged-backtrace id="stack"><frame name="a"><frame name="b"/></frame></tagged-backtrace>', "frame structure"),
+            ('<tagged-backtrace id="stack"><backtrace><unknown/></backtrace></tagged-backtrace>', "frame schema"),
+        )
+        for replacement, message in variants:
+            with self.subTest(replacement=replacement):
+                self.table.write_text(table_xml())
+                def change(root):
+                    row = root.find("node/row")
+                    row.remove(row.find("tagged-backtrace"))
+                    row.append(ET.fromstring(replacement))
+                self.mutate_table(change)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.analyze()
+
+    def test_unrecognized_running_row_stack_container_rejected(self):
+        def change(root):
+            for row in root.findall("node/row"):
+                row.remove(row.find("tagged-backtrace"))
+                ET.SubElement(row, "unsupported-stack")
+        self.mutate_table(change)
+        with self.assertRaisesRegex(ValueError, "Running row schema"):
+            self.analyze()
+
+    def test_direct_unsymbolicated_address_retains_unknown_weight(self):
+        self.table.write_text(direct_table_xml())
+        def change(root):
+            for frame in root.iter("frame"):
+                frame.attrib.pop("name", None)
+        self.mutate_table(change)
+        result = self.analyze()
+        self.assertEqual(result["status"], "analysis_pending")
+        self.assertEqual(result["phases"][0]["quality"]["unknown_leaf_weight_ns"], 2_000_000)
+
+    def test_real_sentinel_preserves_denominator_alongside_direct_stacks(self):
+        self.table.write_text(direct_table_xml())
+        def change(root):
+            row = root.findall("node/row")[2]
+            row.remove(row.find("tagged-backtrace"))
+            ET.SubElement(row, "sentinel")
+        self.mutate_table(change)
+        result = self.analyze()
+        phase = result["phases"][0]
+        self.assertEqual(phase["total"]["weight_ns"], 2_000_000)
+        self.assertEqual(phase["quality"]["missing_stack_weight_ns"], 1_000_000)
+        self.assertEqual(result["recording_quality"]["stack_schemas"], {"direct-frames": 3, "missing": 1})
+
+    def test_sentinel_and_stack_cannot_both_be_present(self):
+        self.mutate_table(lambda root: ET.SubElement(root.find("node/row"), "sentinel"))
+        with self.assertRaisesRegex(ValueError, "sentinel"):
+            self.analyze()
 
     def test_wrong_toc_pid_rejected(self):
         self.toc.write_text(toc_xml().replace('pid="1234"', 'pid="999"'))

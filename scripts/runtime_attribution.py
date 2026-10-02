@@ -32,7 +32,7 @@ WORK = {"chunks": 10000, "output_tokens": 20034, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
 COUNTERS = ("optimized_chart_preparations", "history_tool_order_builds", "history_completed_order_builds",
             "history_tool_order_insertions", "history_completed_order_insertions", "chart_preparations")
-BASELINES = ("native-gpu-optimized", "normal")
+BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal")
 
 
 class RuntimeDeadline(memory.MemoryDeadline):
@@ -79,7 +79,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
     initial = memory.runtime_feature_contract(before.get("graphics_diagnostics", {}), mode)
     if flags is None and not required and mode == "normal":
         return {"available": False, "reason": "Frozen normal predates runtime-control counters"}
-    require(flags is not None and set(flags) == set(memory.RUNTIME_FLAGS) and flags == initial,
+    require(flags is not None and set(memory.RUNTIME_FLAGS) <= set(flags) and flags == initial,
             "Runtime workload lacks a stable complete feature contract")
     delta = {}
     for field in COUNTERS:
@@ -88,6 +88,36 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {field} counter moved backwards")
         delta[field] = last - first
     require(delta["chart_preparations"] > 0, "Runtime workload did not prepare charts")
+    instrumented_shared = (mode in memory.NEXT_RUNTIME_MODES or any(field in flags for field in memory.NEXT_RUNTIME_FLAGS)
+                           or any(field in snapshot for snapshot in (before, after) for field in memory.SHARED_PREPARATION_COUNTERS))
+    if instrumented_shared:
+        for field in memory.SHARED_PREPARATION_COUNTERS:
+            first = memory.unsigned(before.get(field), f"runtime.before.{field}")
+            last = memory.unsigned(after.get(field), f"runtime.after.{field}")
+            require(last >= first, f"Runtime {field} counter moved backwards")
+            delta[field] = last - first
+        if flags.get("shared_chart_preparation", False):
+            require(0 < delta["shared_chart_normalization_builds"] <= delta["shared_chart_preparations"] == delta["chart_preparations"],
+                    "Shared normalization did not cover every chart preparation with bounded positive builds")
+        else:
+            require(all(before[field] == after[field] == 0 for field in memory.SHARED_PREPARATION_COUNTERS),
+                    "Nonshared mode executed shared chart preparation")
+    instrumented_writes = (mode in memory.NEXT_RUNTIME_MODES or any(field in flags for field in memory.NEXT_RUNTIME_FLAGS)
+                           or any("streamed_bodies_without_promises" in snapshot for snapshot in (before, after)))
+    if instrumented_writes:
+        field = "streamed_bodies_without_promises"
+        first = memory.unsigned(before.get(field), f"runtime.before.{field}")
+        last = memory.unsigned(after.get(field), f"runtime.after.{field}")
+        require(last >= first, "Unpromised stream body-write counter moved backwards")
+        delta[field] = last - first
+        if flags.get("unpromised_stream_body_writes", False):
+            require(delta[field] > 0, "Unpromised stream body-write path did not execute")
+        else:
+            require(first == last == 0, "Promised-write mode executed unpromised stream body writes")
+    if flags.get("stable_decoration_hosts", False):
+        require(memory.unsigned(after["graphics_diagnostics"]["roles"]["rail_decorations"].get("created"),
+                                "stable decoration hosts created") > 0,
+                "Stable decoration-host mode did not create a decoration host")
     if flags["optimized_chart_preparation"]:
         require(delta["optimized_chart_preparations"] == delta["chart_preparations"],
                 "Optimized preparation did not cover every prepared chart")
@@ -288,8 +318,27 @@ class RuntimeDiagnostic(memory.MemoryDiagnostic):
         self.runtime["mach_clock_start"] = _mach_clock()
         if self.profile_enabled:
             self.begin_profile()
+            self.profile_readiness_guard()
         self.tracking = True
         self.runtime_checkpoint("before-traffic")
+
+    def profile_readiness_guard(self):
+        """Collect pre-window Running samples while preserving native visibility."""
+        guard = {"minimum_seconds": .5, "snapshots": []}
+        self.runtime["pre_workload_profile_guard"] = guard
+        for boundary in ("before", "after"):
+            self.verify_identity()
+            snapshot = self.collector.snapshot()
+            self.verify_identity()
+            require(snapshot.get("dashboard_visible") is True and snapshot.get("popover_visible") is True
+                    and snapshot.get("active_requests") == 0, "Profile readiness guard lost visible idle windows")
+            self.validate_control_snapshot(snapshot)
+            guard["snapshots"].append({"boundary": boundary, "snapshot": snapshot})
+            if boundary == "before":
+                guard["start_monotonic_seconds"] = time.monotonic()
+                self.collector.wait_until(guard["start_monotonic_seconds"] + .5)
+        guard["end_monotonic_seconds"] = time.monotonic()
+        self.save()
 
     def begin_profile(self):
         self.verify_identity()
@@ -488,6 +537,11 @@ def summary(report):
         lines.append(f"| {case['label']} | {'profiled attribution only' if report['operation'] == 'profile' else 'unprofiled kernel counters'} | "
                      f"{fmt('average_cpu_percent')} | {fmt('rolling_1s_percent')} | {outcome} | {peak / 1e6 if peak is not None else 'unavailable'} |")
     lines += ["", "Whole runtime includes fixture start/end and the three-second visible completion tail. Arrival, steady, completion, and whole-runtime windows are stored separately; selected phase windows must not be summed. GPU and filesystem-write gates are separate."]
+    if report["operation"] == "profile" and report.get("native_capture_complete"):
+        lines += ["", "Native capture: complete. Attribution analysis: `" + report.get("attribution_status", "incomplete") + "`."]
+        if report.get("analysis_pending_reasons"):
+            lines += ["Quantitative CPU attribution is unavailable; raw sample weights and rankings are retained without rescaling.", "",
+                      *["- " + reason for reason in report["analysis_pending_reasons"]]]
     if "baseline_drift" in report:
         lines += ["", "Comparison conclusive: " + str(report["baseline_drift"]["comparison_conclusive"]).lower() + ". " + report["baseline_drift"]["policy"]]
     if report["errors"]:
@@ -569,17 +623,35 @@ def _run(args, deadline):
                 require(row["visual_work"] == report["cases"][0]["visual_work"],
                         "Runtime comparison cases did not execute identical deterministic visual requests")
             if args.operation == "profile":
+                report["native_capture_complete"] = True
                 from runtime_time_profile import analyze_trace
                 runtime = case["runtime"]
                 anchor = runtime["clock_anchor"] | {name: runtime[name] for name in ("mach_clock_start", "mach_clock_end")}
                 with deadline.interrupt_at(deadline.end - 5):
                     report["attribution"] = analyze_trace(directory / "cpu.trace", directory, case["owned_identity"]["process_id"],
                         case["phase_windows"], anchor, case["samples"], deadline)
+                attribution = report["attribution"]
+                report["attribution_status"] = attribution.get("status")
+                require(attribution.get("status") in ("analysis_pending", "profiled_phase_attribution_available"),
+                        "Time Profiler analysis returned an unknown completion status")
+                quality = attribution.get("analysis_quality", {})
+                require(type(quality.get("quantitative_attribution_usable")) is bool
+                        and quality["quantitative_attribution_usable"] == (attribution["status"] == "profiled_phase_attribution_available"),
+                        "Time Profiler analysis status and quantitative quality disagree")
+                if attribution["status"] == "analysis_pending":
+                    reasons = []
+                    if quality.get("sample_kernel_mismatch_phases"):
+                        reasons.append("Sampled CPU and same-window kernel CPU disagree beyond the diagnostic tolerance in: "
+                                       + ", ".join(quality["sample_kernel_mismatch_phases"]) + ".")
+                    if quality.get("all_selected_symbols_missing"):
+                        reasons.append("All selected samples lack usable symbols.")
+                    report["analysis_pending_reasons"] = reasons or ["Time Profiler quantitative attribution quality is unavailable."]
         if args.operation == "compare":
             report["baseline_drift"] = baseline_drift(report["cases"])
         require(runtime_source_identity() == sources, "Runtime measurement sources changed before finalization")
         require(time.monotonic() < deadline.end - 1, "Runtime attribution exceeded its 300-second deadline")
-        report["status"] = "diagnostic_captured"
+        report["status"] = ("analysis_pending" if args.operation == "profile"
+                            and report.get("attribution_status") == "analysis_pending" else "diagnostic_captured")
     except (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         report["errors"].append(str(error) or "Interrupted")
     if output_created:

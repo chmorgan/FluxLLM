@@ -450,6 +450,17 @@ The default profile mode is `normal`; `--graphics-mode` selects
 execution, so profile results provide CPU attribution, not CPU acceptance.
 Trace export and analysis share the command's hard **300-second deadline**.
 The command never builds products or automatically retries a failed capture.
+A profile case has a 120-second budget, including a bounded 30-second trace-save
+allowance. After profiler readiness, a profile-only guard verifies visible idle
+windows across at least 0.5 seconds before traffic starts; it does not alter the
+comparison workload or its measured interval. Export analysis accepts both nested
+backtraces and frames directly inside a tagged backtrace. Both forms retain strict
+schema, frame-shape, identity, and timing validation; malformed or mixed forms
+remain invalid evidence.
+Sampled CPU is cross-checked against the kernel counters for each phase. A
+difference greater than both 20% of kernel CPU and 0.5 percentage points leaves
+attribution pending, retaining the raw weights and rankings without rescaling
+them. Complete recording alone does not establish accurate CPU attribution.
 
 Use an unprofiled comparison to measure a candidate against the same frozen binary:
 
@@ -476,6 +487,28 @@ baseline before and after it; production `normal` enables both CPU optimizations
 | `runtime-chart-preparation` | Use the optimized chart preparation path. |
 | `runtime-optimized` | Enable both history ordering and chart preparation optimizations. |
 | `runtime-no-lifecycle` | Enable both optimizations and remove arrival/completion effects; active retained twinkles remain enabled. |
+| `runtime-shared-preparation` | Share immutable metadata after resolving corrected records across chart consumers, and preserve ordered publication inputs where applicable. |
+| `runtime-stable-decoration-hosts` | Keep Canvas and retained twinkle owners stable during active episodes, suppressing inactive drawing without restarting animation clocks. |
+| `runtime-stream-writes` | Omit individual body-write promises for eligible ordinary responses, retaining existing immediate flushes and failure cancellation. |
+| `runtime-next-optimized` | Combine shared preparation, stable decoration hosts, and the body-write promise experiment. |
+
+The four new controls include the existing history and preparation optimizations.
+They remain experiments: `normal` still uses those two established optimizations
+and enables none of these three candidates. Compare individual candidates with
+`--baseline-mode normal --controls runtime-shared-preparation runtime-stable-decoration-hosts runtime-stream-writes`,
+then use a separate comparison with
+`--baseline-mode normal --controls runtime-next-optimized` for their combination.
+These selections keep the same five-case maximum and 300-second command deadline.
+
+The stream-write control keeps promises on response heads and ends, and on
+`HEAD`/`CONNECT` bodies. Its body fast path requires an active downstream channel
+and an installed lifecycle observer on the same event loop. Downstream errors,
+inactivity, or output closure cancel the relay before upstream closure; existing
+forwarding cadence and the close-future fallback remain in place.
+This contract covers the proxy-owned standard NIO pipeline. A future custom
+outbound handler that reports rejection only through a promise would need that
+promise or explicit lifecycle error handling. As before, a parsed terminal record
+can complete accounting before a later asynchronous delivery failure.
 
 Every case uses the same exact 25-second, two-stream fixture with 10,000 content
 chunks, followed by three seconds of visible completion. Native dashboard and
@@ -507,7 +540,17 @@ must also prove the selected path ran: optimized preparation must account for al
 chart preparations, with a positive count; warmed incremental history must perform
 no full order rebuilds and must record positive tool and completed-record
 insertions. Comparisons require the complete feature/counter contract in every
-case. A frozen older `normal` profile may omit that metadata and records it as
+case. Candidate flags must match the selected mode and remain stable. Shared
+preparation must cover every chart preparation with positive, bounded normalization
+builds; `streamed_bodies_without_promises` must record actual body fast-path
+writes, rather than parsed NDJSON records.
+Shared-preparation and unpromised-write counters must remain zero when those
+paths are disabled; stable-host mode requires native decoration-host creation
+evidence. Existing drawing, twinkle lifecycle, visibility, and closed-resource
+checks still apply; selecting a flag alone is
+insufficient evidence that a candidate ran.
+
+A frozen older `normal` profile may omit that metadata and records it as
 unavailable; supplied flags are validated, and new runtime controls always
 require the full contract. Older frozen profiles without the synthetic identity
 and animation policies remain attribution-only, with full visual-comparison

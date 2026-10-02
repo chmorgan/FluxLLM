@@ -10,7 +10,9 @@ from test_runtime_time_profile import anchor, kernel_samples
 
 
 def phase_report():
-    samples = kernel_samples()
+    # Clock tests retain their independent 1% CPU signal; profiler fixtures use
+    # a lower default rate so their sample weights agree with kernel counters.
+    samples = kernel_samples(cpu_percent=1)
     return {"samples": samples, "owned_identity": {"process_id": 1234, "birth_time_us": 123456},
             "runtime": {key: value for key, value in anchor().items() if key.startswith("mach_clock")}}
 
@@ -19,6 +21,7 @@ class ClockTests(unittest.TestCase):
     def test_kernel_phase_uses_paired_mach_epoch(self):
         report = phase_report()
         result = runtime.phase_cpu(report, {"steady": {"start_monotonic_seconds": 102, "end_monotonic_seconds": 104}})
+        self.assertAlmostEqual(result["steady"]["cpu_seconds"], .02)
         self.assertAlmostEqual(result["steady"]["average_cpu_percent"], 1)
         self.assertAlmostEqual(result["steady"]["rolling_1s_percent"], 1)
 

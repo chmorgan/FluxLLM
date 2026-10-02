@@ -27,6 +27,13 @@ MAX_ROWS = 250_000
 MAX_STACK_DEPTH = 512
 MAX_PHASES = 8
 MAX_KERNEL_SAMPLES = 20_000
+SAMPLE_KERNEL_RELATIVE_LIMIT = .20
+SAMPLE_KERNEL_ABSOLUTE_LIMIT = .5
+SAMPLE_KERNEL_POLICY = (
+    "Quantitative attribution is pending if sampled mean CPU differs from the "
+    "same-window kernel mean by more than 20% of kernel CPU AND 0.5 CPU "
+    "percentage points. This is a diagnostic quality check, not a CPU budget."
+)
 SCHEMA_COLUMNS = {
     "time": "sample-time", "thread": "thread", "process": "process",
     "core": "core", "thread-state": "thread-state", "weight": "weight",
@@ -185,7 +192,7 @@ def parse_running_samples(path, owned_pid):
             resolve(element)
     rows = node.findall("row")
     require(0 < len(rows) <= MAX_ROWS, "Export row count is empty or exceeds its bound")
-    selected, states, weight_formats = [], Counter(), {}
+    selected, states, stack_schemas, weight_formats = [], Counter(), Counter(), {}
     sample_identities = set()
     for row in rows:
         for tag in ("sample-time", "thread", "process", "thread-state", "weight"):
@@ -199,6 +206,12 @@ def parse_running_samples(path, owned_pid):
         states[state] += 1
         if state != "Running":
             continue
+        require(all(child.tag in (*SCHEMA_COLUMNS.values(), "sentinel") for child in row),
+                "Unrecognized Running row schema")
+        sentinels = row.findall("sentinel")
+        require(len(sentinels) <= 1 and not (sentinels and row.find("tagged-backtrace") is not None)
+                and all(not sentinel.attrib and len(sentinel) == 0 for sentinel in sentinels),
+                "Malformed missing-backtrace sentinel")
         weight_element = resolve(row.find("weight"))
         weight = xml_integer(weight_element.text, "sample weight", 1)
         formatted = weight_element.get("fmt", "")
@@ -220,16 +233,39 @@ def parse_running_samples(path, owned_pid):
         require(xml_integer(resolve(thread_process.find("pid")).text, "thread PID", 1) == owned_pid,
                 "Thread process disagrees with row process")
         tagged = row.find("tagged-backtrace")
-        stack = resolve(tagged).find("backtrace") if tagged is not None else None
-        frames = resolve(stack).findall("frame") if stack is not None else []
+        if tagged is None:
+            # Instruments can emit a sentinel instead of a backtrace. Keep its
+            # CPU weight in the denominator, without inventing attribution.
+            frames = []
+            stack_schemas["missing"] += 1
+        else:
+            stack = resolve(tagged)
+            nested = stack.findall("backtrace")
+            if nested:
+                require(len(nested) == 1 and len(stack) == 1,
+                        "Unrecognized or mixed tagged-backtrace schema")
+                stack = resolve(nested[0])
+                stack_schemas["nested-backtrace"] += 1
+            else:
+                stack_schemas["direct-frames"] += 1
+            require(len(stack) > 0 and all(child.tag == "frame" for child in stack),
+                    "Unrecognized or empty backtrace frame schema")
+            frames = [resolve(frame) for frame in stack]
         require(len(frames) <= MAX_STACK_DEPTH, "Backtrace exceeds bounded stack depth")
-        names = [resolve(frame).get("name") or "<unknown>" for frame in frames]
+        for frame in frames:
+            require(bool(frame.get("name")) or re.fullmatch(r"0x[0-9a-fA-F]+", frame.get("addr", "")) is not None,
+                    "Incomplete backtrace frame lacks both symbol and address")
+            require(all(child.tag in ("binary", "source") for child in frame)
+                    and len(frame.findall("binary")) <= 1 and len(frame.findall("source")) <= 1,
+                    "Unrecognized backtrace frame structure")
+        names = [frame.get("name") or "<unknown>" for frame in frames]
         require(all(len(name) <= 16_384 for name in names), "Symbol name exceeds its size bound")
         selected.append({"time_ns": timestamp, "weight_ns": weight, "thread_id": tid,
                          "thread": thread.get("fmt"), "frames": names})
     require(selected, "No Running samples for the owned PID")
     return selected, {"row_count": len(rows), "running_sample_count": len(selected),
-                      "target_states": dict(states), "weight_formats_nanoseconds": weight_formats}
+                      "target_states": dict(states), "stack_schemas": dict(stack_schemas),
+                      "weight_formats_nanoseconds": weight_formats}
 
 
 def clock_mapping(toc, anchor):
@@ -352,6 +388,17 @@ def analyze_exports(toc_path, profile_path, owned_pid, phase_windows, clock_anch
         kernel = app.cpu_interval_metrics(kernel_samples, start + offset, end + offset)
         kernel["average_cpu_percent"] = kernel["cpu_seconds"] / elapsed * 100
         kernel["acceptance_eligible"] = False
+        sampled_percent = total / 1e9 / elapsed * 100
+        absolute_difference = abs(sampled_percent - kernel["average_cpu_percent"])
+        relative_difference = (absolute_difference / kernel["average_cpu_percent"]
+                               if kernel["average_cpu_percent"] else None)
+        significant_mismatch = (absolute_difference > SAMPLE_KERNEL_ABSOLUTE_LIMIT
+                                and (relative_difference is None or relative_difference > SAMPLE_KERNEL_RELATIVE_LIMIT))
+        agreement = {"within_tolerance": not significant_mismatch,
+                     "absolute_difference_percentage_points": absolute_difference,
+                     "relative_difference_of_kernel": relative_difference,
+                     "kernel_counter_is_zero": kernel["cpu_seconds"] == 0,
+                     "policy": SAMPLE_KERNEL_POLICY}
         touching = [r for r in rows if min(abs(r["time_ns"] / 1e9 - edge) for edge in relative) <= uncertainty]
         shifted = [sum(r["weight_ns"] for r in rows if (relative[0] + shift) * 1e9 <= r["time_ns"] < (relative[1] + shift) * 1e9) / 1e6
                    for shift in (-uncertainty, uncertainty)]
@@ -361,14 +408,20 @@ def analyze_exports(toc_path, profile_path, owned_pid, phase_windows, clock_anch
                        "total": summary("All owned-process threads", selected), "inclusive": inclusive,
                        "top_inclusive_symbols": ranked(symbol_weights, symbol_counts), "top_leaf_symbols": ranked(leaf_weights, leaf_counts),
                        "kernel_cpu_same_window": kernel,
+                       "sample_kernel_agreement": agreement,
                        "sampled_minus_kernel_percent_of_kernel": ((total / 1e9 / kernel["cpu_seconds"] - 1) * 100 if kernel["cpu_seconds"] else None),
                        "quality": symbol_quality(selected), "threads": sorted({r["thread_id"] for r in selected}),
                        "edge_uncertainty": {"seconds": uncertainty, "touching_sample_count": len(touching),
                                             "touching_sample_weight_ms": sum(r["weight_ns"] for r in touching) / 1e6,
                                             "sampled_total_ms_at_minus_plus_uncertainty": shifted}})
     all_missing = all(p["quality"]["missing_stack_weight_ns"] + p["quality"]["all_unknown_frames_weight_ns"] == p["total"]["weight_ns"] for p in phases)
-    return {"status": "analysis_pending" if all_missing else "profiled_phase_attribution_available",
+    mismatched_phases = [phase["phase"] for phase in phases if not phase["sample_kernel_agreement"]["within_tolerance"]]
+    return {"status": "analysis_pending" if all_missing or mismatched_phases else "profiled_phase_attribution_available",
             "regression_passed": False, "process_id": owned_pid, "birth_time_us": birth,
+            "analysis_quality": {"quantitative_attribution_usable": not all_missing and not mismatched_phases,
+                                 "sample_kernel_mismatch_phases": mismatched_phases,
+                                 "all_selected_symbols_missing": all_missing,
+                                 "policy": SAMPLE_KERNEL_POLICY},
             "clock": mapping, "recording": toc, "recording_quality": quality, "phases": phases,
             "evidence": {str(Path(p)): digest(p) for p in (toc_path, profile_path, Path(__file__))},
             "limitations": [
@@ -378,6 +431,7 @@ def analyze_exports(toc_path, profile_path, owned_pid, phase_windows, clock_anch
                 "Leaf symbols exclude synchronous descendants; absent asynchronous ancestors receive no attribution.",
                 "Unknown and compiler-deduplicated symbols remain explicit in the quality counters.",
                 "Kernel counters are interpolated within the identical profiled interval, not independent acceptance measurements.",
+                "Material sample/kernel disagreement makes analysis pending; raw weights and rankings remain unscaled and are not reliable absolute CPU attribution.",
                 "TOC dates have finite precision. Mapping assumes no wall-clock step between the paired anchor and trace start.",
                 "Named phases may omit intermediate traffic; retain the whole contiguous runtime phase separately.",
                 "The caller must validate recording loss diagnostics and owned-process birth/clean-exit evidence.",

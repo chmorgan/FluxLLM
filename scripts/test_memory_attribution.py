@@ -77,6 +77,54 @@ All zones: 9 nodes (1312 bytes)
 """
 
 
+class NextRuntimeContractTests(unittest.TestCase):
+    def test_new_mode_flags_and_counter_schema_are_required(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        for mode in memory.NEXT_RUNTIME_MODES:
+            snapshot = drawn_native_gpu_graphics(mode)
+            self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+            for field in memory.NEXT_RUNTIME_FLAGS:
+                for invalid in (None, 0, not snapshot["graphics_diagnostics"][field]):
+                    changed = copy.deepcopy(snapshot)
+                    if invalid is None:
+                        del changed["graphics_diagnostics"][field]
+                    else:
+                        changed["graphics_diagnostics"][field] = invalid
+                    with self.subTest(mode=mode, flag=field, value=invalid), self.assertRaises(InvalidResult):
+                        memory.validate_graphics(changed, mode)
+            for field in memory.NEXT_RUNTIME_COUNTERS:
+                for invalid in (None, True, -1):
+                    changed = copy.deepcopy(snapshot)
+                    changed[field] = invalid
+                    with self.subTest(mode=mode, counter=field, value=invalid), self.assertRaises(InvalidResult):
+                        memory.validate_graphics(changed, mode)
+
+    def test_legacy_metadata_may_be_absent_but_new_metadata_is_all_or_none(self):
+        from test_memory_diagnostic import native_normal_graphics
+        snapshot = native_normal_graphics()
+        snapshot["graphics_diagnostics"].update(incremental_history_ordering=True,
+            optimized_chart_preparation=True, lifecycle_effects_enabled=True)
+        self.assertTrue(memory.validate_graphics(snapshot, "normal")["available"])
+        snapshot["graphics_diagnostics"]["shared_chart_preparation"] = False
+        with self.assertRaises(InvalidResult):
+            memory.validate_graphics(snapshot, "normal")
+        snapshot["graphics_diagnostics"]["stable_decoration_hosts"] = False
+        with self.assertRaises(InvalidResult):
+            memory.validate_graphics(snapshot, "normal")
+        snapshot["graphics_diagnostics"]["unpromised_stream_body_writes"] = False
+        snapshot.update(dict.fromkeys(memory.NEXT_RUNTIME_COUNTERS, 0))
+        diagnostic = memory.MemoryDiagnostic(Path("/unused"), memory.MemoryDeadline(), "normal")
+        diagnostic.validate_graphics_snapshot(snapshot)
+        snapshot["shared_chart_normalization_builds"] = 1
+        with self.assertRaisesRegex(InvalidResult, "Nonshared"):
+            diagnostic.validate_graphics_snapshot(snapshot)
+        snapshot["shared_chart_normalization_builds"] = 0
+        for field in memory.NEXT_RUNTIME_FLAGS:
+            del snapshot["graphics_diagnostics"][field]
+        with self.assertRaisesRegex(InvalidResult, "changed or disappeared"):
+            diagnostic.validate_graphics_snapshot(snapshot)
+
+
 class FootprintParserTests(unittest.TestCase):
     def test_dirty_counts_swapped_once_and_preserves_disjoint_categories(self):
         source = footprint_report()
