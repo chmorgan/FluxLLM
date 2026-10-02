@@ -17,7 +17,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 20)
+        XCTAssertEqual(Mode.allCases.count, 24)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -530,6 +530,15 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 XCTAssertEqual(
                     snapshot["lifecycle_effects_enabled"] as? Bool,
                     !mode.omitsLifecycleEffects)
+                XCTAssertEqual(
+                    snapshot["shared_chart_preparation"] as? Bool,
+                    mode.usesSharedChartPreparation)
+                XCTAssertEqual(
+                    snapshot["stable_decoration_hosts"] as? Bool,
+                    mode.usesStableDecorationHosts)
+                XCTAssertEqual(
+                    snapshot["unpromised_stream_body_writes"] as? Bool,
+                    mode.usesUnpromisedStreamBodyWrites)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
             }
@@ -590,9 +599,15 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
 
     func testNativeOptimizationControlsChangeOnlyTheirNamedFeatures() {
         typealias Mode = PerformanceGraphicsDiagnostics.Mode
-        let runtime: [Mode] = [
-            .runtimeNoLifecycle, .runtimeHistoryOrder, .runtimeChartPreparation, .runtimeOptimized,
+        let next: [Mode] = [
+            .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
+            .runtimeNextOptimized,
         ]
+        let runtime: [Mode] =
+            [
+                .runtimeNoLifecycle, .runtimeHistoryOrder, .runtimeChartPreparation,
+                .runtimeOptimized,
+            ] + next
         for mode in Mode.allCases {
             XCTAssertEqual(
                 mode.usesNativeGPUCanvas,
@@ -610,13 +625,22 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     mode))
             XCTAssertEqual(
                 mode.usesIncrementalHistoryOrdering,
-                [.normal, .runtimeHistoryOrder, .runtimeOptimized, .runtimeNoLifecycle].contains(
-                    mode))
+                ([.normal, .runtimeHistoryOrder, .runtimeOptimized, .runtimeNoLifecycle] + next)
+                    .contains(mode))
             XCTAssertEqual(
                 mode.usesOptimizedChartPreparation,
-                [.normal, .runtimeChartPreparation, .runtimeOptimized, .runtimeNoLifecycle]
+                ([.normal, .runtimeChartPreparation, .runtimeOptimized, .runtimeNoLifecycle] + next)
                     .contains(mode))
             XCTAssertEqual(mode.omitsLifecycleEffects, mode == .runtimeNoLifecycle)
+            XCTAssertEqual(
+                mode.usesSharedChartPreparation,
+                [.runtimeSharedPreparation, .runtimeNextOptimized].contains(mode))
+            XCTAssertEqual(
+                mode.usesStableDecorationHosts,
+                [.runtimeStableDecorationHosts, .runtimeNextOptimized].contains(mode))
+            XCTAssertEqual(
+                mode.usesUnpromisedStreamBodyWrites,
+                [.runtimeStreamWrites, .runtimeNextOptimized].contains(mode))
         }
     }
 

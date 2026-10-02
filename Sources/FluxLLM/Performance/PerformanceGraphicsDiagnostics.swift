@@ -21,6 +21,10 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeHistoryOrder = "runtime-history-order"
         case runtimeChartPreparation = "runtime-chart-preparation"
         case runtimeOptimized = "runtime-optimized"
+        case runtimeSharedPreparation = "runtime-shared-preparation"
+        case runtimeStableDecorationHosts = "runtime-stable-decoration-hosts"
+        case runtimeStreamWrites = "runtime-stream-writes"
+        case runtimeNextOptimized = "runtime-next-optimized"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -58,7 +62,9 @@ public final class PerformanceGraphicsDiagnostics {
         var isRuntimeControl: Bool {
             switch self {
             case .runtimeNoLifecycle, .runtimeHistoryOrder, .runtimeChartPreparation,
-                .runtimeOptimized:
+                .runtimeOptimized,
+                .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
+                .runtimeNextOptimized:
                 true
             default:
                 false
@@ -67,14 +73,30 @@ public final class PerformanceGraphicsDiagnostics {
 
         var omitsLifecycleEffects: Bool { self == .runtimeNoLifecycle }
 
+        var usesSharedChartPreparation: Bool {
+            self == .runtimeSharedPreparation || self == .runtimeNextOptimized
+        }
+
+        var usesStableDecorationHosts: Bool {
+            self == .runtimeStableDecorationHosts || self == .runtimeNextOptimized
+        }
+
+        var usesUnpromisedStreamBodyWrites: Bool {
+            self == .runtimeStreamWrites || self == .runtimeNextOptimized
+        }
+
         var usesIncrementalHistoryOrdering: Bool {
             self == .normal || self == .runtimeHistoryOrder || self == .runtimeOptimized
                 || self == .runtimeNoLifecycle
+                || usesSharedChartPreparation || usesStableDecorationHosts
+                || usesUnpromisedStreamBodyWrites
         }
 
         var usesOptimizedChartPreparation: Bool {
             self == .normal || self == .runtimeChartPreparation || self == .runtimeOptimized
                 || self == .runtimeNoLifecycle
+                || usesSharedChartPreparation || usesStableDecorationHosts
+                || usesUnpromisedStreamBodyWrites
         }
     }
 
@@ -536,6 +558,9 @@ public final class PerformanceGraphicsDiagnostics {
             result["incremental_history_ordering"] = mode.usesIncrementalHistoryOrdering
             result["optimized_chart_preparation"] = mode.usesOptimizedChartPreparation
             result["lifecycle_effects_enabled"] = !mode.omitsLifecycleEffects
+            result["shared_chart_preparation"] = mode.usesSharedChartPreparation
+            result["stable_decoration_hosts"] = mode.usesStableDecorationHosts
+            result["unpromised_stream_body_writes"] = mode.usesUnpromisedStreamBodyWrites
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

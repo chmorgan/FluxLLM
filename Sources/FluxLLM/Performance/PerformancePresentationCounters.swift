@@ -8,6 +8,9 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
         case statusUpdates = "status_updates"
         case chartPreparations = "chart_preparations"
         case optimizedChartPreparations = "optimized_chart_preparations"
+        case sharedChartNormalizationBuilds = "shared_chart_normalization_builds"
+        case sharedChartPreparations = "shared_chart_preparations"
+        case streamedBodiesWithoutPromises = "streamed_bodies_without_promises"
         case historyToolOrderBuilds = "history_tool_order_builds"
         case historyCompletedOrderBuilds = "history_completed_order_builds"
         case historyToolOrderInsertions = "history_tool_order_insertions"
@@ -30,7 +33,8 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
             Metric.statusUpdates, .chartPreparations, .canvasDraws,
             .optimizedChartPreparations, .historyToolOrderBuilds,
             .historyCompletedOrderBuilds, .historyToolOrderInsertions,
-            .historyCompletedOrderInsertions,
+            .historyCompletedOrderInsertions, .sharedChartNormalizationBuilds,
+            .sharedChartPreparations, .streamedBodiesWithoutPromises,
         ] {
             values[metric.rawValue] = 0
         }

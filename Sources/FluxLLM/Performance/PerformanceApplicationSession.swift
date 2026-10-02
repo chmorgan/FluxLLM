@@ -187,6 +187,11 @@ public final class PerformanceApplicationSession {
             "chart_preparations": counters["chart_preparations"] as Any? ?? NSNull(),
             "optimized_chart_preparations": counters["optimized_chart_preparations"] as Any?
                 ?? NSNull(),
+            "shared_chart_normalization_builds": counters["shared_chart_normalization_builds"]
+                as Any? ?? NSNull(),
+            "shared_chart_preparations": counters["shared_chart_preparations"] as Any? ?? NSNull(),
+            "streamed_bodies_without_promises": counters["streamed_bodies_without_promises"] as Any?
+                ?? NSNull(),
             "history_tool_order_builds": counters["history_tool_order_builds"] as Any? ?? NSNull(),
             "history_completed_order_builds": counters["history_completed_order_builds"] as Any?
                 ?? NSNull(),
