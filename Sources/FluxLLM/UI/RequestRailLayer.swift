@@ -13,12 +13,22 @@ struct RequestRailLayer: View {
     let isLive: Bool
 
     var body: some View {
-        RequestRailDecorations(
-            lanes: lanes, segments: segments, presentation: presentation, now: now,
-            duration: duration, rect: rect, plotSize: plotSize, isLive: isLive
-        )
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+        if PerformanceGraphicsDiagnostics.shared.mode.omitsRailDecorations {
+            // Controlled attribution only: preserve layout and the static bars
+            // while omitting the complete animation subtree, including its
+            // scheduler, visibility observer, and drawing surface.
+            Color.clear
+                .frame(width: plotSize.width, height: plotSize.height)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        } else {
+            RequestRailDecorations(
+                lanes: lanes, segments: segments, presentation: presentation, now: now,
+                duration: duration, rect: rect, plotSize: plotSize, isLive: isLive
+            )
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
     }
 }
 

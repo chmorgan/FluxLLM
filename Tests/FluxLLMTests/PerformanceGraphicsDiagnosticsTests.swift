@@ -10,11 +10,13 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.normal.rawValue, "normal")
         XCTAssertEqual(Mode.directHost.rawValue, "direct-host")
         XCTAssertEqual(Mode.bitmapLayerDestination.rawValue, "bitmap-layer-destination")
+        XCTAssertEqual(Mode.bitmapLayerBGRA.rawValue, "bitmap-layer-bgra")
+        XCTAssertEqual(Mode.bitmapLayerNoDecorations.rawValue, "bitmap-layer-no-decorations")
         XCTAssertEqual(Mode.noBlur.rawValue, "no-blur")
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 10)
+        XCTAssertEqual(Mode.allCases.count, 12)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -22,6 +24,42 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         for value in ["", "directHost", "unsupported-mode"] {
             let encoded = try JSONEncoder().encode(value)
             XCTAssertThrowsError(try JSONDecoder().decode(Mode.self, from: encoded))
+        }
+    }
+
+    func testLayerControlPropertiesAndMetadataDescribeEachIndependentVariable() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        let metadataKeys = [
+            "layer_bitmap_pixel_format", "layer_bitmap_color_space", "rail_decorations_enabled",
+        ]
+        for key in metadataKeys {
+            XCTAssertNil(diagnostics.snapshot()[key])
+        }
+        for mode in PerformanceGraphicsDiagnostics.Mode.allCases {
+            try diagnostics.enable(mode: mode)
+            let isLayerMode = layerModes.contains(mode)
+            XCTAssertEqual(mode.usesBitmapLayerDestination, isLayerMode)
+            XCTAssertEqual(mode.usesBGRA, mode == .bitmapLayerBGRA)
+            XCTAssertEqual(mode.omitsRailDecorations, mode == .bitmapLayerNoDecorations)
+            let snapshot = diagnostics.snapshot()
+            if isLayerMode {
+                XCTAssertEqual(
+                    snapshot["layer_bitmap_pixel_format"] as? String,
+                    mode == .bitmapLayerBGRA
+                        ? "bgra8-premultiplied-first" : "rgba8-premultiplied-last")
+                XCTAssertEqual(snapshot["layer_bitmap_color_space"] as? String, "device-rgb")
+                XCTAssertEqual(
+                    snapshot["rail_decorations_enabled"] as? Bool,
+                    mode != .bitmapLayerNoDecorations)
+            } else {
+                for key in metadataKeys {
+                    XCTAssertNil(snapshot[key], "\(mode.rawValue): \(key)")
+                }
+            }
+        }
+        try diagnostics.disable()
+        for key in metadataKeys {
+            XCTAssertNil(diagnostics.snapshot()[key])
         }
     }
 
@@ -304,8 +342,14 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
     }
 
     func testLayerImagesTrackConcurrentOwnershipAndReleaseIndependentlyFromScratchBuffers() throws {
+        for mode in layerModes {
+            try assertLayerImageOwnership(mode: mode)
+        }
+    }
+
+    private func assertLayerImageOwnership(mode: PerformanceGraphicsDiagnostics.Mode) throws {
         let diagnostics = PerformanceGraphicsDiagnostics()
-        try diagnostics.enable(mode: .bitmapLayerDestination)
+        try diagnostics.enable(mode: mode)
         let chart = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
         let secondChart = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
         let cursor = try XCTUnwrap(diagnostics.canvasCreated(role: .cursor))
@@ -353,8 +397,14 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
     }
 
     func testLayerImageOverflowRejectsTheWholePresentationAndPreservesOwnership() throws {
+        for mode in layerModes {
+            try assertLayerImageOverflow(mode: mode)
+        }
+    }
+
+    private func assertLayerImageOverflow(mode: PerformanceGraphicsDiagnostics.Mode) throws {
         let diagnostics = PerformanceGraphicsDiagnostics()
-        try diagnostics.enable(mode: .bitmapLayerDestination)
+        try diagnostics.enable(mode: mode)
         let chart = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
         let secondChart = try XCTUnwrap(diagnostics.canvasCreated(role: .staticChart))
         let cursor = try XCTUnwrap(diagnostics.canvasCreated(role: .cursor))
@@ -390,7 +440,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             diagnostics.recordLayerBitmapFailure()
             diagnostics.recordLayerBitmapFailure()
             diagnostics.recordLayerBitmapNativeDraw()
-            let expected: UInt64 = mode == .bitmapLayerDestination ? 1 : 0
+            let expected: UInt64 = layerModes.contains(mode) ? 1 : 0
             let snapshot = diagnostics.snapshot()
             assertCounter("layer_bitmap_presentations", in: snapshot, equals: expected)
             assertCounter("layer_bitmap_failures", in: snapshot, equals: expected * 2)
@@ -410,8 +460,14 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
     }
 
     func testLayerImageNilIDsAreIgnoredAndUnknownOrDestroyedIDsAreRejected() throws {
+        for mode in layerModes {
+            try assertLayerImageIDs(mode: mode)
+        }
+    }
+
+    private func assertLayerImageIDs(mode: PerformanceGraphicsDiagnostics.Mode) throws {
         let diagnostics = PerformanceGraphicsDiagnostics()
-        try diagnostics.enable(mode: .bitmapLayerDestination)
+        try diagnostics.enable(mode: mode)
         let id = try XCTUnwrap(diagnostics.canvasCreated(role: .cursor))
         let initial = diagnostics.snapshot()
         diagnostics.layerBitmapPresented(nil, imageBytes: 1_024)
@@ -427,6 +483,10 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         assertCounter("layer_bitmap_presentations", in: finished, equals: 0)
         assertCounter("current_layer_image_bytes", in: finished, equals: 0)
         assertCounter("peak_layer_image_bytes", in: finished, equals: 0)
+    }
+
+    private var layerModes: [PerformanceGraphicsDiagnostics.Mode] {
+        [.bitmapLayerDestination, .bitmapLayerBGRA, .bitmapLayerNoDecorations]
     }
 
     private func role(

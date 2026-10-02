@@ -11,6 +11,8 @@ public final class PerformanceGraphicsDiagnostics {
         case noRenderer = "no-renderer"
         case bitmapDestination = "bitmap-destination"
         case bitmapLayerDestination = "bitmap-layer-destination"
+        case bitmapLayerBGRA = "bitmap-layer-bgra"
+        case bitmapLayerNoDecorations = "bitmap-layer-no-decorations"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -19,6 +21,15 @@ public final class PerformanceGraphicsDiagnostics {
         var omitsGradients: Bool {
             self == .noGradients || self == .noGradientsOrBlur
         }
+
+        var usesBitmapLayerDestination: Bool {
+            self == .bitmapLayerDestination || self == .bitmapLayerBGRA
+                || self == .bitmapLayerNoDecorations
+        }
+
+        var usesBGRA: Bool { self == .bitmapLayerBGRA }
+
+        var omitsRailDecorations: Bool { self == .bitmapLayerNoDecorations }
     }
 
     public enum Role: String, CaseIterable, Sendable {
@@ -208,7 +219,7 @@ public final class PerformanceGraphicsDiagnostics {
     /// This is separate from CPU scratch buffers and does not measure Core
     /// Animation's retained copies, allocation pools, or GPU memory.
     public func layerBitmapPresented(_ id: UInt64?, imageBytes: UInt64) {
-        guard isEnabled, mode == .bitmapLayerDestination,
+        guard isEnabled, mode.usesBitmapLayerDestination,
             let (id, canvas) = registered(id)
         else { return }
         let next = (total.layerImageBytes - canvas.layerImageBytes)
@@ -232,7 +243,7 @@ public final class PerformanceGraphicsDiagnostics {
     }
 
     public func layerBitmapCleared(_ id: UInt64?) {
-        guard isEnabled, mode == .bitmapLayerDestination,
+        guard isEnabled, mode.usesBitmapLayerDestination,
             let (id, canvas) = registered(id)
         else { return }
         roles[canvas.role]!.layerImageBytes -= canvas.layerImageBytes
@@ -242,7 +253,7 @@ public final class PerformanceGraphicsDiagnostics {
 
     /// An allocation or rendering failure makes this candidate run invalid.
     public func recordLayerBitmapFailure() {
-        guard isEnabled, mode == .bitmapLayerDestination else { return }
+        guard isEnabled, mode.usesBitmapLayerDestination else { return }
         let next = layerBitmapFailures.addingReportingOverflow(1)
         guard !next.overflow else {
             invalidEvents += 1
@@ -253,7 +264,7 @@ public final class PerformanceGraphicsDiagnostics {
 
     /// Records unexpected entry into native window drawing for this candidate.
     public func recordLayerBitmapNativeDraw() {
-        guard isEnabled, mode == .bitmapLayerDestination else { return }
+        guard isEnabled, mode.usesBitmapLayerDestination else { return }
         let next = layerBitmapNativeDraws.addingReportingOverflow(1)
         guard !next.overflow else {
             invalidEvents += 1
@@ -338,7 +349,7 @@ public final class PerformanceGraphicsDiagnostics {
     }
 
     public func snapshot() -> [String: Any] {
-        [
+        var result: [String: Any] = [
             "enabled": isEnabled, "mode": mode.rawValue,
             "invalid_events": invalidEvents,
             "cpu_glow_fallbacks": cpuGlowFallbacks,
@@ -359,5 +370,13 @@ public final class PerformanceGraphicsDiagnostics {
                     ($0.rawValue, (roles[$0] ?? Counters()).snapshot)
                 }),
         ]
+        if isEnabled, mode.usesBitmapLayerDestination {
+            result["layer_bitmap_pixel_format"] =
+                mode.usesBGRA
+                ? "bgra8-premultiplied-first" : "rgba8-premultiplied-last"
+            result["layer_bitmap_color_space"] = "device-rgb"
+            result["rail_decorations_enabled"] = !mode.omitsRailDecorations
+        }
+        return result
     }
 }

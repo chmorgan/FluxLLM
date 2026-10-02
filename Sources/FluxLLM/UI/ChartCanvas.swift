@@ -158,7 +158,7 @@ struct ChartCanvas: NSViewRepresentable {
 
         required init?(coder: NSCoder) { return nil }
 
-        override var wantsUpdateLayer: Bool { mode == .bitmapLayerDestination }
+        override var wantsUpdateLayer: Bool { mode.usesBitmapLayerDestination }
         override var isOpaque: Bool { false }
         // ImageRenderer maps SwiftUI's top-left coordinates into Quartz itself.
         override var isFlipped: Bool { false }
@@ -190,7 +190,7 @@ struct ChartCanvas: NSViewRepresentable {
             self.drawingEnvironment = drawingEnvironment
             self.drawingBounds = drawingBounds
             self.mode = mode
-            if mode == .bitmapLayerDestination {
+            if mode.usesBitmapLayerDestination {
                 // Keep AppKit from flattening this view into an ancestor's
                 // native drawing context: this mode supplies finished pixels.
                 canDrawSubviewsIntoLayer = false
@@ -248,7 +248,7 @@ struct ChartCanvas: NSViewRepresentable {
             let changed = frame.size != newSize
             super.setFrameSize(newSize)
             if changed {
-                if mode == .bitmapLayerDestination,
+                if mode.usesBitmapLayerDestination,
                     newSize.width <= 0 || newSize.height <= 0
                 {
                     clearLayerBitmap()
@@ -300,7 +300,7 @@ struct ChartCanvas: NSViewRepresentable {
         }
 
         private func clearLayerBitmap() {
-            guard mode == .bitmapLayerDestination else { return }
+            guard mode.usesBitmapLayerDestination else { return }
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             layer?.contents = nil
@@ -309,7 +309,7 @@ struct ChartCanvas: NSViewRepresentable {
         }
 
         override func updateLayer() {
-            guard mode == .bitmapLayerDestination else { return }
+            guard mode.usesBitmapLayerDestination else { return }
             let diagnostics = PerformanceGraphicsDiagnostics.shared
             let size = bounds.size
             guard let content, size.width != 0, size.height != 0
@@ -318,14 +318,19 @@ struct ChartCanvas: NSViewRepresentable {
                 return
             }
             let scale = drawingScale
+            // Change only channel storage for the BGRA diagnostic. Color space,
+            // pixel count, row stride, and the ImageRenderer producer stay fixed.
+            let bitmapInfo =
+                mode.usesBGRA
+                ? CGImageAlphaInfo.premultipliedFirst.rawValue
+                    | CGBitmapInfo.byteOrder32Little.rawValue
+                : CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
             guard let layer,
                 let layout = BitmapLayout.make(size: size, scale: scale),
                 let bitmap = CGContext(
                     data: nil, width: layout.width, height: layout.height,
                     bitsPerComponent: 8, bytesPerRow: layout.bytesPerRow,
-                    space: CGColorSpaceCreateDeviceRGB(),
-                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-                        | CGBitmapInfo.byteOrder32Big.rawValue)
+                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo)
             else {
                 diagnostics.recordLayerBitmapFailure()
                 clearLayerBitmap()
@@ -364,7 +369,7 @@ struct ChartCanvas: NSViewRepresentable {
         }
 
         override func draw(_ dirtyRect: NSRect) {
-            guard mode != .bitmapLayerDestination else {
+            guard !mode.usesBitmapLayerDestination else {
                 // A native fallback would invalidate the destination experiment.
                 PerformanceGraphicsDiagnostics.shared.recordLayerBitmapNativeDraw()
                 clearLayerBitmap()

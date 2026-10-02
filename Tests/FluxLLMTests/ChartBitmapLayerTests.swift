@@ -45,6 +45,61 @@ final class ChartBitmapLayerTests: XCTestCase {
         }
     }
 
+    func testBitmapFormatAndTranslucentChannelsNormalizeToEquivalentColors() throws {
+        try withCandidate {
+            let mode = PerformanceGraphicsDiagnostics.shared.mode
+            let isBGRA = mode == .bitmapLayerBGRA
+            let size = CGSize(width: 12, height: 4)
+            for scale in [CGFloat(1), 2] {
+                var environment = EnvironmentValues()
+                environment.displayScale = scale
+                let view = makeView(size: size, environment: environment) { context, _ in
+                    context.fill(
+                        Path(CGRect(x: 0, y: 0, width: 4, height: 4)),
+                        with: .color(Color(.sRGB, red: 1, green: 0, blue: 0, opacity: 0.5)))
+                    context.fill(
+                        Path(CGRect(x: 8, y: 0, width: 4, height: 4)),
+                        with: .color(Color(.sRGB, red: 0, green: 0, blue: 1, opacity: 0.5)))
+                }
+                defer { view.clearContent() }
+                view.updateLayer()
+                let image = try layerImage(view)
+                XCTAssertEqual(image.alphaInfo, isBGRA ? .premultipliedFirst : .premultipliedLast)
+                XCTAssertEqual(
+                    image.bitmapInfo.rawValue & CGBitmapInfo.byteOrderMask.rawValue,
+                    (isBGRA ? CGBitmapInfo.byteOrder32Little : .byteOrder32Big).rawValue)
+                XCTAssertEqual(image.bitsPerComponent, 8)
+                XCTAssertEqual(image.bitsPerPixel, 32)
+                XCTAssertEqual(image.bytesPerRow, Int(size.width * scale) * 4)
+                XCTAssertTrue(
+                    CFEqual(try XCTUnwrap(image.colorSpace), CGColorSpaceCreateDeviceRGB()))
+                let normalized = try bitmap(size: size, scale: scale)
+                normalized.draw(image, in: CGRect(origin: .zero, size: size))
+                let presented = try bitmap(size: size, scale: scale)
+                try XCTUnwrap(view.layer).render(in: presented)
+                for result in [normalized, presented] {
+                    let pixels = bytes(result)
+                    let red = Int(2 * scale) * result.bytesPerRow + Int(2 * scale) * 4
+                    let transparent = Int(2 * scale) * result.bytesPerRow + Int(6 * scale) * 4
+                    let blue = Int(2 * scale) * result.bytesPerRow + Int(10 * scale) * 4
+                    for (offset, expected) in [
+                        (red, [128, 0, 0, 128]),
+                        (transparent, [0, 0, 0, 0]),
+                        (blue, [0, 0, 128, 128]),
+                    ] {
+                        for component in 0..<4 {
+                            XCTAssertLessThanOrEqual(
+                                abs(Int(pixels[offset + component]) - expected[component]), 1,
+                                "Normalized \(mode.rawValue) channel \(component) at \(scale)×")
+                        }
+                    }
+                }
+                XCTAssertEqual(counter("layer_bitmap_failures"), 0)
+                XCTAssertEqual(counter("layer_bitmap_native_draws"), 0)
+            }
+        }
+    }
+
     func testFractionalDimensionsPreserveNativePixelScaleWithoutStretching() throws {
         try withCandidate {
             let size = CGSize(width: 120.25, height: 80.75)
@@ -305,9 +360,14 @@ final class ChartBitmapLayerTests: XCTestCase {
 
     private func withCandidate(_ operation: () throws -> Void) throws {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
-        try diagnostics.enable(mode: .bitmapLayerDestination)
-        defer { XCTAssertNoThrow(try diagnostics.disable()) }
-        try operation()
+        for mode in [
+            PerformanceGraphicsDiagnostics.Mode.bitmapLayerDestination,
+            .bitmapLayerBGRA, .bitmapLayerNoDecorations,
+        ] {
+            try diagnostics.enable(mode: mode)
+            defer { XCTAssertNoThrow(try diagnostics.disable()) }
+            try operation()
+        }
     }
 
     private func makeView(
