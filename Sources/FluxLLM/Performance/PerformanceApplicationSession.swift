@@ -199,6 +199,8 @@ public final class PerformanceApplicationSession {
                 as Any? ?? NSNull(),
             "chart_publication_full_sorts": counters["chart_publication_full_sorts"] as Any?
                 ?? NSNull(),
+            "direct_tool_plot_builds": counters["direct_tool_plot_builds"] as Any? ?? NSNull(),
+            "legacy_tool_plot_builds": counters["legacy_tool_plot_builds"] as Any? ?? NSNull(),
             "history_tool_order_builds": counters["history_tool_order_builds"] as Any? ?? NSNull(),
             "history_completed_order_builds": counters["history_completed_order_builds"] as Any?
                 ?? NSNull(),

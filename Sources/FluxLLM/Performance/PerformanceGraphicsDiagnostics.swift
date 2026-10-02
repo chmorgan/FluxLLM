@@ -28,6 +28,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeCanvasClock = "runtime-canvas-clock"
         case runtimeStreamCanvasClock = "runtime-stream-canvas-clock"
         case runtimeOrderedPublication = "runtime-ordered-publication"
+        case runtimeDirectToolPlot = "runtime-direct-tool-plot"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -68,7 +69,7 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeOptimized,
                 .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
                 .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
-                .runtimeOrderedPublication:
+                .runtimeOrderedPublication, .runtimeDirectToolPlot:
                 true
             default:
                 false
@@ -87,16 +88,21 @@ public final class PerformanceGraphicsDiagnostics {
 
         var usesOrderedChartPublication: Bool {
             self == .normal || usesSharedChartPreparation || self == .runtimeOrderedPublication
+                || self == .runtimeDirectToolPlot
         }
+
+        var usesDirectToolPlot: Bool { self == .runtimeDirectToolPlot }
 
         var usesUnpromisedStreamBodyWrites: Bool {
             self == .normal || self == .runtimeStreamWrites || self == .runtimeNextOptimized
                 || self == .runtimeStreamCanvasClock || self == .runtimeOrderedPublication
+                || self == .runtimeDirectToolPlot
         }
 
         var usesCanvasFrameClock: Bool {
             self == .normal || self == .runtimeCanvasClock || self == .runtimeStreamCanvasClock
                 || self == .runtimeOrderedPublication
+                || self == .runtimeDirectToolPlot
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -579,6 +585,7 @@ public final class PerformanceGraphicsDiagnostics {
             result["unpromised_stream_body_writes"] = mode.usesUnpromisedStreamBodyWrites
             result["canvas_frame_clock"] = mode.usesCanvasFrameClock
             result["ordered_chart_publication"] = mode.usesOrderedChartPublication
+            result["direct_tool_plot"] = mode.usesDirectToolPlot
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

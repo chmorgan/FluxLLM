@@ -20,10 +20,14 @@ final class LuminousChartGeometryCache {
 
     func frame(
         for key: Key, throughput: ChartDisplayHistory, gpu: ChartDisplayHistory,
-        requestTools: [UUID: ToolActivityHistory]
+        requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false
     ) -> Frame {
-        if let retained, retained.key == key { return retained }
-        let frame = Frame(key: key, throughput: throughput, gpu: gpu, requestTools: requestTools)
+        if let retained, retained.key == key, retained.directToolPlot == directToolPlot {
+            return retained
+        }
+        let frame = Frame(
+            key: key, throughput: throughput, gpu: gpu, requestTools: requestTools,
+            directToolPlot: directToolPlot)
         retained = frame
         return frame
     }
@@ -113,6 +117,7 @@ final class LuminousChartGeometryCache {
         // Replacing the geometry frame also releases its bounded mask cache.
         lazy var seriesGlowRasterCache = SeriesGlowRasterCache()
         let key: Key
+        let directToolPlot: Bool
         let layout: Layout
         let generated: [Segment]
         let device: [Segment]
@@ -122,9 +127,10 @@ final class LuminousChartGeometryCache {
 
         init(
             key: Key, throughput: ChartDisplayHistory, gpu: ChartDisplayHistory,
-            requestTools: [UUID: ToolActivityHistory]
+            requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false
         ) {
             self.key = key
+            self.directToolPlot = directToolPlot
             let layout = Layout(size: key.size, hasTools: key.hasTools, compact: key.compact)
             self.layout = layout
             generated = Self.segments(
@@ -139,13 +145,18 @@ final class LuminousChartGeometryCache {
                     $0.timestamp, value: $0.value, key: key, rect: layout.main, upperBound: 100)
             }
             self.requestTools = requestTools.mapValues { history in
+                PerformancePresentationCounters.shared.record(
+                    directToolPlot ? .directToolPlotBuilds : .legacyToolPlotBuilds)
+                let plotSegments =
+                    directToolPlot
+                    ? history.directZeroFilledPlotSegments : history.zeroFilledPlotSegments
                 let points = history.resultMarkers.map {
                     Self.project(
                         $0.timestamp, value: 0, key: key, rect: layout.tools, upperBound: 1)
                 }
                 return ToolTrack(
                     segments: Self.segments(
-                        history.zeroFilledPlotSegments, key: key, rect: layout.tools,
+                        plotSegments, key: key, rect: layout.tools,
                         upperBound: key.toolUpperBound, smoothed: false),
                     resultPoints: points,
                     resultDiamonds: points.map { point in

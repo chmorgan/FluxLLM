@@ -502,6 +502,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-canvas-clock` | Keep both history and preparation optimizations and drive rail drawing with a dedicated Canvas frame clock. |
 | `runtime-stream-canvas-clock` | Preserve the stream-write and Canvas-clock default before ordered publication, keeping both history and preparation optimizations. |
 | `runtime-ordered-publication` | Combine ordered single-interval chart publication, stream writes, Canvas clock, and both history/preparation optimizations; matches current production feature selection. |
+| `runtime-direct-tool-plot` | Build request-tool plot geometry directly on top of current production behavior. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -526,6 +527,12 @@ preparation and stable decoration hosts remain disabled. The
 shared-preparation controls also enable ordered publication. Older frozen
 `normal` captures may omit the ordered flag or report false. A true ordered flag
 in `normal` requires acknowledgment of the complete current production selection.
+
+`runtime-direct-tool-plot` is a separate experiment that inherits those production
+paths and enables `direct_tool_plot`. Shared preparation and stable decoration
+hosts remain disabled; `normal` keeps `direct_tool_plot = false`. Compare the
+candidate with `--baseline-mode normal --controls runtime-direct-tool-plot`.
+All workload, visibility, clock, deadline, and resource-budget checks still apply.
 
 The stream-write control keeps promises on response heads and ends, and on
 `HEAD`/`CONNECT` bodies. Its body fast path requires an active downstream channel
@@ -598,6 +605,14 @@ and a positive full-sort delta during this fixed workload. Ordered shared modes
 use the same query/sort proof when instrumented. Earlier fallback sorts outside
 the measured interval are allowed. Other older frozen modes may omit the entire
 new flag/counter group; supplied evidence must be complete and valid.
+
+Direct-tool-plot instrumentation must supply the boolean `direct_tool_plot` flag
+and both nonnegative integer counters, `direct_tool_plot_builds` and
+`legacy_tool_plot_builds`. They count actual request-tool geometry builds. The
+direct control requires a positive direct-build delta and zero legacy-build delta
+during the fixed workload. Instrumented nondirect modes require zero total direct
+builds and a positive legacy-build delta. Older frozen products may omit the
+entire group; partial or incorrectly typed evidence is rejected.
 
 A frozen older `normal` profile may omit that metadata and records it as
 unavailable; supplied flags are validated, and new runtime controls always

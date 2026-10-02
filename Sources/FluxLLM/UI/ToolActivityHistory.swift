@@ -57,6 +57,65 @@ struct ToolActivityHistory {
             plotSegments, cutoff: cutoff, now: now, extendsCurrentToNow: current != nil)
     }
 
+    /// Produce the same step and gap geometry without allocating an intermediate
+    /// point array for every observation segment. The reference getters stay intact.
+    var directZeroFilledPlotSegments: [[ChartDisplayPoint]] {
+        guard hasValidWindow else { return [] }
+        return Self.directZeroFilledPlotSegments(
+            buckets: buckets, segmentRanges: segmentRanges, cutoff: cutoff, now: now,
+            extendsCurrentToNow: current != nil)
+    }
+
+    /// The ranges describe already-prepared coverage. Keeping this pure also
+    /// permits direct verification of malformed plotting input without changing
+    /// history construction or manufacturing additional observations.
+    static func directZeroFilledPlotSegments(
+        buckets: [ToolActivityBucket], segmentRanges: [Range<Int>],
+        cutoff: Date, now: Date, extendsCurrentToNow: Bool
+    ) -> [[ChartDisplayPoint]] {
+        guard cutoff.timeIntervalSince1970.isFinite, now.timeIntervalSince1970.isFinite,
+            cutoff < now
+        else { return [] }
+        var points = [ChartDisplayPoint(timestamp: cutoff, value: 0)]
+        func append(_ point: ChartDisplayPoint) {
+            if points.last != point { points.append(point) }
+        }
+        for range in segmentRanges {
+            var startsSegment = true
+            for bucket in buckets[range] where bucket.observedDuration > 0 {
+                let start = ChartDisplayPoint(
+                    timestamp: max(bucket.start, cutoff), value: bucket.callsPerMinute)
+                let end = ChartDisplayPoint(timestamp: bucket.end, value: bucket.callsPerMinute)
+                // Match the reference's validation of emitted points, including
+                // clipping before validation and ignoring instantaneous buckets.
+                guard start.timestamp.timeIntervalSince1970.isFinite,
+                    end.timestamp.timeIntervalSince1970.isFinite,
+                    start.timestamp >= cutoff, start.timestamp <= now,
+                    end.timestamp >= cutoff, end.timestamp <= now,
+                    start.value.isFinite, start.value >= 0,
+                    start.timestamp <= end.timestamp,
+                    start.timestamp >= points[points.count - 1].timestamp
+                else { return [] }
+                if startsSegment, let previous = points.last, start.timestamp > previous.timestamp {
+                    append(ChartDisplayPoint(timestamp: previous.timestamp, value: 0))
+                    append(ChartDisplayPoint(timestamp: start.timestamp, value: 0))
+                }
+                append(start)
+                append(end)
+                startsSegment = false
+            }
+        }
+        if let last = points.last {
+            if extendsCurrentToNow {
+                append(ChartDisplayPoint(timestamp: now, value: last.value))
+            } else {
+                append(ChartDisplayPoint(timestamp: last.timestamp, value: 0))
+                append(ChartDisplayPoint(timestamp: now, value: 0))
+            }
+        }
+        return [points]
+    }
+
     init(
         events: [ToolActivityEvent], observations: [TimeSeriesPoint], now: Date,
         duration: TimeInterval, maximumGap: TimeInterval = 5,

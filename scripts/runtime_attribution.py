@@ -33,7 +33,7 @@ WORK = {"chunks": 10000, "output_tokens": 20034, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
 COUNTERS = ("optimized_chart_preparations", "history_tool_order_builds", "history_completed_order_builds",
             "history_tool_order_insertions", "history_completed_order_insertions", "chart_preparations")
-BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal")
+BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal", memory.ORDERED_PUBLICATION_MODE)
 
 
 class RuntimeDeadline(memory.MemoryDeadline):
@@ -89,7 +89,22 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {field} counter moved backwards")
         delta[field] = last - first
     require(delta["chart_preparations"] > 0, "Runtime workload did not prepare charts")
-    if (mode == memory.ORDERED_PUBLICATION_MODE or "ordered_chart_publication" in flags
+    if (mode == memory.DIRECT_TOOL_PLOT_MODE or "direct_tool_plot" in flags
+            or any(field in snapshot for snapshot in (before, after) for field in memory.DIRECT_TOOL_PLOT_COUNTERS)):
+        require("direct_tool_plot" in flags, "Tool-plot counters lack feature metadata")
+        for field in memory.DIRECT_TOOL_PLOT_COUNTERS:
+            first = memory.unsigned(before.get(field), f"runtime.before.{field}")
+            last = memory.unsigned(after.get(field), f"runtime.after.{field}")
+            require(last >= first, f"Runtime {field} counter moved backwards")
+            delta[field] = last - first
+        if flags["direct_tool_plot"]:
+            require(delta["direct_tool_plot_builds"] > 0 and delta["legacy_tool_plot_builds"] == 0,
+                    "Direct tool plot did not execute geometry builds without legacy fallback")
+        else:
+            require(before["direct_tool_plot_builds"] == after["direct_tool_plot_builds"] == 0,
+                    "Legacy tool-plot mode executed direct geometry builds")
+            require(delta["legacy_tool_plot_builds"] > 0, "Baseline tool plot did not execute legacy geometry builds")
+    if (mode in memory.ORDERED_PUBLICATION_MODES or "ordered_chart_publication" in flags
             or any(field in snapshot for snapshot in (before, after) for field in memory.ORDERED_PUBLICATION_COUNTERS)):
         require("ordered_chart_publication" in flags, "Ordered-publication counters lack feature metadata")
         for field in memory.ORDERED_PUBLICATION_COUNTERS:

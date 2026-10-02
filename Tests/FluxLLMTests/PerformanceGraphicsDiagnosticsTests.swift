@@ -17,7 +17,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 27)
+        XCTAssertEqual(Mode.allCases.count, 28)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -112,6 +112,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertFalse(diagnostics.mode.usesSharedChartPreparation)
         XCTAssertFalse(diagnostics.mode.usesStableDecorationHosts)
         XCTAssertTrue(diagnostics.mode.usesOrderedChartPublication)
+        XCTAssertFalse(diagnostics.mode.usesDirectToolPlot)
         diagnostics.scalarPresentationPublished()
         XCTAssertNil(diagnostics.retainedTwinkleHostCreated())
         diagnostics.retainedTwinkleHostUpdated(
@@ -550,6 +551,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 XCTAssertEqual(
                     snapshot["ordered_chart_publication"] as? Bool,
                     mode.usesOrderedChartPublication)
+                XCTAssertEqual(
+                    snapshot["direct_tool_plot"] as? Bool,
+                    mode.usesDirectToolPlot)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
             }
@@ -613,7 +617,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         let next: [Mode] = [
             .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
             .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
-            .runtimeOrderedPublication,
+            .runtimeOrderedPublication, .runtimeDirectToolPlot,
         ]
         let runtime: [Mode] =
             [
@@ -654,20 +658,21 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 mode.usesUnpromisedStreamBodyWrites,
                 [
                     .normal, .runtimeStreamWrites, .runtimeNextOptimized, .runtimeStreamCanvasClock,
-                    .runtimeOrderedPublication,
+                    .runtimeOrderedPublication, .runtimeDirectToolPlot,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
                 [
                     .normal, .runtimeCanvasClock, .runtimeStreamCanvasClock,
-                    .runtimeOrderedPublication,
+                    .runtimeOrderedPublication, .runtimeDirectToolPlot,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesOrderedChartPublication,
                 [
                     .normal, .runtimeSharedPreparation, .runtimeNextOptimized,
-                    .runtimeOrderedPublication,
+                    .runtimeOrderedPublication, .runtimeDirectToolPlot,
                 ].contains(mode))
+            XCTAssertEqual(mode.usesDirectToolPlot, mode == .runtimeDirectToolPlot)
         }
     }
 

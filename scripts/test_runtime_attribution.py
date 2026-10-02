@@ -26,6 +26,8 @@ def workload_snapshots(mode):
     after["chart_preparations"] += 2
     if value.get("ordered_chart_publication"):
         after["ordered_chart_publication_queries"] += 2
+    if value.get("direct_tool_plot"):
+        after["direct_tool_plot_builds"] += 2
     if value.get("canvas_frame_clock"):
         after["rail_frame_clock_ticks"] += 2
     if value.get("shared_chart_preparation"):
@@ -127,7 +129,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication") if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot") if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -221,6 +223,68 @@ class RuntimeWorkTests(unittest.TestCase):
             after["graphics_diagnostics"]["roles"][role]["draws"] = 9
             with self.subTest(role=role), self.assertRaisesRegex(ValueError, "drawing counter moved backwards"):
                 runtime.validate_runtime_work(before, after, "runtime-optimized")
+
+
+class DirectToolPlotWorkTests(unittest.TestCase):
+    def test_fixed_workload_requires_positive_direct_and_no_legacy_build_delta(self):
+        mode = memory.DIRECT_TOOL_PLOT_MODE
+        before, after = workload_snapshots(mode)
+        work = runtime.validate_runtime_work(before, after, mode)
+        self.assertEqual(work["deltas"]["direct_tool_plot_builds"], 2)
+        self.assertEqual(work["deltas"]["legacy_tool_plot_builds"], 0)
+        self.assertTrue(all(work["features"][field] for field in ("direct_tool_plot", "ordered_chart_publication",
+                                                                "canvas_frame_clock", "unpromised_stream_body_writes")))
+        for direct, legacy in ((0, 0), (2, 1)):
+            changed = copy.deepcopy(after)
+            changed["direct_tool_plot_builds"] = before["direct_tool_plot_builds"] + direct
+            changed["legacy_tool_plot_builds"] = before["legacy_tool_plot_builds"] + legacy
+            with self.subTest(direct=direct, legacy=legacy), self.assertRaisesRegex(ValueError, "without legacy fallback"):
+                runtime.validate_runtime_work(before, changed, mode)
+        before["legacy_tool_plot_builds"] = after["legacy_tool_plot_builds"] = 7
+        self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
+
+    def test_new_candidate_rejects_missing_or_invalid_group_and_changed_metadata(self):
+        mode = memory.DIRECT_TOOL_PLOT_MODE
+        for field in memory.DIRECT_TOOL_PLOT_COUNTERS:
+            for invalid in (None, True, -1):
+                before, after = workload_snapshots(mode)
+                after[field] = invalid
+                with self.subTest(field=field, value=invalid), self.assertRaises(ValueError):
+                    runtime.validate_runtime_work(before, after, mode)
+        before, after = workload_snapshots(mode)
+        del after["graphics_diagnostics"]["direct_tool_plot"]
+        with self.assertRaises(ValueError):
+            runtime.validate_runtime_work(before, after, mode)
+
+    def test_instrumented_normal_uses_legacy_builder_and_preserves_frozen_compatibility(self):
+        before, after = workload_snapshots(memory.ORDERED_PUBLICATION_MODE)
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"]["mode"] = "normal"
+        self.assertTrue(runtime.validate_runtime_work(before, after, "normal")["available"])
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"]["direct_tool_plot"] = False
+            snapshot.update(direct_tool_plot_builds=0, legacy_tool_plot_builds=0)
+        with self.assertRaisesRegex(ValueError, "did not execute legacy"):
+            runtime.validate_runtime_work(before, after, "normal")
+        after["legacy_tool_plot_builds"] = 2
+        self.assertTrue(runtime.validate_runtime_work(before, after, "normal")["available"])
+        after["direct_tool_plot_builds"] = 1
+        with self.assertRaisesRegex(ValueError, "Legacy tool-plot"):
+            runtime.validate_runtime_work(before, after, "normal")
+        after["direct_tool_plot_builds"] = 0
+        del after["graphics_diagnostics"]["direct_tool_plot"]
+        with self.assertRaisesRegex(ValueError, "stable complete"):
+            runtime.validate_runtime_work(before, after, "normal")
+        del before["graphics_diagnostics"]["direct_tool_plot"]
+        with self.assertRaisesRegex(ValueError, "lack feature metadata"):
+            runtime.validate_runtime_work(before, after, "normal")
+
+    def test_ordered_baseline_and_direct_control_keep_bounded_three_case_sequence(self):
+        args = runtime.parser().parse_args(["compare", "--app-binary", "/app", "--test-bundle", "/tests",
+            "--collector-binary", "/collector", "--provenance", "/provenance", "--baseline-mode",
+            memory.ORDERED_PUBLICATION_MODE, "--controls", memory.DIRECT_TOOL_PLOT_MODE])
+        self.assertEqual(runtime.selected_cases(args), [("baseline-before", memory.ORDERED_PUBLICATION_MODE),
+            (memory.DIRECT_TOOL_PLOT_MODE, memory.DIRECT_TOOL_PLOT_MODE), ("baseline-after", memory.ORDERED_PUBLICATION_MODE)])
 
 
 class NextRuntimeWorkTests(unittest.TestCase):
