@@ -77,6 +77,43 @@ All zones: 9 nodes (1312 bytes)
 """
 
 
+class NonNativeFeatureCounterTests(unittest.TestCase):
+    def full_counter_snapshot(self, mode):
+        from test_memory_diagnostic import graphics
+        snapshot = graphics(mode)
+        fields = (memory.NEXT_RUNTIME_COUNTERS + memory.CANVAS_CLOCK_COUNTERS + memory.ORDERED_PUBLICATION_COUNTERS
+                  + memory.DIRECT_TOOL_PLOT_COUNTERS + memory.NATIVE_CANVAS_GROUP_COUNTERS)
+        snapshot.update(dict.fromkeys(fields, 0))
+        snapshot.update(chart_publication_full_sorts=7, legacy_tool_plot_builds=21, rail_timeline_content_updates=3)
+        snapshot["graphics_diagnostics"]["native_gpu_canvas_draws"] = 0
+        return snapshot
+
+    def test_full_non_native_counter_exports_allow_legitimate_fallback_without_feature_claims(self):
+        for mode in ("normal", "no-renderer", "empty-drawing", "bitmap-destination"):
+            snapshot = self.full_counter_snapshot(mode)
+            with self.subTest(mode=mode):
+                result = memory.validate_graphics(snapshot, mode)
+                self.assertTrue(result["available"])
+                self.assertNotIn("runtime_feature_contract", result)
+
+    def test_non_native_counter_exports_reject_fast_path_activity_and_bad_or_partial_groups(self):
+        snapshot = self.full_counter_snapshot("empty-drawing")
+        disabled = (memory.NEXT_RUNTIME_COUNTERS + ("rail_frame_clock_ticks", "ordered_chart_publication_queries",
+                    "direct_tool_plot_builds") + memory.NATIVE_CANVAS_GROUP_COUNTERS)
+        for field in disabled:
+            changed = copy.deepcopy(snapshot)
+            changed[field] = 1
+            with self.subTest(nonzero=field), self.assertRaises(InvalidResult):
+                memory.validate_graphics(changed, "empty-drawing")
+        for field in (memory.SHARED_PREPARATION_COUNTERS + memory.CANVAS_CLOCK_COUNTERS + memory.ORDERED_PUBLICATION_COUNTERS
+                      + memory.DIRECT_TOOL_PLOT_COUNTERS + memory.NATIVE_CANVAS_GROUP_COUNTERS):
+            for invalid in (None, True, -1):
+                changed = copy.deepcopy(snapshot)
+                changed[field] = invalid
+                with self.subTest(field=field, invalid=invalid), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(changed, "empty-drawing")
+
+
 class NativeCanvasGroupingContractTests(unittest.TestCase):
     def test_backend_exactly_identifies_requested_grouping(self):
         from test_memory_diagnostic import drawn_native_gpu_graphics

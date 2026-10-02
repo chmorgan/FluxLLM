@@ -431,7 +431,8 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     runtime_features = runtime_feature_contract(value, mode)
     if (mode == UNGROUPED_CANVAS_MODE or "ungrouped_native_canvas" in value
             or any(field in snapshot for field in NATIVE_CANVAS_GROUP_COUNTERS)):
-        require("ungrouped_native_canvas" in value, "Native Canvas grouping counters lack feature metadata")
+        require("ungrouped_native_canvas" in value or contract not in NATIVE_GPU_MODES,
+                "Native Canvas grouping counters lack feature metadata")
         grouping = {field: unsigned(snapshot.get(field), field) for field in NATIVE_CANVAS_GROUP_COUNTERS}
         if contract in NATIVE_GPU_MODES:
             callbacks = unsigned(value.get("native_gpu_canvas_draws"), "graphics.native_gpu_canvas_draws")
@@ -445,7 +446,8 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             require(grouping["ungrouped_native_canvas_draws"] == 0, "Grouped native Canvas mode executed ungrouped callbacks")
     if (mode in (DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE) or "direct_tool_plot" in value
             or any(field in snapshot for field in DIRECT_TOOL_PLOT_COUNTERS)):
-        require("direct_tool_plot" in value, "Tool-plot counters lack feature metadata")
+        require("direct_tool_plot" in value or contract not in NATIVE_GPU_MODES,
+                "Tool-plot counters lack feature metadata")
         tool_plot = {field: unsigned(snapshot.get(field), field) for field in DIRECT_TOOL_PLOT_COUNTERS}
         if (runtime_features or {}).get("direct_tool_plot", False):
             if completed_visible_workload:
@@ -454,7 +456,8 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             require(tool_plot["direct_tool_plot_builds"] == 0, "Legacy tool-plot mode executed direct geometry builds")
     if (mode in ORDERED_PUBLICATION_MODES or "ordered_chart_publication" in value
             or any(field in snapshot for field in ORDERED_PUBLICATION_COUNTERS)):
-        require("ordered_chart_publication" in value, "Ordered-publication counters lack feature metadata")
+        require("ordered_chart_publication" in value or contract not in NATIVE_GPU_MODES,
+                "Ordered-publication counters lack feature metadata")
         ordered = {field: unsigned(snapshot.get(field), field) for field in ORDERED_PUBLICATION_COUNTERS}
         if (runtime_features or {}).get("ordered_chart_publication", False):
             if completed_visible_workload:

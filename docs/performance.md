@@ -636,6 +636,11 @@ verified sum of role draw deltas. The new mode requires this complete group;
 older modes may omit the entire group, but partial or incorrectly typed evidence
 is rejected.
 
+Non-native memory diagnostics export the same top-level counters without native
+feature flags. Complete typed fallback counts for full sorts, legacy tool plots,
+and Timeline updates are allowed. Unsupported fast-path and native-draw counters
+must remain zero; no runtime feature contract is inferred from these counters.
+
 A frozen older `normal` profile may omit that metadata and records it as
 unavailable; supplied flags are validated, and new runtime controls always
 require the full contract. Older frozen profiles without the synthetic identity
