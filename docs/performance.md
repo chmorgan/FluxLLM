@@ -241,7 +241,9 @@ Choose one diagnostic mode per invocation with `--graphics-mode`:
 | `empty-drawing` | Keep the native canvas and renderer lifecycle but use an empty drawing closure. |
 | `no-renderer` | Keep native canvas layout but skip renderer creation and drawing. |
 | `bitmap-destination` | Render through a bounded temporary CPU bitmap before copying into the native destination. |
-| `bitmap-layer-destination` | Keep ImageRenderer, gradients, and blur, render into a bounded CPU bitmap, and assign the finished image directly to `CALayer.contents`. |
+| `bitmap-layer-destination` | Keep ImageRenderer, gradients, and blur, render into a bounded RGBA bitmap, and assign the finished image directly to `CALayer.contents`. |
+| `bitmap-layer-bgra` | Use the same layer destination and drawing workload, changing only the bitmap format to BGRA. |
+| `bitmap-layer-no-decorations` | Use the RGBA layer destination while omitting the animated request-rail decoration surface. |
 | `no-blur` | Keep the renderer and drawing geometry while skipping the main-series Gaussian blur. |
 | `cpu-glow` | Use a bounded CPU raster glow in place of the filtered series-glow pass. |
 | `no-gradients` | Substitute solid fills for the three chart gradient operations, preserving geometry and animation. |
@@ -251,14 +253,25 @@ Both gradient controls require valid substitution counters throughout the captur
 and a positive count after the visible workload. They affect the three Canvas
 gradient operations; SwiftUI surface and rim gradients remain unchanged.
 
-The layer-destination control bounds each bitmap buffer to 32 MiB and retains
-one current layer image per chart surface. It never copies that image into the
+The three layer-destination controls use the same frozen app binary and bound
+each bitmap buffer to 32 MiB while retaining
+one current layer image per chart surface. They never copy that image into the
 native window drawing context. The runner requires zero bitmap failures and
 zero native draw callbacks throughout the capture, positive chart draws and
-image presentations after the visible workload, reconciled role/image byte
+image presentations after the visible workload, presentations equal to summed
+role draw counts, reconciled role/image byte
 counters, and zero retained image bytes at closed checkpoints. ImageRenderer
 must still be created for drawn roles. These requested image and scratch-buffer
 bytes describe owned CPU data, not measured GPU allocation.
+
+The two newer controls must acknowledge their pixel format, Device RGB color
+space, and whether rail decorations are enabled. `bitmap-layer-bgra` requires
+`bgra8-premultiplied-first`; the other layer controls use
+`rgba8-premultiplied-last`. Only `bitmap-layer-no-decorations` may report
+decorations disabled, and every counter for its `rail_decorations` role must
+remain zero, including creation, update, draw, renderer, and image counters.
+The original layer mode accepts older frozen products without format metadata;
+any metadata they do expose must match that mode.
 
 Optionally add `--no-popover-animation` independently of the graphics mode to
 disable native popover animation for this diagnostic. The runner verifies the
@@ -285,6 +298,13 @@ sampling gaps, PID/birth identity, ready/final events, and exact kernel boundari
 are checked before computing CPU. Captures with native inspection explicitly
 report this CPU comparison as unavailable. Neither variant evaluates CPU/GPU
 gates; both retain the 90-second deadline.
+
+To compare the three layer controls, run them serially with
+`--no-native-inspection`, the same frozen app/test/collector/provenance paths,
+and a new output directory per mode. Each invocation applies the same automated
+25-second high-rate workload and lifecycle; no manual load or PID selection is
+needed. Compare CPU only among these unprofiled captures, then use a separate
+native-inspection capture when allocation categories are needed.
 
 Results use a unique ignored `.performance-results/memory-*` directory, or a new
 directory supplied with `--output-dir`. Existing artifacts are never overwritten.

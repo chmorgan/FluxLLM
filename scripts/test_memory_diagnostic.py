@@ -22,16 +22,19 @@ def graphics(mode="normal"):
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
         **({"layer_bitmap_presentations": 0, "layer_bitmap_failures": 0, "layer_bitmap_native_draws": 0,
-            "current_layer_image_bytes": 0, "peak_layer_image_bytes": 0} if mode == "bitmap-layer-destination" else {}),
+            "current_layer_image_bytes": 0, "peak_layer_image_bytes": 0} if mode in memory.LAYER_DESTINATION_MODES else {}),
+        **({"layer_bitmap_pixel_format": "bgra8-premultiplied-first" if mode == "bitmap-layer-bgra" else "rgba8-premultiplied-last",
+            "layer_bitmap_color_space": "device-rgb", "rail_decorations_enabled": mode != "bitmap-layer-no-decorations"}
+           if mode in memory.LAYER_DESTINATION_MODES and mode != "bitmap-layer-destination" else {}),
         "live_canvases": 0, "peak_live_canvases": 0, "live_renderers": 0, "peak_live_renderers": 0,
         "current_pixel_area": 0, "peak_pixel_area": 0, "current_bitmap_bytes": 0, "peak_bitmap_bytes": 0,
         "roles": {role: dict.fromkeys(fields + (("current_layer_image_bytes", "peak_layer_image_bytes")
-                                               if mode == "bitmap-layer-destination" else ()), 0)
+                                               if mode in memory.LAYER_DESTINATION_MODES else ()), 0)
                   for role in ("static_chart", "cursor", "rail_bars", "rail_decorations")}}}
 
 
-def drawn_layer_graphics():
-    snapshot = graphics("bitmap-layer-destination")
+def drawn_layer_graphics(mode="bitmap-layer-destination"):
+    snapshot = graphics(mode)
     value = snapshot["graphics_diagnostics"]
     value.update(layer_bitmap_presentations=3, live_canvases=1, peak_live_canvases=1,
                  live_renderers=1, peak_live_renderers=1, current_layer_image_bytes=400, peak_layer_image_bytes=400)
@@ -41,6 +44,78 @@ def drawn_layer_graphics():
 
 
 class GraphicsTests(unittest.TestCase):
+    def test_layer_variants_require_exact_metadata_and_original_mode_accepts_legacy_omission(self):
+        for mode in memory.LAYER_DESTINATION_MODES:
+            expected = {
+                "layer_bitmap_pixel_format": "bgra8-premultiplied-first" if mode == "bitmap-layer-bgra" else "rgba8-premultiplied-last",
+                "layer_bitmap_color_space": "device-rgb",
+                "rail_decorations_enabled": mode != "bitmap-layer-no-decorations",
+            }
+            snapshot = drawn_layer_graphics(mode)
+            snapshot["graphics_diagnostics"].update(expected)
+            self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+            for field, correct in expected.items():
+                missing = copy.deepcopy(snapshot)
+                del missing["graphics_diagnostics"][field]
+                if mode == "bitmap-layer-destination":
+                    self.assertTrue(memory.validate_graphics(missing, mode)["available"])
+                else:
+                    with self.subTest(mode=mode, missing=field), self.assertRaisesRegex(InvalidResult, field):
+                        memory.validate_graphics(missing, mode)
+                for wrong in (None, 0, 1, "wrong", not correct if type(correct) is bool else False):
+                    invalid = copy.deepcopy(snapshot)
+                    invalid["graphics_diagnostics"][field] = wrong
+                    with self.subTest(mode=mode, field=field, wrong=wrong), self.assertRaisesRegex(InvalidResult, field):
+                        memory.validate_graphics(invalid, mode)
+            swapped = copy.deepcopy(snapshot)
+            swapped["graphics_diagnostics"]["layer_bitmap_pixel_format"] = (
+                "rgba8-premultiplied-last" if mode == "bitmap-layer-bgra" else "bgra8-premultiplied-first")
+            with self.subTest(mode=mode, swapped_pixel_format=True), self.assertRaisesRegex(InvalidResult, "pixel_format"):
+                memory.validate_graphics(swapped, mode)
+
+    def test_all_layer_variants_reject_missing_or_inconsistent_image_and_frame_evidence(self):
+        changes = (
+            lambda value: value.pop("layer_bitmap_presentations"),
+            lambda value: value.update(layer_bitmap_presentations=2),
+            lambda value: value.update(layer_bitmap_failures=1),
+            lambda value: value.update(layer_bitmap_native_draws=1),
+            lambda value: value.update(current_layer_image_bytes=399),
+            lambda value: value.update(peak_layer_image_bytes=401),
+            lambda value: value["roles"]["static_chart"].pop("peak_layer_image_bytes"),
+            lambda value: value["roles"]["static_chart"].update(current_layer_image_bytes=True),
+            lambda value: value["roles"]["static_chart"].update(renderer_creations=0),
+        )
+        for mode in memory.LAYER_DESTINATION_MODES:
+            self.assertTrue(memory.validate_graphics(graphics(mode), mode)["available"])
+            self.assertTrue(memory.validate_graphics(drawn_layer_graphics(mode), mode, completed_visible_workload=True)["available"])
+            with self.subTest(mode=mode, empty_workload=True), self.assertRaisesRegex(InvalidResult, "did not present"):
+                memory.validate_graphics(graphics(mode), mode, completed_visible_workload=True)
+            with self.subTest(mode=mode, retained_when_closed=True), self.assertRaisesRegex(InvalidResult, "retains layer image"):
+                memory.validate_graphics(drawn_layer_graphics(mode), mode, expected_closed=True)
+            for change in changes:
+                snapshot = drawn_layer_graphics(mode)
+                change(snapshot["graphics_diagnostics"])
+                with self.subTest(mode=mode, change=change), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+
+    def test_no_decorations_rejects_every_role_counter_even_if_lifecycle_would_otherwise_reconcile(self):
+        mode = "bitmap-layer-no-decorations"
+        for field in graphics(mode)["graphics_diagnostics"]["roles"]["rail_decorations"]:
+            snapshot = drawn_layer_graphics(mode)
+            snapshot["graphics_diagnostics"]["roles"]["rail_decorations"][field] = 1
+            with self.subTest(field=field), self.assertRaisesRegex(InvalidResult, "Rail decoration work"):
+                memory.validate_graphics(snapshot, mode)
+        snapshot = drawn_layer_graphics(mode)
+        # Even a created-and-destroyed surface with no remaining allocation is leakage.
+        snapshot["graphics_diagnostics"]["roles"]["rail_decorations"].update(created=1, destroyed=1, peak_live=1)
+        snapshot["graphics_diagnostics"]["peak_live_canvases"] = 2
+        with self.assertRaisesRegex(InvalidResult, "Rail decoration work"):
+            memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+        for control in ("bitmap-layer-destination", "bitmap-layer-bgra"):
+            snapshot = drawn_layer_graphics(control)
+            snapshot["graphics_diagnostics"]["roles"]["rail_decorations"]["updates"] = 1
+            self.assertTrue(memory.validate_graphics(snapshot, control)["available"])
+
     def test_layer_destination_requires_all_new_fields_without_breaking_old_modes(self):
         for mode in memory.GRAPHICS_MODES:
             self.assertTrue(memory.validate_graphics(graphics(mode), mode)["available"])

@@ -21,7 +21,9 @@ import app_performance as app
 from run_performance_checks import interrupted, load_json, number, require, write_json
 
 
-GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "bitmap-layer-destination", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
+GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "bitmap-layer-destination",
+                  "bitmap-layer-bgra", "bitmap-layer-no-decorations", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
+LAYER_DESTINATION_MODES = ("bitmap-layer-destination", "bitmap-layer-bgra", "bitmap-layer-no-decorations")
 GRADIENT_ABLATION_MODES = ("no-gradients", "no-gradients-or-blur")
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 DEADLINE_SECONDS = 90
@@ -325,8 +327,18 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     fields = ("created", "destroyed", "live", "peak_live", "updates", "renderer_creations", "renderer_updates",
               "renderer_destructions", "live_renderers", "peak_live_renderers", "draws", "skipped_draws",
               "current_pixel_area", "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes")
-    layer_destination = mode == "bitmap-layer-destination"
+    layer_destination = mode in LAYER_DESTINATION_MODES
     if layer_destination:
+        metadata = {
+            "layer_bitmap_pixel_format": "bgra8-premultiplied-first" if mode == "bitmap-layer-bgra" else "rgba8-premultiplied-last",
+            "layer_bitmap_color_space": "device-rgb",
+            "rail_decorations_enabled": mode != "bitmap-layer-no-decorations",
+        }
+        for field, expected in metadata.items():
+            # Original frozen layer-destination products predate this metadata.
+            if mode != "bitmap-layer-destination" or field in value:
+                require(type(value.get(field)) is type(expected) and value[field] == expected,
+                        f"Graphics {field} does not match the requested layer destination control")
         fields += ("current_layer_image_bytes", "peak_layer_image_bytes")
         presentations = unsigned(value.get("layer_bitmap_presentations"), "graphics.layer_bitmap_presentations")
         for field in ("layer_bitmap_failures", "layer_bitmap_native_draws"):
@@ -338,6 +350,9 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             unsigned(role.get(field), f"graphics.{name}.{field}")
         for field in ("max_width_points", "max_height_points", "max_scale"):
             number(role.get(field), f"graphics.{name}.{field}")
+        if mode == "bitmap-layer-no-decorations" and name == "rail_decorations":
+            require(all(type(counter) in (int, float) and counter == 0 for counter in role.values()),
+                    "Rail decoration work occurred in the no-decorations control")
         require(role["created"] - role["destroyed"] == role["live"]
                 and role["renderer_creations"] - role["renderer_destructions"] == role["live_renderers"],
                 f"Graphics {name} lifecycle counters do not reconcile")
