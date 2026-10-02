@@ -162,6 +162,8 @@ public final class ProxyManager: ObservableObject {
             let upstreamHost = configuration.upstreamHost
             let upstreamPort = ollamaPort
             let requestIDFactory = self.requestIDFactory
+            let usesUnpromisedStreamBodyWrites =
+                PerformanceGraphicsDiagnostics.shared.mode.usesUnpromisedStreamBodyWrites
 
             let bootstrap = ServerBootstrap(group: group)
                 .serverChannelOption(
@@ -190,7 +192,8 @@ public final class ProxyManager: ObservableObject {
                                 RequestForwarder(
                                     ollamaHost: upstreamHost, ollamaPort: upstreamPort,
                                     registry: registry, eventSink: sink,
-                                    requestIDFactory: requestIDFactory))
+                                    requestIDFactory: requestIDFactory,
+                                    usesUnpromisedStreamBodyWrites: usesUnpromisedStreamBodyWrites))
                         }
                     }
                 }
@@ -384,19 +387,22 @@ private final class RequestForwarder: ChannelInboundHandler {
     private let registry: ProxyChannelRegistry
     private let eventSink: @Sendable (GenerationEvent) -> Void
     private let requestIDFactory: (@Sendable (Data) -> UUID)?
+    private let usesUnpromisedStreamBodyWrites: Bool
     private var hasForwardedRequest = false
     private var requestRelay: GenerationRelay?
 
     init(
         ollamaHost: String, ollamaPort: Int, registry: ProxyChannelRegistry,
         eventSink: @escaping @Sendable (GenerationEvent) -> Void,
-        requestIDFactory: (@Sendable (Data) -> UUID)?
+        requestIDFactory: (@Sendable (Data) -> UUID)?,
+        usesUnpromisedStreamBodyWrites: Bool
     ) {
         self.ollamaHost = ollamaHost
         self.ollamaPort = ollamaPort
         self.registry = registry
         self.eventSink = eventSink
         self.requestIDFactory = requestIDFactory
+        self.usesUnpromisedStreamBodyWrites = usesUnpromisedStreamBodyWrites
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -430,6 +436,7 @@ private final class RequestForwarder: ChannelInboundHandler {
         let upstreamHost = ollamaHost.contains(":") ? "[\(ollamaHost)]" : ollamaHost
         head.headers.replaceOrAdd(name: "host", value: "\(upstreamHost):\(ollamaPort)")
         let forwardedHead = head
+        let usesUnpromisedStreamBodyWrites = self.usesUnpromisedStreamBodyWrites
 
         ClientBootstrap(group: serverChannel.eventLoop)
             .connectTimeout(.seconds(10))
@@ -455,10 +462,22 @@ private final class RequestForwarder: ChannelInboundHandler {
                 // Only the winning connection may emit response telemetry.
                 channel.pipeline.addHTTPClientHandlers().flatMap {
                     channel.eventLoop.submit {
+                        let lifecycle: StreamBodyWriteLifecycle?
+                        if usesUnpromisedStreamBodyWrites,
+                            forwardedHead.method != .HEAD, forwardedHead.method != .CONNECT
+                        {
+                            let observer = StreamBodyWriteLifecycle(upstream: channel, relay: relay)
+                            try serverChannel.pipeline.syncOperations.addHandler(observer)
+                            lifecycle = observer
+                        } else {
+                            lifecycle = nil
+                        }
                         try channel.pipeline.syncOperations.addHandler(
                             StreamTapper(
                                 serverChannel: serverChannel, relay: relay,
-                                isGeneration: isGeneration))
+                                isGeneration: isGeneration,
+                                requestMethod: forwardedHead.method,
+                                bodyWriteLifecycle: lifecycle))
                     }
                 }.map { channel }
             }

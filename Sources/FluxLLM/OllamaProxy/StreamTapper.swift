@@ -144,6 +144,73 @@ final class GenerationRelay: @unchecked Sendable {
     }
 }
 
+/// Installed on the downstream connection before its upstream tapper. Socket
+/// write failures close the connection synchronously, whereas closeFuture can
+/// complete on a later event-loop turn. Cancel here before a failed body can be
+/// accepted by telemetry, without allocating a promise for every body write.
+/// The proxy owns this pipeline; heads and end retain their write promises.
+final class StreamBodyWriteLifecycle: ChannelDuplexHandler {
+    typealias InboundIn = NIOAny
+    typealias OutboundIn = HTTPServerResponsePart
+
+    private let upstream: Channel
+    private let relay: GenerationRelay
+    private var downstream: Channel?
+    private var closing = false
+
+    init(upstream: Channel, relay: GenerationRelay) {
+        self.upstream = upstream
+        self.relay = relay
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        precondition(context.eventLoop === upstream.eventLoop)
+        downstream = context.channel
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        downstream = nil
+    }
+
+    func permitsUnpromisedBody(downstream: Channel, upstream: Channel) -> Bool {
+        self.downstream === downstream && self.upstream === upstream
+            && !closing && downstream.isActive
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        cancelBeforeClosingUpstream()
+        context.fireChannelInactive()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        cancelBeforeClosingUpstream()
+        context.close(promise: nil)
+        context.fireErrorCaught(error)
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let event = event as? ChannelEvent, event == .outputClosed {
+            cancelBeforeClosingUpstream()
+            context.close(promise: nil)
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
+    func close(context: ChannelHandlerContext, mode: CloseMode, promise: EventLoopPromise<Void>?) {
+        // Output closure can defer its notification while queued writes drain.
+        // Stop accounting at the request, not after that deferred notification.
+        if mode == .all || mode == .output { cancelBeforeClosingUpstream() }
+        context.close(mode: mode, promise: promise)
+    }
+
+    private func cancelBeforeClosingUpstream() {
+        guard !closing else { return }
+        closing = true
+        relay.cancel()
+        upstream.close(promise: nil)
+    }
+}
+
 /// Forwards response bodies without aggregating the stream, then taps native
 /// Ollama payloads on the upstream event loop in order through completion.
 final class StreamTapper: ChannelInboundHandler {
@@ -153,6 +220,8 @@ final class StreamTapper: ChannelInboundHandler {
     private let serverChannel: Channel
     private let relay: GenerationRelay
     private let isGeneration: Bool
+    private let requestMethod: HTTPMethod
+    private let bodyWriteLifecycle: StreamBodyWriteLifecycle?
     private var parser = SSEParser()
     private var counter = TokenState()
     private var toolCalls = ToolCallParser()
@@ -162,10 +231,15 @@ final class StreamTapper: ChannelInboundHandler {
     private var ended = false
     private var nonStreamBody: ByteBuffer?
 
-    init(serverChannel: Channel, relay: GenerationRelay, isGeneration: Bool) {
+    init(
+        serverChannel: Channel, relay: GenerationRelay, isGeneration: Bool,
+        requestMethod: HTTPMethod = .POST, bodyWriteLifecycle: StreamBodyWriteLifecycle? = nil
+    ) {
         self.serverChannel = serverChannel
         self.relay = relay
         self.isGeneration = isGeneration
+        self.requestMethod = requestMethod
+        self.bodyWriteLifecycle = bodyWriteLifecycle
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
@@ -276,6 +350,23 @@ final class StreamTapper: ChannelInboundHandler {
     private func forward(_ part: HTTPServerResponsePart, upstream: Channel) {
         let downstream = serverChannel
         let relay = relay
+        if let bodyWriteLifecycle, case .body = part,
+            requestMethod != .HEAD, requestMethod != .CONNECT
+        {
+            guard downstream.isActive else {
+                relay.cancel()
+                upstream.close(promise: nil)
+                return
+            }
+            if bodyWriteLifecycle.permitsUnpromisedBody(downstream: downstream, upstream: upstream)
+            {
+                // Flush every incoming body immediately. NIO's chunked encoder
+                // skips its three promises and their combining futures here.
+                PerformancePresentationCounters.shared.record(.streamedBodiesWithoutPromises)
+                downstream.writeAndFlush(part, promise: nil)
+                return
+            }
+        }
         downstream.writeAndFlush(part).whenFailure { _ in
             relay.cancel()
             upstream.close(promise: nil)

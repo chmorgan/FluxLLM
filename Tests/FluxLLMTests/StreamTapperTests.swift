@@ -23,6 +23,18 @@ final class StreamTapperTests: XCTestCase {
         try await verifyLiveForwarding(chat: true)
     }
 
+    func testUnpromisedBodiesKeepLiveDeliveryAndAuthoritativeCompletion() async throws {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        let previousMode = diagnostics.mode
+        try diagnostics.enable(mode: .runtimeStreamWrites)
+        defer { try? diagnostics.enable(mode: previousMode) }
+        PerformancePresentationCounters.shared.enable()
+        try await verifyLiveForwarding(chat: true)
+        XCTAssertGreaterThan(
+            PerformancePresentationCounters.shared.snapshot()[
+                "streamed_bodies_without_promises", default: 0], 0)
+    }
+
     func testSharedRecordPreservesTextToolsMalformedBytesAndFinalCorrection() async throws {
         let gate = MockResponseGate()
         let call =
@@ -286,6 +298,18 @@ final class StreamTapperTests: XCTestCase {
     }
 
     func testClientCancellationMarksGenerationCancelled() async throws {
+        try await verifyClientCancellation()
+    }
+
+    func testUnpromisedBodiesCancelWhenClientDisconnects() async throws {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        let previousMode = diagnostics.mode
+        try diagnostics.enable(mode: .runtimeStreamWrites)
+        defer { try? diagnostics.enable(mode: previousMode) }
+        try await verifyClientCancellation()
+    }
+
+    private func verifyClientCancellation() async throws {
         let gate = MockResponseGate()
         let fixture = MockOllamaResponse.generation(gate: gate)
         try await withProxy(response: fixture) { context in
