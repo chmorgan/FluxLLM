@@ -31,6 +31,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeDirectToolPlot = "runtime-direct-tool-plot"
         case runtimeUngroupedCanvas = "runtime-ungrouped-canvas"
         case runtimeNoArrivalEffects = "runtime-no-arrival-effects"
+        case runtimeCompactToolPaths = "runtime-compact-tool-paths"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -72,7 +73,7 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
                 .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
                 .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
-                .runtimeNoArrivalEffects:
+                .runtimeNoArrivalEffects, .runtimeCompactToolPaths:
                 true
             default:
                 false
@@ -95,9 +96,12 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeDirectToolPlot
                 || self == .runtimeUngroupedCanvas
                 || self == .runtimeNoArrivalEffects
+                || self == .runtimeCompactToolPaths
         }
 
         var usesDirectToolPlot: Bool { self == .runtimeDirectToolPlot }
+
+        var usesCompactToolPaths: Bool { self == .runtimeCompactToolPaths }
 
         var usesUngroupedNativeCanvas: Bool { self == .runtimeUngroupedCanvas }
 
@@ -107,6 +111,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeDirectToolPlot
                 || self == .runtimeUngroupedCanvas
                 || self == .runtimeNoArrivalEffects
+                || self == .runtimeCompactToolPaths
         }
 
         var usesCanvasFrameClock: Bool {
@@ -115,6 +120,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeDirectToolPlot
                 || self == .runtimeUngroupedCanvas
                 || self == .runtimeNoArrivalEffects
+                || self == .runtimeCompactToolPaths
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -603,6 +609,7 @@ public final class PerformanceGraphicsDiagnostics {
             result["ungrouped_native_canvas"] = mode.usesUngroupedNativeCanvas
             result["arrival_effects_enabled"] =
                 !mode.omitsLifecycleEffects && !mode.omitsArrivalEffects
+            result["compact_tool_paths_enabled"] = mode.usesCompactToolPaths
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

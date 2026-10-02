@@ -20,14 +20,17 @@ final class LuminousChartGeometryCache {
 
     func frame(
         for key: Key, throughput: ChartDisplayHistory, gpu: ChartDisplayHistory,
-        requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false
+        requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false,
+        compactToolPaths: Bool = false
     ) -> Frame {
-        if let retained, retained.key == key, retained.directToolPlot == directToolPlot {
+        if let retained, retained.key == key, retained.directToolPlot == directToolPlot,
+            retained.compactToolPaths == compactToolPaths
+        {
             return retained
         }
         let frame = Frame(
             key: key, throughput: throughput, gpu: gpu, requestTools: requestTools,
-            directToolPlot: directToolPlot)
+            directToolPlot: directToolPlot, compactToolPaths: compactToolPaths)
         retained = frame
         return frame
     }
@@ -68,14 +71,20 @@ final class LuminousChartGeometryCache {
         let spans: [ChartCurveGeometry.Span]
         let trace: Path
         let area: Path?
+        let tracePointCount: Int
 
-        init(points: [CGPoint], smoothed: Bool, baseline: CGFloat) {
+        init(
+            points: [CGPoint], smoothed: Bool, baseline: CGFloat,
+            compactToolPaths: Bool = false
+        ) {
             self.points = points
             spans = smoothed ? ChartCurveGeometry.spans(points: points) : []
             var trace = Path()
+            var tracePointCount = points.count
             if let first = points.first {
                 trace.move(to: first)
                 if smoothed {
+                    tracePointCount = spans.count + 1
                     for span in spans {
                         if span.isVertical {
                             trace.addLine(to: span.end)
@@ -84,11 +93,23 @@ final class LuminousChartGeometryCache {
                                 to: span.end, control1: span.control1, control2: span.control2)
                         }
                     }
+                } else if compactToolPaths {
+                    for index in 1..<points.count {
+                        if index < points.count - 1,
+                            Self.isHorizontalInterior(
+                                points[index - 1], points[index], points[index + 1])
+                        {
+                            tracePointCount -= 1
+                        } else {
+                            trace.addLine(to: points[index])
+                        }
+                    }
                 } else {
                     for point in points.dropFirst() { trace.addLine(to: point) }
                 }
             }
             self.trace = trace
+            self.tracePointCount = tracePointCount
             if smoothed, points.count > 1, let first = points.first, let last = points.last {
                 var area = trace
                 area.addLine(to: CGPoint(x: last.x, y: baseline))
@@ -98,6 +119,19 @@ final class LuminousChartGeometryCache {
             } else {
                 area = nil
             }
+        }
+
+        /// Only exact horizontal interiors can disappear from a tool trace.
+        /// Inspect original neighbors so duplicate, reversed, vertical, and
+        /// nonfinite vertices retain their original command boundaries.
+        private static func isHorizontalInterior(
+            _ previous: CGPoint, _ point: CGPoint, _ next: CGPoint
+        ) -> Bool {
+            previous.x.isFinite && previous.y.isFinite
+                && point.x.isFinite && point.y.isFinite
+                && next.x.isFinite && next.y.isFinite
+                && previous.y == point.y && point.y == next.y
+                && previous.x < point.x && point.x < next.x
         }
 
         func inspectedY(atX x: CGFloat) -> CGFloat? {
@@ -118,6 +152,7 @@ final class LuminousChartGeometryCache {
         lazy var seriesGlowRasterCache = SeriesGlowRasterCache()
         let key: Key
         let directToolPlot: Bool
+        let compactToolPaths: Bool
         let layout: Layout
         let generated: [Segment]
         let device: [Segment]
@@ -127,10 +162,12 @@ final class LuminousChartGeometryCache {
 
         init(
             key: Key, throughput: ChartDisplayHistory, gpu: ChartDisplayHistory,
-            requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false
+            requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false,
+            compactToolPaths: Bool = false
         ) {
             self.key = key
             self.directToolPlot = directToolPlot
+            self.compactToolPaths = compactToolPaths
             let layout = Layout(size: key.size, hasTools: key.hasTools, compact: key.compact)
             self.layout = layout
             generated = Self.segments(
@@ -144,6 +181,8 @@ final class LuminousChartGeometryCache {
                 Self.project(
                     $0.timestamp, value: $0.value, key: key, rect: layout.main, upperBound: 100)
             }
+            var toolPathInputPoints: UInt64 = 0
+            var toolPathOutputPoints: UInt64 = 0
             self.requestTools = requestTools.mapValues { history in
                 PerformancePresentationCounters.shared.record(
                     directToolPlot ? .directToolPlotBuilds : .legacyToolPlotBuilds)
@@ -154,10 +193,16 @@ final class LuminousChartGeometryCache {
                     Self.project(
                         $0.timestamp, value: 0, key: key, rect: layout.tools, upperBound: 1)
                 }
+                let segments = Self.segments(
+                    plotSegments, key: key, rect: layout.tools,
+                    upperBound: key.toolUpperBound, smoothed: false,
+                    compactToolPaths: compactToolPaths)
+                for segment in segments {
+                    toolPathInputPoints &+= UInt64(segment.points.count)
+                    toolPathOutputPoints &+= UInt64(segment.tracePointCount)
+                }
                 return ToolTrack(
-                    segments: Self.segments(
-                        plotSegments, key: key, rect: layout.tools,
-                        upperBound: key.toolUpperBound, smoothed: false),
+                    segments: segments,
                     resultPoints: points,
                     resultDiamonds: points.map { point in
                         var diamond = Path()
@@ -169,11 +214,17 @@ final class LuminousChartGeometryCache {
                         return diamond
                     })
             }
+            if toolPathInputPoints > 0 {
+                PerformancePresentationCounters.shared.record(
+                    .toolPathInputPoints, by: toolPathInputPoints)
+                PerformancePresentationCounters.shared.record(
+                    .toolPathOutputPoints, by: toolPathOutputPoints)
+            }
         }
 
         private static func segments(
             _ segments: [[ChartDisplayPoint]], key: Key, rect: CGRect, upperBound: Double,
-            smoothed: Bool
+            smoothed: Bool, compactToolPaths: Bool = false
         ) -> [Segment] {
             guard key.duration.isFinite, key.duration > 0, upperBound.isFinite, upperBound > 0
             else {
@@ -185,7 +236,8 @@ final class LuminousChartGeometryCache {
                         project(
                             $0.timestamp, value: $0.value, key: key, rect: rect,
                             upperBound: upperBound)
-                    }, smoothed: smoothed, baseline: rect.maxY)
+                    }, smoothed: smoothed, baseline: rect.maxY,
+                    compactToolPaths: compactToolPaths)
             }
         }
 

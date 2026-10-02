@@ -540,6 +540,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-direct-tool-plot` | Build request-tool plot geometry directly on top of current production behavior. |
 | `runtime-ungrouped-canvas` | Omit `drawingGroup` around native Canvas surfaces while retaining current production behavior elsewhere. |
 | `runtime-no-arrival-effects` | Suppress request-arrival effects while preserving completion effects and active retained twinkles. |
+| `runtime-compact-tool-paths` | Enable tool-path compaction on top of current production behavior. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -589,6 +590,15 @@ disabled. It keeps `lifecycle_effects_enabled = true` and sets
 `arrival_effects_enabled = false`; compare it with
 `--baseline-mode normal --controls runtime-no-arrival-effects`. Production
 `normal` continues to show arrival effects; this diagnostic makes no CPU-gain claim.
+
+
+`runtime-compact-tool-paths` is opt-in and inherits every current `normal` feature,
+changing only `compact_tool_paths_enabled` to `true`; production `normal` keeps
+it `false`. Use the existing `runtime compare` command with
+`--baseline-mode normal --controls runtime-compact-tool-paths` for a same-binary
+normal/candidate/normal comparison. The 300-second deadline, fixed workload,
+publication cadence, 5% CPU limit, and separate 1% GPU limit remain unchanged.
+This experiment has no established performance gain and is not promoted.
 
 The stream-write control keeps promises on response heads and ends, and on
 `HEAD`/`CONNECT` bodies. Its body fast path requires an active downstream channel
@@ -696,6 +706,16 @@ grouped-draw delta. The two deltas must sum to the native GPU draw delta and the
 verified sum of role draw deltas. The new mode requires this complete group;
 older modes may omit the entire group, but partial or incorrectly typed evidence
 is rejected.
+
+
+Tool-path compaction records actual construction work in the top-level unsigned
+integer counters `tool_path_input_points` and `tool_path_output_points`. When
+supplied, both counters are required and must be valid and nondecreasing. The
+candidate requires positive input-point work and an output-point delta smaller
+than its input-point delta; instrumented `normal` requires equal input/output
+deltas. These counts prove the selected construction path executed; they do not
+establish a CPU or GPU improvement. Older frozen products may omit the entire
+flag/counter group; supplied partial evidence is rejected.
 
 Non-native memory diagnostics export the same top-level counters without native
 feature flags. Complete typed fallback counts for full sorts, legacy tool plots,

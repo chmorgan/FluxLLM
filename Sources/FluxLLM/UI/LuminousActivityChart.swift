@@ -195,7 +195,8 @@ struct LuminousActivityChart: View {
                     size: geometry.size, compact: compact, hasTools: tools != nil,
                     tokenUpperBound: tokenScale.upperBound, toolUpperBound: toolScale.upperBound),
                 throughput: throughput, gpu: gpu, requestTools: requestTools,
-                directToolPlot: PerformanceGraphicsDiagnostics.shared.mode.usesDirectToolPlot)
+                directToolPlot: PerformanceGraphicsDiagnostics.shared.mode.usesDirectToolPlot,
+                compactToolPaths: PerformanceGraphicsDiagnostics.shared.mode.usesCompactToolPaths)
             let layout = frame.layout
             let generated = frame.generated
             let device = frame.device

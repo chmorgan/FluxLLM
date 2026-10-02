@@ -26,6 +26,9 @@ def workload_snapshots(mode):
     after["chart_preparations"] += 2
     if mode == memory.NO_ARRIVAL_MODE:
         after["suppressed_arrival_effects"] += 2
+    if mode == memory.COMPACT_TOOL_PATHS_MODE:
+        after["tool_path_input_points"] += 100
+        after["tool_path_output_points"] += 30
     if value.get("ordered_chart_publication"):
         after["ordered_chart_publication_queries"] += 2
     if value.get("direct_tool_plot"):
@@ -146,7 +149,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled") if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled") if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -383,6 +386,61 @@ class NativeCanvasGroupingWorkTests(unittest.TestCase):
             runtime.validate_runtime_work(before, after, "normal")
         for snapshot in (before, after):
             for field in memory.NATIVE_CANVAS_GROUP_COUNTERS:
+                del snapshot[field]
+        self.assertTrue(runtime.validate_runtime_work(before, after, "normal")["available"])
+
+
+class CompactToolPathWorkTests(unittest.TestCase):
+    def baseline(self):
+        before, after = workload_snapshots(memory.COMPACT_TOOL_PATHS_MODE)
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"].update(mode="normal", compact_tool_paths_enabled=False)
+            snapshot["tool_path_output_points"] = snapshot["tool_path_input_points"]
+        return before, after
+
+    def test_control_requires_runtime_reduction_and_normal_requires_equal_construction(self):
+        candidate = runtime.validate_runtime_work(*workload_snapshots(memory.COMPACT_TOOL_PATHS_MODE), memory.COMPACT_TOOL_PATHS_MODE)
+        baseline = runtime.validate_runtime_work(*self.baseline(), "normal")
+        self.assertEqual((candidate["deltas"]["tool_path_input_points"], candidate["deltas"]["tool_path_output_points"]), (100, 30))
+        self.assertEqual((baseline["deltas"]["tool_path_input_points"], baseline["deltas"]["tool_path_output_points"]), (100, 100))
+        self.assertEqual(candidate["features"], baseline["features"] | {"compact_tool_paths_enabled": True})
+        arguments = ["compare", "--app-binary", "/app", "--test-bundle", "/tests", "--collector-binary", "/collector",
+                     "--provenance", "/provenance", "--baseline-mode", "normal", "--controls", memory.COMPACT_TOOL_PATHS_MODE]
+        self.assertEqual(runtime.selected_cases(runtime.parser().parse_args(arguments)), [
+            ("baseline-before", "normal"), (memory.COMPACT_TOOL_PATHS_MODE, memory.COMPACT_TOOL_PATHS_MODE), ("baseline-after", "normal")])
+
+    def test_prior_reduction_cannot_substitute_for_current_work_and_counters_cannot_regress(self):
+        mode = memory.COMPACT_TOOL_PATHS_MODE
+        for input_delta, output_delta in ((0, 0), (100, 0), (100, 100), (100, 101), (-1, 1), (100, -1)):
+            before, after = workload_snapshots(mode)
+            after["tool_path_input_points"] = before["tool_path_input_points"] + input_delta
+            after["tool_path_output_points"] = before["tool_path_output_points"] + output_delta
+            with self.subTest(input_delta=input_delta, output_delta=output_delta), self.assertRaises(ValueError):
+                runtime.validate_runtime_work(before, after, mode)
+        for field in memory.TOOL_PATH_POINT_COUNTERS:
+            before, after = workload_snapshots(mode)
+            del after[field]
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                runtime.validate_runtime_work(before, after, mode)
+
+    def test_baseline_rejects_vertex_change_zero_work_or_partial_acknowledgment(self):
+        for fault in ("reduction", "zero", "flag", "pair"):
+            before, after = self.baseline()
+            if fault == "reduction":
+                after["tool_path_output_points"] -= 1
+            elif fault == "zero":
+                after.update({field: before[field] for field in memory.TOOL_PATH_POINT_COUNTERS})
+            elif fault == "flag":
+                for snapshot in (before, after):
+                    del snapshot["graphics_diagnostics"]["compact_tool_paths_enabled"]
+            else:
+                del after["tool_path_output_points"]
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                runtime.validate_runtime_work(before, after, "normal")
+        before, after = self.baseline()
+        for snapshot in (before, after):
+            del snapshot["graphics_diagnostics"]["compact_tool_paths_enabled"]
+            for field in memory.TOOL_PATH_POINT_COUNTERS:
                 del snapshot[field]
         self.assertTrue(runtime.validate_runtime_work(before, after, "normal")["available"])
 

@@ -89,6 +89,22 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {field} counter moved backwards")
         delta[field] = last - first
     require(delta["chart_preparations"] > 0, "Runtime workload did not prepare charts")
+    if (mode == memory.COMPACT_TOOL_PATHS_MODE or "compact_tool_paths_enabled" in flags
+            or any(field in snapshot for snapshot in (before, after) for field in memory.TOOL_PATH_POINT_COUNTERS)):
+        require("compact_tool_paths_enabled" in flags, "Tool-path point counters lack feature metadata")
+        first, last = memory.tool_path_point_counts(before), memory.tool_path_point_counts(after)
+        for field in memory.TOOL_PATH_POINT_COUNTERS:
+            require(last[field] >= first[field], f"Runtime {field} counter moved backwards")
+            delta[field] = last[field] - first[field]
+        if flags["compact_tool_paths_enabled"]:
+            require(0 < delta["tool_path_output_points"] < delta["tool_path_input_points"],
+                    "Compact tool paths did not execute positive vertex reduction during runtime")
+        else:
+            require(first["tool_path_output_points"] == first["tool_path_input_points"]
+                    and last["tool_path_output_points"] == last["tool_path_input_points"],
+                    "Noncompact tool paths changed the input vertex count")
+            if mode == "normal":
+                require(delta["tool_path_input_points"] > 0, "Baseline tool paths did not execute vertex construction")
     if mode == memory.NO_ARRIVAL_MODE or "arrival_effects_enabled" in flags or any("suppressed_arrival_effects" in snapshot for snapshot in (before, after)):
         require("arrival_effects_enabled" in flags, "Arrival suppression counter lacks feature metadata")
         first = memory.unsigned(before.get("suppressed_arrival_effects"), "runtime.before.suppressed_arrival_effects")

@@ -17,7 +17,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 30)
+        XCTAssertEqual(Mode.allCases.count, 31)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -564,6 +564,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 XCTAssertEqual(
                     snapshot["arrival_effects_enabled"] as? Bool,
                     !mode.omitsLifecycleEffects && !mode.omitsArrivalEffects)
+                XCTAssertEqual(
+                    snapshot["compact_tool_paths_enabled"] as? Bool,
+                    mode.usesCompactToolPaths)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
             }
@@ -628,7 +631,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
             .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
             .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
-            .runtimeNoArrivalEffects,
+            .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
         ]
         let runtime: [Mode] =
             [
@@ -670,25 +673,26 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 [
                     .normal, .runtimeStreamWrites, .runtimeNextOptimized, .runtimeStreamCanvasClock,
                     .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
-                    .runtimeNoArrivalEffects,
+                    .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
                 [
                     .normal, .runtimeCanvasClock, .runtimeStreamCanvasClock,
                     .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
-                    .runtimeNoArrivalEffects,
+                    .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesOrderedChartPublication,
                 [
                     .normal, .runtimeSharedPreparation, .runtimeNextOptimized,
                     .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
-                    .runtimeNoArrivalEffects,
+                    .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                 ].contains(mode))
             XCTAssertEqual(mode.usesDirectToolPlot, mode == .runtimeDirectToolPlot)
             XCTAssertEqual(mode.usesUngroupedNativeCanvas, mode == .runtimeUngroupedCanvas)
             XCTAssertEqual(mode.omitsArrivalEffects, mode == .runtimeNoArrivalEffects)
+            XCTAssertEqual(mode.usesCompactToolPaths, mode == .runtimeCompactToolPaths)
         }
     }
 

@@ -20,6 +20,8 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
         case ungroupedNativeCanvasDraws = "ungrouped_native_canvas_draws"
         case groupedNativeCanvasDraws = "grouped_native_canvas_draws"
         case suppressedArrivalEffects = "suppressed_arrival_effects"
+        case toolPathInputPoints = "tool_path_input_points"
+        case toolPathOutputPoints = "tool_path_output_points"
         case historyToolOrderBuilds = "history_tool_order_builds"
         case historyCompletedOrderBuilds = "history_completed_order_builds"
         case historyToolOrderInsertions = "history_tool_order_insertions"
@@ -48,18 +50,18 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
             .orderedChartPublicationQueries, .chartPublicationFullSorts,
             .directToolPlotBuilds, .legacyToolPlotBuilds,
             .ungroupedNativeCanvasDraws, .groupedNativeCanvasDraws,
-            .suppressedArrivalEffects,
+            .suppressedArrivalEffects, .toolPathInputPoints, .toolPathOutputPoints,
         ] {
             values[metric.rawValue] = 0
         }
         enabled = true
     }
 
-    public func record(_ metric: Metric) {
+    public func record(_ metric: Metric, by count: UInt64 = 1) {
         lock.lock()
         defer { lock.unlock() }
         guard enabled else { return }
-        values[metric.rawValue, default: 0] &+= 1
+        values[metric.rawValue, default: 0] &+= count
     }
 
     public func snapshot() -> [String: UInt64] {
