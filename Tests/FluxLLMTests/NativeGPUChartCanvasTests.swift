@@ -9,6 +9,34 @@ import XCTest
 /// invalidation only. They are not evidence of live on-screen GPU execution.
 @MainActor
 final class NativeGPUChartCanvasTests: XCTestCase {
+    func testDefaultSurfaceDrawsWithNormalModeAndDiagnosticsDisabled() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        XCTAssertFalse(diagnostics.isEnabled)
+        XCTAssertEqual(diagnostics.mode, .normal)
+        XCTAssertTrue(diagnostics.mode.usesNativeGPUCanvas)
+        let initial = diagnostics.snapshot() as NSDictionary
+        let size = CGSize(width: 120, height: 80)
+        for scale in [CGFloat(1), 2] {
+            var environment = EnvironmentValues()
+            environment.displayScale = scale
+            environment.colorScheme = .dark
+            var drawingCalls = 0
+            let actual = try render(
+                ChartDrawingSurface { context, size in
+                    drawingCalls += 1
+                    self.artwork(&context, size)
+                }.environment(\.self, environment), size: size, scale: scale)
+            let expected = try render(
+                Canvas(renderer: artwork).environment(\.self, environment), size: size, scale: scale
+            )
+            XCTAssertGreaterThan(
+                drawingCalls, 0, "The production surface must draw without a diagnostic token")
+            XCTAssertGreaterThan(bytes(actual).filter { $0 > 0 }.count, 500)
+            assertPixels(actual, match: expected)
+        }
+        XCTAssertEqual(diagnostics.snapshot() as NSDictionary, initial)
+    }
+
     func testDirectCanvasPreservesPathsGradientBlurTextOrientationAndTransparency() throws {
         let size = CGSize(width: 120, height: 80)
         for scale in [CGFloat(1), 2] {
@@ -146,6 +174,43 @@ final class NativeGPUChartCanvasTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.02))
         let next = try render(renderer, size: size, scale: 1)
         XCTAssertNotEqual(bytes(first), bytes(next))
+    }
+
+    func testOwnerDrawsAndReappearsWithoutDiagnosticRegistration() {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        XCTAssertFalse(diagnostics.isEnabled)
+        XCTAssertEqual(diagnostics.mode, .normal)
+        XCTAssertTrue(diagnostics.mode.usesNativeGPUCanvas)
+        let initial = diagnostics.snapshot() as NSDictionary
+        let owner = NativeGPUChartCanvasOwner(diagnostics: diagnostics)
+        let size = CGSize(width: 20, height: 12)
+
+        owner.contentUpdated(role: .staticChart)
+        XCTAssertTrue(owner.beginDraw(role: .staticChart, size: size, scale: 2))
+        owner.didDraw()
+        owner.appeared(role: .staticChart)
+        XCTAssertEqual(owner.presentationGeneration, 0)
+        owner.disappeared()
+        XCTAssertFalse(owner.beginDraw(role: .staticChart, size: size, scale: 2))
+        owner.didDraw()
+
+        owner.appeared(role: .staticChart)
+        XCTAssertEqual(owner.presentationGeneration, 1)
+        XCTAssertFalse(owner.beginDraw(role: .staticChart, size: size, scale: 2, generation: 0))
+        owner.didDraw(generation: 0)
+        XCTAssertTrue(owner.beginDraw(role: .staticChart, size: size, scale: 2, generation: 1))
+        owner.didDraw(generation: 1)
+        owner.contentUpdated(role: .cursor)
+        XCTAssertTrue(owner.beginDraw(role: .cursor, size: size, scale: 1, generation: 1))
+        owner.didDraw(generation: 1)
+
+        owner.stop()
+        owner.appeared(role: .staticChart)
+        XCTAssertFalse(owner.beginDraw(role: .staticChart, size: size, scale: 2, generation: 1))
+        owner.didDraw(generation: 1)
+        XCTAssertEqual(
+            diagnostics.snapshot() as NSDictionary, initial,
+            "Rendering and visibility must work while diagnostic accounting remains disabled")
     }
 
     func testOwnerAccountsEarlyDrawVisibilityReappearanceRoleChangesAndFinalRelease() throws {

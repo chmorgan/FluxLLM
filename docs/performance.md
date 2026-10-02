@@ -117,11 +117,12 @@ Explicit dashboard opening attaches its host before ordering the native window
 front. This avoids the large first-use allocation and writes reproduced when a
 host is inserted into an already visible empty window. Native visibility still
 controls host release after an unsuccessful presentation or later occlusion.
-Chart canvases render their existing drawing operations through `ImageRenderer`
-into an AppKit Core Graphics context. Each native view creates its renderer on
-first drawing and releases it with the view's content. Isolated renderer probes
-motivate this path; complete application measurements still enforce CPU, memory,
-and write budgets across first window opening and subsequent UI rendering.
+Production chart surfaces render through SwiftUI `Canvas.drawingGroup`, coalesce
+scalar presentation updates, and retain twinkle animations in Core Animation
+shape layers. The explicit ImageRenderer controls remain available for comparing
+the earlier rendering path. Complete application measurements still enforce
+CPU, memory, GPU, and write budgets across first window opening and subsequent
+UI rendering; selecting the improved path is not a performance-gate pass.
 
 ## Measurements and limits
 
@@ -236,7 +237,7 @@ Choose one diagnostic mode per invocation with `--graphics-mode`:
 
 | Mode | Controlled difference |
 | --- | --- |
-| `normal` (default) | Production presentation and rendering with available diagnostic counters. |
+| `normal` (default) | Production native GPU Canvas rendering, coalesced scalar presentation, and retained twinkles; older frozen binaries retain their original behavior. |
 | `direct-host` | Attach the dashboard host without the initial placeholder, at a fixed diagnostic viewport. |
 | `empty-drawing` | Keep the native canvas and renderer lifecycle but use an empty drawing closure. |
 | `no-renderer` | Keep native canvas layout but skip renderer creation and drawing. |
@@ -294,6 +295,16 @@ checks any supplied flag. Coalesced modes also require a positive
 that changed presentation values were published. Other modes require that count
 to remain zero when exposed.
 
+Current `normal` captures identify the native GPU backend and must satisfy the
+full `native-gpu-optimized` contract, including both enabled flags and actual
+publication/animation evidence. Once a run acknowledges this backend, every
+later graphics snapshot must retain that metadata; dropping it or reverting to
+renderer/bitmap counters fails validation. The report records the selected
+normal rendering contract. Older frozen `normal` binaries without this marker
+retain legacy validation, or explicitly unavailable graphics counters if they
+predate instrumentation. They cannot claim native drawing or enabled
+optimizations without the backend marker.
+
 Retained modes must identify `core-animation-shape-layers` and expose host,
 instance, and submitted-animation counters. Created minus destroyed counts must
 equal live counts, peak counts must be consistent, live instances must not exceed
@@ -322,8 +333,8 @@ disabled setting at ready and in every snapshot; missing or mismatched evidence
 fails the experiment. Without this flag, the app's default is retained and older
 products report an unavailable animation setting instead of an assumed value.
 
-These modes isolate allocation causes; they do not select a production rendering
-policy. Native memory inspection also perturbs runtime. Run them separately from
+The alternative modes isolate allocation causes; `normal` follows the frozen
+binary's production behavior. Native memory inspection also perturbs runtime. Run them separately from
 CPU/GPU gates and other native workloads. A successful diagnostic is never a
 regression pass and does not alter the normal CPU, memory, GPU, or write limits
 above. Exit zero means `diagnostic_captured`; failed validation, incomplete native
@@ -387,10 +398,11 @@ for its serial cases, inspections, and cleanup. Each case runs in a fresh owned
 process with one 664-by-357-point native window. All backends except the explicitly
 unhosted control use the same minimal SwiftUI host.
 It starts no model traffic, history, popover, or application monitoring. The
-default cases compare an empty drawing and one fixed line through the production
+default cases compare an empty drawing and one fixed line through the explicit
 `ChartCanvas`, that same line through a plain on-screen `Canvas`, and the line
-drawn directly into the native `CGContext`. The production wrapper retains its
-normal `ImageRenderer`; the diagnostic does not change production rendering.
+drawn directly into the native `CGContext`. This probe calls the ImageRenderer
+wrapper directly, bypassing the application's `ChartDrawingSurface` backend
+selector, so production backend changes do not change its renderer identity.
 
 The runner records the blank visible baseline, first drawing, settled drawing,
 100 requested redraws at 30 Hz, post-redraw idle, and released content. Native visibility, dimensions,

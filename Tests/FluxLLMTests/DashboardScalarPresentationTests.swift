@@ -17,7 +17,8 @@ final class DashboardScalarPresentationTests: XCTestCase {
 
     func testLiveUpdatesKeepExactLedgerWhileOnlySamplingPublishesScalars() throws {
         for mode in [
-            PerformanceGraphicsDiagnostics.Mode.nativeGPUCoalescedScalars, .nativeGPUOptimized,
+            PerformanceGraphicsDiagnostics.Mode.normal, .nativeGPUCoalescedScalars,
+            .nativeGPUOptimized,
         ] {
             try withMode(mode) {
                 let store = MetricsStore(clock: { self.origin })
@@ -58,8 +59,7 @@ final class DashboardScalarPresentationTests: XCTestCase {
 
     func testComparisonModesLeaveScalarCandidateDisabled() throws {
         for mode in [
-            PerformanceGraphicsDiagnostics.Mode.normal, .nativeGPUCanvas,
-            .nativeGPURetainedTwinkles,
+            PerformanceGraphicsDiagnostics.Mode.nativeGPUCanvas, .nativeGPURetainedTwinkles,
         ] {
             try withMode(mode) {
                 let store = MetricsStore(clock: { self.origin })
@@ -72,6 +72,84 @@ final class DashboardScalarPresentationTests: XCTestCase {
                 XCTAssertEqual(store.dashboardScalarPresentation, .empty)
             }
         }
+    }
+
+    func testNormalPresentationWorksWithDiagnosticsDisabledAcrossNativeDemandLifecycle() throws {
+        try PerformanceGraphicsDiagnostics.shared.disable()
+        defer { try? PerformanceGraphicsDiagnostics.shared.disable() }
+        XCTAssertEqual(PerformanceGraphicsDiagnostics.shared.mode, .normal)
+        XCTAssertFalse(PerformanceGraphicsDiagnostics.shared.isEnabled)
+        let store = MetricsStore(clock: { self.origin })
+        // Mirrors MenuBarController.start before sampling/monitoring begins.
+        store.setChartPresentationDemand(false, consumer: .popover)
+        store.setChartPresentationDemand(false, consumer: .dashboard)
+        let first = GenerationRequest(startedAt: origin)
+        store.apply(.began(first))
+        update(store, request: first.id, tokens: 12, at: 0.1)
+        store.sample(at: date(0.5))
+        XCTAssertEqual(store.dashboardScalarPresentation, .empty)
+        XCTAssertEqual(store.usageSummary(in: allHistory).outputTokens, 12)
+
+        store.setChartPresentationDemand(true, consumer: .dashboard)
+        XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.outputTokens, 12)
+        XCTAssertEqual(store.dashboardScalarPresentation.usage.outputTokens, 12)
+        let changes = observe(store)
+        update(store, request: first.id, tokens: 24, at: 0.6)
+        XCTAssertEqual(changes.value, 0)
+        XCTAssertEqual(store.outputTokens, 24)
+        XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.outputTokens, 12)
+        store.sample(at: date(1))
+        XCTAssertEqual(changes.value, 1)
+        XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.outputTokens, 24)
+        finish(store, request: first.id, tokens: 25, at: 1.2)
+        XCTAssertEqual(
+            store.dashboardScalarPresentation.latestResponse,
+            .init(
+                requestID: first.id, outputTokens: 25, outputIsEstimated: false))
+        XCTAssertEqual(store.dashboardScalarPresentation.usage.activeRequests, 0)
+
+        store.setChartPresentationDemand(false, consumer: .dashboard)
+        XCTAssertEqual(store.dashboardScalarPresentation, .empty)
+        let next = GenerationRequest(startedAt: date(1.3))
+        store.apply(.began(next))
+        update(store, request: next.id, tokens: 7, at: 1.4)
+        store.sample(at: date(1.5))
+        XCTAssertEqual(store.dashboardScalarPresentation, .empty)
+        store.setChartPresentationDemand(true, consumer: .popover)
+        XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.requestID, next.id)
+        XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.outputTokens, 7)
+        store.setChartPresentationDemand(true, consumer: .dashboard)
+        XCTAssertEqual(store.dashboardScalarPresentation.usage.outputTokens, 32)
+        XCTAssertEqual(store.dashboardScalarPresentation.usage.activeRequests, 1)
+        store.apply(.failed(requestID: next.id, message: "interrupted"))
+        XCTAssertEqual(store.dashboardScalarPresentation.usage.activeRequests, 0)
+        XCTAssertEqual(store.generationError, "interrupted")
+        XCTAssertEqual(scalarPublications, 0, "Production publication must not enable diagnostics")
+        XCTAssertFalse(PerformanceGraphicsDiagnostics.shared.isEnabled)
+    }
+
+    func testInjectedHistoryHasAnInitialScalarSnapshotWithoutSamplingOrQueryCaches() throws {
+        try PerformanceGraphicsDiagnostics.shared.disable()
+        defer { try? PerformanceGraphicsDiagnostics.shared.disable() }
+        let history = UsageHistory(now: origin)
+        let request = GenerationRequest(startedAt: date(-2))
+        history.apply(.began(request), source: BackendKind.ollama.rawValue, at: date(-2))
+        history.apply(
+            .updated(
+                requestID: request.id,
+                snapshot: GenerationSnapshot(
+                    outputTokens: 63, promptTokens: 8, isEstimated: false,
+                    finished: true, timestamp: date(-1))), source: BackendKind.ollama.rawValue,
+            at: date(-1))
+        XCTAssertEqual(history.cachedQueryEntryCount, 0)
+        let store = MetricsStore(clock: { self.origin }, usageHistory: history)
+        XCTAssertEqual(store.dashboardScalarPresentation.usage.requests, 1)
+        XCTAssertEqual(store.dashboardScalarPresentation.usage.outputTokens, 63)
+        XCTAssertEqual(store.dashboardScalarPresentation.usage.inputTokens, 8)
+        XCTAssertNil(store.dashboardScalarPresentation.latestResponse)
+        XCTAssertEqual(history.cachedQueryEntryCount, 0)
+        XCTAssertEqual(scalarPublications, 0)
+        XCTAssertFalse(PerformanceGraphicsDiagnostics.shared.isEnabled)
     }
 
     func testToolBurstKeepsDiscreteEventsExactWithoutPublishingEveryCounterChange() throws {

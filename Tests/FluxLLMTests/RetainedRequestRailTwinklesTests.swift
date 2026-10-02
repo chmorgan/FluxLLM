@@ -187,6 +187,104 @@ final class RetainedRequestRailTwinklesTests: XCTestCase {
         XCTAssertTrue(view.layer?.sublayers?.isEmpty ?? true)
     }
 
+    func testNormalHostAnimatesAndReleasesHiddenLayersWithDiagnosticsDisabled() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        XCTAssertFalse(diagnostics.isEnabled)
+        XCTAssertEqual(diagnostics.mode, .normal)
+        XCTAssertTrue(diagnostics.mode.usesRetainedTwinkles)
+        let initial = diagnostics.snapshot() as NSDictionary
+        _ = NSApplication.shared
+        let frame = CGRect(x: 0, y: 0, width: 100, height: 60)
+        let window = RetainedTwinkleVisibilityWindow(
+            contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let container = NSView(frame: frame)
+        window.contentView = container
+        let host = RetainedRequestRailTwinkleView(frame: frame)
+        defer {
+            host.stop()
+            host.removeFromSuperview()
+            window.close()
+        }
+        // A long remaining lifetime avoids timer sleeps or expiry races. The
+        // simulated visibility exercises host lifecycle, not displayed frames.
+        let startedAt = Date().addingTimeInterval(-5)
+        let descriptors = [CGFloat(25), 45, 65].map { x in
+            let original = descriptor(centerX: x)
+            return RetainedTwinkleDescriptor(
+                twinkle: RequestRailTwinkle(
+                    requestID: original.twinkle.requestID, startedAt: startedAt, duration: 60,
+                    location: original.twinkle.location, size: original.twinkle.size,
+                    angle: original.twinkle.angle, star: original.twinkle.star),
+                placement: original.placement, color: original.color)
+        }
+        container.addSubview(host)
+        host.update(descriptors: descriptors, scale: 2)
+        let layer = try XCTUnwrap(host.layer)
+        let clips = try XCTUnwrap(layer.sublayers)
+        XCTAssertEqual(
+            clips.count, 2, "The real host must enforce the two-instance bound without counters")
+        for clip in clips {
+            XCTAssertEqual(clip.sublayers?.count, 2)
+            XCTAssertEqual(clip.sublayers?.reduce(0) { $0 + ($1.animationKeys()?.count ?? 0) }, 4)
+        }
+        let mark = try XCTUnwrap(clips.first?.sublayers?.last as? CAShapeLayer)
+        let path = mark.path
+        let firstStart = try animation("opacity", on: mark).beginTime
+        let moved = descriptors.map {
+            RetainedTwinkleDescriptor(
+                twinkle: $0.twinkle,
+                placement: .init(
+                    center: CGPoint(x: $0.placement.center.x + 1, y: $0.placement.center.y),
+                    bar: $0.placement.bar, cornerRadius: $0.placement.cornerRadius),
+                color: $0.color)
+        }
+        host.update(descriptors: moved, scale: 1)
+        XCTAssertTrue(layer.sublayers?.first === clips.first)
+        XCTAssertTrue(mark.path === path)
+        XCTAssertEqual(try animation("opacity", on: mark).beginTime, firstStart)
+
+        window.simulatedOccluded = true
+        NotificationCenter.default.post(
+            name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        XCTAssertTrue(layer.sublayers?.isEmpty ?? true)
+        for clip in clips {
+            XCTAssertNil(clip.superlayer)
+            for shape in clip.sublayers ?? [] {
+                XCTAssertTrue(shape.animationKeys()?.isEmpty ?? true)
+            }
+        }
+        window.simulatedOccluded = false
+        NotificationCenter.default.post(
+            name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        XCTAssertEqual(layer.sublayers?.count, 2)
+        let resumedMark = try XCTUnwrap(layer.sublayers?.first?.sublayers?.last as? CAShapeLayer)
+        XCTAssertFalse(resumedMark === mark)
+        XCTAssertEqual(
+            try animation("opacity", on: resumedMark).beginTime, firstStart, accuracy: 0.05,
+            "Reappearance resumes the original age rather than restarting the glint")
+
+        host.isHidden = true
+        host.viewDidHide()
+        host.update(descriptors: descriptors, scale: 2)
+        XCTAssertTrue(layer.sublayers?.isEmpty ?? true)
+        host.isHidden = false
+        host.viewDidUnhide()
+        XCTAssertEqual(layer.sublayers?.count, 2)
+        host.removeFromSuperview()
+        XCTAssertNil(host.window)
+        XCTAssertTrue(layer.sublayers?.isEmpty ?? true)
+        container.addSubview(host)
+        XCTAssertEqual(layer.sublayers?.count, 2)
+        host.stop()
+        host.update(descriptors: descriptors, scale: 2)
+        NotificationCenter.default.post(name: NSWindow.didExposeNotification, object: window)
+        XCTAssertTrue(layer.sublayers?.isEmpty ?? true)
+        XCTAssertEqual(
+            diagnostics.snapshot() as NSDictionary, initial,
+            "Animation lifetime must not depend on optional diagnostic registrations")
+    }
+
     private func descriptor(centerX: CGFloat, star: Bool = true) -> RetainedTwinkleDescriptor {
         let twinkle = RequestRailTwinkle(
             requestID: UUID(), startedAt: origin, duration: 0.5,
@@ -279,4 +377,14 @@ final class RetainedRequestRailTwinklesTests: XCTestCase {
             Double(abs(actualAlpha - expectedAlpha)) / Double(max(1, expectedAlpha)),
             0.08, file: file, line: line)
     }
+}
+
+/// No test orders a real window front. Only the visibility queried by the
+/// production host is simulated; its native layer and notification hooks run.
+@MainActor
+private final class RetainedTwinkleVisibilityWindow: NSWindow {
+    var simulatedOccluded = false
+    override var isVisible: Bool { true }
+    override var isMiniaturized: Bool { false }
+    override var occlusionState: NSWindow.OcclusionState { simulatedOccluded ? [] : [.visible] }
 }

@@ -1,8 +1,8 @@
 import Combine
 import SwiftUI
 
-/// Selects an opt-in native SwiftUI renderer without changing the normal chart
-/// path. Both implementations receive the same drawing closure and crop.
+/// Uses the native SwiftUI renderer in normal operation while preserving the
+/// diagnostic controls. Both paths receive the same drawing closure and crop.
 struct ChartDrawingSurface: View {
     let role: PerformanceGraphicsDiagnostics.Role
     let revision: AnyHashable?

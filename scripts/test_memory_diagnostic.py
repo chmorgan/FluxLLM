@@ -67,7 +67,111 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
     return snapshot
 
 
+def native_normal_graphics(*, drawn=False):
+    snapshot = drawn_native_gpu_graphics("native-gpu-optimized") if drawn else graphics("native-gpu-optimized")
+    snapshot["graphics_diagnostics"]["mode"] = "normal"
+    return snapshot
+
+
 class GraphicsTests(unittest.TestCase):
+    def test_normal_preserves_old_renderer_snapshots_and_validates_new_combined_contract(self):
+        legacy = graphics()
+        value = legacy["graphics_diagnostics"]
+        value.update(live_canvases=1, peak_live_canvases=1, live_renderers=1, peak_live_renderers=1)
+        value["roles"]["static_chart"].update(created=1, live=1, peak_live=1, renderer_creations=1,
+                                               live_renderers=1, peak_live_renderers=1, draws=3)
+        result = memory.validate_graphics(legacy, "normal", completed_visible_workload=True)
+        self.assertEqual(result["normal_rendering_contract"], "legacy")
+        self.assertFalse(memory.validate_graphics({}, "normal")["available"])
+        for drawn in (False, True):
+            snapshot = native_normal_graphics(drawn=drawn)
+            result = memory.validate_graphics(snapshot, "normal", completed_visible_workload=drawn)
+            self.assertEqual(result["normal_rendering_contract"], "native-gpu-optimized")
+            self.assertEqual(result["counters"]["mode"], "normal")
+
+    def test_native_normal_requires_every_combined_metadata_and_execution_field(self):
+        fields = ("native_gpu_backend", "native_gpu_canvas_draws", "scalar_presentation_coalesced",
+                  "scalar_presentation_publications", "retained_twinkles_enabled",
+                  "retained_twinkle_backend", "retained_twinkles")
+        for field in fields:
+            snapshot = native_normal_graphics(drawn=True)
+            del snapshot["graphics_diagnostics"][field]
+            with self.subTest(missing=field), self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, "normal", completed_visible_workload=True)
+        changes = (
+            {"native_gpu_backend": "image-renderer"}, {"native_gpu_backend": None},
+            {"scalar_presentation_coalesced": False}, {"retained_twinkles_enabled": False},
+            {"scalar_presentation_publications": 0}, {"native_gpu_canvas_draws": 0},
+            {"retained_twinkle_backend": "canvas"},
+        )
+        for change in changes:
+            snapshot = native_normal_graphics(drawn=True)
+            snapshot["graphics_diagnostics"].update(change)
+            with self.subTest(change=change), self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, "normal", completed_visible_workload=True)
+        snapshot = native_normal_graphics(drawn=True)
+        snapshot["graphics_diagnostics"]["retained_twinkles"]["animation_starts"] = 0
+        with self.assertRaisesRegex(InvalidResult, "did not submit"):
+            memory.validate_graphics(snapshot, "normal", completed_visible_workload=True)
+
+    def test_unmarked_legacy_normal_cannot_claim_new_rendering_or_optimization_activity(self):
+        for change in ({"native_gpu_canvas_draws": 1}, {"native_gpu_canvas_draws": True},
+                       {"scalar_presentation_coalesced": True}, {"scalar_presentation_coalesced": 0},
+                       {"retained_twinkles_enabled": True}, {"retained_twinkles_enabled": 0},
+                       {"retained_twinkle_backend": "core-animation-shape-layers"}):
+            snapshot = graphics()
+            snapshot["graphics_diagnostics"].update(change)
+            with self.subTest(change=change), self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, "normal")
+        snapshot = graphics()
+        snapshot["graphics_diagnostics"].update(native_gpu_canvas_draws=0, scalar_presentation_coalesced=False,
+                                                retained_twinkles_enabled=False)
+        self.assertEqual(memory.validate_graphics(snapshot, "normal")["normal_rendering_contract"], "legacy")
+
+    def test_native_normal_rejects_fallback_and_requires_release_when_closed(self):
+        for field in ("live_renderers", "peak_bitmap_bytes", "peak_layer_image_bytes", "layer_bitmap_presentations"):
+            snapshot = native_normal_graphics(drawn=True)
+            snapshot["graphics_diagnostics"][field] = 1
+            with self.subTest(field=field), self.assertRaisesRegex(InvalidResult, "fallback"):
+                memory.validate_graphics(snapshot, "normal")
+        snapshot = native_normal_graphics(drawn=True)
+        with self.assertRaisesRegex(InvalidResult, "closed checkpoint"):
+            memory.validate_graphics(snapshot, "normal", expected_closed=True)
+        value = snapshot["graphics_diagnostics"]
+        value["live_canvases"] = value["current_pixel_area"] = 0
+        value["roles"]["static_chart"].update(destroyed=1, live=0, current_pixel_area=0)
+        with self.assertRaisesRegex(InvalidResult, "Retained twinkle resources remain live"):
+            memory.validate_graphics(snapshot, "normal", expected_closed=True)
+        value["retained_twinkles"].update(hosts_destroyed=1, live_hosts=0, instances_destroyed=2, live_instances=0)
+        self.assertTrue(memory.validate_graphics(snapshot, "normal", expected_closed=True)["available"])
+
+    def test_normal_run_latches_native_contract_and_rejects_disappearance_in_later_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "normal")
+            self.assertFalse(diagnostic.require_native_normal)
+            diagnostic.validate_graphics_snapshot(native_normal_graphics())
+            self.assertTrue(diagnostic.require_native_normal)
+            self.assertEqual(diagnostic.report["normal_rendering_contract"], "native-gpu-optimized")
+            for snapshot in (graphics(), {}):
+                with self.subTest(snapshot=snapshot), self.assertRaisesRegex(InvalidResult, "disappeared"):
+                    diagnostic.validate_control_snapshot(snapshot)
+                diagnostic.collector = mock.Mock()
+                diagnostic.collector.command.return_value = {"status": "ok", "snapshot": snapshot}
+                with mock.patch.object(diagnostic, "verify_identity"), self.assertRaisesRegex(InvalidResult, "disappeared"):
+                    diagnostic.command("show_dashboard")
+            self.assertTrue(diagnostic.validate_graphics_snapshot(native_normal_graphics(drawn=True),
+                                                                 completed_visible_workload=True)["available"])
+            self.assertEqual(diagnostic.report["normal_rendering_contract"], "native-gpu-optimized")
+
+    def test_legacy_normal_run_does_not_assume_new_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "normal")
+            diagnostic.validate_graphics_snapshot({})
+            self.assertEqual(diagnostic.report["normal_rendering_contract"], "unavailable")
+            diagnostic.validate_graphics_snapshot(graphics())
+            self.assertEqual(diagnostic.report["normal_rendering_contract"], "legacy")
+            self.assertFalse(diagnostic.require_native_normal)
+
     def test_coalesced_modes_require_actual_integer_publications_and_other_modes_reject_them(self):
         for mode in memory.GRAPHICS_MODES:
             snapshot = drawn_native_gpu_graphics(mode) if mode in memory.NATIVE_GPU_MODES else graphics(mode)
@@ -667,6 +771,24 @@ class WorkloadCPUAndInspectionTests(unittest.TestCase):
                 diagnostic.cleanup()
                 self.assertEqual(diagnostic.report["workload_cpu"]["available"], not bad_graphics)
                 self.assertEqual(bool(diagnostic.report["errors"]), bad_graphics)
+
+    def test_final_event_replay_cannot_silently_drop_acknowledged_normal_native_contract(self):
+        for disappeared in (False, True):
+            with self.subTest(disappeared=disappeared), tempfile.TemporaryDirectory() as directory:
+                diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "normal", no_native_inspection=True)
+                diagnostic.validate_graphics_snapshot(native_normal_graphics())
+                points, events, workload, identity, _ = self.evidence()
+                events.insert(-1, {"type": "app_event", "event": {
+                    "type": "ack", "snapshot": {} if disappeared else native_normal_graphics()}})
+                events.insert(-1, {"type": "app_event", "event": {"type": "stopped", "status": "ok"}})
+                diagnostic.identity = identity
+                diagnostic.report["workload"] = workload
+                diagnostic.collector = mock.Mock(samples=points, events=events, storage={}, cleanup_errors=[])
+                diagnostic.cleanup()
+                self.assertEqual(diagnostic.report["workload_cpu"]["available"], not disappeared)
+                self.assertEqual(bool(diagnostic.report["errors"]), disappeared)
+                if disappeared:
+                    self.assertIn("disappeared", diagnostic.report["workload_cpu"]["reason"])
 
     def test_inspection_flag_is_opt_in(self):
         arguments = ["--app-binary", "app", "--test-bundle", "tests", "--collector-binary", "collector", "--provenance", "provenance"]

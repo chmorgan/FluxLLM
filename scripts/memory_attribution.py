@@ -342,15 +342,33 @@ def validate_retained_twinkles(value, mode, *, completed_visible_workload=False,
                 "Retained twinkle resources remain live at a closed checkpoint")
 
 
-def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False):
+def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False,
+                      require_native_normal=False):
     value = snapshot.get("graphics_diagnostics")
+    if mode == "normal" and require_native_normal:
+        require(isinstance(value, dict) and "native_gpu_backend" in value,
+                "Normal native GPU rendering metadata disappeared after it was acknowledged")
     if "graphics_diagnostics" not in snapshot and mode == "normal":
         return {"available": False, "reason": "This frozen app does not expose graphics diagnostic counters; native and kernel memory evidence remain separate."}
     require(isinstance(value, dict) and value.get("enabled") is True and value.get("mode") == mode,
             "App did not acknowledge the requested graphics diagnostic mode")
     require(unsigned(value.get("invalid_events"), "graphics.invalid_events") == 0,
             "Graphics diagnostic counters reported invalid lifecycle events")
-    coalesced_scalars = mode in COALESCED_SCALAR_MODES
+    # Keep the requested mode acknowledgment while applying the complete
+    # combined contract to newer production binaries that identify this backend.
+    native_normal = mode == "normal" and "native_gpu_backend" in value
+    contract = "native-gpu-optimized" if native_normal else mode
+    if mode == "normal" and not native_normal:
+        for field in ("scalar_presentation_coalesced", "retained_twinkles_enabled"):
+            if field in value:
+                require(value[field] is False,
+                        f"Normal {field} requires native GPU backend metadata")
+        if "native_gpu_canvas_draws" in value:
+            require(unsigned(value["native_gpu_canvas_draws"], "graphics.native_gpu_canvas_draws") == 0,
+                    "Normal native GPU draw activity requires backend metadata")
+        require("retained_twinkle_backend" not in value,
+                "Normal retained twinkle backend requires native GPU backend metadata")
+    coalesced_scalars = contract in COALESCED_SCALAR_MODES
     if coalesced_scalars or "scalar_presentation_publications" in value:
         publications = unsigned(value.get("scalar_presentation_publications"), "graphics.scalar_presentation_publications")
         if coalesced_scalars and completed_visible_workload:
@@ -371,11 +389,11 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     fields = ("created", "destroyed", "live", "peak_live", "updates", "renderer_creations", "renderer_updates",
               "renderer_destructions", "live_renderers", "peak_live_renderers", "draws", "skipped_draws",
               "current_pixel_area", "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes")
-    native_gpu = mode in NATIVE_GPU_MODES
+    native_gpu = contract in NATIVE_GPU_MODES
     if native_gpu:
-        for field, expected in (("scalar_presentation_coalesced", mode in COALESCED_SCALAR_MODES),
-                                ("retained_twinkles_enabled", mode in RETAINED_TWINKLE_MODES)):
-            if mode != "native-gpu-canvas" or field in value:
+        for field, expected in (("scalar_presentation_coalesced", contract in COALESCED_SCALAR_MODES),
+                                ("retained_twinkles_enabled", contract in RETAINED_TWINKLE_MODES)):
+            if contract != "native-gpu-canvas" or field in value:
                 require(type(value.get(field)) is bool and value[field] is expected,
                         f"Graphics {field} does not match the requested native GPU control")
         require(value.get("native_gpu_backend") == "swiftui-canvas-drawing-group",
@@ -390,7 +408,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
         if expected_closed:
             require(value.get("live_canvases") == 0 and value.get("current_pixel_area") == 0,
                     "Native GPU Canvas resources remain live at a closed checkpoint")
-    validate_retained_twinkles(value, mode, completed_visible_workload=completed_visible_workload,
+    validate_retained_twinkles(value, contract, completed_visible_workload=completed_visible_workload,
                               expected_closed=expected_closed)
     layer_destination = mode in LAYER_DESTINATION_MODES
     if layer_destination:
@@ -471,7 +489,9 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
         if completed_visible_workload:
             require(native_gpu_draws > 0 and roles["static_chart"]["draws"] > 0,
                     "Completed visible workload did not execute native GPU static-chart drawing")
-    return {"available": True, "counters": value}
+    return {"available": True, "counters": value,
+            **({"normal_rendering_contract": "native-gpu-optimized" if native_normal else "legacy"}
+               if mode == "normal" else {})}
 
 
 def workload_cpu_diagnostic(samples, events, workload, identity, memory_validation):
@@ -521,6 +541,7 @@ class MemoryDiagnostic:
         self.output, self.deadline, self.graphics_mode = output, deadline, graphics_mode
         self.no_popover_animation = no_popover_animation
         self.no_native_inspection = no_native_inspection
+        self.require_native_normal = False
         self.collector = self.fixture = self.active_probe = None
         self.identity = None
         self.report = {"schema_version": 1, "kind": "memory-attribution-diagnostic", "status": "running",
@@ -561,8 +582,8 @@ class MemoryDiagnostic:
                 f"Wrong native UI state at {label}: dashboard={snapshot.get('dashboard_visible')}, popover={snapshot.get('popover_visible')}")
         require(type(snapshot.get("active_requests")) is int and snapshot["active_requests"] == active,
                 f"Wrong active stream count at {label}: {snapshot.get('active_requests')}")
-        entry["graphics_validation"] = validate_graphics(snapshot, self.graphics_mode,
-                                                        expected_closed=not dashboard and not popover)
+        entry["graphics_validation"] = self.validate_graphics_snapshot(snapshot,
+                                                                       expected_closed=not dashboard and not popover)
         entry["popover_animation_validation"] = validate_popover_animation(snapshot, self.no_popover_animation)
         self.save()
         return snapshot
@@ -577,8 +598,18 @@ class MemoryDiagnostic:
             self.validate_control_snapshot(response["snapshot"])
         return response
 
+    def validate_graphics_snapshot(self, snapshot, *, completed_visible_workload=False, expected_closed=False):
+        result = validate_graphics(snapshot, self.graphics_mode, completed_visible_workload=completed_visible_workload,
+                                   expected_closed=expected_closed, require_native_normal=self.require_native_normal)
+        if self.graphics_mode == "normal":
+            contract = result.get("normal_rendering_contract", "unavailable")
+            self.report["normal_rendering_contract"] = contract
+            if contract == "native-gpu-optimized":
+                self.require_native_normal = True
+        return result
+
     def validate_control_snapshot(self, snapshot):
-        validate_graphics(snapshot, self.graphics_mode)
+        self.validate_graphics_snapshot(snapshot)
         validate_popover_animation(snapshot, self.no_popover_animation)
 
     def inspect_tool(self, label, tool):
@@ -669,7 +700,7 @@ class MemoryDiagnostic:
         require(seed.get("history_verified") is True and seed.get("history") == "populated"
                 and (seed.get("seed_persistent_requests"), seed.get("seed_raw_requests"), seed.get("seed_tool_events")) == (19000, 256, 38512),
                 "Populated history dimensions were not verified")
-        self.report["ready_graphics_validation"] = validate_graphics(seed, self.graphics_mode)
+        self.report["ready_graphics_validation"] = self.validate_graphics_snapshot(seed)
         self.report["ready_popover_animation_validation"] = validate_popover_animation(seed, self.no_popover_animation)
         self.identity = authenticate_ready(self.collector, self.validate_control_snapshot)
         self.report["owned_identity"] = self.identity
@@ -701,7 +732,7 @@ class MemoryDiagnostic:
         self.report["workload"].update(fixture_status=status, after=after)
         self.save()
         work = app.validate_workload(stage, status, before, after, acknowledgment)
-        graphics = validate_graphics(after, self.graphics_mode, completed_visible_workload=True)
+        graphics = self.validate_graphics_snapshot(after, completed_visible_workload=True)
         self.report["workload"].update(validated_work=work, graphics_validation=graphics, validated=True)
         self.command("close_popover")
         self.command("close_dashboard")

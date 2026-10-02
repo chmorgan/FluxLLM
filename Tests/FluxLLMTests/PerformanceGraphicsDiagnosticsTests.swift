@@ -102,6 +102,14 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         let initial = diagnostics.snapshot()
         XCTAssertEqual(initial["enabled"] as? Bool, false)
         XCTAssertEqual(initial["mode"] as? String, "normal")
+        XCTAssertTrue(diagnostics.mode.usesNativeGPUCanvas)
+        XCTAssertTrue(diagnostics.mode.usesCoalescedScalarPresentation)
+        XCTAssertTrue(diagnostics.mode.usesRetainedTwinkles)
+        diagnostics.scalarPresentationPublished()
+        XCTAssertNil(diagnostics.retainedTwinkleHostCreated())
+        diagnostics.retainedTwinkleHostUpdated(
+            nil, instances: [AnyHashable(1)], animationsStarted: 4)
+        diagnostics.retainedTwinkleHostDestroyed(nil)
         for key in [
             "invalid_events", "live_canvases", "peak_live_canvases",
             "live_renderers", "peak_live_renderers", "current_pixel_area",
@@ -110,6 +118,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             "layer_bitmap_presentations", "layer_bitmap_failures", "layer_bitmap_native_draws",
             "current_layer_image_bytes", "peak_layer_image_bytes",
             "native_gpu_canvas_draws",
+            "scalar_presentation_publications",
         ] {
             assertCounter(key, in: initial, equals: 0)
         }
@@ -574,15 +583,15 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             XCTAssertEqual(
                 mode.usesNativeGPUCanvas,
                 [
-                    .nativeGPUCanvas, .nativeGPUCoalescedScalars,
+                    .normal, .nativeGPUCanvas, .nativeGPUCoalescedScalars,
                     .nativeGPURetainedTwinkles, .nativeGPUOptimized,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesCoalescedScalarPresentation,
-                [.nativeGPUCoalescedScalars, .nativeGPUOptimized].contains(mode))
+                [.normal, .nativeGPUCoalescedScalars, .nativeGPUOptimized].contains(mode))
             XCTAssertEqual(
                 mode.usesRetainedTwinkles,
-                [.nativeGPURetainedTwinkles, .nativeGPUOptimized].contains(mode))
+                [.normal, .nativeGPURetainedTwinkles, .nativeGPUOptimized].contains(mode))
         }
     }
 

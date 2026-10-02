@@ -1,6 +1,6 @@
 import Foundation
 
-/// Immutable values consumed by the optional coalesced dashboard presentation.
+/// Immutable values consumed by the coalesced dashboard presentation.
 /// The telemetry ledger remains current between publications. No history arrays,
 /// observable store references, or wall-clock ticks are retained in this value.
 struct DashboardScalarPresentation: Equatable, Sendable {

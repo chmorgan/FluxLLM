@@ -36,16 +36,16 @@ public final class PerformanceGraphicsDiagnostics {
         var omitsRailDecorations: Bool { self == .bitmapLayerNoDecorations }
 
         var usesNativeGPUCanvas: Bool {
-            self == .nativeGPUCanvas || self == .nativeGPUCoalescedScalars
+            self == .normal || self == .nativeGPUCanvas || self == .nativeGPUCoalescedScalars
                 || self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
         }
 
         var usesCoalescedScalarPresentation: Bool {
-            self == .nativeGPUCoalescedScalars || self == .nativeGPUOptimized
+            self == .normal || self == .nativeGPUCoalescedScalars || self == .nativeGPUOptimized
         }
 
         var usesRetainedTwinkles: Bool {
-            self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
+            self == .normal || self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
         }
     }
 

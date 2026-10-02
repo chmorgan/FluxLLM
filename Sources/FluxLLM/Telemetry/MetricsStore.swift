@@ -175,8 +175,9 @@ public final class MetricsStore {
     /// All chart series and their time axis advance together once per second.
     /// The raw half-second histories above retain every captured peak and gap.
     public private(set) var chartPresentation: ChartPresentationSnapshot
-    /// Diagnostic candidate: scalar views observe this one immutable value,
-    /// while public raw metrics and exact usage queries retain their semantics.
+    /// Scalar views observe this immutable value while public raw metrics and
+    /// exact usage queries retain their semantics. Diagnostic controls can
+    /// independently compare the previous uncoalesced presentation.
     private(set) var dashboardScalarPresentation = DashboardScalarPresentation.empty
 
     public static let chartWindow: TimeInterval = 3600
@@ -264,6 +265,10 @@ public final class MetricsStore {
         self.chartArchive = chartArchive ?? ChartHistoryArchive(now: now)
         sampleDate = now
         chartPresentation = ChartPresentationSnapshot(timestamp: now)
+        // Standalone callers may inject populated history before attaching a
+        // native host. The initial since-launch summary is bounded and does not
+        // construct ordering caches; ordinary fresh startup remains empty.
+        publishDashboardScalarPresentation()
     }
 
     /// Compatibility hooks; session history performs no filesystem work.
