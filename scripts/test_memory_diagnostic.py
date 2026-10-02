@@ -834,6 +834,67 @@ class WorkloadCPUAndInspectionTests(unittest.TestCase):
             self.assertFalse(diagnostic.report["workload_cpu"]["available"])
             self.assertIn("Native inspection perturbs", diagnostic.report["workload_cpu"]["reason"])
 
+    def test_optional_work_counter_failure_does_not_invalidate_clean_workload_cpu(self):
+        for malformed in (False, True):
+            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as directory:
+                diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "normal", no_native_inspection=True)
+                points, events, workload, identity, _ = self.evidence()
+                expected_cpu = memory.workload_cpu_diagnostic(points, events, workload, identity, {"problems": []})
+                if malformed:
+                    for point in points:
+                        point["cpu_work_counters"] = {"instructions": 1}
+                events.insert(-1, {"type": "app_event", "event": {"type": "stopped", "status": "ok"}})
+                diagnostic.identity = identity
+                diagnostic.report["workload"] = workload
+                diagnostic.collector = mock.Mock(samples=points, events=events, storage={}, cleanup_errors=[])
+                diagnostic.cleanup()
+                self.assertEqual(diagnostic.report["workload_cpu"], expected_cpu)
+                self.assertEqual(diagnostic.report["errors"], [])
+                optional = diagnostic.report["workload_cpu_work_counters"]
+                self.assertEqual(optional["status"], "invalid_diagnostic" if malformed else "unavailable")
+                self.assertFalse(optional["gate_evaluated"])
+
+    def test_unavailable_workload_cpu_skips_optional_boundary_lookup_and_preserves_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "normal", no_native_inspection=True)
+            points, events, workload, identity, _ = self.evidence()
+            events.insert(-1, {"type": "app_event", "event": {"type": "stopped", "status": "ok"}})
+            diagnostic.identity = identity
+            diagnostic.report["workload"] = workload
+            diagnostic.collector = mock.Mock(samples=points, events=events, storage={}, cleanup_errors=[])
+            unavailable = {"available": False, "gate_evaluated": False, "reason": "Original CPU qualification reason"}
+            with mock.patch.object(memory, "workload_cpu_diagnostic", return_value=unavailable), \
+                    mock.patch.object(memory.app, "cpu_work_counter_diagnostic") as work_counters:
+                diagnostic.cleanup()
+            work_counters.assert_not_called()
+            self.assertEqual(diagnostic.report["workload_cpu"], unavailable)
+            self.assertEqual(diagnostic.report["workload_cpu_work_counters"]["reason"], unavailable["reason"])
+            self.assertEqual(diagnostic.report["errors"], [])
+
+    def test_summary_keeps_valid_counter_family_when_other_family_is_unavailable(self):
+        for unavailable_family in ("hardware", "qos"):
+            with self.subTest(unavailable_family=unavailable_family), tempfile.TemporaryDirectory() as directory:
+                diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "normal", no_native_inspection=True)
+                points, events, *_ = self.evidence()
+                for index, point in enumerate(points):
+                    point["cpu_work_counters"] = dict(memory.app.CPU_WORK_METADATA,
+                        instructions=index * 11 if unavailable_family != "hardware" else 0,
+                        cycles=index * 7 if unavailable_family != "hardware" else 0,
+                        qos_time_raw={key: index * 13 if key == "default" and unavailable_family != "qos" else 0
+                                      for key in memory.app.CPU_WORK_QOS_BUCKETS})
+                diagnostic.report["workload_cpu_work_counters"] = memory.app.cpu_work_counter_diagnostic(points, events, 1, 3)
+                self.assertFalse(diagnostic.report["workload_cpu_work_counters"]["available"])
+                summary = memory.summary_markdown(diagnostic.report)
+                if unavailable_family == "qos":
+                    self.assertIn("| Instructions | 88 | available |", summary)
+                    self.assertIn("| Cycles | 56 | available |", summary)
+                    self.assertIn("| QoS default (raw) | 0 | unavailable / unverified |", summary)
+                else:
+                    self.assertIn("| Instructions | 0 | unavailable / unverified |", summary)
+                    self.assertIn("| Cycles | 0 | unavailable / unverified |", summary)
+                    self.assertIn("| QoS default (raw) | 104 | available |", summary)
+                self.assertIn("Raw zeros marked unverified do not establish zero work", summary)
+
     def test_no_inspection_final_validation_publishes_cpu_and_rejects_bad_final_graphics(self):
         for bad_graphics in (False, True):
             with self.subTest(bad_graphics=bad_graphics), tempfile.TemporaryDirectory() as directory:

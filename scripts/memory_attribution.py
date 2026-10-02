@@ -708,6 +708,8 @@ class MemoryDiagnostic:
                        "workload_cpu": {"available": False, "gate_evaluated": False,
                                         "reason": "Awaiting validated workload and final accounting" if no_native_inspection
                                         else "Native inspection perturbs runtime; CPU comparison is unavailable"},
+                       "workload_cpu_work_counters": {"available": False, "status": "unavailable", "gate_evaluated": False,
+                                        "reason": "Awaiting validated unprofiled workload and final accounting"},
                        "errors": [], "checkpoints": [], "probes": [], "inspection_stages": [], "commands": [],
                        "driver_sha256": app.path_hash(Path(__file__)),
                        "caveat": "Native VM/heap inspection and graphics modes perturb runtime. These are attribution diagnostics, not CPU/GPU or regression passes. Pixel/bitmap requests are not measured GPU allocations."}
@@ -951,6 +953,14 @@ class MemoryDiagnostic:
                     self.report["workload_cpu"] = workload_cpu_diagnostic(
                         self.collector.samples, self.collector.events, self.report.get("workload", {}),
                         self.identity, self.report["memory_validation"])
+                    cpu = self.report["workload_cpu"]
+                    if cpu.get("available"):
+                        self.report["workload_cpu_work_counters"] = app.cpu_work_counter_diagnostic(
+                            self.collector.samples, self.collector.events,
+                            cpu["start_monotonic_seconds"], cpu["end_monotonic_seconds"])
+                    else:
+                        self.report["workload_cpu_work_counters"] = {"available": False, "status": "unavailable",
+                            "gate_evaluated": False, "reason": cpu.get("reason", "Workload CPU boundaries are unavailable")}
             except (ValueError, KeyError, TypeError, TimeoutError) as error:
                 self.report["errors"].append(str(error))
                 if self.no_native_inspection:
@@ -1006,6 +1016,23 @@ def summary_markdown(report):
                       cpu["interval"] + ". No CPU gate is evaluated."])
     elif cpu:
         lines.extend(["", "Workload CPU unavailable: " + cpu.get("reason", "Missing evidence") + "."])
+    work = report.get("workload_cpu_work_counters", {})
+    if "deltas" in work:
+        hardware_status = "available" if work.get("hardware_counter_status") == "available" else "unavailable / unverified"
+        qos_status = "available" if work.get("qos_counter_status") == "available" else "unavailable / unverified"
+        ratio = work.get("instructions_per_cycle")
+        lines.extend(["", "| Optional raw CPU work diagnostic | Value | Status |", "|---|---:|---|",
+                      f"| Instructions | {work['deltas']['instructions']} | {hardware_status} |",
+                      f"| Cycles | {work['deltas']['cycles']} | {hardware_status} |",
+                      f"| Instructions / cycle | {ratio if ratio is not None else 'unavailable'} | {hardware_status if ratio is not None else 'no positive counter ratio'} |"])
+        for bucket, value in work["deltas"]["qos_time_raw"].items():
+            lines.append(f"| QoS {bucket} (raw) | {value} | {qos_status} |")
+        lines.extend(["", "QoS values use unspecified kernel units. Raw zeros marked unverified do not establish zero work. Hardware and QoS availability are independent; these counters do not identify frequency, core type, or a cause, and do not change CPU acceptance."])
+        if work.get("reason"):
+            lines.extend(["", work["reason"] + "."])
+    elif work:
+        lines.extend(["", "Optional CPU work diagnostics: " + work.get("status", "unavailable") + ". "
+                      + work.get("reason", "; ".join(work.get("errors", [])))])
     if report["errors"]:
         lines.extend(["", "Unavailable or invalid evidence:", ""])
         lines.extend("- " + error.replace("\n", " ") for error in report["errors"])

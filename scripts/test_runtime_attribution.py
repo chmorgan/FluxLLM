@@ -796,6 +796,44 @@ class CompletionCounterIntervalTests(unittest.TestCase):
             "end_checkpoint": "completion-end", "start_monotonic_seconds": 100, "end_monotonic_seconds": 129})
 
 
+class OptionalRuntimeWorkCounterTests(unittest.TestCase):
+    def report(self):
+        from test_memory_diagnostic import WorkloadCPUAndInspectionTests
+        points, events, workload, identity, _ = WorkloadCPUAndInspectionTests().evidence()
+        for index, point in enumerate(points):
+            point["cpu_work_counters"] = dict(runtime.app.CPU_WORK_METADATA,
+                instructions=2**53 + index * 3, cycles=2**53 + index * 4,
+                qos_time_raw={key: index * 2 if key == "default" else 0 for key in runtime.app.CPU_WORK_QOS_BUCKETS})
+        workload["after"]["runner_collector_sample_monotonic_seconds"] = 2
+        return {"samples": points, "events": events, "owned_identity": identity, "workload": workload,
+                "runtime": {"checkpoints": [
+                    {"label": "before-traffic", "snapshot": {"runner_collector_sample_monotonic_seconds": 1}},
+                    {"label": "completion-end", "snapshot": {"runner_collector_sample_monotonic_seconds": 3}}]}}
+
+    def test_counter_interval_uses_exact_completion_checkpoint_not_traffic_ack_or_interpolated_phases(self):
+        for profile in (False, True):
+            report = self.report()
+            report["phase_windows"] = {"whole_contiguous_runtime": {"start_monotonic_seconds": 1.1, "end_monotonic_seconds": 2.9}}
+            result = runtime.runtime_work_counter_diagnostic(report, profile=profile)
+            self.assertTrue(result["available"])
+            self.assertEqual((result["start_monotonic_seconds"], result["end_monotonic_seconds"]), (1, 3))
+            self.assertEqual(result["deltas"]["instructions"], 24)
+            self.assertEqual(result["deltas"]["cycles"], 32)
+            self.assertEqual(result["deltas"]["qos_time_raw"]["default"], 16)
+            self.assertEqual(result["profiled"], profile)
+            self.assertFalse(result["acceptance_eligible"])
+            self.assertIn("Exact acknowledged", result["interval_scope"])
+            self.assertIn("differ from interpolated CPU phase-window edges", result["interval_scope"])
+
+    def test_missing_or_interpolated_counter_boundary_is_only_an_invalid_optional_diagnostic(self):
+        for boundary in (None, 2.9):
+            report = self.report()
+            report["runtime"]["checkpoints"][-1]["snapshot"]["runner_collector_sample_monotonic_seconds"] = boundary
+            result = runtime.runtime_work_counter_diagnostic(report)
+            self.assertEqual(result["status"], "invalid_diagnostic")
+            self.assertFalse(result["available"])
+
+
 class ProfilerFinalizationTests(unittest.TestCase):
     def diagnostic(self, directory, now, seconds=120):
         diagnostic = runtime.RuntimeDiagnostic(Path(directory),

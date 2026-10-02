@@ -27,8 +27,9 @@ struct ExitTransitionObservation {
     var hasExited: (ControlledProcess) throws -> Bool = { try $0.hasExited() }
 }
 
-/// Values returned by proc_pid_rusage are cumulative Mach ticks, not nanoseconds.
-/// Keep the raw counters and conversion in the report so its units are auditable.
+/// User/system CPU times returned by proc_pid_rusage are cumulative Mach ticks.
+/// Other fields retain their own units; QoS times remain raw because their units
+/// are not documented in the local SDK. Keep counters and conversions auditable.
 struct ProcessResources {
     let processID: Int32
     let birthTimeMicroseconds: UInt64
@@ -61,6 +62,48 @@ struct ProcessResources {
         numer: UInt32, denom: UInt32
     ) -> Double {
         (Double(userTicks) + Double(systemTicks)) * Double(numer) / Double(denom) / 1_000_000_000
+    }
+
+    /// Export the existing V4 read without converting integer work counts or
+    /// assigning time units to undocumented QoS counters. Zero is raw evidence,
+    /// not proof that instruction/cycle accounting is supported by this hardware.
+    static func cpuWorkCounters(_ usage: rusage_info_v4) -> [String: Any] {
+        let qos: [String: UInt64] = [
+            "default": usage.ri_cpu_time_qos_default,
+            "maintenance": usage.ri_cpu_time_qos_maintenance,
+            "background": usage.ri_cpu_time_qos_background,
+            "utility": usage.ri_cpu_time_qos_utility,
+            "legacy": usage.ri_cpu_time_qos_legacy,
+            "user_initiated": usage.ri_cpu_time_qos_user_initiated,
+            "user_interactive": usage.ri_cpu_time_qos_user_interactive,
+        ]
+        return [
+            "schema_version": 1, "source": "proc_pid_rusage/RUSAGE_INFO_V4",
+            "instructions": usage.ri_instructions, "cycles": usage.ri_cycles,
+            "instructions_unit": "count", "cycles_unit": "count",
+            "qos_time_unit": "unspecified_kernel_units", "qos_time_raw": qos,
+        ]
+    }
+
+    /// Observe the already scheduled CPU calibration, without making CPU-time
+    /// availability depend on these optional hardware counters.
+    static func cpuWorkCounterObservation(before: rusage_info_v4, after: rusage_info_v4) -> [String:
+        Any]
+    {
+        let monotonic =
+            after.ri_instructions >= before.ri_instructions && after.ri_cycles >= before.ri_cycles
+        return [
+            "source": "proc_pid_rusage/RUSAGE_INFO_V4",
+            "instructions_before": before.ri_instructions,
+            "instructions_after": after.ri_instructions,
+            "cycles_before": before.ri_cycles, "cycles_after": after.ri_cycles,
+            "instructions_delta": monotonic
+                ? (after.ri_instructions - before.ri_instructions) as Any : NSNull(),
+            "cycles_delta": monotonic ? (after.ri_cycles - before.ri_cycles) as Any : NSNull(),
+            "monotonic": monotonic,
+            "observed_positive": monotonic && after.ri_instructions > before.ri_instructions
+                && after.ri_cycles > before.ri_cycles,
+        ]
     }
 
     /// PID reuse is impossible while this collector still owns the unreaped
@@ -173,6 +216,7 @@ struct ProcessResources {
                 userTicks: usage.ri_user_time, systemTicks: usage.ri_system_time,
                 numer: timebase.numer, denom: timebase.denom),
             "user_cpu_ticks": usage.ri_user_time, "system_cpu_ticks": usage.ri_system_time,
+            "cpu_work_counters": Self.cpuWorkCounters(usage),
             "mach_timebase_numer": timebase.numer, "mach_timebase_denom": timebase.denom,
             "physical_footprint_bytes": usage.ri_phys_footprint,
             "lifetime_peak_footprint_bytes": usage.ri_lifetime_max_phys_footprint,
@@ -242,6 +286,7 @@ struct ProcessResources {
             "measured_cpu_seconds": measured,
             "mach_timebase_numer": probe.timebase.numer,
             "mach_timebase_denom": probe.timebase.denom,
+            "cpu_work_counter_observation": cpuWorkCounterObservation(before: before, after: after),
             "reason": passed ? NSNull() : "CPU counters failed getrusage calibration" as Any,
         ]
     }

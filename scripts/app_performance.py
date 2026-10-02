@@ -280,6 +280,96 @@ def authenticated_cpu_ready(samples, events):
             "source": "collector-handshake kernel sample immediately before ready"}
 
 
+CPU_WORK_QOS_BUCKETS = ("default", "maintenance", "background", "utility", "legacy",
+                        "user_initiated", "user_interactive")
+CPU_WORK_METADATA = {"schema_version": 1, "source": "proc_pid_rusage/RUSAGE_INFO_V4",
+                     "instructions_unit": "count", "cycles_unit": "count",
+                     "qos_time_unit": "unspecified_kernel_units"}
+
+
+def cpu_work_counter_diagnostic(samples, events, start, end):
+    """Optional raw V4 evidence; failures never alter independent CPU accounting.
+
+    Only exact authenticated samples are subtracted. QoS units are deliberately
+    not converted, and hardware counts never normalize the CPU acceptance limit.
+    """
+    result = {"available": False, "status": "unavailable", "gate_evaluated": False, "errors": [],
+              "source": CPU_WORK_METADATA["source"], "qos_time_unit": CPU_WORK_METADATA["qos_time_unit"],
+              "scope": "Owned-process raw kernel work counters; not frequency, core-type, thermal, or causal attribution"}
+    try:
+        require(isinstance(samples, list) and samples and all(isinstance(sample, dict) for sample in samples),
+                "Work-counter diagnostics require resource samples")
+        present = ["cpu_work_counters" in sample for sample in samples]
+        if not any(present):
+            return result | {"reason": "Frozen collector does not export optional CPU work counters"}
+        require(all(present), "CPU work-counter group is missing from some samples")
+        problems = sample_validation_problems(samples)
+        require(not problems["shared"] and not problems["cpu_seconds"],
+                "Work-counter diagnostics lack valid CPU identity/timeline accounting")
+        ready = authenticated_cpu_ready(samples, events)
+        exits = [event for event in events if event.get("type") == "exited"]
+        require(len(exits) == 1 and type(exits[0].get("status")) is int and exits[0]["status"] == 0
+                and exits[0].get("final_sample") == samples[-1] and samples[-1].get("phase") == "final",
+                "Work-counter diagnostics lack a clean authenticated final exit")
+        require(type(start) in (int, float) and type(end) in (int, float)
+                and math.isfinite(start) and math.isfinite(end) and ready["monotonic_seconds"] <= start < end,
+                "Work-counter interval must follow authenticated readiness")
+        boundaries = []
+        for timestamp in (start, end):
+            matches = [sample for sample in samples if sample["monotonic_seconds"] == timestamp]
+            require(len(matches) == 1 and matches[0].get("phase") in ("control_boundary", "final")
+                    and sum(event == matches[0] for event in events) == 1,
+                    "Work-counter boundary lacks one exact authenticated kernel control/final sample")
+            boundaries.append(matches[0])
+
+        def unsigned(value, label):
+            require(type(value) is int and 0 <= value <= 2**64 - 1, f"Invalid UInt64 work counter {label}")
+            return value
+
+        previous = None
+        for sample in samples:
+            group = sample["cpu_work_counters"]
+            require(isinstance(group, dict) and set(group) == set(CPU_WORK_METADATA) | {"instructions", "cycles", "qos_time_raw"},
+                    "CPU work-counter group is incomplete or has unknown fields")
+            require(all(type(group.get(key)) is type(expected) and group[key] == expected
+                        for key, expected in CPU_WORK_METADATA.items()), "CPU work-counter source, schema, or raw units changed")
+            qos = group["qos_time_raw"]
+            require(isinstance(qos, dict) and set(qos) == set(CPU_WORK_QOS_BUCKETS),
+                    "CPU work-counter QoS buckets are incomplete or unknown")
+            current = {key: unsigned(group[key], key) for key in ("instructions", "cycles")}
+            current.update({"qos." + key: unsigned(qos[key], "qos." + key) for key in CPU_WORK_QOS_BUCKETS})
+            require(previous is None or all(value >= previous[key] for key, value in current.items()),
+                    "Cumulative CPU work counter moved backwards")
+            previous = current
+        first, last = (boundary["cpu_work_counters"] for boundary in boundaries)
+        delta = {key: last[key] - first[key] for key in ("instructions", "cycles")}
+        delta["qos_time_raw"] = {key: last["qos_time_raw"][key] - first["qos_time_raw"][key]
+                                 for key in CPU_WORK_QOS_BUCKETS}
+        cpu_seconds = boundaries[1]["cpu_seconds"] - boundaries[0]["cpu_seconds"]
+        active = cpu_seconds > 0
+        hardware_observed = any(sample["cpu_work_counters"]["instructions"] > 0
+                                and sample["cpu_work_counters"]["cycles"] > 0 for sample in samples)
+        hardware_usable = (delta["instructions"] > 0 and delta["cycles"] > 0) or (not active and hardware_observed)
+        qos_total = sum(delta["qos_time_raw"].values())
+        qos_observed = any(sum(sample["cpu_work_counters"]["qos_time_raw"].values()) > 0 for sample in samples)
+        qos_usable = qos_total > 0 or (not active and qos_observed)
+        result.update(available=hardware_usable and qos_usable,
+                      status="available" if hardware_usable and qos_usable else "unavailable",
+                      start_monotonic_seconds=start, end_monotonic_seconds=end, elapsed_seconds=end - start,
+                      process_id=ready["process_id"], birth_time_us=ready["birth_time_us"],
+                      cpu_seconds=cpu_seconds, deltas=delta,
+                      hardware_counter_status="available" if hardware_usable else "unavailable",
+                      qos_counter_status="available" if qos_usable else "unavailable",
+                      hardware_counter_observed_positive=hardware_observed, qos_counter_observed_positive=qos_observed,
+                      instructions_per_cycle=(delta["instructions"] / delta["cycles"]
+                                              if delta["instructions"] > 0 and delta["cycles"] > 0 else None))
+        if not result["available"]:
+            result["reason"] = "Counters lack positive observed evidence, or did not advance during active CPU; zero does not establish unsupported versus unpopulated counters"
+        return result
+    except (InvalidResult, KeyError, TypeError, ValueError, OverflowError) as error:
+        return result | {"status": "invalid_diagnostic", "errors": [str(error)]}
+
+
 def cpu_interval_metrics(samples, start, end, include_initial=False):
     """Exact extrema of the piecewise-linear counter, including clipped edges."""
     require(samples[0]["monotonic_seconds"] <= start < end <= samples[-1]["monotonic_seconds"],

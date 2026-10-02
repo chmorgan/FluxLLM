@@ -157,6 +157,41 @@ all raw peaks remain nondecreasing. Missing final evidence, malformed values,
 and counter regressions leave memory coverage incomplete; the runner never
 constructs a replacement peak from current readings.
 
+**Optional CPU work counters.**
+
+Each existing kernel sample may include `cpu_work_counters` from
+`proc_pid_rusage/RUSAGE_INFO_V4`. Schema version 1 records unsigned 64-bit
+`instructions` and `cycles` in `count` units, plus `qos_time_raw` for `default`,
+`maintenance`, `background`, `utility`, `legacy`, `user_initiated`, and
+`user_interactive`. QoS units are explicitly `unspecified_kernel_units`; the
+runner does not convert them to seconds. Integers and interval deltas retain
+full UInt64 precision, including values above 2^53.
+
+The optional diagnostic requires the existing authenticated ready/final process
+identity and unique, exact control or final kernel boundaries. Runtime reports
+use the acknowledged before-traffic and completion-end samples, not interpolated
+phase edges. The diagnostic subtracts
+cumulative integers without interpolating them. The complete group must have
+identical schema/units, all required fields, and nondecreasing counters throughout
+the capture. A malformed, partial, mixed, or regressing group produces
+`invalid_diagnostic`; an entirely absent group in an older product is
+`unavailable`. Neither changes independently valid CPU/resource gate results.
+
+For an interval with positive measured CPU time, both instruction and cycle
+deltas must be positive and at least one QoS bucket must advance before the
+combined diagnostic is available. Unsupported all-zero counters remain
+unavailable, with their exact deltas preserved; zero nondefault QoS buckets are
+valid. An idle interval with zero CPU time may retain usable zero deltas only
+when positive cumulative instruction/cycle and QoS evidence elsewhere in the run
+establishes that those counters are populated. An entirely zero run remains
+unavailable, including idle captures.
+`instructions_per_cycle` is reported only when both hardware deltas are positive.
+These raw counters do not establish GHz, performance/efficiency-core placement,
+or a thermal cause. They never normalize the 5% CPU target, add a polling or
+calibration stage, or imply a performance-gate pass. Adding this instrumentation
+changes its hash: freeze new product provenance and preserve older baselines;
+do not retrofit these fields into existing captures.
+
 The default `powermetrics` adapter requests one self-limiting 250 ms sample of
 `tasks` with `--show-process-gpu`, sample-normalized output and plist formatting.
 It runs directly when already privileged, otherwise through `sudo -n`; it never

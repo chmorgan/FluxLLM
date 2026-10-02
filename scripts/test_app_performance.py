@@ -473,6 +473,256 @@ class StartupCPUAccountingTests(unittest.TestCase):
         self.assertTrue(any("ready event" in item for item in invalid))
 
 
+class CPUWorkCounterDiagnosticTests(unittest.TestCase):
+    QOS = ("default", "maintenance", "background", "utility", "legacy", "user_initiated", "user_interactive")
+
+    def points(self, *, idle=False):
+        result = samples()
+        for index, point in enumerate(result):
+            if idle:
+                point["cpu_seconds"] = 0
+            if index in (4, 8):
+                point.update(phase="control_boundary", command_id="work-before" if index == 4 else "work-after")
+            point["cpu_work_counters"] = {
+                "schema_version": 1, "source": "proc_pid_rusage/RUSAGE_INFO_V4",
+                "instructions": 1000 + index * 101, "cycles": 2000 + index * 73,
+                "instructions_unit": "count", "cycles_unit": "count",
+                "qos_time_unit": "unspecified_kernel_units",
+                "qos_time_raw": {name: index * 37 if name == "default" else 0 for name in self.QOS},
+            }
+        return result
+
+    def diagnostic(self, points, *, events=None, start=1.0, end=2.0):
+        return app.cpu_work_counter_diagnostic(points, cpu_events(points) if events is None else events, start, end)
+
+    def assert_invalid(self, result):
+        self.assertFalse(result["available"])
+        self.assertEqual(result["status"], "invalid_diagnostic")
+        self.assertFalse(result["gate_evaluated"])
+        self.assertIsInstance(result["errors"], list)
+        self.assertTrue(result["errors"])
+
+    def test_exact_control_boundaries_and_nondefault_zero_qos_buckets_are_valid(self):
+        result = self.diagnostic(self.points())
+        self.assertTrue(result["available"])
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["errors"], [])
+        self.assertFalse(result["gate_evaluated"])
+        self.assertEqual(result["hardware_counter_status"], "available")
+        self.assertEqual(result["qos_counter_status"], "available")
+        self.assertEqual(result["deltas"], {"instructions": 404, "cycles": 292,
+            "qos_time_raw": {name: 148 if name == "default" else 0 for name in self.QOS}})
+        self.assertAlmostEqual(result["instructions_per_cycle"], 404 / 292)
+        self.assertEqual(result["qos_time_unit"], "unspecified_kernel_units")
+
+    def test_deltas_larger_than_double_integer_precision_remain_exact(self):
+        points = self.points()
+        for index, point in enumerate(points):
+            value = point["cpu_work_counters"]
+            value["instructions"] = 7 + index * ((1 << 53) + 1)
+            value["cycles"] = 11 + index * ((1 << 53) + 3)
+            value["qos_time_raw"]["default"] = 13 + index * ((1 << 53) + 5)
+        result = self.diagnostic(points)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["deltas"]["instructions"], 4 * ((1 << 53) + 1))
+        self.assertEqual(result["deltas"]["cycles"], 4 * ((1 << 53) + 3))
+        self.assertEqual(result["deltas"]["qos_time_raw"]["default"], 4 * ((1 << 53) + 5))
+        self.assertIs(type(result["deltas"]["instructions"]), int)
+        self.assertIs(type(result["deltas"]["cycles"]), int)
+
+    def test_uint64_maximum_is_accepted_without_float_rounding(self):
+        points = self.points()
+        for index, point in enumerate(points):
+            point["cpu_work_counters"]["instructions"] = (1 << 64) - 1 - (12 - index) * 17
+        result = self.diagnostic(points)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["deltas"]["instructions"], 68)
+
+    def test_idle_zero_deltas_require_positive_cumulative_support_evidence(self):
+        points = self.points(idle=True)
+        for point in points:
+            value = point["cpu_work_counters"]
+            value.update(instructions=101, cycles=73,
+                         qos_time_raw={name: 37 if name == "default" else 0 for name in self.QOS})
+        result = self.diagnostic(points)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["deltas"], {"instructions": 0, "cycles": 0, "qos_time_raw": dict.fromkeys(self.QOS, 0)})
+        self.assertIsNone(result["instructions_per_cycle"])
+
+    def test_entirely_zero_idle_run_is_unavailable_not_verified_zero(self):
+        points = self.points(idle=True)
+        for point in points:
+            point["cpu_work_counters"].update(instructions=0, cycles=0, qos_time_raw=dict.fromkeys(self.QOS, 0))
+        result = self.diagnostic(points)
+        self.assertFalse(result["available"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["hardware_counter_status"], "unavailable")
+        self.assertEqual(result["qos_counter_status"], "unavailable")
+        self.assertEqual(result["deltas"], {"instructions": 0, "cycles": 0, "qos_time_raw": dict.fromkeys(self.QOS, 0)})
+        self.assertIsNone(result["instructions_per_cycle"])
+
+    def test_idle_hardware_and_qos_support_are_independent(self):
+        for unsupported in ("hardware", "qos"):
+            points = self.points(idle=True)
+            for point in points:
+                value = point["cpu_work_counters"]
+                value.update(instructions=0 if unsupported == "hardware" else 101,
+                             cycles=0 if unsupported == "hardware" else 73,
+                             qos_time_raw={name: 37 if name == "default" and unsupported != "qos" else 0 for name in self.QOS})
+            result = self.diagnostic(points)
+            with self.subTest(unsupported=unsupported):
+                self.assertFalse(result["available"])
+                self.assertEqual(result["status"], "unavailable")
+                self.assertEqual(result["hardware_counter_status"], "unavailable" if unsupported == "hardware" else "available")
+                self.assertEqual(result["qos_counter_status"], "unavailable" if unsupported == "qos" else "available")
+
+    def test_active_cpu_requires_both_positive_hardware_deltas(self):
+        for field in ("instructions", "cycles"):
+            points = self.points()
+            for point in points:
+                point["cpu_work_counters"][field] = 99
+            result = self.diagnostic(points)
+            with self.subTest(field=field):
+                self.assertFalse(result["available"])
+                self.assertEqual(result["status"], "unavailable")
+                self.assertEqual(result["hardware_counter_status"], "unavailable")
+                self.assertEqual(result["qos_counter_status"], "available")
+                self.assertEqual(result["deltas"][field], 0)
+                self.assertIsNone(result["instructions_per_cycle"])
+                self.assertFalse(result["gate_evaluated"])
+
+    def test_active_cpu_with_zero_qos_preserves_hardware_deltas(self):
+        points = self.points()
+        for point in points:
+            point["cpu_work_counters"]["qos_time_raw"] = dict.fromkeys(self.QOS, 0)
+        result = self.diagnostic(points)
+        self.assertFalse(result["available"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["hardware_counter_status"], "available")
+        self.assertEqual(result["qos_counter_status"], "unavailable")
+        self.assertEqual(result["deltas"]["instructions"], 404)
+        self.assertEqual(result["deltas"]["cycles"], 292)
+        self.assertEqual(result["deltas"]["qos_time_raw"], dict.fromkeys(self.QOS, 0))
+        self.assertAlmostEqual(result["instructions_per_cycle"], 404 / 292)
+
+    def test_legacy_samples_with_no_group_are_unavailable(self):
+        points = self.points()
+        for point in points:
+            del point["cpu_work_counters"]
+        result = self.diagnostic(points)
+        self.assertFalse(result["available"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertFalse(result["gate_evaluated"])
+        self.assertIsInstance(result["errors"], list)
+
+    def test_mixed_absent_null_or_partial_groups_are_invalid_not_legacy(self):
+        for fault in ("absent", "null", "partial", "all-null", "extra-key"):
+            points = self.points()
+            if fault == "absent":
+                del points[5]["cpu_work_counters"]
+            elif fault == "null":
+                points[5]["cpu_work_counters"] = None
+            elif fault == "partial":
+                del points[5]["cpu_work_counters"]["cycles"]
+            elif fault == "all-null":
+                for point in points:
+                    point["cpu_work_counters"] = None
+            else:
+                points[5]["cpu_work_counters"]["unknown"] = 0
+            with self.subTest(fault=fault):
+                self.assert_invalid(self.diagnostic(points))
+
+    def test_counter_types_ranges_and_qos_shape_are_strict(self):
+        for field in ("instructions", "cycles", "default"):
+            for invalid in (True, -1, 1 << 64, 1.0, "1", None):
+                points = self.points()
+                target = points[5]["cpu_work_counters"]
+                if field == "default":
+                    target = target["qos_time_raw"]
+                target[field] = invalid
+                with self.subTest(field=field, invalid=invalid):
+                    self.assert_invalid(self.diagnostic(points))
+        for qos in (None, [], {"default": 1}, dict.fromkeys(self.QOS + ("unknown",), 1)):
+            points = self.points()
+            points[5]["cpu_work_counters"]["qos_time_raw"] = qos
+            with self.subTest(qos=qos):
+                self.assert_invalid(self.diagnostic(points))
+
+    def test_schema_source_and_units_are_not_inferred(self):
+        faults = (("schema_version", True), ("schema_version", 2), ("source", "getrusage"),
+                  ("instructions_unit", "nanoseconds"), ("cycles_unit", "GHz"),
+                  ("qos_time_unit", "nanoseconds"))
+        for field, invalid in faults:
+            points = self.points()
+            points[5]["cpu_work_counters"][field] = invalid
+            with self.subTest(field=field, invalid=invalid):
+                self.assert_invalid(self.diagnostic(points))
+
+    def test_decreasing_counters_inside_or_outside_selected_window_are_invalid(self):
+        for index in (6, 12):
+            for field in ("instructions", "cycles", "default"):
+                points = self.points()
+                previous = points[index - 1]["cpu_work_counters"]
+                target = points[index]["cpu_work_counters"]
+                if field == "default":
+                    previous, target = previous["qos_time_raw"], target["qos_time_raw"]
+                target[field] = previous[field] - 1
+                with self.subTest(index=index, field=field):
+                    self.assert_invalid(self.diagnostic(points))
+
+    def test_final_sample_is_an_exact_allowed_end_boundary(self):
+        result = self.diagnostic(self.points(), end=3.0)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["deltas"]["instructions"], 808)
+        self.assertEqual(result["deltas"]["cycles"], 584)
+
+    def test_interpolated_periodic_pre_ready_and_reversed_boundaries_are_invalid(self):
+        for start, end in ((1.125, 2), (1, 2.125), (.5, 2), (1, 1.5), (0, 2), (2, 1), (1, 1),
+                           (10**400, 2), (1, 10**400), (float("nan"), 2), (1, float("inf"))):
+            with self.subTest(start=start, end=end):
+                self.assert_invalid(self.diagnostic(self.points(), start=start, end=end))
+
+    def test_missing_duplicate_or_wrong_process_authentication_is_invalid(self):
+        faults = ("no-ready", "duplicate-ready", "wrong-launch", "wrong-birth", "no-final", "failed-exit",
+                  "wrong-final", "duplicate-boundary", "missing-boundary", "wrong-boundary-phase")
+        for fault in faults:
+            points = self.points()
+            if fault == "wrong-birth":
+                points[5]["birth_time_us"] = 999
+            if fault == "wrong-boundary-phase":
+                points[4]["phase"] = "periodic"
+            events = copy.deepcopy(cpu_events(points))
+            ready = next(event for event in events if event.get("type") == "app_event")
+            if fault == "no-ready":
+                events.remove(ready)
+            elif fault == "duplicate-ready":
+                events.append(copy.deepcopy(ready))
+            elif fault == "wrong-launch":
+                events[0]["pid"] = 999
+            elif fault == "no-final":
+                events.pop()
+            elif fault == "failed-exit":
+                events[-1]["status"] = 137
+            elif fault == "wrong-final":
+                events[-1]["final_sample"]["cpu_seconds"] += 1
+            elif fault == "duplicate-boundary":
+                events.append(copy.deepcopy(points[4]))
+            elif fault == "missing-boundary":
+                events.remove(points[4])
+            with self.subTest(fault=fault):
+                self.assert_invalid(self.diagnostic(points, events=events))
+
+    def test_bad_optional_group_never_changes_resource_gate_results(self):
+        points = self.points()
+        expected = evaluate_resources(points, budget()["limits"], [])
+        for invalid in (None, {}, {"instructions": True}):
+            broken = copy.deepcopy(points)
+            broken[5]["cpu_work_counters"] = invalid
+            self.assert_invalid(self.diagnostic(broken))
+            self.assertEqual(evaluate_resources(broken, budget()["limits"], []), expected)
+
+
 class ProtocolTests(unittest.TestCase):
     def test_explicit_visibility_failure_keeps_remaining_ui_commands_running(self):
         collector = mock.Mock()

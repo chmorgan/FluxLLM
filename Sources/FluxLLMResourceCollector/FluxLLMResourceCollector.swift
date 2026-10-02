@@ -164,6 +164,7 @@ struct FluxLLMResourceCollector {
         guard parallel == 4 else {
             throw CollectorFailure.message("CPU conversion lost parallel-thread time")
         }
+        try verifyCPUWorkCounterExports()
         let calibration = try ProcessResources.calibrateCPU()
         guard calibration["available"] as? Bool == true else {
             throw CollectorFailure.message("CPU self-calibration failed")
@@ -175,6 +176,9 @@ struct FluxLLMResourceCollector {
             uncertainty >= 0, uncertainty < 0.01
         else {
             throw CollectorFailure.message("Mach/monotonic clock pairing self-test failed")
+        }
+        guard clockSample["cpu_work_counters"] as? [String: Any] != nil else {
+            throw CollectorFailure.message("Resource snapshot omitted raw CPU work counters")
         }
         try GPUResourceProvider.verifyControlPipe()
         try GPUCapabilityReport.verifyCoverageReporting()
@@ -201,8 +205,96 @@ struct FluxLLMResourceCollector {
             "type": "self_test", "passed": true, "cpu": calibration, "short_line_pipe": true,
             "raw_gpu_final_receipt": true, "gpu_lifetime_capability_reporting": true,
             "paired_mach_monotonic_clocks": true, "closing_filesystem_proof": true,
+            "cpu_work_counter_mapping": true,
             "owned_exit_resource_sampling": true, "bounded_exit_transition_recovery": true,
         ])
+    }
+
+    private static func verifyCPUWorkCounterExports() throws {
+        let large: UInt64 = 9_007_199_254_740_993  // Double would round this integer.
+        var usage = rusage_info_v4()
+        usage.ri_instructions = large
+        usage.ri_cycles = large + 2
+        usage.ri_cpu_time_qos_default = large + 4
+        usage.ri_cpu_time_qos_maintenance = large + 6
+        usage.ri_cpu_time_qos_background = large + 8
+        usage.ri_cpu_time_qos_utility = large + 10
+        usage.ri_cpu_time_qos_legacy = large + 12
+        usage.ri_cpu_time_qos_user_initiated = large + 14
+        usage.ri_cpu_time_qos_user_interactive = large + 16
+        let expectedQoS: [String: UInt64] = [
+            "default": large + 4, "maintenance": large + 6, "background": large + 8,
+            "utility": large + 10, "legacy": large + 12,
+            "user_initiated": large + 14, "user_interactive": large + 16,
+        ]
+        let exported = ProcessResources.cpuWorkCounters(usage)
+        guard
+            Set(exported.keys)
+                == Set([
+                    "schema_version", "source", "instructions", "cycles",
+                    "instructions_unit", "cycles_unit", "qos_time_unit", "qos_time_raw",
+                ]),
+            exported["schema_version"] as? Int == 1,
+            exported["source"] as? String == "proc_pid_rusage/RUSAGE_INFO_V4",
+            exported["instructions_unit"] as? String == "count",
+            exported["cycles_unit"] as? String == "count",
+            exported["qos_time_unit"] as? String == "unspecified_kernel_units",
+            exported["instructions"] as? UInt64 == large,
+            exported["cycles"] as? UInt64 == large + 2,
+            exported["qos_time_raw"] as? [String: UInt64] == expectedQoS
+        else {
+            throw CollectorFailure.message("Raw CPU work counter mapping or units self-test failed")
+        }
+        let encoded = try jsonLine(exported)
+        guard let text = String(data: encoded, encoding: .utf8),
+            text.contains("\"instructions\":\(large)"), text.contains("\"cycles\":\(large + 2)"),
+            expectedQoS.allSatisfy({ text.contains("\"\($0.key)\":\($0.value)") }),
+            let decoded = try JSONSerialization.jsonObject(with: encoded) as? [String: Any],
+            (decoded["instructions"] as? NSNumber)?.uint64Value == large,
+            (decoded["cycles"] as? NSNumber)?.uint64Value == large + 2
+        else {
+            throw CollectorFailure.message("CPU work counter JSON lost integer precision")
+        }
+        let zeroUsage = rusage_info_v4()
+        let zero = ProcessResources.cpuWorkCounters(zeroUsage)
+        let zeroObservation = ProcessResources.cpuWorkCounterObservation(
+            before: zeroUsage, after: zeroUsage)
+        guard zero["instructions"] as? UInt64 == 0, zero["cycles"] as? UInt64 == 0,
+            zero["qos_time_raw"] as? [String: UInt64] == expectedQoS.mapValues({ _ in UInt64(0) }),
+            zeroObservation["monotonic"] as? Bool == true,
+            zeroObservation["observed_positive"] as? Bool == false,
+            zeroObservation["instructions_delta"] as? UInt64 == 0,
+            zeroObservation["cycles_delta"] as? UInt64 == 0
+        else {
+            throw CollectorFailure.message(
+                "Zero CPU work counters were not preserved as unqualified observations")
+        }
+        var after = usage
+        after.ri_instructions += 37
+        after.ri_cycles += 91
+        let observation = ProcessResources.cpuWorkCounterObservation(before: usage, after: after)
+        guard observation["monotonic"] as? Bool == true,
+            observation["observed_positive"] as? Bool == true,
+            observation["instructions_delta"] as? UInt64 == 37,
+            observation["cycles_delta"] as? UInt64 == 91
+        else {
+            throw CollectorFailure.message("CPU work counter observation delta self-test failed")
+        }
+        var fewerInstructions = usage
+        fewerInstructions.ri_instructions -= 1
+        var fewerCycles = usage
+        fewerCycles.ri_cycles -= 1
+        for regressed in [fewerInstructions, fewerCycles] {
+            let invalid = ProcessResources.cpuWorkCounterObservation(
+                before: usage, after: regressed)
+            guard invalid["monotonic"] as? Bool == false,
+                invalid["observed_positive"] as? Bool == false,
+                invalid["instructions_delta"] is NSNull, invalid["cycles_delta"] is NSNull
+            else {
+                throw CollectorFailure.message(
+                    "Regressing CPU work counters produced usable deltas")
+            }
+        }
     }
 
     private static func runResourceExitSelfTestWorker() -> Int32 {

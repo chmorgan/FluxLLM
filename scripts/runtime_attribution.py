@@ -681,6 +681,7 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
             "end_checkpoint": points[-1]["label"], **report["phase_windows"]["whole_contiguous_runtime"]}
         report["canvas_clock_work"] = validate_canvas_clock_work(report, mode)
         report["phase_cpu"] = phase_cpu(report, report["phase_windows"])
+        report["runtime_cpu_work_counters"] = runtime_work_counter_diagnostic(report, profile=profile)
         report["phase_cpu_comparison_available"] = not profile
         report["runtime_cpu_target"] = {"evaluated": not profile, "limit_percent": 5.0,
             "within_limit": report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5 if not profile else None,
@@ -693,6 +694,18 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
         report["status"] = "diagnostic_incomplete"
     write_json(output / "runtime-case.json", report)
     return report
+
+
+def runtime_work_counter_diagnostic(report, *, profile=False):
+    """Separate raw diagnostic evidence over exact runtime checkpoint samples."""
+    points = report.get("runtime", {}).get("checkpoints", [])
+    first = points[0].get("snapshot", {}) if points else {}
+    last = points[-1].get("snapshot", {}) if points else {}
+    return app.cpu_work_counter_diagnostic(report.get("samples", []), report.get("events", []),
+        first.get("runner_collector_sample_monotonic_seconds"),
+        last.get("runner_collector_sample_monotonic_seconds")) | {
+            "interval_scope": "Exact acknowledged before-traffic through completion-end kernel checkpoint boundaries; these control timestamps may differ from interpolated CPU phase-window edges",
+            "profiled": profile, "acceptance_eligible": False}
 
 
 def selected_cases(args):
@@ -803,6 +816,7 @@ def _run(args, deadline):
             row = {"label": label, "mode": mode, "status": case["status"], "report_path": str(directory / "runtime-case.json"),
                    "report_sha256": app.path_hash(directory / "runtime-case.json"), "workload_cpu": case.get("workload_cpu"),
                    "phase_cpu": case.get("phase_cpu"), "runtime_work": case.get("runtime_work"),
+                   "runtime_cpu_work_counters": case.get("runtime_cpu_work_counters"),
                    "visual_work": case.get("visual_work"),
                    "runtime_cpu_target": case.get("runtime_cpu_target"),
                    "peak_footprint_bytes": (case.get("samples") or [{}])[-1].get("lifetime_peak_footprint_bytes")}
