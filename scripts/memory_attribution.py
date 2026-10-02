@@ -22,7 +22,7 @@ from run_performance_checks import interrupted, load_json, number, require, writ
 
 
 GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "bitmap-layer-destination",
-                  "bitmap-layer-bgra", "bitmap-layer-no-decorations", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
+                  "bitmap-layer-bgra", "bitmap-layer-no-decorations", "native-gpu-canvas", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
 LAYER_DESTINATION_MODES = ("bitmap-layer-destination", "bitmap-layer-bgra", "bitmap-layer-no-decorations")
 GRADIENT_ABLATION_MODES = ("no-gradients", "no-gradients-or-blur")
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -327,6 +327,20 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     fields = ("created", "destroyed", "live", "peak_live", "updates", "renderer_creations", "renderer_updates",
               "renderer_destructions", "live_renderers", "peak_live_renderers", "draws", "skipped_draws",
               "current_pixel_area", "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes")
+    native_gpu = mode == "native-gpu-canvas"
+    if native_gpu:
+        require(value.get("native_gpu_backend") == "swiftui-canvas-drawing-group",
+                "App did not acknowledge the native GPU Canvas drawing-group backend")
+        native_gpu_draws = unsigned(value.get("native_gpu_canvas_draws"), "graphics.native_gpu_canvas_draws")
+        for field in ("live_renderers", "peak_live_renderers", "current_bitmap_bytes", "peak_bitmap_bytes",
+                      "current_layer_image_bytes", "peak_layer_image_bytes", "layer_bitmap_presentations",
+                      "layer_bitmap_failures", "layer_bitmap_native_draws"):
+            if field in value:
+                require(unsigned(value[field], f"graphics.{field}") == 0,
+                        f"Native GPU Canvas used a renderer or CPU bitmap fallback: {field}")
+        if expected_closed:
+            require(value.get("live_canvases") == 0 and value.get("current_pixel_area") == 0,
+                    "Native GPU Canvas resources remain live at a closed checkpoint")
     layer_destination = mode in LAYER_DESTINATION_MODES
     if layer_destination:
         metadata = {
@@ -350,6 +364,16 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             unsigned(role.get(field), f"graphics.{name}.{field}")
         for field in ("max_width_points", "max_height_points", "max_scale"):
             number(role.get(field), f"graphics.{name}.{field}")
+        if native_gpu:
+            for field in ("renderer_creations", "renderer_updates", "renderer_destructions", "live_renderers",
+                          "peak_live_renderers", "current_bitmap_bytes", "peak_bitmap_bytes",
+                          "current_layer_image_bytes", "peak_layer_image_bytes"):
+                if field in role:
+                    require(unsigned(role[field], f"graphics.{name}.{field}") == 0,
+                            f"Native GPU Canvas {name} used a renderer or CPU bitmap fallback: {field}")
+            if role["live"] == 0:
+                require(role["current_pixel_area"] == 0,
+                        f"Native GPU Canvas {name} retains pixel area after destruction")
         if mode == "bitmap-layer-no-decorations" and name == "rail_decorations":
             require(all(type(counter) in (int, float) and counter == 0 for counter in role.values()),
                     "Rail decoration work occurred in the no-decorations control")
@@ -390,6 +414,12 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             require(presentations > 0 and roles["static_chart"]["draws"] > 0
                     and value["peak_layer_image_bytes"] > 0,
                     "Completed visible workload did not present a drawn chart layer image; the comparison is invalid")
+    if native_gpu:
+        require(native_gpu_draws == sum(role["draws"] for role in roles.values()),
+                "Native GPU Canvas callbacks do not reconcile with drawn role frames")
+        if completed_visible_workload:
+            require(native_gpu_draws > 0 and roles["static_chart"]["draws"] > 0,
+                    "Completed visible workload did not execute native GPU static-chart drawing")
     return {"available": True, "counters": value}
 
 

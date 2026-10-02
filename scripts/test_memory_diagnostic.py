@@ -21,6 +21,8 @@ def graphics(mode="normal"):
     return {"graphics_diagnostics": {
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
+        **({"native_gpu_backend": "swiftui-canvas-drawing-group", "native_gpu_canvas_draws": 0}
+           if mode == "native-gpu-canvas" else {}),
         **({"layer_bitmap_presentations": 0, "layer_bitmap_failures": 0, "layer_bitmap_native_draws": 0,
             "current_layer_image_bytes": 0, "peak_layer_image_bytes": 0} if mode in memory.LAYER_DESTINATION_MODES else {}),
         **({"layer_bitmap_pixel_format": "bgra8-premultiplied-first" if mode == "bitmap-layer-bgra" else "rgba8-premultiplied-last",
@@ -43,7 +45,104 @@ def drawn_layer_graphics(mode="bitmap-layer-destination"):
     return snapshot
 
 
+def drawn_native_gpu_graphics():
+    snapshot = graphics("native-gpu-canvas")
+    value = snapshot["graphics_diagnostics"]
+    value.update(native_gpu_canvas_draws=3, live_canvases=1, peak_live_canvases=1,
+                 current_pixel_area=400, peak_pixel_area=400)
+    value["roles"]["static_chart"].update(created=1, live=1, peak_live=1, draws=3,
+        current_pixel_area=400, peak_pixel_area=400, max_width_points=10, max_height_points=10, max_scale=2)
+    return snapshot
+
+
 class GraphicsTests(unittest.TestCase):
+    def test_native_gpu_requires_exact_backend_and_integer_callback_evidence(self):
+        mode = "native-gpu-canvas"
+        self.assertTrue(memory.validate_graphics(graphics(mode), mode)["available"])
+        for field, invalid_values in (
+                ("native_gpu_backend", (None, True, "metal", "swiftui-canvas", "bitmap-layer-destination")),
+                ("native_gpu_canvas_draws", (None, True, -1, 0.0, "0"))):
+            for invalid in invalid_values:
+                snapshot = graphics(mode)
+                snapshot["graphics_diagnostics"][field] = invalid
+                with self.subTest(field=field, invalid=invalid), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, mode)
+            snapshot = graphics(mode)
+            del snapshot["graphics_diagnostics"][field]
+            with self.subTest(field=field, missing=True), self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, mode)
+
+    def test_native_gpu_callback_count_must_match_role_draws_and_execute_static_chart(self):
+        mode = "native-gpu-canvas"
+        self.assertTrue(memory.validate_graphics(drawn_native_gpu_graphics(), mode, completed_visible_workload=True)["available"])
+        for count in (0, 2, 4):
+            snapshot = drawn_native_gpu_graphics()
+            snapshot["graphics_diagnostics"]["native_gpu_canvas_draws"] = count
+            with self.subTest(count=count), self.assertRaisesRegex(InvalidResult, "callbacks do not reconcile"):
+                memory.validate_graphics(snapshot, mode)
+        snapshot = drawn_native_gpu_graphics()
+        value = snapshot["graphics_diagnostics"]
+        value["roles"]["static_chart"]["draws"] = 0
+        value["roles"]["rail_decorations"]["draws"] = 3
+        with self.assertRaisesRegex(InvalidResult, "static-chart drawing"):
+            memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+        with self.assertRaisesRegex(InvalidResult, "static-chart drawing"):
+            memory.validate_graphics(graphics(mode), mode, completed_visible_workload=True)
+
+    def test_native_gpu_rejects_any_renderer_or_cpu_bitmap_fallback_history(self):
+        mode = "native-gpu-canvas"
+        global_fields = ("live_renderers", "peak_live_renderers", "current_bitmap_bytes", "peak_bitmap_bytes",
+                         "current_layer_image_bytes", "peak_layer_image_bytes", "layer_bitmap_presentations",
+                         "layer_bitmap_failures", "layer_bitmap_native_draws")
+        role_fields = ("renderer_creations", "renderer_updates", "renderer_destructions", "live_renderers",
+                       "peak_live_renderers", "current_bitmap_bytes", "peak_bitmap_bytes",
+                       "current_layer_image_bytes", "peak_layer_image_bytes")
+        for role in (None, "static_chart", "cursor", "rail_bars", "rail_decorations"):
+            for field in global_fields if role is None else role_fields:
+                snapshot = drawn_native_gpu_graphics()
+                counters = snapshot["graphics_diagnostics"]
+                if role is not None:
+                    counters = counters["roles"][role]
+                for invalid in (1, True, "0"):
+                    counters[field] = invalid
+                    with self.subTest(role=role, field=field, invalid=invalid), self.assertRaises(InvalidResult):
+                        memory.validate_graphics(snapshot, mode)
+                counters[field] = 0
+                self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+
+    def test_native_gpu_closed_state_requires_released_canvases_and_geometry(self):
+        mode = "native-gpu-canvas"
+        snapshot = drawn_native_gpu_graphics()
+        with self.assertRaisesRegex(InvalidResult, "closed checkpoint"):
+            memory.validate_graphics(snapshot, mode, expected_closed=True)
+        value = snapshot["graphics_diagnostics"]
+        value["live_canvases"] = 0
+        value["roles"]["static_chart"].update(destroyed=1, live=0)
+        with self.assertRaisesRegex(InvalidResult, "retains pixel area"):
+            memory.validate_graphics(snapshot, mode)
+        value["current_pixel_area"] = value["roles"]["static_chart"]["current_pixel_area"] = 0
+        self.assertTrue(memory.validate_graphics(snapshot, mode, expected_closed=True)["available"])
+        value["roles"]["static_chart"]["max_scale"] = float("nan")
+        with self.assertRaises(InvalidResult):
+            memory.validate_graphics(snapshot, mode)
+
+    def test_native_gpu_requirements_do_not_change_normal_or_frozen_layer_evidence(self):
+        self.assertTrue(memory.validate_graphics(graphics(), "normal")["available"])
+        self.assertTrue(memory.validate_graphics(drawn_layer_graphics(), "bitmap-layer-destination")["available"])
+        self.assertFalse(memory.validate_graphics({}, "normal")["available"])
+
+    def test_native_gpu_backend_drift_is_rejected_in_command_and_control_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = memory.MemoryDiagnostic(Path(directory), memory.MemoryDeadline(), "native-gpu-canvas")
+            snapshot = drawn_native_gpu_graphics()
+            snapshot["graphics_diagnostics"]["native_gpu_backend"] = "image-renderer"
+            diagnostic.collector = mock.Mock()
+            diagnostic.collector.command.return_value = {"status": "ok", "snapshot": snapshot}
+            with mock.patch.object(diagnostic, "verify_identity"), self.assertRaises(InvalidResult):
+                diagnostic.command("show_dashboard")
+            with self.assertRaises(InvalidResult):
+                diagnostic.validate_control_snapshot(snapshot)
+
     def test_layer_variants_require_exact_metadata_and_original_mode_accepts_legacy_omission(self):
         for mode in memory.LAYER_DESTINATION_MODES:
             expected = {
