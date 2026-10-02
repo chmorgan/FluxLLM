@@ -19,13 +19,15 @@ def graphics(mode="normal"):
               "current_pixel_area", "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes",
               "max_width_points", "max_height_points", "max_scale")
     return {**({"shared_chart_normalization_builds": 0, "shared_chart_preparations": 0, "streamed_bodies_without_promises": 0, "chart_preparations": 0}
-               if mode in memory.NEXT_RUNTIME_MODES else {}), "graphics_diagnostics": {
+               if mode in memory.NEXT_RUNTIME_MODES else {}),
+            **(dict.fromkeys(memory.CANVAS_CLOCK_COUNTERS, 0) if mode in memory.CANVAS_CLOCK_MODES else {}), "graphics_diagnostics": {
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
         **({"shared_chart_preparation": mode in ("runtime-shared-preparation", "runtime-next-optimized"),
             "stable_decoration_hosts": mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"),
-            "unpromised_stream_body_writes": mode in ("runtime-stream-writes", "runtime-next-optimized")}
+            "unpromised_stream_body_writes": mode in ("runtime-stream-writes", "runtime-next-optimized", "runtime-stream-canvas-clock")}
            if mode in memory.NEXT_RUNTIME_MODES else {}),
+        **({"canvas_frame_clock": True} if mode in memory.CANVAS_CLOCK_MODES else {}),
         **({"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
             "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
             "lifecycle_effects_enabled": mode != "runtime-no-lifecycle"} if mode in memory.RUNTIME_MODES else {}),
@@ -69,8 +71,10 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
         current_pixel_area=400, peak_pixel_area=400, max_width_points=10, max_height_points=10, max_scale=2)
     if mode in ("runtime-shared-preparation", "runtime-next-optimized"):
         snapshot.update(shared_chart_normalization_builds=1, shared_chart_preparations=3, chart_preparations=3)
-    if mode in ("runtime-stream-writes", "runtime-next-optimized"):
+    if mode in ("runtime-stream-writes", "runtime-next-optimized", "runtime-stream-canvas-clock"):
         snapshot["streamed_bodies_without_promises"] = 3
+    if mode in memory.CANVAS_CLOCK_MODES:
+        snapshot["rail_frame_clock_ticks"] = 3
     if mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"):
         value.update(live_canvases=2, peak_live_canvases=2)
         value["roles"]["rail_decorations"].update(created=1, live=1, peak_live=1)

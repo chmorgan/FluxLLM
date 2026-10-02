@@ -491,14 +491,24 @@ baseline before and after it; production `normal` enables both CPU optimizations
 | `runtime-stable-decoration-hosts` | Keep Canvas and retained twinkle owners stable during active episodes, suppressing inactive drawing without restarting animation clocks. |
 | `runtime-stream-writes` | Omit individual body-write promises for eligible ordinary responses, retaining existing immediate flushes and failure cancellation. |
 | `runtime-next-optimized` | Combine shared preparation, stable decoration hosts, and the body-write promise experiment. |
+| `runtime-canvas-clock` | Keep both history and preparation optimizations and drive rail drawing with a dedicated Canvas frame clock. |
+| `runtime-stream-canvas-clock` | Combine the Canvas frame clock with the body-write promise experiment, keeping both history and preparation optimizations. |
 
-The four new controls include the existing history and preparation optimizations.
-They remain experiments: `normal` still uses those two established optimizations
-and enables none of these three candidates. Compare individual candidates with
+The shared-preparation, stable-host, stream-write, and combined controls include
+the existing history and preparation optimizations. They remain experiments:
+`normal` still uses those two established optimizations. Compare individual candidates with
 `--baseline-mode normal --controls runtime-shared-preparation runtime-stable-decoration-hosts runtime-stream-writes`,
 then use a separate comparison with
 `--baseline-mode normal --controls runtime-next-optimized` for their combination.
 These selections keep the same five-case maximum and 300-second command deadline.
+
+The two Canvas-clock controls are isolated experiments with
+`canvas_frame_clock = true` and shared preparation and stable decoration hosts
+disabled. Only `runtime-stream-canvas-clock` also enables
+`unpromised_stream_body_writes`. Compare them with
+`--baseline-mode normal --controls runtime-canvas-clock runtime-stream-canvas-clock`.
+Production `normal` enables none of these experimental paths; the **5% runtime
+CPU** and **1% GPU** limits remain unchanged.
 
 The stream-write control keeps promises on response heads and ends, and on
 `HEAD`/`CONNECT` bodies. Its body fast path requires an active downstream channel
@@ -546,7 +556,19 @@ builds; `streamed_bodies_without_promises` must record actual body fast-path
 writes, rather than parsed NDJSON records.
 Shared-preparation and unpromised-write counters must remain zero when those
 paths are disabled; stable-host mode requires native decoration-host creation
-evidence. Existing drawing, twinkle lifecycle, visibility, and closed-resource
+evidence. Canvas-clock controls require positive top-level
+`rail_frame_clock_ticks` and zero `rail_timeline_content_updates`; nonclock modes
+must report zero clock ticks whenever that counter is supplied. Older frozen
+products may omit the new clock flag and counters, but any supplied evidence is
+validated. Clock candidates must also produce at least 80% as many native rail
+decoration draws as frame ticks, rounded down with a two-frame boundary allowance
+and a minimum of one draw. Reports retain both counts; they do not establish
+pixel-for-pixel visual equality. Authenticated checkpoints strictly inside the
+fixed fixture's +5s to +20s steady phase must show both requests active and zero
+additional clock ticks, after arrival effects have ended and before completion.
+The two closed checkpoints, five seconds apart, must also show no additional
+ticks. The completion endpoint itself is not assumed animation-free.
+Existing drawing, twinkle lifecycle, visibility, and closed-resource
 checks still apply; selecting a flag alone is
 insufficient evidence that a candidate ran.
 

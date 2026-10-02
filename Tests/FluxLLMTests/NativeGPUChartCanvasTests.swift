@@ -176,6 +176,54 @@ final class NativeGPUChartCanvasTests: XCTestCase {
         XCTAssertNotEqual(bytes(first), bytes(next))
     }
 
+    func testFrameClockChangesOnlyDrawingAndClearsWithoutReplayingStoppedTicks() throws {
+        let clock = RequestRailFrameClock()
+        let origin = Date(timeIntervalSince1970: 1_800_000_000)
+        let generation = clock.start(at: origin, monotonicTime: 0)
+        defer { clock.stop() }
+        let size = CGSize(width: 20, height: 12)
+        var contentUpdates = 0
+        var drawingCalls = 0
+        func surface(isDrawing: Bool) -> NativeGPUFrameClockTestSurface {
+            NativeGPUFrameClockTestSurface(
+                clock: clock, origin: origin, isDrawing: isDrawing,
+                contentUpdated: { contentUpdates += 1 },
+                didDraw: { drawingCalls += 1 })
+        }
+        let renderer = ImageRenderer(content: surface(isDrawing: true))
+        renderer.isObservationEnabled = true
+        renderer.proposedSize = ProposedViewSize(size)
+        renderer.scale = 1
+        let first = try render(renderer, size: size, scale: 1)
+        let initialContentUpdates = contentUpdates
+        XCTAssertGreaterThan(initialContentUpdates, 0)
+        XCTAssertGreaterThan(drawingCalls, 0)
+
+        XCTAssertTrue(
+            clock.tick(
+                generation: generation, at: origin.addingTimeInterval(0.5), monotonicTime: 0.5))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        let next = try render(renderer, size: size, scale: 1)
+        XCTAssertNotEqual(bytes(first), bytes(next))
+        let expected = try render(Canvas(renderer: solid(.blue)), size: size, scale: 1)
+        assertPixels(next, match: expected)
+        XCTAssertEqual(
+            contentUpdates, initialContentUpdates,
+            "Reading the clock only inside Canvas must not rebuild its enclosing content")
+
+        renderer.content = surface(isDrawing: false)
+        clock.stop()
+        let cleared = try render(renderer, size: size, scale: 1)
+        XCTAssertTrue(bytes(cleared).allSatisfy { $0 == 0 })
+        let callsAfterClear = drawingCalls
+        let updatesAfterClear = contentUpdates
+        XCTAssertFalse(
+            clock.tick(generation: generation, at: origin.addingTimeInterval(1), monotonicTime: 1))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        XCTAssertEqual(drawingCalls, callsAfterClear)
+        XCTAssertEqual(contentUpdates, updatesAfterClear)
+    }
+
     func testOwnerDrawsAndReappearsWithoutDiagnosticRegistration() {
         let diagnostics = PerformanceGraphicsDiagnostics()
         XCTAssertFalse(diagnostics.isEnabled)
@@ -381,4 +429,23 @@ final class NativeGPUChartCanvasTests: XCTestCase {
 @MainActor @Observable
 private final class NativeGPUObservedState {
     var highlighted = false
+}
+
+private struct NativeGPUFrameClockTestSurface: View {
+    let clock: RequestRailFrameClock
+    let origin: Date
+    let isDrawing: Bool
+    let contentUpdated: () -> Void
+    let didDraw: () -> Void
+
+    var body: some View {
+        let _ = contentUpdated()
+        return NativeGPUChartCanvas(revision: AnyHashable(isDrawing)) { context, size in
+            didDraw()
+            if isDrawing {
+                let color: Color = clock.date.timeIntervalSince(origin) < 0.5 ? .red : .blue
+                context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(color))
+            }
+        }
+    }
 }

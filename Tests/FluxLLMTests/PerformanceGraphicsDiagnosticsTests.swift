@@ -17,7 +17,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 24)
+        XCTAssertEqual(Mode.allCases.count, 26)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -539,6 +539,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 XCTAssertEqual(
                     snapshot["unpromised_stream_body_writes"] as? Bool,
                     mode.usesUnpromisedStreamBodyWrites)
+                XCTAssertEqual(
+                    snapshot["canvas_frame_clock"] as? Bool,
+                    mode.usesCanvasFrameClock)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
             }
@@ -601,7 +604,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         typealias Mode = PerformanceGraphicsDiagnostics.Mode
         let next: [Mode] = [
             .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
-            .runtimeNextOptimized,
+            .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
         ]
         let runtime: [Mode] =
             [
@@ -640,7 +643,11 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 [.runtimeStableDecorationHosts, .runtimeNextOptimized].contains(mode))
             XCTAssertEqual(
                 mode.usesUnpromisedStreamBodyWrites,
-                [.runtimeStreamWrites, .runtimeNextOptimized].contains(mode))
+                [.runtimeStreamWrites, .runtimeNextOptimized, .runtimeStreamCanvasClock].contains(
+                    mode))
+            XCTAssertEqual(
+                mode.usesCanvasFrameClock,
+                [.runtimeCanvasClock, .runtimeStreamCanvasClock].contains(mode))
         }
     }
 

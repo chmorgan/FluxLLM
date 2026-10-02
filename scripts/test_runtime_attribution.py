@@ -24,6 +24,8 @@ def workload_snapshots(mode):
         before[field] = 10
     after = copy.deepcopy(before)
     after["chart_preparations"] += 2
+    if value.get("canvas_frame_clock"):
+        after["rail_frame_clock_ticks"] += 2
     if value.get("shared_chart_preparation"):
         after["shared_chart_preparations"] += 2
         after["shared_chart_normalization_builds"] += 1
@@ -41,6 +43,32 @@ def workload_snapshots(mode):
     if value["lifecycle_effects_enabled"]:
         after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 1
     return before, after
+
+
+def clock_work_report(mode="runtime-canvas-clock"):
+    before, after = workload_snapshots(mode)
+    samples = []
+    def point(label, elapsed, snapshot, active, visible=True):
+        snapshot = copy.deepcopy(snapshot)
+        sample = {"monotonic_seconds": 100 + elapsed, "mach_absolute_seconds": 1000 + elapsed,
+                  "process_id": 123, "birth_time_us": 456}
+        samples.append(sample)
+        snapshot.update(runner_collector_sample_monotonic_seconds=sample["monotonic_seconds"],
+                        dashboard_visible=visible, popover_visible=visible, active_requests=active)
+        snapshot["canvas_draws"] = snapshot["graphics_diagnostics"]["native_gpu_canvas_draws"] = sum(
+            role["draws"] for role in snapshot["graphics_diagnostics"]["roles"].values())
+        return {"label": label, "snapshot": snapshot, "resource_sample": sample}
+    steady = copy.deepcopy(before)
+    steady["rail_frame_clock_ticks"] += 1
+    points = [point("before-traffic", 0, before, 0), point("during-6", 6, steady, 2),
+              point("during-19", 19, steady, 2), point("completion-end", 29, after, 0)]
+    closed = [point("07-both-closed-after-probe", 32, after, 0, False),
+              point("08-closed-after-five-more-seconds", 37, after, 0, False)]
+    return {"runtime": {"checkpoints": points, "mach_clock_start": {"absolute_minus_monotonic_seconds": 900},
+                        "mach_clock_end": {"absolute_minus_monotonic_seconds": 900}},
+            "checkpoints": closed, "samples": samples, "owned_identity": {"process_id": 123, "birth_time_us": 456},
+            "phase_windows": {"steady": {"start_monotonic_seconds": 105, "end_monotonic_seconds": 120},
+                              "whole_contiguous_runtime": {"start_monotonic_seconds": 100, "end_monotonic_seconds": 129}}}
 
 
 def options(**kwargs):
@@ -97,7 +125,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock",) if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -194,6 +222,52 @@ class RuntimeWorkTests(unittest.TestCase):
 
 
 class NextRuntimeWorkTests(unittest.TestCase):
+    def test_canvas_clock_controls_select_isolated_paths(self):
+        for mode in memory.CANVAS_CLOCK_MODES:
+            work = runtime.validate_runtime_work(*workload_snapshots(mode), mode)
+            self.assertTrue(work["features"]["canvas_frame_clock"])
+            self.assertFalse(work["features"]["shared_chart_preparation"])
+            self.assertFalse(work["features"]["stable_decoration_hosts"])
+            self.assertEqual(work["features"]["unpromised_stream_body_writes"], mode == "runtime-stream-canvas-clock")
+            args = runtime.parser().parse_args(["compare", "--app-binary", "/app", "--test-bundle", "/tests",
+                "--collector-binary", "/collector", "--provenance", "/provenance", "--controls", mode])
+            self.assertEqual(runtime.selected_cases(args)[1], (mode, mode))
+
+    def test_canvas_clock_work_rejects_absence_fallback_and_unrendered_ticks(self):
+        for mode in memory.CANVAS_CLOCK_MODES:
+            for field in memory.CANVAS_CLOCK_COUNTERS:
+                for invalid in (None, True, -1):
+                    before, after = workload_snapshots(mode)
+                    after[field] = invalid
+                    with self.subTest(mode=mode, field=field, invalid=invalid), self.assertRaises(ValueError):
+                        runtime.validate_runtime_work(before, after, mode)
+            for ticks, timeline, draws in ((0, 0, 1), (20, 0, 0), (20, 0, 13), (20, 1, 20)):
+                before, after = workload_snapshots(mode)
+                after["rail_frame_clock_ticks"] = before["rail_frame_clock_ticks"] + ticks
+                after["rail_timeline_content_updates"] = timeline
+                after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] = before["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] + draws
+                with self.subTest(mode=mode, ticks=ticks, timeline=timeline, draws=draws), self.assertRaises(ValueError):
+                    runtime.validate_runtime_work(before, after, mode)
+            before, after = workload_snapshots(mode)
+            after["rail_frame_clock_ticks"] = before["rail_frame_clock_ticks"] + 20
+            after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 13
+            self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
+
+    def test_legacy_clock_counters_optional_but_contract_cannot_disappear(self):
+        before, after = workload_snapshots("runtime-optimized")
+        self.assertTrue(runtime.validate_runtime_work(before, after, "runtime-optimized")["available"])
+        for snapshot in (before, after):
+            snapshot["graphics_diagnostics"]["canvas_frame_clock"] = False
+            snapshot.update(rail_frame_clock_ticks=0, rail_timeline_content_updates=5)
+        self.assertTrue(runtime.validate_runtime_work(before, after, "runtime-optimized")["available"])
+        after["rail_frame_clock_ticks"] = 1
+        with self.assertRaisesRegex(ValueError, "Nonclock"):
+            runtime.validate_runtime_work(before, after, "runtime-optimized")
+        after["rail_frame_clock_ticks"] = 0
+        del after["graphics_diagnostics"]["canvas_frame_clock"]
+        with self.assertRaisesRegex(ValueError, "stable complete"):
+            runtime.validate_runtime_work(before, after, "runtime-optimized")
+
     def test_old_optimized_mode_can_be_the_preserved_baseline(self):
         args = runtime.parser().parse_args(["compare", "--app-binary", "/app", "--test-bundle", "/tests",
             "--collector-binary", "/collector", "--provenance", "/provenance", "--baseline-mode", "runtime-optimized",
@@ -259,6 +333,50 @@ class NextRuntimeWorkTests(unittest.TestCase):
         del after["graphics_diagnostics"]["stable_decoration_hosts"]
         with self.assertRaises(ValueError):
             runtime.validate_runtime_work(before, after, "runtime-next-optimized")
+
+
+class CanvasClockPhaseTests(unittest.TestCase):
+    def test_steady_and_closed_proof_uses_authenticated_interior_checkpoints(self):
+        for mode in memory.CANVAS_CLOCK_MODES:
+            report = clock_work_report(mode)
+            proof = runtime.validate_canvas_clock_work(report, mode)
+            self.assertEqual(proof["steady"]["start_monotonic_seconds"], 106)
+            self.assertEqual(proof["steady"]["end_monotonic_seconds"], 119)
+            self.assertEqual(proof["steady"]["deltas"]["rail_frame_clock_ticks"], 0)
+            self.assertEqual(proof["closed"]["rail_frame_clock_ticks_delta"], 0)
+            # A late completion tick before closing is allowed; neither the
+            # three-second tail nor a pending final effect is assumed idle.
+            report["runtime"]["checkpoints"][-1]["snapshot"]["rail_frame_clock_ticks"] += 1
+            for point in report["checkpoints"]:
+                point["snapshot"]["rail_frame_clock_ticks"] += 1
+            self.assertTrue(runtime.validate_canvas_clock_work(report, mode)["available"])
+
+    def test_steady_ticks_closed_ticks_and_lost_activity_are_rejected(self):
+        for target, field, value in (("steady", "rail_frame_clock_ticks", 5),
+                                     ("steady", "active_requests", 1),
+                                     ("closed", "rail_frame_clock_ticks", 6),
+                                     ("closed", "dashboard_visible", True),
+                                     ("steady", "rail_timeline_content_updates", 1)):
+            report = clock_work_report()
+            point = report["runtime"]["checkpoints"][2] if target == "steady" else report["checkpoints"][1]
+            point["snapshot"][field] = value
+            with self.subTest(target=target, field=field), self.assertRaises(ValueError):
+                runtime.validate_canvas_clock_work(report, "runtime-canvas-clock")
+
+    def test_phase_and_closed_evidence_cannot_be_missing_or_unauthenticated(self):
+        for mutation in (lambda report: report["runtime"]["checkpoints"].pop(2),
+                         lambda report: report["checkpoints"].pop(),
+                         lambda report: report["checkpoints"][1]["snapshot"].update(runner_collector_sample_monotonic_seconds=-1),
+                         lambda report: report["runtime"]["checkpoints"][1]["snapshot"].pop("rail_frame_clock_ticks")):
+            report = clock_work_report()
+            mutation(report)
+            with self.assertRaises(ValueError):
+                runtime.validate_canvas_clock_work(report, "runtime-canvas-clock")
+
+    def test_legacy_frozen_capture_does_not_require_clock_phase_evidence(self):
+        before, after = workload_snapshots("runtime-optimized")
+        report = {"runtime": {"checkpoints": [{"snapshot": before}, {"snapshot": after}]}}
+        self.assertFalse(runtime.validate_canvas_clock_work(report, "runtime-optimized")["available"])
 
 
 class ProfileReadinessGuardTests(unittest.TestCase):

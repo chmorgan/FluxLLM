@@ -134,6 +134,7 @@ private struct RequestRailDecorations: View {
     @State private var prepared: [PreparedEffect] = []
     @State private var twinkles: [RequestRailTwinkle] = []
     @State private var animating = false
+    @State private var frameClock = RequestRailFrameClock()
 
     private var effectsEnabled: Bool {
         isLive && !reduceMotion && !reduceTransparency && contrast != .increased && windowVisible
@@ -196,27 +197,53 @@ private struct RequestRailDecorations: View {
                 .frame(width: plotSize.width, height: plotSize.height)
             }
             if needsSurface && !bounds.isEmpty {
-                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !drawsLifecycle)) {
-                    clock in
-                    // The experiment keeps this owner mounted between effects.
-                    // Clear once, then ignore ordinary glint publications until
-                    // another effect starts; nil would redraw every update.
-                    let revision: AnyHashable? =
-                        stableHosts && !drawsLifecycle
-                        ? AnyHashable(InactiveDecorationRevision()) : nil
+                // The stable-host control clears once between effects, then
+                // ignores ordinary glint publications until animation resumes.
+                let revision: AnyHashable? =
+                    stableHosts && !drawsLifecycle
+                    ? AnyHashable(InactiveDecorationRevision()) : nil
+                if mode.usesCanvasFrameClock {
                     ChartDrawingSurface(
                         role: .railDecorations, revision: revision,
                         drawingBounds: bounds
                     ) { context, _ in
                         PerformancePresentationCounters.shared.record(.canvasDraws)
-                        // A paused timeline can retain its previous date. Draw
-                        // an empty frame after the visible interval has ended.
                         if drawsLifecycle {
-                            drawDecorations(decoratedSegments, at: clock.date, in: &context)
+                            // This is the only observed date read. Clock ticks
+                            // invalidate drawing without rebuilding the view.
+                            drawDecorations(decoratedSegments, at: frameClock.date, in: &context)
                         }
                     }
                     .frame(width: bounds.width, height: bounds.height)
                     .offset(x: bounds.minX, y: bounds.minY)
+                    .task(id: drawsLifecycle) {
+                        guard !Task.isCancelled else { return }
+                        if drawsLifecycle {
+                            await frameClock.run()
+                        } else {
+                            frameClock.stop()
+                        }
+                    }
+                    .onDisappear { frameClock.stop() }
+                } else {
+                    TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !drawsLifecycle)) {
+                        clock in
+                        let _ = PerformancePresentationCounters.shared.record(
+                            .railTimelineContentUpdates)
+                        ChartDrawingSurface(
+                            role: .railDecorations, revision: revision,
+                            drawingBounds: bounds
+                        ) { context, _ in
+                            PerformancePresentationCounters.shared.record(.canvasDraws)
+                            // A paused timeline can retain its previous date. Draw
+                            // an empty frame after the visible interval has ended.
+                            if drawsLifecycle {
+                                drawDecorations(decoratedSegments, at: clock.date, in: &context)
+                            }
+                        }
+                        .frame(width: bounds.width, height: bounds.height)
+                        .offset(x: bounds.minX, y: bounds.minY)
+                    }
                 }
             }
         }

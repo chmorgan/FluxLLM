@@ -192,6 +192,9 @@ public final class PerformanceApplicationSession {
             "shared_chart_preparations": counters["shared_chart_preparations"] as Any? ?? NSNull(),
             "streamed_bodies_without_promises": counters["streamed_bodies_without_promises"] as Any?
                 ?? NSNull(),
+            "rail_frame_clock_ticks": counters["rail_frame_clock_ticks"] as Any? ?? NSNull(),
+            "rail_timeline_content_updates": counters["rail_timeline_content_updates"] as Any?
+                ?? NSNull(),
             "history_tool_order_builds": counters["history_tool_order_builds"] as Any? ?? NSNull(),
             "history_completed_order_builds": counters["history_completed_order_builds"] as Any?
                 ?? NSNull(),

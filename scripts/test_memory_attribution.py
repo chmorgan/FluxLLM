@@ -78,6 +78,44 @@ All zones: 9 nodes (1312 bytes)
 
 
 class NextRuntimeContractTests(unittest.TestCase):
+    def test_canvas_clock_modes_require_flag_counters_and_actual_ticks(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        for mode in memory.CANVAS_CLOCK_MODES:
+            snapshot = drawn_native_gpu_graphics(mode)
+            self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
+            for invalid in (None, False, 1):
+                changed = copy.deepcopy(snapshot)
+                changed["graphics_diagnostics"]["canvas_frame_clock"] = invalid
+                with self.subTest(mode=mode, flag=invalid), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(changed, mode)
+            for field in memory.CANVAS_CLOCK_COUNTERS:
+                for invalid in (None, True, -1):
+                    changed = copy.deepcopy(snapshot)
+                    changed[field] = invalid
+                    with self.subTest(mode=mode, field=field, value=invalid), self.assertRaises(InvalidResult):
+                        memory.validate_graphics(changed, mode)
+            snapshot["rail_frame_clock_ticks"] = 0
+            with self.assertRaisesRegex(InvalidResult, "did not execute"):
+                memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+            snapshot["rail_frame_clock_ticks"] = 3
+            snapshot["rail_timeline_content_updates"] = 1
+            with self.assertRaisesRegex(InvalidResult, "Timeline"):
+                memory.validate_graphics(snapshot, mode)
+
+    def test_legacy_clock_absence_remains_valid_but_supplied_nonclock_ticks_fail(self):
+        from test_memory_diagnostic import drawn_native_gpu_graphics
+        for mode in ("runtime-optimized", "runtime-next-optimized", "native-gpu-optimized"):
+            snapshot = drawn_native_gpu_graphics(mode)
+            self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+            snapshot["graphics_diagnostics"]["canvas_frame_clock"] = False
+            with self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, mode)
+            snapshot.update(rail_frame_clock_ticks=0, rail_timeline_content_updates=17)
+            self.assertTrue(memory.validate_graphics(snapshot, mode)["available"])
+            snapshot["rail_frame_clock_ticks"] = 1
+            with self.assertRaisesRegex(InvalidResult, "Nonclock"):
+                memory.validate_graphics(snapshot, mode)
+
     def test_new_mode_flags_and_counter_schema_are_required(self):
         from test_memory_diagnostic import drawn_native_gpu_graphics
         for mode in memory.NEXT_RUNTIME_MODES:

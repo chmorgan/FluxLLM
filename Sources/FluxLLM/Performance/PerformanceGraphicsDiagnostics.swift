@@ -25,6 +25,8 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeStableDecorationHosts = "runtime-stable-decoration-hosts"
         case runtimeStreamWrites = "runtime-stream-writes"
         case runtimeNextOptimized = "runtime-next-optimized"
+        case runtimeCanvasClock = "runtime-canvas-clock"
+        case runtimeStreamCanvasClock = "runtime-stream-canvas-clock"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -64,7 +66,7 @@ public final class PerformanceGraphicsDiagnostics {
             case .runtimeNoLifecycle, .runtimeHistoryOrder, .runtimeChartPreparation,
                 .runtimeOptimized,
                 .runtimeSharedPreparation, .runtimeStableDecorationHosts, .runtimeStreamWrites,
-                .runtimeNextOptimized:
+                .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock:
                 true
             default:
                 false
@@ -83,6 +85,11 @@ public final class PerformanceGraphicsDiagnostics {
 
         var usesUnpromisedStreamBodyWrites: Bool {
             self == .runtimeStreamWrites || self == .runtimeNextOptimized
+                || self == .runtimeStreamCanvasClock
+        }
+
+        var usesCanvasFrameClock: Bool {
+            self == .runtimeCanvasClock || self == .runtimeStreamCanvasClock
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -90,6 +97,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeNoLifecycle
                 || usesSharedChartPreparation || usesStableDecorationHosts
                 || usesUnpromisedStreamBodyWrites
+                || usesCanvasFrameClock
         }
 
         var usesOptimizedChartPreparation: Bool {
@@ -97,6 +105,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeNoLifecycle
                 || usesSharedChartPreparation || usesStableDecorationHosts
                 || usesUnpromisedStreamBodyWrites
+                || usesCanvasFrameClock
         }
     }
 
@@ -561,6 +570,7 @@ public final class PerformanceGraphicsDiagnostics {
             result["shared_chart_preparation"] = mode.usesSharedChartPreparation
             result["stable_decoration_hosts"] = mode.usesStableDecorationHosts
             result["unpromised_stream_body_writes"] = mode.usesUnpromisedStreamBodyWrites
+            result["canvas_frame_clock"] = mode.usesCanvasFrameClock
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

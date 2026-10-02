@@ -8,6 +8,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import os
+import math
 from pathlib import Path
 import secrets
 import shutil
@@ -88,6 +89,20 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {field} counter moved backwards")
         delta[field] = last - first
     require(delta["chart_preparations"] > 0, "Runtime workload did not prepare charts")
+    if (mode in memory.CANVAS_CLOCK_MODES or "canvas_frame_clock" in flags
+            or any(field in snapshot for snapshot in (before, after) for field in memory.CANVAS_CLOCK_COUNTERS)):
+        for field in memory.CANVAS_CLOCK_COUNTERS:
+            first = memory.unsigned(before.get(field), f"runtime.before.{field}")
+            last = memory.unsigned(after.get(field), f"runtime.after.{field}")
+            require(last >= first, f"Runtime {field} counter moved backwards")
+            delta[field] = last - first
+        if flags.get("canvas_frame_clock", False):
+            require(delta["rail_frame_clock_ticks"] > 0, "Canvas frame-clock path did not execute frame ticks")
+            require(before["rail_timeline_content_updates"] == after["rail_timeline_content_updates"] == 0,
+                    "Canvas frame-clock mode updated Timeline content")
+        else:
+            require(before["rail_frame_clock_ticks"] == after["rail_frame_clock_ticks"] == 0,
+                    "Nonclock mode executed Canvas frame ticks")
     instrumented_shared = (mode in memory.NEXT_RUNTIME_MODES or any(field in flags for field in memory.NEXT_RUNTIME_FLAGS)
                            or any(field in snapshot for snapshot in (before, after) for field in memory.SHARED_PREPARATION_COUNTERS))
     if instrumented_shared:
@@ -137,6 +152,10 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {role} drawing counter moved backwards")
         delta[role + "_draws"] = last - first
     require(delta["static_chart_draws"] > 0, "Runtime static charts did not redraw")
+    if flags.get("canvas_frame_clock", False):
+        minimum_draws = max(1, math.floor(.8 * delta["rail_frame_clock_ticks"]) - 2)
+        require(delta["rail_decorations_draws"] >= minimum_draws,
+                "Canvas frame ticks did not produce sufficient native decoration draws")
     if not flags["lifecycle_effects_enabled"]:
         require(delta["rail_decorations_draws"] == 0, "No-lifecycle control still drew lifecycle decorations")
     return {"available": True, "features": flags, "deltas": delta}
@@ -193,6 +212,73 @@ def validate_visual_work(report, *, required):
             "identity_policy": "fixture-index-v1", "animation_policy": "fixture-index-and-fixed-twinkle-seed-v1",
             "requests": [{"index": index, "id": expected[index]} for index in sorted(indices)],
             "invalid_requests": 0, "real_time_clocks_preserved": True}
+
+
+def validate_canvas_clock_work(report, mode):
+    """Use existing authenticated checkpoints; never infer idle from a tail deadline."""
+    points = report["runtime"]["checkpoints"]
+    flags = memory.runtime_feature_contract(points[0]["snapshot"].get("graphics_diagnostics", {}), mode) or {}
+    if (mode not in memory.CANVAS_CLOCK_MODES and "canvas_frame_clock" not in flags
+            and not any(field in point["snapshot"] for point in points for field in memory.CANVAS_CLOCK_COUNTERS)):
+        return {"available": False, "reason": "Frozen product predates rail frame-clock counters"}
+    clock_enabled = flags.get("canvas_frame_clock", False)
+    clocks = report["runtime"]
+    offset = sum(clocks[name]["absolute_minus_monotonic_seconds"] for name in ("mach_clock_start", "mach_clock_end")) / 2
+
+    def boundary(point):
+        snapshot, sample = point["snapshot"], point["resource_sample"]
+        matches = [row for row in report["samples"]
+                   if row["monotonic_seconds"] == snapshot.get("runner_collector_sample_monotonic_seconds")]
+        require(len(matches) == 1 and matches[0] == sample
+                and sample["process_id"] == report["owned_identity"]["process_id"]
+                and sample["birth_time_us"] == report["owned_identity"]["birth_time_us"],
+                "Frame-clock checkpoint lacks its authenticated kernel boundary")
+        require(memory.runtime_feature_contract(snapshot.get("graphics_diagnostics", {}), mode) == flags,
+                "Frame-clock feature metadata changed during the capture")
+        for field in memory.CANVAS_CLOCK_COUNTERS:
+            memory.unsigned(snapshot.get(field), field)
+        if clock_enabled:
+            require(snapshot["rail_timeline_content_updates"] == 0, "Canvas frame-clock mode updated Timeline content")
+        else:
+            require(snapshot["rail_frame_clock_ticks"] == 0, "Nonclock mode executed Canvas frame ticks")
+        return sample["mach_absolute_seconds"] - offset
+
+    timestamps = [boundary(point) for point in points]
+    for first, last in zip(points, points[1:]):
+        require(all(last["snapshot"][field] >= first["snapshot"][field] for field in memory.CANVAS_CLOCK_COUNTERS),
+                "Frame-clock counters moved backwards during runtime")
+    window = report["phase_windows"]["steady"]
+    steady = [(point, timestamp) for point, timestamp in zip(points, timestamps)
+              if window["start_monotonic_seconds"] < timestamp < window["end_monotonic_seconds"]]
+    require(len(steady) >= 2 and all(point["snapshot"].get("active_requests") == 2 for point, _ in steady),
+            "Frame-clock steady evidence lacks both active requests and interior checkpoints")
+    first, last = steady[0][0], steady[-1][0]
+    delta = {field: last["snapshot"][field] - first["snapshot"][field] for field in memory.CANVAS_CLOCK_COUNTERS}
+    if clock_enabled:
+        # This exact fixture has only two simultaneous arrivals (0.8s effects)
+        # and no completion before 25s. The +5s..+20s interior excludes both.
+        require(delta["rail_frame_clock_ticks"] == 0, "Canvas frame clock continued ticking during effect-free steady traffic")
+    result = {"available": True, "steady": {"start_checkpoint": first["label"], "end_checkpoint": last["label"],
+        "start_monotonic_seconds": steady[0][1], "end_monotonic_seconds": steady[-1][1], "deltas": delta,
+        "scope": "Interior of the fixed fixture's +5s..+20s steady phase; arrival/completion effects absent"}}
+    if clock_enabled:
+        closed = []
+        for label in ("07-both-closed-after-probe", "08-closed-after-five-more-seconds"):
+            matches = [point for point in report["checkpoints"] if point["label"] == label]
+            require(len(matches) == 1, "Frame-clock closed cancellation checkpoints are incomplete")
+            point = matches[0]
+            timestamp = boundary(point)
+            snapshot = point["snapshot"]
+            require(snapshot.get("dashboard_visible") is False and snapshot.get("popover_visible") is False
+                    and snapshot.get("active_requests") == 0, "Frame-clock cancellation checkpoint is not closed and idle")
+            closed.append((point, timestamp))
+        require(closed[1][1] - closed[0][1] >= 5, "Frame-clock closed cancellation interval is shorter than five seconds")
+        require(closed[0][0]["snapshot"]["rail_frame_clock_ticks"] >= points[-1]["snapshot"]["rail_frame_clock_ticks"]
+                and closed[0][0]["snapshot"]["rail_frame_clock_ticks"] == closed[1][0]["snapshot"]["rail_frame_clock_ticks"],
+                "Canvas frame clock continued ticking after both windows closed")
+        result["closed"] = {"start_checkpoint": closed[0][0]["label"], "end_checkpoint": closed[1][0]["label"],
+            "start_monotonic_seconds": closed[0][1], "end_monotonic_seconds": closed[1][1], "rail_frame_clock_ticks_delta": 0}
+    return result
 
 
 def phase_windows(report):
@@ -487,6 +573,7 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
         report["runtime_work"]["interval"] = {
             "scope": "whole_contiguous_runtime", "start_checkpoint": points[0]["label"],
             "end_checkpoint": points[-1]["label"], **report["phase_windows"]["whole_contiguous_runtime"]}
+        report["canvas_clock_work"] = validate_canvas_clock_work(report, mode)
         report["phase_cpu"] = phase_cpu(report, report["phase_windows"])
         report["phase_cpu_comparison_available"] = not profile
         report["runtime_cpu_target"] = {"evaluated": not profile, "limit_percent": 5.0,
