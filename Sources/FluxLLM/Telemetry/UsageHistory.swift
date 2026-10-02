@@ -58,6 +58,11 @@ public final class UsageHistory {
     private var toolCallTotals: [AccountingBucket: Int] = [:]
     private var toolOrder: [ToolKey] = []
     private var toolOrderIsDirty = true
+    /// Scalar work evidence; no event payloads or historical query results retained.
+    private(set) var completedOrderBuildCount: UInt64 = 0
+    private(set) var toolOrderBuildCount: UInt64 = 0
+    private(set) var completedOrderIncrementalInsertCount: UInt64 = 0
+    private(set) var toolOrderIncrementalInsertCount: UInt64 = 0
     private var cachedToolOwners: ToolOwnerQueryCache?
     /// Counts visited event records, excluding binary-search probes, so regression
     /// checks can distinguish a rolling query from rescanning the retained day.
@@ -143,12 +148,13 @@ public final class UsageHistory {
             if !terminal && snapshot.liveTPS.isFinite {
                 record.liveTPS = max(0, snapshot.liveTPS)
             }
-            if terminal && record.endedAt == nil {
+            let newlyCompleted = terminal && record.endedAt == nil
+            if newlyCompleted {
                 record.endedAt = max(record.startedAt, snapshot.timestamp)
                 activeRequests.remove(key)
-                completedOrderIsDirty = true
             }
             records[key] = record
+            if newlyCompleted { insertCompletedOrder(key, endedAt: record.endedAt!) }
             updateLaunchTotals(source: source, removing: old, adding: record)
         case .failed(let id, _), .cancelled(let id):
             finish(RequestKey(source: source, id: id), at: date)
@@ -176,8 +182,7 @@ public final class UsageHistory {
                 tools[key] = UsageToolRecord(
                     id: event.id, nameID: metadata.retain(event.name), timestamp: event.timestamp)
                 retainedToolEventCounts[requestKey, default: 0] += 1
-                toolOrderIsDirty = true
-                cachedToolOwners = nil
+                insertToolOrder(key, timestamp: event.timestamp)
                 if event.kind == .call {
                     launchTotals[source, default: UsageTotals()].toolCalls += 1
                     toolCallTotals[
@@ -408,16 +413,78 @@ public final class UsageHistory {
 
     private func prepareToolOrder() {
         guard toolOrderIsDirty else { return }
-        toolOrder = tools.keys.sorted { tools[$0]!.timestamp < tools[$1]!.timestamp }
+        if PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering {
+            toolOrder = tools.map { (key: $0.key, timestamp: $0.value.timestamp) }
+                .sorted { $0.timestamp < $1.timestamp }.map(\.key)
+        } else {
+            toolOrder = tools.keys.sorted { tools[$0]!.timestamp < tools[$1]!.timestamp }
+        }
         toolOrderIsDirty = false
+        toolOrderBuildCount &+= 1
+        PerformancePresentationCounters.shared.record(.historyToolOrderBuilds)
     }
 
     private func prepareCompletedOrder() {
         guard completedOrderIsDirty else { return }
-        completedOrder = records.keys.filter { records[$0]!.endedAt != nil }.sorted {
-            records[$0]!.endedAt! < records[$1]!.endedAt!
+        if PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering {
+            completedOrder = records.compactMap { element in
+                element.value.endedAt.map { (key: element.key, timestamp: $0) }
+            }.sorted { $0.timestamp < $1.timestamp }.map(\.key)
+        } else {
+            completedOrder = records.keys.filter { records[$0]!.endedAt != nil }.sorted {
+                records[$0]!.endedAt! < records[$1]!.endedAt!
+            }
         }
         completedOrderIsDirty = false
+        completedOrderBuildCount &+= 1
+        PerformancePresentationCounters.shared.record(.historyCompletedOrderBuilds)
+    }
+
+    /// Keep a materialized order current without sorting the retained history
+    /// for one new record. Released/never-queried caches remain unmaterialized.
+    private func insertCompletedOrder(_ key: RequestKey, endedAt: Date) {
+        guard PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering,
+            !completedOrderIsDirty
+        else {
+            completedOrderIsDirty = true
+            return
+        }
+        if let last = completedOrder.last, records[last]!.endedAt! > endedAt {
+            let index = lowerBound(completedOrder.count) {
+                records[completedOrder[$0]]!.endedAt! <= endedAt
+            }
+            completedOrder.insert(key, at: index)
+        } else {
+            completedOrder.append(key)
+        }
+        completedOrderIncrementalInsertCount &+= 1
+        PerformancePresentationCounters.shared.record(.historyCompletedOrderInsertions)
+    }
+
+    private func insertToolOrder(_ key: ToolKey, timestamp: Date) {
+        guard PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering,
+            !toolOrderIsDirty
+        else {
+            toolOrderIsDirty = true
+            cachedToolOwners = nil
+            return
+        }
+        if let last = toolOrder.last, tools[last]!.timestamp > timestamp {
+            let index = lowerBound(toolOrder.count) { tools[toolOrder[$0]]!.timestamp <= timestamp }
+            toolOrder.insert(key, at: index)
+            // Every saved range uses array indices. An insertion before its end
+            // may shift those indices or add an owner to an unchanged viewport.
+            cachedToolOwners = nil
+        } else {
+            toolOrder.append(key)
+            // A chronological append beyond the half-open window changes none
+            // of its indices or owners. The next rolling query visits the delta.
+            if let cachedToolOwners, timestamp < cachedToolOwners.interval.end {
+                self.cachedToolOwners = nil
+            }
+        }
+        toolOrderIncrementalInsertCount &+= 1
+        PerformancePresentationCounters.shared.record(.historyToolOrderInsertions)
     }
 
     private func addBoundaryUsage(source: Int, interval: DateInterval, to total: inout UsageTotals)
@@ -471,7 +538,7 @@ public final class UsageHistory {
         record.lastUpdatedAt = record.endedAt ?? date
         records[key] = record
         activeRequests.remove(key)
-        completedOrderIsDirty = true
+        insertCompletedOrder(key, endedAt: record.endedAt!)
         updateLaunchTotals(source: key.source, removing: old, adding: record)
     }
 
@@ -526,6 +593,11 @@ public final class UsageHistory {
             records.count > recordLimit || tools.count > toolEventLimit
                 || (lastPrunedAt.map({ now.timeIntervalSince($0) >= 60 }) ?? true)
         else { return }
+        // Removal helpers invalidate indices immediately. Repair each prepared
+        // order once after the batch, avoiding a shift per expired record.
+        let incremental = PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering
+        let preserveCompletedOrder = incremental && !completedOrderIsDirty
+        let preserveToolOrder = incremental && !toolOrderIsDirty
         lastPrunedAt = now
         let cutoff = now.addingTimeInterval(-Self.retentionInterval)
         let expired = records.filter { ($0.value.endedAt.map { $0 < cutoff }) ?? false }
@@ -564,6 +636,14 @@ public final class UsageHistory {
         }
         requestTruncatedThrough = requestTruncatedThrough.filter { $0.value >= cutoff }
         toolTruncatedThrough = toolTruncatedThrough.filter { $0.value >= cutoff }
+        if preserveCompletedOrder && completedOrderIsDirty {
+            completedOrder.removeAll { records[$0] == nil }
+            completedOrderIsDirty = false
+        }
+        if preserveToolOrder && toolOrderIsDirty {
+            toolOrder.removeAll { tools[$0] == nil }
+            toolOrderIsDirty = false
+        }
     }
 
     private func contains(_ interval: DateInterval, _ date: Date) -> Bool {
