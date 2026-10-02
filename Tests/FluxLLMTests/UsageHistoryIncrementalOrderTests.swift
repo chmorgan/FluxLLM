@@ -243,8 +243,8 @@ final class UsageHistoryIncrementalOrderTests: XCTestCase {
         }
     }
 
-    func testNormalComparisonStillUsesFullRebuildAfterAnInsertion() throws {
-        try withMode(.normal) {
+    func testBaselineComparisonStillUsesFullRebuildAfterAnInsertion() throws {
+        try withMode(.nativeGPUOptimized) {
             let history = UsageHistory(now: origin)
             let first = begin(history, at: 0)
             tools(history, first, events: [event(at: 1)])

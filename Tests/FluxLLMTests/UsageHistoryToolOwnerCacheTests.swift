@@ -76,7 +76,7 @@ final class UsageHistoryToolOwnerCacheTests: XCTestCase {
         }
     }
 
-    func testDuplicatesAndRequestUpdatesReuseCacheButNewToolEventsInvalidateIt() {
+    func testOnlyInWindowToolInsertionsInvalidateCachedOwners() {
         let history = UsageHistory(now: origin)
         let first = begin(history, id: 1)
         let second = begin(history, id: 2)
@@ -115,7 +115,9 @@ final class UsageHistoryToolOwnerCacheTests: XCTestCase {
         XCTAssertEqual(
             history.requestIDsWithToolEvents(source: source, interval: window),
             Set([first.id, second.id]))
-        XCTAssertGreaterThan(history.toolOwnerQueryVisitedEvents, afterInsertion)
+        // A chronological append outside this half-open window leaves its
+        // materialized order indices and owner counts unchanged.
+        XCTAssertEqual(history.toolOwnerQueryVisitedEvents, afterInsertion)
     }
 
     func testCapacityEvictionInvalidatesCachedCountsAndUnboundedOwnership() {

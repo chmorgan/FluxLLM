@@ -105,6 +105,8 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertTrue(diagnostics.mode.usesNativeGPUCanvas)
         XCTAssertTrue(diagnostics.mode.usesCoalescedScalarPresentation)
         XCTAssertTrue(diagnostics.mode.usesRetainedTwinkles)
+        XCTAssertTrue(diagnostics.mode.usesIncrementalHistoryOrdering)
+        XCTAssertTrue(diagnostics.mode.usesOptimizedChartPreparation)
         diagnostics.scalarPresentationPublished()
         XCTAssertNil(diagnostics.retainedTwinkleHostCreated())
         diagnostics.retainedTwinkleHostUpdated(
@@ -608,10 +610,12 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     mode))
             XCTAssertEqual(
                 mode.usesIncrementalHistoryOrdering,
-                [.runtimeHistoryOrder, .runtimeOptimized, .runtimeNoLifecycle].contains(mode))
+                [.normal, .runtimeHistoryOrder, .runtimeOptimized, .runtimeNoLifecycle].contains(
+                    mode))
             XCTAssertEqual(
                 mode.usesOptimizedChartPreparation,
-                [.runtimeChartPreparation, .runtimeOptimized, .runtimeNoLifecycle].contains(mode))
+                [.normal, .runtimeChartPreparation, .runtimeOptimized, .runtimeNoLifecycle]
+                    .contains(mode))
             XCTAssertEqual(mode.omitsLifecycleEffects, mode == .runtimeNoLifecycle)
         }
     }

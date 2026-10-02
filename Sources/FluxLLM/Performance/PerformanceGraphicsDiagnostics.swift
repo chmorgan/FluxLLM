@@ -68,11 +68,12 @@ public final class PerformanceGraphicsDiagnostics {
         var omitsLifecycleEffects: Bool { self == .runtimeNoLifecycle }
 
         var usesIncrementalHistoryOrdering: Bool {
-            self == .runtimeHistoryOrder || self == .runtimeOptimized || self == .runtimeNoLifecycle
+            self == .normal || self == .runtimeHistoryOrder || self == .runtimeOptimized
+                || self == .runtimeNoLifecycle
         }
 
         var usesOptimizedChartPreparation: Bool {
-            self == .runtimeChartPreparation || self == .runtimeOptimized
+            self == .normal || self == .runtimeChartPreparation || self == .runtimeOptimized
                 || self == .runtimeNoLifecycle
         }
     }
