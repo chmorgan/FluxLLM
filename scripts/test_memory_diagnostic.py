@@ -21,6 +21,9 @@ def graphics(mode="normal"):
     return {"graphics_diagnostics": {
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
+        **({"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle"),
+            "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle"),
+            "lifecycle_effects_enabled": mode != "runtime-no-lifecycle"} if mode in memory.RUNTIME_MODES else {}),
         **({"native_gpu_backend": "swiftui-canvas-drawing-group", "native_gpu_canvas_draws": 0}
            if mode in memory.NATIVE_GPU_MODES else {}),
         **({"scalar_presentation_coalesced": mode in memory.COALESCED_SCALAR_MODES,
@@ -74,6 +77,48 @@ def native_normal_graphics(*, drawn=False):
 
 
 class GraphicsTests(unittest.TestCase):
+    def test_runtime_modes_require_exact_feature_contract_and_native_work(self):
+        for mode in memory.RUNTIME_MODES:
+            snapshot = drawn_native_gpu_graphics(mode)
+            self.assertIsNotNone(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["runtime_feature_contract"])
+            for field in memory.RUNTIME_FLAGS:
+                for replacement in (None, 0, not snapshot["graphics_diagnostics"][field]):
+                    changed = copy.deepcopy(snapshot)
+                    if replacement is None:
+                        del changed["graphics_diagnostics"][field]
+                    else:
+                        changed["graphics_diagnostics"][field] = replacement
+                    with self.subTest(mode=mode, field=field, replacement=replacement), self.assertRaises(InvalidResult):
+                        memory.validate_graphics(changed, mode)
+            snapshot["graphics_diagnostics"]["retained_twinkles"]["animation_starts"] = 0
+            with self.assertRaisesRegex(InvalidResult, "did not submit"):
+                memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+
+    def test_normal_runtime_contract_preserves_old_and_promoted_paths_but_cannot_disappear(self):
+        self.assertIsNone(memory.runtime_feature_contract({}, "normal"))
+        for enabled in (False, True):
+            snapshot = native_normal_graphics()
+            snapshot["graphics_diagnostics"].update(incremental_history_ordering=enabled,
+                optimized_chart_preparation=enabled, lifecycle_effects_enabled=True)
+            diagnostic = memory.MemoryDiagnostic(Path("/unused"), memory.MemoryDeadline(), "normal")
+            diagnostic.validate_graphics_snapshot(snapshot)
+            for field in memory.RUNTIME_FLAGS:
+                changed = copy.deepcopy(snapshot)
+                del changed["graphics_diagnostics"][field]
+                with self.subTest(enabled=enabled, missing=field), self.assertRaises(InvalidResult):
+                    diagnostic.validate_graphics_snapshot(changed)
+            changed = copy.deepcopy(snapshot)
+            for field in memory.RUNTIME_FLAGS:
+                del changed["graphics_diagnostics"][field]
+            with self.assertRaisesRegex(InvalidResult, "changed or disappeared"):
+                diagnostic.validate_graphics_snapshot(changed)
+            changed = copy.deepcopy(snapshot)
+            changed["graphics_diagnostics"].update(incremental_history_ordering=not enabled,
+                optimized_chart_preparation=not enabled)
+            with self.assertRaisesRegex(InvalidResult, "changed or disappeared"):
+                diagnostic.validate_graphics_snapshot(changed)
+
+
     def test_normal_preserves_old_renderer_snapshots_and_validates_new_combined_contract(self):
         legacy = graphics()
         value = legacy["graphics_diagnostics"]

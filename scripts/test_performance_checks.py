@@ -37,6 +37,15 @@ class CommandRoutingTests(unittest.TestCase):
         module.run.assert_called_once_with(["--graphics-mode", "normal"])
         legacy.assert_not_called()
 
+    def test_runtime_dispatch_does_not_build_or_run_full_gate(self):
+        module = mock.Mock()
+        module.run.return_value = 8
+        with mock.patch.dict(sys.modules, {"runtime_attribution": module}), \
+                mock.patch.object(perf, "legacy_main") as legacy:
+            self.assertEqual(perf.main(["runtime", "compare"]), 8)
+        module.run.assert_called_once_with(["compare"])
+        legacy.assert_not_called()
+
     def test_legacy_command_routing_is_unchanged(self):
         with mock.patch.object(perf, "legacy_main", return_value=4) as legacy:
             self.assertEqual(perf.main(["baseline", "--command", "prebuilt-test"]), 4)

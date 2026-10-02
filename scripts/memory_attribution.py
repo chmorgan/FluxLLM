@@ -24,10 +24,13 @@ from run_performance_checks import interrupted, load_json, number, require, writ
 GRAPHICS_MODES = ("normal", "direct-host", "empty-drawing", "no-renderer", "bitmap-destination", "bitmap-layer-destination",
                   "bitmap-layer-bgra", "bitmap-layer-no-decorations", "native-gpu-canvas", "native-gpu-coalesced-scalars",
                   "native-gpu-retained-twinkles", "native-gpu-optimized", "no-blur", "cpu-glow", "no-gradients", "no-gradients-or-blur")
+RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized")
+GRAPHICS_MODES += RUNTIME_MODES
+RUNTIME_FLAGS = ("incremental_history_ordering", "optimized_chart_preparation", "lifecycle_effects_enabled")
 LAYER_DESTINATION_MODES = ("bitmap-layer-destination", "bitmap-layer-bgra", "bitmap-layer-no-decorations")
-NATIVE_GPU_MODES = ("native-gpu-canvas", "native-gpu-coalesced-scalars", "native-gpu-retained-twinkles", "native-gpu-optimized")
-COALESCED_SCALAR_MODES = ("native-gpu-coalesced-scalars", "native-gpu-optimized")
-RETAINED_TWINKLE_MODES = ("native-gpu-retained-twinkles", "native-gpu-optimized")
+NATIVE_GPU_MODES = ("native-gpu-canvas", "native-gpu-coalesced-scalars", "native-gpu-retained-twinkles", "native-gpu-optimized") + RUNTIME_MODES
+COALESCED_SCALAR_MODES = ("native-gpu-coalesced-scalars", "native-gpu-optimized") + RUNTIME_MODES
+RETAINED_TWINKLE_MODES = ("native-gpu-retained-twinkles", "native-gpu-optimized") + RUNTIME_MODES
 RETAINED_TWINKLE_FIELDS = ("hosts_created", "hosts_destroyed", "live_hosts", "peak_hosts",
                           "instances_created", "instances_destroyed", "live_instances", "peak_instances", "animation_starts")
 GRADIENT_ABLATION_MODES = ("no-gradients", "no-gradients-or-blur")
@@ -342,6 +345,25 @@ def validate_retained_twinkles(value, mode, *, completed_visible_workload=False,
                 "Retained twinkle resources remain live at a closed checkpoint")
 
 
+def runtime_feature_contract(value, mode):
+    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS):
+        return None
+    if mode == "normal":
+        require(all(type(value.get(field)) is bool for field in RUNTIME_FLAGS), "Normal runtime feature metadata is incomplete")
+        flags = {field: value[field] for field in RUNTIME_FLAGS}
+        require(flags["lifecycle_effects_enabled"] and flags["incremental_history_ordering"] == flags["optimized_chart_preparation"],
+                "Normal runtime feature metadata does not identify the baseline or combined production path")
+        return flags
+    expected = {"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle"),
+                "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle"),
+                "lifecycle_effects_enabled": mode != "runtime-no-lifecycle"}
+    for field, enabled in expected.items():
+        if mode in RUNTIME_MODES or field in value:
+            require(type(value.get(field)) is bool and value[field] is enabled,
+                    f"Graphics {field} does not match the requested runtime control")
+    return {field: value[field] for field in RUNTIME_FLAGS if field in value}
+
+
 def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False,
                       require_native_normal=False):
     value = snapshot.get("graphics_diagnostics")
@@ -357,7 +379,8 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     # Keep the requested mode acknowledgment while applying the complete
     # combined contract to newer production binaries that identify this backend.
     native_normal = mode == "normal" and "native_gpu_backend" in value
-    contract = "native-gpu-optimized" if native_normal else mode
+    contract = "native-gpu-optimized" if native_normal or mode in RUNTIME_MODES else mode
+    runtime_features = runtime_feature_contract(value, mode)
     if mode == "normal" and not native_normal:
         for field in ("scalar_presentation_coalesced", "retained_twinkles_enabled"):
             if field in value:
@@ -490,6 +513,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             require(native_gpu_draws > 0 and roles["static_chart"]["draws"] > 0,
                     "Completed visible workload did not execute native GPU static-chart drawing")
     return {"available": True, "counters": value,
+            **({"runtime_feature_contract": runtime_features} if runtime_features is not None else {}),
             **({"normal_rendering_contract": "native-gpu-optimized" if native_normal else "legacy"}
                if mode == "normal" else {})}
 
@@ -542,6 +566,7 @@ class MemoryDiagnostic:
         self.no_popover_animation = no_popover_animation
         self.no_native_inspection = no_native_inspection
         self.require_native_normal = False
+        self.runtime_feature_contract = None
         self.collector = self.fixture = self.active_probe = None
         self.identity = None
         self.report = {"schema_version": 1, "kind": "memory-attribution-diagnostic", "status": "running",
@@ -601,6 +626,12 @@ class MemoryDiagnostic:
     def validate_graphics_snapshot(self, snapshot, *, completed_visible_workload=False, expected_closed=False):
         result = validate_graphics(snapshot, self.graphics_mode, completed_visible_workload=completed_visible_workload,
                                    expected_closed=expected_closed, require_native_normal=self.require_native_normal)
+        contract = result.get("runtime_feature_contract")
+        if self.runtime_feature_contract is not None:
+            require(contract == self.runtime_feature_contract, "Runtime feature metadata changed or disappeared during the capture")
+        elif contract is not None:
+            self.runtime_feature_contract = contract
+            self.report["runtime_feature_contract"] = contract
         if self.graphics_mode == "normal":
             contract = result.get("normal_rendering_contract", "unavailable")
             self.report["normal_rendering_contract"] = contract
@@ -611,6 +642,10 @@ class MemoryDiagnostic:
     def validate_control_snapshot(self, snapshot):
         self.validate_graphics_snapshot(snapshot)
         validate_popover_animation(snapshot, self.no_popover_animation)
+
+    def create_collector(self, *args, **kwargs):
+        """A local extension point for bounded diagnostic collectors."""
+        return app.Collector(*args, **kwargs)
 
     def inspect_tool(self, label, tool):
         self.verify_identity()
@@ -688,7 +723,7 @@ class MemoryDiagnostic:
         if self.no_popover_animation:
             configuration["popover_animations_enabled"] = False
         write_json(directory / "configuration.json", configuration)
-        self.collector = app.Collector(paths["collector"], paths["app"], configuration, {}, directory, self.deadline,
+        self.collector = self.create_collector(paths["collector"], paths["app"], configuration, {}, directory, self.deadline,
                                        {"external_trace": True, "provenance": provenance, "fixture_schema_version": 2})
         ready = self.collector.ready()
         self.report["ready"] = ready

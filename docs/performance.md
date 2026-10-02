@@ -433,6 +433,81 @@ and released memory separate; do not infer a leak or API-wide cost from one peak
 Results and source/product identities are written to a new ignored artifact
 directory; previous captures are never overwritten.
 
+## Runtime CPU attribution
+
+Profile the visible application with reviewed, prebuilt products:
+
+```sh
+python3 scripts/run_performance_checks.py runtime profile \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json
+```
+
+The default profile mode is `normal`; `--graphics-mode` selects
+`native-gpu-optimized` or a runtime control below. Time Profiler samples perturb
+execution, so profile results provide CPU attribution, not CPU acceptance.
+Trace export and analysis share the command's hard **300-second deadline**.
+The command never builds products or automatically retries a failed capture.
+
+Use an unprofiled comparison to measure a candidate against the same frozen binary:
+
+```sh
+python3 scripts/run_performance_checks.py runtime compare \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json
+```
+
+The default sequence is `native-gpu-optimized`, `runtime-optimized`, then
+`native-gpu-optimized` again. Use `--baseline-mode normal` to change both baseline
+cases. `--controls` accepts one through three distinct controls, for at most five
+cases within the same 300-second deadline. For example,
+`--controls runtime-history-order runtime-chart-preparation runtime-optimized`
+compares each optimization separately and together.
+
+| Runtime control | Behavior |
+|---|---|
+| `runtime-history-order` | Maintain history ordering incrementally. |
+| `runtime-chart-preparation` | Use the optimized chart preparation path. |
+| `runtime-optimized` | Enable both history ordering and chart preparation optimizations. |
+| `runtime-no-lifecycle` | Enable both optimizations and remove arrival/completion effects; active retained twinkles remain enabled. |
+
+Every case uses the same exact 25-second, two-stream fixture with 10,000 content
+chunks, followed by three seconds of visible completion. Native dashboard and
+popover visibility, token progression, and owned PID/birth identity are checked
+at one-second intervals. Product hashes and measurement sources must remain
+unchanged. Missing visibility, stalled progress, changed identity, incomplete
+forwarding, invalid counters, or an unfinished trace/export produce an incomplete
+diagnostic rather than a usable comparison.
+
+Unprofiled reports show CPU averaged across the whole contiguous runtime and its
+maximum rolling one-second CPU, normalized to one core. An explicit CPU
+`within_limit` result compares that maximum with **5%**; it covers visible traffic
+and completion, not startup or the full resource gate. Memory is reported only.
+The calibrated GPU and filesystem-write gates remain separate, and normal strict
+budgets are unchanged. Arrival, steady, completion, and whole-runtime windows are
+also retained separately; overlapping windows must not be summed.
+
+A comparison is inconclusive if either baseline mean or maximum drifts by more
+than both 20% of the larger baseline value and 0.5 percentage points. Work counters
+must also prove the selected path ran: optimized preparation must account for all
+chart preparations, with a positive count; warmed incremental history must perform
+no full order rebuilds and must record positive tool and completed-record
+insertions. Comparisons require the complete feature/counter contract in every
+case. A frozen older `normal` profile may omit that metadata and records it as
+unavailable; supplied flags are validated, and new runtime controls always
+require the full contract.
+
+Each command writes `runtime-report.json`, `SUMMARY.md`, per-case raw evidence,
+and a hashed measurement-source capsule to a unique ignored
+`.performance-results/runtime-*` directory. Profiles also preserve their trace
+and exported attribution. `--output-dir` may select a new directory; existing
+artifacts are never overwritten. Consult the authoritative JSON status before
+using any partially written artifacts.
+
 ## Baselines and comparison artifacts
 
 Record the same workload before changing production behavior:
