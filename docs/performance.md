@@ -976,7 +976,7 @@ This runs exactly **reference-before / candidate / reference-after**, with
 detailed timing off in all three cases. Each uses the same three-episode replay
 and a 65-second case allowance inside the shared 300-second command deadline.
 `--graphics-mode` selects `runtime-metal-arrival-bursts` by default or `normal`
-for all three cases; it is only valid with reference products. Reference
+for all three cases; it is valid with reference products or `--profile`. Reference
 comparison cannot be combined with `--profile`, and partial reference arguments
 are rejected before capture. Omitting reference arguments preserves the existing
 four-case comparison or single profiling invocation.
@@ -990,6 +990,53 @@ compares only the two reference cases; candidate CPU does not determine whether
 the reference bracket is stable. CPU targets, native visibility, exact work,
 quiet/closed cancellation, and clean-exit checks remain unchanged. GPU execution
 still requires its separate measurement invocation.
+
+## Short matched GPU comparison
+
+Compare two frozen Release products with the same renderer in one calibrated
+Instruments recording:
+
+```sh
+python3 scripts/run_performance_checks.py gpu-compare \
+  --reference-products /absolute/reference-products \
+  --candidate-products /absolute/candidate-products \
+  --graphics-mode normal \
+  --output-dir .performance-results/gpu-version-comparison
+```
+
+Each products directory supplies `FluxLLMApp`, `FluxLLMPackageTests.xctest`,
+`FluxLLMResourceCollector`, resource bundles, and reviewed `provenance.json`.
+`runtime-metal-arrival-bursts` may replace `normal`; both products always use the
+same selected mode. No build is performed.
+
+If reviewed external measurement scripts changed since the products were frozen,
+`--rebind-measurement` preserves a separate provenance binding in the report
+directory. It verifies the original products and collector before rebinding;
+the original provenance and binaries remain unchanged.
+
+Each app runs the same populated dashboard workload: two concurrent streams at
+200 chunks per second for eight seconds, then at least three seconds of visible
+completion. Expected work is 3,200 chunks, 6,434 output tokens, 46 prompt tokens,
+two requests, two tool calls, and two results. Native visibility, exact forwarding
+and accounting, process ownership, paired clocks, calibration, loss diagnostics,
+GPU command completion, and clean exit must qualify before comparing GPU values.
+CPU collected under Instruments is diagnostic only and cannot satisfy the CPU
+gate; use the separate unprofiled arrival comparison for CPU.
+
+| Stage | Absolute cutoff from command start |
+|---|---:|
+| Stop recording | 80 seconds |
+| Finalize and save recording | 190 seconds |
+| Export table of contents | 200 seconds |
+| Export required tables | 255 seconds |
+| Evaluate GPU execution | 290 seconds |
+| Cleanup and report | 300 seconds |
+
+These are deadlines, not expected durations. A missed stage leaves an incomplete
+result and its raw evidence; it cannot consume the entire remaining budget and
+silently omit later validation. This shorter GPU workload is separately identified
+and must not be pooled with the ordinary 25-second CPU workload or earlier GPU
+captures. The 1% maximum rolling one-second GPU target remains unchanged.
 
 ## Baselines and comparison artifacts
 

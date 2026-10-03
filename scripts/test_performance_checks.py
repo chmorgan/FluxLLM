@@ -19,6 +19,16 @@ import run_performance_checks as perf
 
 
 class CommandRoutingTests(unittest.TestCase):
+    def test_gpu_comparison_dispatch_does_not_build_or_run_full_gate(self):
+        module = mock.Mock()
+        module.run.return_value = 9
+        arguments = ["--reference-products", "/reference", "--candidate-products", "/candidate"]
+        with mock.patch.dict(sys.modules, {"runtime_gpu_comparison": module}), \
+                mock.patch.object(perf, "legacy_main") as legacy:
+            self.assertEqual(perf.main(["gpu-compare", *arguments]), 9)
+        module.run.assert_called_once_with(arguments)
+        legacy.assert_not_called()
+
     def test_drawing_dispatch_is_separate_from_the_application_gate(self):
         module = mock.Mock()
         module.run.return_value = 6

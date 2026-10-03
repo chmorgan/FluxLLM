@@ -6,6 +6,7 @@ utilization or an absent self counter. Raw XML remains an audit artifact.
 
 from bisect import bisect_right
 from collections import defaultdict
+from contextlib import contextmanager
 import ctypes
 import json
 import math
@@ -570,10 +571,25 @@ class _Sentinel:
 
 class TraceSession:
     """Synchronous start/finalize, independent of the measured app processes."""
-    def __init__(self, output, deadline):
+    def __init__(self, output, deadline, *, phase_deadlines=None, record_limit_seconds=None):
+        self.deadline = float(deadline)
+        self.phase_deadlines = dict(phase_deadlines or {})
+        names = ("record", "finalize", "toc", "export", "evaluate")
+        if set(self.phase_deadlines) - set(names):
+            raise TraceError("Unknown GPU trace phase deadline")
+        ordered = [self.phase_deadlines[name] for name in names if name in self.phase_deadlines]
+        if (not math.isfinite(self.deadline) or any(type(value) not in (int, float)
+                or not math.isfinite(value) or value > self.deadline for value in ordered)
+                or ordered != sorted(ordered)):
+            raise TraceError("GPU trace phase deadlines must be finite, ordered, and within the overall deadline")
+        if record_limit_seconds is not None and (type(record_limit_seconds) not in (int, float)
+                or not math.isfinite(record_limit_seconds) or record_limit_seconds < 1):
+            raise TraceError("GPU recording limit must be at least one finite second")
+        self.record_limit_seconds = record_limit_seconds
+        self.phases = {}
+        self._active_phase = None
         self.output = Path(output) / "system-trace"
         self.output.mkdir(parents=True, exist_ok=False)
-        self.deadline = float(deadline)
         self.trace = self.output / "performance.trace"
         self.xml = self.output / "tables.xml"
         self.toc = self.output / "toc.xml"
@@ -589,11 +605,53 @@ class TraceSession:
         self.schemas = [*CORE_SCHEMAS, *TERMINAL_SCHEMAS]
         self.result = None
 
+    def _phase_deadline(self, name=None):
+        deadline = getattr(self, "deadline", None)
+        phase = name if name is not None else getattr(self, "_active_phase", None)
+        return getattr(self, "phase_deadlines", {}).get(phase, deadline)
+
     def _remaining(self, cap=None):
-        remaining = self.deadline - time.monotonic()
+        remaining = self._phase_deadline() - time.monotonic()
         if remaining <= 0:
-            raise TraceError("Performance deadline expired during trace collection/export")
+            phase = getattr(self, "_active_phase", None)
+            raise TraceError(f"Performance deadline expired during trace {phase or 'collection/export'}")
         return min(remaining, cap) if cap is not None else remaining
+
+    def _begin_phase(self, name, *, check=True):
+        if not hasattr(self, "phases"):
+            self.phases = {}
+        self._active_phase = name
+        self.phases[name] = {"started_monotonic_seconds": time.monotonic(),
+                             "deadline_monotonic_seconds": self._phase_deadline(name), "status": "running"}
+        if check:
+            self._remaining()
+
+    def _end_phase(self, name, error=None):
+        phase = self.phases[name]
+        ended = time.monotonic()
+        expired = ended >= phase["deadline_monotonic_seconds"]
+        phase.update(ended_monotonic_seconds=ended,
+                     elapsed_seconds=max(0, ended - phase["started_monotonic_seconds"]),
+                     status="deadline_exceeded" if expired or isinstance(error, subprocess.TimeoutExpired)
+                     else "failed" if error is not None else "complete")
+        if error is not None:
+            phase["error"] = str(error)
+        return expired
+
+    @contextmanager
+    def _phase(self, name):
+        previous = getattr(self, "_active_phase", None)
+        try:
+            self._begin_phase(name)
+            yield
+            self._remaining()
+        except BaseException as error:
+            self._end_phase(name, error)
+            raise
+        else:
+            self._end_phase(name)
+        finally:
+            self._active_phase = previous
 
     def monotonic_from_mach_seconds(self, value):
         """Convert a collector's paired Mach anchor to the runner clock domain."""
@@ -602,54 +660,72 @@ class TraceSession:
         return value - self.clock_start["absolute_minus_monotonic_seconds"]
 
     def start(self):
-        self.clock_start = _mach_clock()
-        xctrace = Path(subprocess.check_output(["xcrun", "--find", "xctrace"], text=True,
-                                               timeout=self._remaining(3)).strip())
-        template = xctrace.parent.parent.parent.parent / "Applications/Instruments.app/Contents/Packages/Base.instrdst/Contents/Templates/Blank.tracetemplate"
-        if not template.is_file():
-            raise TraceError("The installed minimal Instruments template is unavailable")
-        # The full Metal template also enables CPU profiling, display/resource
-        # modeling, hangs and thermal tracks. They are unnecessary for these
-        # measurements and make a system-wide trace prohibitively expensive.
-        notice = _Notice()
+        notice = None
         try:
+            self._begin_phase("record")
+            self.clock_start = _mach_clock()
+            xctrace = Path(subprocess.check_output(["xcrun", "--find", "xctrace"], text=True,
+                                                   timeout=self._remaining(3)).strip())
+            template = xctrace.parent.parent.parent.parent / "Applications/Instruments.app/Contents/Packages/Base.instrdst/Contents/Templates/Blank.tracetemplate"
+            if not template.is_file():
+                raise TraceError("The installed minimal Instruments template is unavailable")
+            # The full Metal template enables expensive CPU/display/resource
+            # tracks that are unnecessary for process GPU measurements.
+            notice = _Notice()
             self.sentinel = _Sentinel(self.deadline)
+            record_limit = getattr(self, "record_limit_seconds", None)
+            if record_limit is None:
+                record_limit = max(1, int(self._remaining() - 15))
+            if getattr(self, "record_limit_seconds", None) is not None or "record" in self.phase_deadlines:
+                record_limit = int(min(record_limit, self._remaining()))
+                if record_limit < 1:
+                    raise TraceError("Less than one second remains in the GPU recording budget")
             command = [str(xctrace), "record", "--template", str(template), "--attach", str(self.sentinel.process.pid),
                        "--no-prompt", "--notify-tracing-started", notice.name,
-                       "--time-limit", f"{max(1, int(self._remaining() - 15))}s", "--output", str(self.trace)]
+                       "--time-limit", f"{record_limit}s", "--output", str(self.trace)]
             command.extend(["--instrument", "GPU"])
             self.log = (self.output / "record.log").open("w")
             self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
-            ready_deadline = min(self.deadline, time.monotonic() + 15)
+            ready_deadline = min(self._phase_deadline("record"), time.monotonic() + 15)
             while time.monotonic() < ready_deadline:
                 if self.process.poll() is not None:
                     raise TraceError("Instruments exited before recording readiness; see record.log")
                 if notice.ready():
                     self.sentinel.verify()
+                    self._remaining()
                     self.ready_monotonic = time.monotonic()
                     result = {"provider": PROVIDER, "ready_monotonic_seconds": self.ready_monotonic,
                               "clock_start": self.clock_start, "command": command,
                               "attachment_target": {"pid": self.sentinel.process.pid, "birth_time_us": self.sentinel.birth},
+                              "phase_deadlines": self.phase_deadlines,
                               "capture_scope": "Global GPU execution; attached to an owned inert sentinel. Separate future-born helper PIDs validate global attribution each run.",
                               "artifacts": {"trace": str(self.trace)}}
                     (self.output / "start.json").write_text(json.dumps(result, indent=2) + "\n")
                     return result
                 time.sleep(.01)
             raise TraceError("Instruments did not announce recording readiness within 15 seconds")
-        except Exception:
-            if self.process is not None and self.process.poll() is None:
-                self.process.kill()
-                try:
+        except Exception as error:
+            self._end_phase("record", error)
+            try:
+                if self.process is not None and self.process.poll() is None:
+                    self.process.kill()
                     self.process.wait(timeout=.25)
-                except subprocess.TimeoutExpired:
-                    self.invalid.append("Recorder startup cleanup did not finish immediately")
+            except (OSError, subprocess.TimeoutExpired) as cleanup_error:
+                self.invalid.append(f"Recorder startup cleanup: {cleanup_error}")
             if self.sentinel is not None:
-                self.sentinel.close()
+                try:
+                    self.sentinel.close()
+                except (TraceError, OSError, subprocess.TimeoutExpired) as cleanup_error:
+                    self.invalid.append(f"GPU trace attachment startup cleanup: {cleanup_error}")
             if self.log is not None and not self.log.closed:
-                self.log.close()
+                try:
+                    self.log.close()
+                except OSError as cleanup_error:
+                    self.invalid.append(f"GPU trace log startup cleanup: {cleanup_error}")
             raise
         finally:
-            notice.close()
+            if notice is not None:
+                notice.close()
 
     def register_process(self, pid, birth_time_us, baseline_monotonic):
         if type(pid) is not int or pid <= 0 or type(birth_time_us) is not int or birth_time_us <= 0:
@@ -676,8 +752,9 @@ class TraceSession:
 
     def calibrate(self, collector):
         workers = []
-        calibration_deadline = min(self.deadline, time.monotonic() + 8)
+        calibration_deadline = min(self._phase_deadline("record"), time.monotonic() + 8)
         try:
+            self._remaining()
             for label in ("target", "unrelated"):
                 worker = _Worker(collector, calibration_deadline, self.output, label)
                 workers.append(worker)
@@ -691,6 +768,7 @@ class TraceSession:
                 start = time.monotonic()
                 worker.command("work", seconds=1)
                 reply = worker.reply("completed")
+                self._remaining()
                 end = time.monotonic()
                 metal = reply.get("gpu_seconds")
                 if type(metal) not in (int, float) or not math.isfinite(metal) or metal < .05:
@@ -706,9 +784,12 @@ class TraceSession:
             return {"pending_trace_export": False, "invalid": [str(error)]}
         finally:
             for worker in workers:
-                terminal = worker.close()
-                self.register_exit(worker.pid, worker.birth, terminal["final_sample_monotonic_seconds"],
-                                   time.monotonic(), terminal["status"])
+                try:
+                    terminal = worker.close()
+                    self.register_exit(worker.pid, worker.birth, terminal["final_sample_monotonic_seconds"],
+                                       time.monotonic(), terminal["status"])
+                except (ValueError, KeyError, OSError, subprocess.TimeoutExpired) as error:
+                    self.invalid.append(f"GPU trace calibration helper {worker.pid} cleanup: {error}")
             (self.output / "calibration-references.json").write_text(json.dumps(
                 {"references": self.references, "exits": self.exits, "invalid": self.invalid}, indent=2) + "\n")
 
@@ -730,6 +811,7 @@ class TraceSession:
         result = {"provider": PROVIDER, "valid": False, "invalid": self.invalid,
                   "calibration": {}, "windows": {}, "final_exit_coverage": {},
                   "recording_complete": False, "lost_events": None, "tables": {},
+                  "phases": getattr(self, "phases", {}),
                   "artifacts": {"trace": str(self.trace), "xml": str(self.xml), "toc": str(self.toc)}}
         self.result = result
         try:
@@ -743,56 +825,74 @@ class TraceSession:
             else:
                 self.stop_requested_monotonic = time.monotonic()
                 self.invalid.append("Trace recording ended before controlled finalization")
-            self.process.wait(timeout=self._remaining())
-            self.log.close()
-            if self.process.returncode != 0:
-                raise TraceError(f"Instruments recording exited with status {self.process.returncode}")
-            result["recording_complete"] = True
-            result["recording_issues"] = read_run_issues(self.trace)
-            result["lost_events"] = result["recording_issues"]["lost_events"]
-            self.invalid.extend(result["recording_issues"]["invalid"])
-            self.clock_end = _mach_clock()
-            log = (self.output / "record.log").read_text(errors="replace")
-            warnings = [line for line in log.splitlines() if re.search(r"lost|dropped|overflow|incomplete|error|failed", line, re.I)]
-            self.invalid.extend(f"Trace diagnostic: {line}" for line in warnings)
-            if any(re.search(r"lost|dropped|overflow", line, re.I) for line in warnings):
-                result["lost_events"] = True
-            self._run_export(["--toc", "--output", str(self.toc)], "export-toc")
-            toc = ET.parse(self.toc).getroot()
-            available = {table.get("schema") for table in toc.findall(".//table")}
-            if "metal-command-buffer-error" in available:
-                self.schemas.append("metal-command-buffer-error")
-            self.exported_schemas = sorted(set(self.schemas) & available)
-            missing = set(CORE_SCHEMAS) - available
-            self.invalid.extend(f"Required trace schema is absent: {schema}" for schema in sorted(missing))
-            clauses = " or ".join(f'@schema="{name}"' for name in self.exported_schemas)
-            self._run_export(["--xpath", f"/trace-toc/run[@number=\"1\"]/data/table[{clauses}]", "--output", str(self.xml)], "export-tables")
-            export_schema_index(self.trace, self.toc, self.xml)
-            result["exported_schemas"] = self.exported_schemas
-            result["tables"] = {schema: str(self.xml) for schema in self.exported_schemas}
-            self._evaluate(toc, result)
+            if getattr(self, "phases", {}).get("record", {}).get("status") == "running":
+                if self._end_phase("record"):
+                    self.invalid.append("GPU recording exceeded its phase deadline")
+            with self._phase("finalize"):
+                self.process.wait(timeout=self._remaining())
+                self.log.close()
+                if self.process.returncode != 0:
+                    raise TraceError(f"Instruments recording exited with status {self.process.returncode}")
+                result["recording_complete"] = True
+                result["recording_issues"] = read_run_issues(self.trace)
+                result["lost_events"] = result["recording_issues"]["lost_events"]
+                self.invalid.extend(result["recording_issues"]["invalid"])
+                self.clock_end = _mach_clock()
+                log = (self.output / "record.log").read_text(errors="replace")
+                warnings = [line for line in log.splitlines() if re.search(r"lost|dropped|overflow|incomplete|error|failed", line, re.I)]
+                self.invalid.extend(f"Trace diagnostic: {line}" for line in warnings)
+                if any(re.search(r"lost|dropped|overflow", line, re.I) for line in warnings):
+                    result["lost_events"] = True
+            with self._phase("toc"):
+                self._run_export(["--toc", "--output", str(self.toc)], "export-toc")
+                toc = ET.parse(self.toc).getroot()
+                available = {table.get("schema") for table in toc.findall(".//table")}
+                if "metal-command-buffer-error" in available:
+                    self.schemas.append("metal-command-buffer-error")
+                self.exported_schemas = sorted(set(self.schemas) & available)
+                missing = set(CORE_SCHEMAS) - available
+                self.invalid.extend(f"Required trace schema is absent: {schema}" for schema in sorted(missing))
+            with self._phase("export"):
+                clauses = " or ".join(f'@schema="{name}"' for name in self.exported_schemas)
+                self._run_export(["--xpath", f"/trace-toc/run[@number=\"1\"]/data/table[{clauses}]", "--output", str(self.xml)], "export-tables")
+                export_schema_index(self.trace, self.toc, self.xml)
+                result["exported_schemas"] = self.exported_schemas
+                result["tables"] = {schema: str(self.xml) for schema in self.exported_schemas}
+            with self._phase("evaluate"):
+                self._evaluate(toc, result)
         except (ValueError, KeyError, OSError, subprocess.TimeoutExpired, ET.ParseError) as error:
             self.invalid.append(str(error))
         finally:
-            if self.process is not None and self.process.poll() is None:
-                self.process.kill()
-                try:
+            if getattr(self, "phases", {}).get("record", {}).get("status") == "running":
+                self._end_phase("record", TraceError("Recording did not reach controlled finalization"))
+            self._begin_phase("cleanup", check=False)
+            cleanup_errors_before = len(self.invalid)
+            try:
+                if self.process is not None and self.process.poll() is None:
+                    self.process.kill()
                     self.process.wait(timeout=max(.001, min(.5, self.deadline - time.monotonic())))
-                except subprocess.TimeoutExpired:
-                    self.invalid.append("Instruments did not terminate before the deadline")
+            except (OSError, subprocess.TimeoutExpired) as error:
+                self.invalid.append(f"Instruments recorder cleanup: {error}")
             if self.log is not None and not self.log.closed:
-                self.log.close()
+                try:
+                    self.log.close()
+                except OSError as error:
+                    self.invalid.append(f"Instruments log cleanup: {error}")
             if self.sentinel is not None:
                 try:
                     self.sentinel.close()
                 except (TraceError, OSError, subprocess.TimeoutExpired) as error:
                     self.invalid.append(f"GPU trace attachment cleanup: {error}")
+            cleanup_error = (TraceError("; ".join(self.invalid[cleanup_errors_before:]))
+                             if len(self.invalid) > cleanup_errors_before else None)
+            if self._end_phase("cleanup", cleanup_error):
+                self.invalid.append("GPU trace cleanup exceeded the overall deadline")
         result["valid"] = not self.invalid
         (self.output / "trace-report.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
         return result
 
     def _evaluate(self, toc, result):
-        deadline = getattr(self, "deadline", None)
+        deadline = self._phase_deadline("evaluate")
         _check_deadline(deadline)
         result["parser"] = {"implementation": "stdlib.xml.etree.ElementTree", "python_version": platform.python_version(),
                             "element_tree_version": ET.VERSION, "selection": {}}
@@ -1029,7 +1129,7 @@ class TraceSession:
         boundaries or missing modeled execution remain invalid, never finite zero.
         """
         invalid, process_issues = [], []
-        deadline = getattr(self, "deadline", None)
+        deadline = self._phase_deadline("evaluate")
 
         def process_issue(pids, start, end, message):
             for pid in pids:

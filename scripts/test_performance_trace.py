@@ -4,6 +4,7 @@ Run: python3 -m unittest discover -s scripts -p 'test_performance_trace.py' -v
 """
 
 import copy
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -78,6 +79,243 @@ def exported_row(*, start="0", duration="100", process=None, state="Active"):
             "<metal-device-name>Test GPU</metal-device-name><gpu-channel-name>Compute</gpu-channel-name>"
             "<uint64>17</uint64><metal-command-buffer-id>19</metal-command-buffer-id>"
             "<metal-command-buffer-id>23</metal-command-buffer-id>")
+
+
+class TracePhaseBudgetTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.now = 100.0
+        self.clock = patch.object(trace.time, "monotonic", side_effect=lambda: self.now)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.budgets = dict(record=180, finalize=290, toc=300, export=355, evaluate=390)
+
+    def session(self, **kwargs):
+        return trace.TraceSession(self.directory.name, 400, **kwargs)
+
+    def ready_session(self):
+        session = self.session(phase_deadlines=self.budgets, record_limit_seconds=80)
+        session._begin_phase("record")
+        session.process = Mock(returncode=None)
+        session.process.poll.side_effect = lambda: session.process.returncode
+        session.sentinel = Mock()
+        session.log = (session.output / "record.log").open("w")
+
+        def wait(**kwargs):
+            session.process.returncode = 0
+            return 0
+
+        session.process.wait.side_effect = wait
+        return session
+
+    def test_default_budget_remains_overall_deadline(self):
+        session = self.session()
+        self.assertEqual(session._remaining(), 300)
+        self.assertEqual(session._phase_deadline("evaluate"), 400)
+        with session._phase("finalize"):
+            self.assertEqual(session._remaining(), 300)
+        self.assertEqual(session.phases["finalize"]["status"], "complete")
+
+    def test_invalid_phase_budgets_rejected_before_artifact_directory_creation(self):
+        for budgets in ({"unknown": 200}, {"record": 300, "finalize": 200},
+                        {"evaluate": 401}, {"record": float("nan")}, {"record": True}):
+            with self.subTest(budgets=budgets), self.assertRaises(trace.TraceError):
+                self.session(phase_deadlines=budgets)
+        self.assertFalse((Path(self.directory.name) / "system-trace").exists())
+
+    def test_expired_phase_does_not_execute_body_or_consume_next_budget(self):
+        session = self.session(phase_deadlines=self.budgets)
+        self.now = 300
+        body = Mock()
+        with self.assertRaisesRegex(trace.TraceError, "trace toc"):
+            with session._phase("toc"):
+                body()
+        body.assert_not_called()
+        self.assertEqual(session.phases["toc"]["status"], "deadline_exceeded")
+        self.assertEqual(session._phase_deadline("export"), 355)
+
+    def test_readiness_and_record_guard_use_record_deadline(self):
+        session = self.session(phase_deadlines={"record": 108}, record_limit_seconds=80)
+        notice, sentinel, process = Mock(name="notice"), Mock(), Mock()
+        notice.name = "fake-notice"
+        notice.ready.return_value = True
+        sentinel.process.pid = 123
+        sentinel.birth = 456
+        process.poll.return_value = None
+        with patch.object(trace, "_mach_clock", return_value={}), \
+                patch.object(trace.subprocess, "check_output", return_value="/Xcode/a/b/c/xctrace"), \
+                patch.object(Path, "is_file", return_value=True), \
+                patch.object(trace, "_Notice", return_value=notice), \
+                patch.object(trace, "_Sentinel", return_value=sentinel), \
+                patch.object(trace.subprocess, "Popen", return_value=process) as popen:
+            session.start()
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--time-limit") + 1], "8s")
+        self.assertEqual(session.phases["record"]["deadline_monotonic_seconds"], 108)
+        session.log.close()
+
+    def test_startup_failure_records_phase_and_closes_owned_handles(self):
+        session = self.session(phase_deadlines=self.budgets)
+        with patch.object(trace, "_mach_clock", side_effect=trace.TraceError("clock unavailable")):
+            with self.assertRaisesRegex(trace.TraceError, "clock unavailable"):
+                session.start()
+        self.assertEqual(session.phases["record"]["status"], "failed")
+        result = session.finish()
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["phases"]["cleanup"]["status"], "complete")
+
+    def test_finish_uses_separate_absolute_deadlines_and_records_phases(self):
+        session = self.ready_session()
+        self.now = 150
+        timeouts = []
+
+        def wait(**kwargs):
+            timeouts.append(("finalize", kwargs["timeout"]))
+            self.now = 280
+            session.process.returncode = 0
+            return 0
+
+        def export(command, **kwargs):
+            toc = "--toc" in command
+            timeouts.append(("toc" if toc else "export", kwargs["timeout"]))
+            destination = Path(command[command.index("--output") + 1])
+            destination.write_text("<trace-toc>" + "".join(
+                f'<table schema="{schema}"/>' for schema in trace.CORE_SCHEMAS) + "</trace-toc>")
+            self.now = 295 if toc else 350
+            return Mock(returncode=0)
+
+        def evaluate(toc, result):
+            timeouts.append(("evaluate", session._remaining()))
+            self.now = 385
+
+        session.process.wait.side_effect = wait
+        with patch.object(trace, "read_run_issues", return_value={"lost_events": False, "invalid": []}), \
+                patch.object(trace, "_mach_clock", return_value={}), \
+                patch.object(trace.subprocess, "run", side_effect=export), \
+                patch.object(trace, "export_schema_index"), \
+                patch.object(session, "_evaluate", side_effect=evaluate):
+            result = session.finish()
+        self.assertTrue(result["valid"], result["invalid"])
+        self.assertEqual(timeouts, [("finalize", 140), ("toc", 20), ("export", 60), ("evaluate", 40)])
+        self.assertEqual(set(result["phases"]), {*self.budgets, "cleanup"})
+        self.assertTrue(all(phase["status"] == "complete" for phase in result["phases"].values()))
+        self.assertEqual(result["phases"]["cleanup"]["deadline_monotonic_seconds"], 400)
+        session.sentinel.close.assert_called_once()
+        session.process.kill.assert_not_called()
+        self.assertEqual(json.loads((session.output / "trace-report.json").read_text()), result)
+
+    def test_finalize_timeout_stops_pipeline_and_cleans_up_with_global_budget(self):
+        session = self.ready_session()
+        self.now = 150
+
+        def wait(**kwargs):
+            if session.process.wait.call_count == 1:
+                self.now = 290
+                raise trace.subprocess.TimeoutExpired("xctrace record", kwargs["timeout"])
+            session.process.returncode = -9
+            return -9
+
+        session.process.wait.side_effect = wait
+        with patch.object(session, "_run_export") as export:
+            result = session.finish()
+        self.assertFalse(result["valid"])
+        self.assertFalse(result["recording_complete"])
+        self.assertEqual(result["phases"]["finalize"]["status"], "deadline_exceeded")
+        self.assertEqual(result["phases"]["cleanup"]["status"], "complete")
+        self.assertEqual(session.process.wait.call_args_list[-1].kwargs["timeout"], .5)
+        export.assert_not_called()
+        session.process.kill.assert_called_once()
+        session.sentinel.close.assert_called_once()
+        self.assertTrue(session.log.closed)
+        self.assertTrue((session.output / "trace-report.json").is_file())
+
+    def test_record_deadline_overrun_invalidates_result(self):
+        session = self.ready_session()
+        self.now = 181
+        with patch.object(trace, "read_run_issues", side_effect=trace.TraceError("fixture stop")):
+            result = session.finish()
+        self.assertIn("GPU recording exceeded its phase deadline", result["invalid"])
+        self.assertEqual(result["phases"]["record"]["status"], "deadline_exceeded")
+        self.assertFalse(result["valid"])
+
+    def test_toc_timeout_preserves_partial_artifacts_and_stops_later_phases(self):
+        session = self.ready_session()
+        self.now = 150
+
+        def export(command, **kwargs):
+            session.toc.write_text("partial TOC")
+            self.now = 300
+            raise trace.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with patch.object(trace, "read_run_issues", return_value={"lost_events": False, "invalid": []}), \
+                patch.object(trace, "_mach_clock", return_value={}), \
+                patch.object(trace.subprocess, "run", side_effect=export), \
+                patch.object(session, "_evaluate") as evaluate:
+            result = session.finish()
+        self.assertFalse(result["valid"])
+        self.assertTrue(result["recording_complete"])
+        self.assertEqual(result["phases"]["toc"]["status"], "deadline_exceeded")
+        self.assertNotIn("export", result["phases"])
+        self.assertEqual(session.toc.read_text(), "partial TOC")
+        self.assertTrue((session.output / "export-toc.log").is_file())
+        evaluate.assert_not_called()
+        session.sentinel.close.assert_called_once()
+
+    def test_cleanup_failure_still_closes_remaining_owned_handles(self):
+        session = self.ready_session()
+        session.process.wait.side_effect = trace.subprocess.TimeoutExpired("xctrace record", 140)
+        session.process.kill.side_effect = OSError("owned recorder cleanup failed")
+        result = session.finish()
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["phases"]["cleanup"]["status"], "failed")
+        self.assertTrue(session.log.closed)
+        session.sentinel.close.assert_called_once()
+        self.assertTrue((session.output / "trace-report.json").is_file())
+
+    def test_calibration_inherits_record_deadline(self):
+        session = self.session(phase_deadlines={"record": 103})
+        session._begin_phase("record")
+        workers = [Mock(pid=1, birth=11), Mock(pid=2, birth=22)]
+        for worker in workers:
+            worker.reply.return_value = {"gpu_seconds": .1}
+            worker.close.return_value = {"final_sample_monotonic_seconds": 100, "status": 0}
+        with patch.object(trace, "_Worker", side_effect=workers) as worker_type, \
+                patch.object(trace.time, "sleep"):
+            result = session.calibrate("collector")
+        self.assertTrue(result["pending_trace_export"])
+        self.assertEqual([call.args[1] for call in worker_type.call_args_list], [103, 103])
+        for worker in workers:
+            worker.close.assert_called_once()
+
+    def test_calibration_cleanup_failure_does_not_skip_second_owned_worker(self):
+        session = self.session(phase_deadlines=self.budgets)
+        session._begin_phase("record")
+        workers = [Mock(pid=1, birth=11), Mock(pid=2, birth=22)]
+        for worker in workers:
+            worker.reply.return_value = {"gpu_seconds": .1}
+            worker.close.return_value = {"final_sample_monotonic_seconds": 100, "status": 0}
+        workers[0].close.side_effect = trace.TraceError("helper identity changed")
+        with patch.object(trace, "_Worker", side_effect=workers), patch.object(trace.time, "sleep"):
+            session.calibrate("collector")
+        for worker in workers:
+            worker.close.assert_called_once()
+        self.assertNotIn(1, session.exits)
+        self.assertEqual(session.exits[2]["status"], 0)
+        self.assertEqual(session.invalid, ["GPU trace calibration helper 1 cleanup: helper identity changed"])
+        artifact = json.loads((session.output / "calibration-references.json").read_text())
+        self.assertEqual(artifact["invalid"], session.invalid)
+        self.assertEqual(artifact["exits"]["2"], session.exits[2])
+
+    def test_evaluation_and_execution_coverage_honor_earlier_phase_deadline(self):
+        session = self.session(phase_deadlines=self.budgets)
+        self.now = 391
+        with patch.object(trace, "read_table") as read:
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                session._evaluate(ET.fromstring("<trace-toc/>"), {})
+        read.assert_not_called()
+        with self.assertRaisesRegex(TimeoutError, "deadline"):
+            session._execution_coverage(TraceCoverageTests.points((100, 17, 1)), {"intervals": []}, 0, 1)
 
 
 class TraceCoverageTests(unittest.TestCase):
