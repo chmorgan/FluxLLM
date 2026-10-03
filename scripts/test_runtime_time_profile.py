@@ -134,6 +134,59 @@ class AttributionTests(unittest.TestCase):
         self.assertTrue(result["analysis_quality"]["quantitative_attribution_usable"])
         self.assertTrue(phase["sample_kernel_agreement"]["within_tolerance"])
 
+    def test_caller_context_keeps_recursion_and_separates_self_from_descendants(self):
+        phase = self.analyze()["phases"][0]
+        nodes = phase["call_tree"]["nodes"]
+        root, parent, caller, leaf = nodes
+        self.assertEqual([node["symbol"] for node in nodes],
+                         ["<all owned-process threads>", "parent", "MetricsStore.sample()", "MetricsStore.sample()"])
+        self.assertEqual([node["parent_id"] for node in nodes], [None, 0, 1, 2])
+        self.assertEqual(leaf["self_weight_ns"], 2_000_000)
+        self.assertEqual(caller["self_weight_ns"], 0)
+        self.assertEqual(parent["inclusive_weight_ns"], root["inclusive_weight_ns"])
+        self.assertEqual(sum(node["self_weight_ns"] for node in nodes), phase["total"]["weight_ns"])
+        self.assertEqual(phase["call_tree"]["unexpanded_stack_weight_ns"], 0)
+
+    def test_thread_totals_cover_worker_and_main_without_double_counting(self):
+        def change(root):
+            row = root.findall("node/row")[2]
+            row.remove(row.find("thread"))
+            worker = ET.SubElement(row, "thread", fmt="Worker")
+            ET.SubElement(worker, "tid").text = "8"
+            ET.SubElement(worker, "process", ref="p")
+        self.mutate_table(change)
+        phase = self.analyze()["phases"][0]
+        self.assertEqual(phase["threads"], [7, 8])
+        self.assertEqual([row["weight_ns"] for row in phase["thread_totals"]], [1_000_000, 1_000_000])
+        self.assertEqual(sum(row["weight_ns"] for row in phase["thread_totals"]), phase["total"]["weight_ns"])
+
+    def test_sampling_resolution_does_not_invent_precision_or_rescale(self):
+        phase = self.analyze()["phases"][0]
+        resolution = phase["sampling_resolution"]
+        self.assertEqual(resolution["sample_count"], 2)
+        self.assertEqual(resolution["effective_weighted_sample_count"], 2)
+        self.assertAlmostEqual(resolution["largest_sample_cpu_percentage_points"], .05)
+        self.assertEqual(resolution["one_sample_fraction_of_sampled_cpu_percent"], 50)
+        self.assertIn("not a confidence interval", resolution["warning"])
+        self.assertEqual(phase["total"]["weight_ns"], 2_000_000)
+
+    def test_uncertainty_requires_running_coverage_beyond_both_phase_edges(self):
+        self.table.write_text(table_xml().replace("9000000000", "4000050000"))
+        result = self.analyze()
+        self.assertEqual(result["status"], "analysis_pending")
+        self.assertEqual(result["analysis_quality"]["clock_uncertainty_unbracketed_phases"], ["arrival"])
+        self.assertFalse(result["analysis_quality"]["quantitative_attribution_usable"])
+        self.assertEqual(result["phases"][0]["total"]["weight_ns"], 2_000_000)
+
+    def test_call_tree_bound_keeps_unexpanded_cpu_explicit(self):
+        rows = [{"frames": ["leaf", "mid", "caller", "root"], "weight_ns": 10}]
+        with patch.object(profile, "MAX_CALL_TREE_NODES", 4):
+            tree = profile.call_tree(rows, 1)
+        self.assertLessEqual(tree["total_node_count"], 4)
+        self.assertEqual(tree["unexpanded_stack_weight_ns"], 10)
+        self.assertEqual(sum(node["self_weight_ns"] for node in tree["nodes"]), 10)
+        self.assertEqual(tree["nodes"][0]["inclusive_weight_ns"], 10)
+
     def test_material_sample_kernel_disagreement_is_pending_without_rescaling(self):
         # The frame weights claim 10% of one core, but kernel counters say 5%.
         self.table.write_text(table_xml().replace('fmt="1.00 ms">1000000', 'fmt="100.00 ms">100000000'))
@@ -452,6 +505,87 @@ class AttributionTests(unittest.TestCase):
         with patch.object(profile, "MAX_XML_ELEMENTS", 1):
             with self.assertRaisesRegex(ValueError, "element count"):
                 self.analyze()
+
+
+class ArrivalWindowTests(unittest.TestCase):
+    def report(self):
+        clocks = anchor()
+        end = clocks["mach_clock_end"]
+        end.update(monotonic_seconds=145, mach_ticks=155_000_000_000)
+        samples = []
+        for index in range(85):
+            mono = 100 + index / 2
+            samples.append({"process_id": PID, "birth_time_us": 123456,
+                            "monotonic_seconds": 500 + index / 2, "cpu_seconds": index / 40,
+                            "mach_absolute_ticks": int((mono + 10) * 1e9), "mach_timebase_numer": 1,
+                            "mach_timebase_denom": 1, "mach_absolute_seconds": mono + 10,
+                            "clock_read_uncertainty_seconds": .0000001})
+        episodes, windows = [], {}
+        for ordinal, began in enumerate((102, 114, 126), 1):
+            episodes.append({"ordinal": ordinal, "fixture_status": {"timing": {"streams": [
+                {"first_write_started_monotonic_seconds": began + stagger,
+                 "terminal_write_started_monotonic_seconds": began + 5 + stagger} for stagger in (0, .02)]}}})
+            windows[f"episode-{ordinal}-arrival"] = {"start_monotonic_seconds": began, "end_monotonic_seconds": began + 2}
+        windows["whole_replay"] = {"start_monotonic_seconds": 101, "end_monotonic_seconds": 136}
+        return {"runtime": {"profiled": True, **{name: clocks[name] for name in ("mach_clock_start", "mach_clock_end")}},
+                "owned_identity": {"process_id": PID, "birth_time_us": 123456},
+                "samples": samples, "episodes": episodes, "phase_windows": windows}
+
+    def test_eight_source_bound_phases_and_contiguous_steady_reference(self):
+        report = self.report()
+        result = profile.arrival_profile_windows(report)
+        self.assertEqual(len(result), 8)
+        for ordinal, began in enumerate((102, 114, 126), 1):
+            self.assertEqual(result[f"episode-{ordinal}-arrival"], report["phase_windows"][f"episode-{ordinal}-arrival"])
+            selected = result[f"episode-{ordinal}-arrival-worst-1s"]
+            self.assertEqual(selected["start_monotonic_seconds"], began)
+            self.assertEqual(selected["end_monotonic_seconds"], began + 1)
+            self.assertAlmostEqual(selected["selection"]["rolling_1s_percent"], 5)
+            self.assertFalse(selected["selection"]["acceptance_eligible"])
+        self.assertEqual(result["episode-3-steady"], {"start_monotonic_seconds": 128, "end_monotonic_seconds": 130})
+        self.assertEqual(result["whole_replay"], report["phase_windows"]["whole_replay"])
+
+    def test_worst_second_uses_counter_breakpoints_instead_of_a_sampling_grid(self):
+        samples = [{"monotonic_seconds": moment, "cpu_seconds": cpu} for moment, cpu in
+                   ((0, 0), (1.2, .001), (1.6, .041), (2.2, .071), (3, .072))]
+        selected = profile.worst_one_second_window(samples, .3, 2.7)
+        self.assertEqual(selected["start_monotonic_seconds"], 1.2)
+        self.assertEqual(selected["end_monotonic_seconds"], 2.2)
+        self.assertAlmostEqual(selected["selection"]["rolling_1s_percent"], 7)
+        self.assertEqual(selected["selection"]["rolling_1s_percent"],
+                         profile.app.cpu_interval_metrics(samples, .3, 2.7)["rolling_1s_percent"])
+
+    def test_worst_second_considers_shifted_breakpoints_and_clipped_phase_edges(self):
+        for samples, bounds, expected in (
+            ([(0, 0), (.8, .08), (1.4, .08), (2, .08)], (.3, 1.8), (.3, 1.3)),
+            ([(0, 0), (.8, 0), (1.4, .06), (2, .12)], (.3, 1.8), (.8, 1.8)),
+        ):
+            with self.subTest(samples=samples):
+                selected = profile.worst_one_second_window(
+                    [{"monotonic_seconds": moment, "cpu_seconds": cpu} for moment, cpu in samples], *bounds)
+                self.assertEqual((selected["start_monotonic_seconds"], selected["end_monotonic_seconds"]), expected)
+
+    def test_worst_second_ties_use_earliest_full_second(self):
+        samples = [{"monotonic_seconds": moment, "cpu_seconds": moment / 20} for moment in (0, 1, 2, 3)]
+        selected = profile.worst_one_second_window(samples, .25, 2.25)
+        self.assertEqual(selected["start_monotonic_seconds"], .25)
+        self.assertEqual(selected["end_monotonic_seconds"], 1.25)
+
+    def test_source_mismatch_unprofiled_or_truncated_steady_is_rejected(self):
+        changes = (
+            lambda value: value["runtime"].update(profiled=False),
+            lambda value: value["phase_windows"]["episode-1-arrival"].update(end_monotonic_seconds=103.9),
+            lambda value: value["episodes"][2]["fixture_status"]["timing"]["streams"][0].update(terminal_write_started_monotonic_seconds=129.9),
+            lambda value: value["phase_windows"]["whole_replay"].update(end_monotonic_seconds=129),
+            lambda value: value["owned_identity"].update(birth_time_us=999),
+            lambda value: value["episodes"].pop(),
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                report = self.report()
+                change(report)
+                with self.assertRaises(ValueError):
+                    profile.arrival_profile_windows(report)
 
 
 class ExportTests(unittest.TestCase):

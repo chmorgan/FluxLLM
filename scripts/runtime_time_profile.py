@@ -4,6 +4,7 @@ All percentages here are statistical estimates from a profiled process. They
 never establish an unprofiled CPU, GPU, memory, or filesystem regression pass.
 The caller authenticates the recording's owned process and recording issues.
 """
+from bisect import bisect_right
 from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -27,6 +28,8 @@ MAX_ROWS = 250_000
 MAX_STACK_DEPTH = 512
 MAX_PHASES = 8
 MAX_KERNEL_SAMPLES = 20_000
+MAX_CALL_TREE_NODES = 20_000
+CALL_TREE_RANK_LIMIT = 40
 SAMPLE_KERNEL_RELATIVE_LIMIT = .20
 SAMPLE_KERNEL_ABSOLUTE_LIMIT = .5
 SAMPLE_KERNEL_POLICY = (
@@ -338,6 +341,151 @@ def symbol_quality(rows):
     }
 
 
+def worst_one_second_window(samples, start, end):
+    """Select the earliest exact maximum of the linear kernel CPU counter.
+
+    Samples must already have authenticated, increasing timestamps and CPU
+    counters. As in app.cpu_interval_metrics, extrema occur at counter
+    breakpoints or breakpoints shifted by one second, including both edges.
+    """
+    require(number(end, "selection end") - number(start, "selection start") >= 1,
+            "Worst-second selection needs a complete second")
+    start, end = Decimal(str(start)), Decimal(str(end))
+    times = [Decimal(str(sample["monotonic_seconds"])) for sample in samples]
+    values = [Decimal(str(sample["cpu_seconds"])) for sample in samples]
+    require(times and times[0] <= start < end <= times[-1], "Selection lacks kernel coverage")
+    require(all(a < b for a, b in zip(times, times[1:]))
+            and all(a <= b for a, b in zip(values, values[1:])), "Selection counters are not monotonic")
+
+    def counter(timestamp):
+        index = bisect_right(times, timestamp) - 1
+        if times[index] == timestamp or index == len(times) - 1:
+            return values[index]
+        fraction = (timestamp - times[index]) / (times[index + 1] - times[index])
+        return values[index] + fraction * (values[index + 1] - values[index])
+
+    candidates = {start + 1, end}
+    candidates.update(timestamp for timestamp in times if start + 1 <= timestamp <= end)
+    candidates.update(timestamp + 1 for timestamp in times if start + 1 <= timestamp + 1 <= end)
+    right = max(sorted(candidates), key=lambda point: counter(point) - counter(point - 1))
+    peak = float(100 * (counter(right) - counter(right - 1)))
+    reference = app.cpu_interval_metrics(samples, float(start), float(end))["rolling_1s_percent"]
+    require(math.isclose(peak, reference, rel_tol=1e-10, abs_tol=1e-8),
+            "Selected worst second disagrees with the CPU interval metric")
+    return {"start_monotonic_seconds": float(right - 1), "end_monotonic_seconds": float(right),
+            "selection": {"source": "same-process profiled kernel CPU counter",
+                          "rolling_1s_percent": peak, "acceptance_eligible": False,
+                          "tie_policy": "earliest complete one-second interval",
+                          "candidate_policy": "all linear-counter breakpoints and one-second shifted breakpoints"}}
+
+
+def arrival_profile_windows(report):
+    """Bind eight diagnostic windows to the validated three-episode replay."""
+    runtime, identity = report["runtime"], report["owned_identity"]
+    require(runtime.get("profiled") is True, "Arrival attribution requires a profiled replay")
+    anchor = {"monotonic_before_ns": 1, "monotonic_after_ns": 1, "wall_time_ns": 1,
+              **{name: runtime[name] for name in ("mach_clock_start", "mach_clock_end")}}
+    mapping = clock_mapping({"start_epoch_ns": 1, "duration_seconds": 1}, anchor)
+    samples, birth = validate_kernel_samples(report["samples"], identity["process_id"], mapping)
+    require(birth == identity["birth_time_us"], "Arrival profile kernel process birth differs")
+    offset = mapping["python_to_mach_offset_seconds"]
+    episodes, original = report["episodes"], report["phase_windows"]
+    require(isinstance(episodes, list) and len(episodes) == 3, "Arrival profile needs exactly three episodes")
+    result = {}
+    for ordinal, episode in enumerate(episodes, 1):
+        require(episode.get("ordinal") == ordinal, "Arrival profile episode order differs")
+        streams = episode["fixture_status"]["timing"]["streams"]
+        require(isinstance(streams, list) and len(streams) == 2, "Arrival profile requires both stream timings")
+        began = min(number(stream.get("first_write_started_monotonic_seconds"), "arrival source start") for stream in streams)
+        terminal = min(number(stream.get("terminal_write_started_monotonic_seconds"), "arrival terminal start") for stream in streams)
+        require(began + 4 < terminal, "Arrival profile lacks complete steady traffic")
+        name = f"episode-{ordinal}-arrival"
+        window = original[name]
+        require(window.get("start_monotonic_seconds") == began
+                and window.get("end_monotonic_seconds") == began + 2,
+                "Arrival profile window differs from exact two-second source interval")
+        result[name] = {"start_monotonic_seconds": began, "end_monotonic_seconds": began + 2}
+        selected = worst_one_second_window(samples, began + offset, began + 2 + offset)
+        selected["start_monotonic_seconds"] -= offset
+        selected["end_monotonic_seconds"] -= offset
+        result[f"{name}-worst-1s"] = selected
+    result["episode-3-steady"] = {"start_monotonic_seconds": began + 2, "end_monotonic_seconds": began + 4}
+    whole = original["whole_replay"]
+    left, right = (number(whole.get(key), "whole replay boundary") for key in ("start_monotonic_seconds", "end_monotonic_seconds"))
+    require(all(left <= window["start_monotonic_seconds"] < window["end_monotonic_seconds"] <= right
+                for window in result.values()), "Arrival profile phases extend outside the whole replay")
+    require(runtime["mach_clock_start"]["monotonic_seconds"] <= left < right
+            <= runtime["mach_clock_end"]["monotonic_seconds"], "Arrival profile is outside paired Mach bridges")
+    result["whole_replay"] = {"start_monotonic_seconds": left, "end_monotonic_seconds": right}
+    return result
+
+
+def call_tree(rows, elapsed):
+    """Bounded caller context; recursion keeps distinct nodes, never extra CPU."""
+    nodes = [{"node_id": 0, "parent_id": None, "symbol": "<all owned-process threads>",
+              "inclusive_weight_ns": 0, "self_weight_ns": 0, "sample_count": 0}]
+    lookup, overflow = {}, 0
+    for row in rows:
+        path = list(reversed(row["frames"])) or ["<missing stack>"]
+        parent, missing = 0, None
+        for index, symbol in enumerate(path):
+            child = lookup.get((parent, symbol))
+            if child is None:
+                missing = index
+                break
+            parent = child
+        # Reserve one node for CPU whose stack cannot fit the bounded tree.
+        if missing is not None and len(nodes) + len(path) - missing > MAX_CALL_TREE_NODES - 1:
+            overflow += row["weight_ns"]
+            path = ["<unexpanded stack: call-tree node limit>"]
+        parent = 0
+        nodes[0]["inclusive_weight_ns"] += row["weight_ns"]
+        nodes[0]["sample_count"] += 1
+        for symbol in path:
+            key = (parent, symbol)
+            if key not in lookup:
+                lookup[key] = len(nodes)
+                nodes.append({"node_id": len(nodes), "parent_id": parent, "symbol": symbol,
+                              "inclusive_weight_ns": 0, "self_weight_ns": 0, "sample_count": 0})
+            parent = lookup[key]
+            nodes[parent]["inclusive_weight_ns"] += row["weight_ns"]
+            nodes[parent]["sample_count"] += 1
+        nodes[parent]["self_weight_ns"] += row["weight_ns"]
+    top_inclusive = sorted(nodes[1:], key=lambda node: (-node["inclusive_weight_ns"], node["node_id"]))[:CALL_TREE_RANK_LIMIT]
+    top_self = sorted((node for node in nodes[1:] if node["self_weight_ns"]),
+                      key=lambda node: (-node["self_weight_ns"], node["node_id"]))[:CALL_TREE_RANK_LIMIT]
+    selected = {0}
+    for node in top_inclusive + top_self:
+        current = node["node_id"]
+        while current not in selected:
+            selected.add(current)
+            current = nodes[current]["parent_id"]
+    output = []
+    for index in sorted(selected):
+        node = dict(nodes[index])
+        for kind in ("inclusive", "self"):
+            weight = node[f"{kind}_weight_ns"]
+            node[f"{kind}_cpu_ms"] = weight / 1e6
+            node[f"{kind}_cpu_percent_one_core"] = weight / 1e9 / elapsed * 100
+        output.append(node)
+    return {"nodes": output, "top_inclusive_node_ids": [node["node_id"] for node in top_inclusive],
+            "top_self_node_ids": [node["node_id"] for node in top_self],
+            "total_node_count": len(nodes), "omitted_node_count": len(nodes) - len(output),
+            "unexpanded_stack_weight_ns": overflow,
+            "semantics": "Root-to-leaf caller context across all app threads; inclusive includes descendants. Parent and child rows overlap."}
+
+
+def sampling_resolution(rows, elapsed):
+    weights = [row["weight_ns"] for row in rows]
+    total = sum(weights)
+    effective = total * total / sum(weight * weight for weight in weights)
+    return {"sample_count": len(rows), "effective_weighted_sample_count": effective,
+            "largest_sample_cpu_percentage_points": max(weights) / 1e9 / elapsed * 100,
+            "one_sample_fraction_of_sampled_cpu_percent": max(weights) / total * 100,
+            "independent_poisson_relative_standard_error_reference": 1 / math.sqrt(effective),
+            "warning": "Count-based resolution diagnostic, not a confidence interval or quality threshold. Samples may be correlated; one-second rankings can be noisy."}
+
+
 def analyze_exports(toc_path, profile_path, owned_pid, phase_windows, clock_anchor, samples):
     toc = validate_toc(toc_path, owned_pid)
     rows, quality = parse_running_samples(profile_path, owned_pid)
@@ -402,24 +550,37 @@ def analyze_exports(toc_path, profile_path, owned_pid, phase_windows, clock_anch
         touching = [r for r in rows if min(abs(r["time_ns"] / 1e9 - edge) for edge in relative) <= uncertainty]
         shifted = [sum(r["weight_ns"] for r in rows if (relative[0] + shift) * 1e9 <= r["time_ns"] < (relative[1] + shift) * 1e9) / 1e6
                    for shift in (-uncertainty, uncertainty)]
+        edge_coverage = (min(r["time_ns"] for r in rows) <= (relative[0] - uncertainty) * 1e9
+                         and max(r["time_ns"] for r in rows) >= (relative[1] + uncertainty) * 1e9)
+        threads = sorted({r["thread_id"] for r in selected})
         phases.append({"phase": name, "elapsed_seconds": elapsed,
                        "window_python_monotonic_seconds": [start, end],
+                       "window_selection": window.get("selection"),
                        "window_trace_relative_seconds": relative, "window_mach_absolute_seconds": [start + offset, end + offset],
                        "total": summary("All owned-process threads", selected), "inclusive": inclusive,
                        "top_inclusive_symbols": ranked(symbol_weights, symbol_counts), "top_leaf_symbols": ranked(leaf_weights, leaf_counts),
+                       "call_tree": call_tree(selected, elapsed),
+                       "sampling_resolution": sampling_resolution(selected, elapsed),
+                       "thread_totals": [{"thread_id": tid,
+                           "thread_names": sorted({r["thread"] for r in selected if r["thread_id"] == tid and r["thread"]}),
+                           **summary(f"Thread {tid}", [r for r in selected if r["thread_id"] == tid])} for tid in threads],
                        "kernel_cpu_same_window": kernel,
                        "sample_kernel_agreement": agreement,
                        "sampled_minus_kernel_percent_of_kernel": ((total / 1e9 / kernel["cpu_seconds"] - 1) * 100 if kernel["cpu_seconds"] else None),
-                       "quality": symbol_quality(selected), "threads": sorted({r["thread_id"] for r in selected}),
+                       "quality": symbol_quality(selected), "threads": threads,
                        "edge_uncertainty": {"seconds": uncertainty, "touching_sample_count": len(touching),
+                                            "running_samples_bracket_full_uncertainty": edge_coverage,
                                             "touching_sample_weight_ms": sum(r["weight_ns"] for r in touching) / 1e6,
                                             "sampled_total_ms_at_minus_plus_uncertainty": shifted}})
     all_missing = all(p["quality"]["missing_stack_weight_ns"] + p["quality"]["all_unknown_frames_weight_ns"] == p["total"]["weight_ns"] for p in phases)
     mismatched_phases = [phase["phase"] for phase in phases if not phase["sample_kernel_agreement"]["within_tolerance"]]
-    return {"status": "analysis_pending" if all_missing or mismatched_phases else "profiled_phase_attribution_available",
+    unbracketed_phases = [phase["phase"] for phase in phases if not phase["edge_uncertainty"]["running_samples_bracket_full_uncertainty"]]
+    usable = not all_missing and not mismatched_phases and not unbracketed_phases
+    return {"status": "profiled_phase_attribution_available" if usable else "analysis_pending",
             "regression_passed": False, "process_id": owned_pid, "birth_time_us": birth,
-            "analysis_quality": {"quantitative_attribution_usable": not all_missing and not mismatched_phases,
+            "analysis_quality": {"quantitative_attribution_usable": usable,
                                  "sample_kernel_mismatch_phases": mismatched_phases,
+                                 "clock_uncertainty_unbracketed_phases": unbracketed_phases,
                                  "all_selected_symbols_missing": all_missing,
                                  "policy": SAMPLE_KERNEL_POLICY},
             "clock": mapping, "recording": toc, "recording_quality": quality, "phases": phases,
@@ -428,11 +589,14 @@ def analyze_exports(toc_path, profile_path, owned_pid, phase_windows, clock_anch
                 "Profiled statistical samples only; no unprofiled CPU, GPU, memory or write acceptance.",
                 "Running sample weights are nanoseconds; 100% CPU means one core. Never rescaled to kernel counters.",
                 "Inclusive symbols count each sample once despite recursion. Parent/child rows overlap and must not be added.",
+                "Call-tree nodes retain recursive caller context; self CPU excludes descendants. Ranked nodes and their ancestors are retained, with explicit omitted-node and unexpanded-stack counts.",
                 "Leaf symbols exclude synchronous descendants; absent asynchronous ancestors receive no attribution.",
+                "Per-phase sample resolution is descriptive, not a confidence interval. Short-window rankings can vary substantially between captures.",
                 "Unknown and compiler-deduplicated symbols remain explicit in the quality counters.",
                 "Kernel counters are interpolated within the identical profiled interval, not independent acceptance measurements.",
                 "Material sample/kernel disagreement makes analysis pending; raw weights and rankings remain unscaled and are not reliable absolute CPU attribution.",
                 "TOC dates have finite precision. Mapping assumes no wall-clock step between the paired anchor and trace start.",
+                "Running samples must bracket the whole mapping-uncertainty range at both phase edges, or quantitative attribution remains pending.",
                 "Named phases may omit intermediate traffic; retain the whole contiguous runtime phase separately.",
                 "The caller must validate recording loss diagnostics and owned-process birth/clean-exit evidence.",
             ]}
