@@ -22,6 +22,8 @@ struct LuminousActivityChart: View {
     /// invalidate geometry even when its window and scales happen to match.
     let geometryPublicationID: UUID
 
+    @Environment(\.self) private var environment
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -31,6 +33,8 @@ struct LuminousActivityChart: View {
     @State private var hoverLocation: CGPoint?
     @State private var dragSelection: DragSelection?
     @State private var geometryCache = LuminousChartGeometryCache()
+    @State private var metalSceneCache = MetalFullChartSceneCache()
+    @State private var metalFailed = false
     @GestureState private var isSelecting = false
 
     init(
@@ -189,6 +193,8 @@ struct LuminousActivityChart: View {
 
     private var plot: some View {
         GeometryReader { geometry in
+            let usesMetal =
+                PerformanceGraphicsDiagnostics.shared.mode.usesMetalFullChart && !metalFailed
             let frame = geometryCache.frame(
                 for: .init(
                     publicationID: geometryPublicationID, now: now, duration: duration,
@@ -198,7 +204,8 @@ struct LuminousActivityChart: View {
                 directToolPlot: PerformanceGraphicsDiagnostics.shared.mode.usesDirectToolPlot,
                 compactToolPaths: PerformanceGraphicsDiagnostics.shared.mode.usesCompactToolPaths,
                 deferredToolGeometry: PerformanceGraphicsDiagnostics.shared.mode
-                    .usesDeferredToolGeometry)
+                    .usesDeferredToolGeometry,
+                buildDrawingPaths: !usesMetal)
             let layout = frame.layout
             let generated = frame.generated
             let device = frame.device
@@ -224,78 +231,89 @@ struct LuminousActivityChart: View {
                     lanes: lanes, assignments: requestRails.assignments)
             }
             ZStack(alignment: .topLeading) {
-                ChartDrawingSurface(role: .staticChart, revision: staticRevision) { context, _ in
-                    PerformancePresentationCounters.shared.record(.canvasDraws)
-                    drawGrid(in: &context, layout: layout)
-                    let cpuGlow =
-                        PerformanceGraphicsDiagnostics.shared.mode == .cpuGlow
-                        ? frame.seriesGlowRasterCache : nil
-                    let surfaceBounds = CGRect(origin: .zero, size: frame.key.size)
-                    drawSeries(
-                        device, color: gpuColor, fillOpacity: 0.14, in: &context, rect: layout.main,
-                        cpuGlow: cpuGlow, series: 0, surfaceBounds: surfaceBounds)
-                    drawSeries(
-                        generated, color: generatedColor, fillOpacity: 0.25, in: &context,
-                        rect: layout.main, cpuGlow: cpuGlow, series: 1,
-                        surfaceBounds: surfaceBounds)
-                    drawEndpoint(frame.generatedEndpoint, color: generatedColor, in: &context)
-                    drawEndpoint(frame.deviceEndpoint, color: gpuColor, in: &context)
-                    // Tool tracks retain their request's current appearance.
-                    let toolTracks = frame.requestTools
-                    for lane in lanes {
-                        if let track = toolTracks[lane.id] {
-                            drawTools(track, in: &context, color: laneColor(lane))
-                        }
-                    }
-                    if !compact {
-                        if layout.lanes.height > 0 {
-                            context.draw(
-                                Text("Requests")
-                                    .font(.system(size: 9, weight: .medium))
-                                    .foregroundColor(.secondary),
-                                at: CGPoint(x: layout.lanes.minX, y: layout.lanes.minY - 6),
-                                anchor: .leading)
-                        }
-                        // Preserve the former bar layer's position in drawing
-                        // order, sharing the static chart's native backing.
-                        RequestRailBarDrawing(
-                            rect: layout.lanes, presentation: requestRails,
-                            colorScheme: colorScheme, contrast: contrast,
-                            reduceTransparency: reduceTransparency
-                        ).draw(railSegments, overflow: railOverflow, in: &context)
-                    }
-                }
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-                if !compact {
-                    RequestRailLayer(
-                        lanes: lanes, segments: railSegments, presentation: requestRails, now: now,
-                        duration: duration, rect: layout.lanes, plotSize: geometry.size,
-                        isLive: isLive
-                    )
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
-                }
-                if let selected {
-                    let cursorX = project(
-                        selected.timestamp, value: 0, in: layout.main, upperBound: 1
-                    ).x
-                    let bounds = ChartSurfaceBounds.cursor(x: cursorX, plotSize: geometry.size)
-                    ChartDrawingSurface(
-                        role: .cursor,
-                        revision: CursorDrawingRevision(
-                            frame: ObjectIdentifier(frame), timestamp: selected.timestamp),
-                        drawingBounds: bounds
-                    ) { context, _ in
+                if usesMetal {
+                    metalSurface(
+                        frame: frame, segments: railSegments, overflow: railOverflow,
+                        cursorX: selected.map {
+                            project($0.timestamp, value: 0, in: layout.main, upperBound: 1).x
+                        })
+                } else {
+                    ChartDrawingSurface(role: .staticChart, revision: staticRevision) {
+                        context, _ in
                         PerformancePresentationCounters.shared.record(.canvasDraws)
-                        drawCursor(
-                            selected.timestamp, generated: generated, device: device,
-                            in: &context, layout: layout)
+                        drawGrid(in: &context, layout: layout)
+                        let cpuGlow =
+                            PerformanceGraphicsDiagnostics.shared.mode == .cpuGlow
+                            ? frame.seriesGlowRasterCache : nil
+                        let surfaceBounds = CGRect(origin: .zero, size: frame.key.size)
+                        drawSeries(
+                            device, color: gpuColor, fillOpacity: 0.14, in: &context,
+                            rect: layout.main,
+                            cpuGlow: cpuGlow, series: 0, surfaceBounds: surfaceBounds)
+                        drawSeries(
+                            generated, color: generatedColor, fillOpacity: 0.25, in: &context,
+                            rect: layout.main, cpuGlow: cpuGlow, series: 1,
+                            surfaceBounds: surfaceBounds)
+                        drawEndpoint(frame.generatedEndpoint, color: generatedColor, in: &context)
+                        drawEndpoint(frame.deviceEndpoint, color: gpuColor, in: &context)
+                        // Tool tracks retain their request's current appearance.
+                        let toolTracks = frame.requestTools
+                        for lane in lanes {
+                            if let track = toolTracks[lane.id] {
+                                drawTools(track, in: &context, color: laneColor(lane))
+                            }
+                        }
+                        if !compact {
+                            if layout.lanes.height > 0 {
+                                context.draw(
+                                    Text("Requests")
+                                        .font(.system(size: 9, weight: .medium))
+                                        .foregroundColor(.secondary),
+                                    at: CGPoint(x: layout.lanes.minX, y: layout.lanes.minY - 6),
+                                    anchor: .leading)
+                            }
+                            // Preserve the former bar layer's position in drawing
+                            // order, sharing the static chart's native backing.
+                            RequestRailBarDrawing(
+                                rect: layout.lanes, presentation: requestRails,
+                                colorScheme: colorScheme, contrast: contrast,
+                                reduceTransparency: reduceTransparency
+                            ).draw(railSegments, overflow: railOverflow, in: &context)
+                        }
                     }
-                    .frame(width: bounds.width, height: bounds.height)
-                    .offset(x: bounds.minX, y: bounds.minY)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
+                    if !compact {
+                        RequestRailLayer(
+                            lanes: lanes, segments: railSegments, presentation: requestRails,
+                            now: now,
+                            duration: duration, rect: layout.lanes, plotSize: geometry.size,
+                            isLive: isLive
+                        )
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                    }
+                    if let selected {
+                        let cursorX = project(
+                            selected.timestamp, value: 0, in: layout.main, upperBound: 1
+                        ).x
+                        let bounds = ChartSurfaceBounds.cursor(x: cursorX, plotSize: geometry.size)
+                        ChartDrawingSurface(
+                            role: .cursor,
+                            revision: CursorDrawingRevision(
+                                frame: ObjectIdentifier(frame), timestamp: selected.timestamp),
+                            drawingBounds: bounds
+                        ) { context, _ in
+                            PerformancePresentationCounters.shared.record(.canvasDraws)
+                            drawCursor(
+                                selected.timestamp, generated: generated, device: device,
+                                in: &context, layout: layout)
+                        }
+                        .frame(width: bounds.width, height: bounds.height)
+                        .offset(x: bounds.minX, y: bounds.minY)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                    }
                 }
                 axes(layout: layout)
                 selectionOverlay(layout: layout)
@@ -344,6 +362,75 @@ struct LuminousActivityChart: View {
                 dragSelection = nil
             }
         }
+    }
+
+    /// The native surface receives publication data, never an animation clock.
+    /// Cache identities include resolved appearance so changing theme uploads
+    /// fresh colors without changing history or rebuilding on cursor movement.
+    private func metalSurface(
+        frame: LuminousChartGeometryCache.Frame,
+        segments: [RequestRailGeometry.Segment],
+        overflow: [RequestRailGeometry.OverflowSegment], cursorX: CGFloat?
+    ) -> some View {
+        let colors = Dictionary(
+            uniqueKeysWithValues: lanes.map { ($0.id, metalColor(laneColor($0))) })
+        let style = MetalFullChartScene.Style(
+            generatedColor: metalColor(generatedColor), deviceColor: metalColor(gpuColor),
+            backgroundColor: metalColor(Color(nsColor: .windowBackgroundColor)),
+            primaryColor: metalColor(.primary), secondaryColor: metalColor(.secondary),
+            compact: compact, hasEffects: hasEffects,
+            increasedContrast: contrast == .increased, isDark: colorScheme == .dark)
+        let scene = metalSceneCache.scene(
+            frame: frame, lanes: lanes, laneColors: colors, segments: segments,
+            overflow: overflow, style: style)
+        let cursor = metalSceneCache.cursor(frame: frame, x: cursorX, style: style)
+        return ZStack(alignment: .topLeading) {
+            MetalFullChartSurface(
+                scene: scene, revision: ObjectIdentifier(scene), cursor: cursor,
+                cursorRevision: ObjectIdentifier(cursor),
+                decorations: .init(
+                    lanes: lanes, segments: segments, presentation: requestRails,
+                    now: now, duration: duration, rail: frame.layout.lanes, colors: colors,
+                    enabled: isLive && !compact && !reduceMotion && hasEffects),
+                onFailure: { metalFailed = true })
+            ForEach(Array(scene.labels.enumerated()), id: \.offset) { _, label in
+                metalLabel(label)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func metalLabel(_ label: MetalFullChartScene.Label) -> some View {
+        let font: Font =
+            switch label.role {
+            case .requestHeading: .system(size: label.fontSize, weight: .medium)
+            case .emptyRequests: .system(size: label.fontSize)
+            case .overflow: .system(size: label.fontSize, weight: .semibold, design: .rounded)
+            }
+        return Text(label.text)
+            .font(font)
+            .foregroundStyle(
+                Color(
+                    .sRGB, red: Double(label.color.x),
+                    green: Double(label.color.y), blue: Double(label.color.z),
+                    opacity: Double(label.color.w))
+            )
+            .fixedSize()
+            .frame(width: 0, height: 0, alignment: label.leadingAligned ? .leading : .center)
+            .position(label.position)
+    }
+
+    private func metalColor(_ color: Color) -> SIMD4<Float> {
+        let resolved = color.resolve(in: environment)
+        if let space = CGColorSpace(name: CGColorSpace.sRGB),
+            let converted = resolved.cgColor.converted(
+                to: space, intent: .relativeColorimetric, options: nil),
+            let values = converted.components, values.count == 4
+        {
+            return SIMD4(Float(values[0]), Float(values[1]), Float(values[2]), Float(values[3]))
+        }
+        return SIMD4(resolved.red, resolved.green, resolved.blue, resolved.opacity)
     }
 
     /// Frame identity covers immutable publication, viewport and scales. Small

@@ -18,7 +18,8 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
         XCTAssertEqual(Mode.runtimeHeldStaticChart.rawValue, "runtime-held-static-chart")
-        XCTAssertEqual(Mode.allCases.count, 35)
+        XCTAssertEqual(Mode.runtimeMetalFullChart.rawValue, "runtime-metal-full-chart")
+        XCTAssertEqual(Mode.allCases.count, 36)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -588,6 +589,11 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 XCTAssertEqual(
                     snapshot["chart_publication_interval_seconds"] as? Double,
                     mode == .runtimeDeferredToolGeometry2Hz ? 0.5 : 1)
+            } else if mode.usesMetalFullChart {
+                XCTAssertEqual(snapshot["native_gpu_backend"] as? String, "metal-persistent-chart")
+                XCTAssertEqual(snapshot["arrival_backend"] as? String, "metal-full-chart-shader")
+                XCTAssertEqual(snapshot["canvas_frame_clock"] as? Bool, false)
+                XCTAssertEqual(snapshot["retained_twinkles_enabled"] as? Bool, false)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
                 XCTAssertNil(snapshot["chart_publication_interval_seconds"])
@@ -657,7 +663,8 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
             .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
             .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
-            .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts, .runtimeHeldStaticChart,
+            .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts, .runtimeMetalFullChart,
+            .runtimeHeldStaticChart,
         ]
         let runtime: [Mode] =
             [
@@ -670,7 +677,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 ([
                     .normal, .nativeGPUCanvas, .nativeGPUCoalescedScalars,
                     .nativeGPURetainedTwinkles, .nativeGPUOptimized,
-                ] + runtime).contains(mode))
+                ] + runtime).contains(mode) && mode != .runtimeMetalFullChart)
             XCTAssertEqual(
                 mode.usesCoalescedScalarPresentation,
                 ([.normal, .nativeGPUCoalescedScalars, .nativeGPUOptimized] + runtime).contains(
@@ -678,7 +685,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             XCTAssertEqual(
                 mode.usesRetainedTwinkles,
                 ([.normal, .nativeGPURetainedTwinkles, .nativeGPUOptimized] + runtime).contains(
-                    mode))
+                    mode) && mode != .runtimeMetalFullChart)
             XCTAssertEqual(
                 mode.usesIncrementalHistoryOrdering,
                 ([.normal, .runtimeHistoryOrder, .runtimeOptimized, .runtimeNoLifecycle] + next)
@@ -702,7 +709,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
                     .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
-                    .runtimeHeldStaticChart,
+                    .runtimeMetalFullChart, .runtimeHeldStaticChart,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
@@ -722,7 +729,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
                     .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
-                    .runtimeHeldStaticChart,
+                    .runtimeMetalFullChart, .runtimeHeldStaticChart,
                 ].contains(mode))
             XCTAssertEqual(mode.usesDirectToolPlot, mode == .runtimeDirectToolPlot)
             XCTAssertEqual(mode.usesUngroupedNativeCanvas, mode == .runtimeUngroupedCanvas)
@@ -733,6 +740,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 mode.usesDeferredToolGeometry,
                 [.runtimeDeferredToolGeometry, .runtimeDeferredToolGeometry2Hz].contains(mode))
             XCTAssertEqual(mode.usesMetalArrivalBursts, mode == .runtimeMetalArrivalBursts)
+            XCTAssertEqual(mode.usesMetalFullChart, mode == .runtimeMetalFullChart)
             XCTAssertEqual(
                 mode.chartPublicationIntervalSeconds,
                 mode == .runtimeDeferredToolGeometry2Hz ? 0.5 : 1)
@@ -860,6 +868,67 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         }
         try diagnostics.disable()
         assertCounter("scalar_presentation_publications", in: diagnostics.snapshot(), equals: 0)
+    }
+
+    func testFullMetalChartCountersRecordExecutedWorkAndDrainHostResources() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        XCTAssertNil(diagnostics.metalFullChartHostCreated())
+        diagnostics.metalFullChartFailure()
+        try diagnostics.enable(mode: .runtimeMetalFullChart)
+        let first = try XCTUnwrap(diagnostics.metalFullChartHostCreated())
+        let second = try XCTUnwrap(diagnostics.metalFullChartHostCreated())
+        diagnostics.metalFullChartGeometryUploaded(first, bytes: 100)
+        diagnostics.metalFullChartGeometryUploaded(second, bytes: 200)
+        diagnostics.metalFullChartGeometryUploaded(first, bytes: 50)
+        XCTAssertTrue(diagnostics.metalFullChartBuffersRetained(first, bytes: 75))
+        diagnostics.metalFullChartFrameSubmitted(
+            first, staticChart: true, arrival: true, completion: false, twinkle: true)
+        diagnostics.metalFullChartFrameSubmitted(
+            second, staticChart: true, arrival: false, completion: true, twinkle: false)
+        diagnostics.metalFullChartFrameSkipped(first)
+        XCTAssertThrowsError(try diagnostics.disable())
+        var counts = try XCTUnwrap(diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64])
+        XCTAssertEqual(counts["geometry_uploads"], 3)
+        XCTAssertEqual(counts["submissions"], 2)
+        XCTAssertEqual(counts["static_frames"], 2)
+        XCTAssertEqual(counts["arrival_frames"], 1)
+        XCTAssertEqual(counts["completion_frames"], 1)
+        XCTAssertEqual(counts["twinkle_frames"], 1)
+        XCTAssertEqual(counts["frames_skipped"], 1)
+        XCTAssertEqual(counts["current_buffer_bytes"], 275)
+        XCTAssertEqual(counts["peak_buffer_bytes"], 300)
+        diagnostics.metalFullChartHostDestroyed(first)
+        diagnostics.metalFullChartHostDestroyed(second)
+        counts = try XCTUnwrap(diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64])
+        XCTAssertEqual(counts["live_hosts"], 0)
+        XCTAssertEqual(counts["current_buffer_bytes"], 0)
+        XCTAssertEqual(counts["hosts_created"], counts["hosts_destroyed"])
+        XCTAssertEqual(counts["peak_hosts"], 2)
+        try diagnostics.disable()
+        XCTAssertEqual(
+            diagnostics.snapshot() as NSDictionary,
+            PerformanceGraphicsDiagnostics().snapshot() as NSDictionary)
+    }
+
+    func testFullMetalChartInvalidOwnersAndAllocationOverflowCannotFabricateWork() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .runtimeMetalFullChart)
+        let first = try XCTUnwrap(diagnostics.metalFullChartHostCreated())
+        let second = try XCTUnwrap(diagnostics.metalFullChartHostCreated())
+        diagnostics.metalFullChartGeometryUploaded(first, bytes: .max)
+        let prior = diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64]
+        diagnostics.metalFullChartGeometryUploaded(second, bytes: 1)
+        diagnostics.metalFullChartFrameSubmitted(
+            .max, staticChart: true, arrival: true, completion: true, twinkle: true)
+        diagnostics.metalFullChartFrameSkipped(.max)
+        XCTAssertEqual(diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64], prior)
+        diagnostics.metalFullChartHostDestroyed(first)
+        diagnostics.metalFullChartHostDestroyed(second)
+        diagnostics.metalFullChartHostDestroyed(second)
+        diagnostics.metalFullChartFailure()
+        assertCounter("invalid_events", in: diagnostics.snapshot(), equals: 4)
+        XCTAssertEqual(
+            (diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64])?["failures"], 1)
     }
 
     private var layerModes: [PerformanceGraphicsDiagnostics.Mode] {

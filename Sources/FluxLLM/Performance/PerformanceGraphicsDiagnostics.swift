@@ -35,6 +35,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeDeferredToolGeometry = "runtime-deferred-tool-geometry"
         case runtimeDeferredToolGeometry2Hz = "runtime-deferred-tool-geometry-2hz"
         case runtimeMetalArrivalBursts = "runtime-metal-arrival-bursts"
+        case runtimeMetalFullChart = "runtime-metal-full-chart"
         case runtimeHeldStaticChart = "runtime-held-static-chart"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
@@ -55,9 +56,11 @@ public final class PerformanceGraphicsDiagnostics {
         var omitsRailDecorations: Bool { self == .bitmapLayerNoDecorations }
 
         var usesNativeGPUCanvas: Bool {
-            self == .normal || self == .nativeGPUCanvas || self == .nativeGPUCoalescedScalars
-                || self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
-                || isRuntimeControl
+            !usesMetalFullChart
+                && (self == .normal || self == .nativeGPUCanvas
+                    || self == .nativeGPUCoalescedScalars
+                    || self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
+                    || isRuntimeControl)
         }
 
         var usesCoalescedScalarPresentation: Bool {
@@ -66,8 +69,10 @@ public final class PerformanceGraphicsDiagnostics {
         }
 
         var usesRetainedTwinkles: Bool {
-            self == .normal || self == .nativeGPURetainedTwinkles || self == .nativeGPUOptimized
-                || isRuntimeControl
+            !usesMetalFullChart
+                && (self == .normal || self == .nativeGPURetainedTwinkles
+                    || self == .nativeGPUOptimized
+                    || isRuntimeControl)
         }
 
         var isRuntimeControl: Bool {
@@ -78,7 +83,7 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
                 .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                 .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
-                .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
+                .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts, .runtimeMetalFullChart,
                 .runtimeHeldStaticChart:
                 true
             default:
@@ -89,6 +94,7 @@ public final class PerformanceGraphicsDiagnostics {
         var omitsLifecycleEffects: Bool { self == .runtimeNoLifecycle }
         var omitsArrivalEffects: Bool { self == .runtimeNoArrivalEffects }
         var usesMetalArrivalBursts: Bool { self == .runtimeMetalArrivalBursts }
+        var usesMetalFullChart: Bool { self == .runtimeMetalFullChart }
         /// Causal diagnostic only: the displayed static chart intentionally stops updating.
         var usesHeldStaticChart: Bool { self == .runtimeHeldStaticChart }
 
@@ -108,6 +114,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeCompactToolPaths
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
+                || usesMetalFullChart
                 || usesHeldStaticChart
         }
 
@@ -136,6 +143,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeCompactToolPaths
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
+                || usesMetalFullChart
                 || usesHeldStaticChart
         }
 
@@ -256,6 +264,44 @@ public final class PerformanceGraphicsDiagnostics {
     private var scalarPresentationPublications: UInt64 = 0
     private var twinkleHosts: [UInt64: Set<AnyHashable>] = [:]
     private var twinkleCounters = TwinkleCounters()
+    private var metalFullChartHosts: [UInt64: UInt64] = [:]
+    private var metalFullChartCounters = MetalFullChartCounters()
+
+    private struct MetalFullChartCounters {
+        var hostsCreated: UInt64 = 0
+        var hostsDestroyed: UInt64 = 0
+        var liveHosts: UInt64 = 0
+        var peakHosts: UInt64 = 0
+        var geometryUploads: UInt64 = 0
+        var submissions: UInt64 = 0
+        var failures: UInt64 = 0
+        var framesSkipped: UInt64 = 0
+        var staticFrames: UInt64 = 0
+        var arrivalFrames: UInt64 = 0
+        var completionFrames: UInt64 = 0
+        var twinkleFrames: UInt64 = 0
+        var currentBufferBytes: UInt64 = 0
+        var peakBufferBytes: UInt64 = 0
+
+        var snapshot: [String: UInt64] {
+            [
+                "hosts_created": hostsCreated,
+                "hosts_destroyed": hostsDestroyed,
+                "live_hosts": liveHosts,
+                "peak_hosts": peakHosts,
+                "geometry_uploads": geometryUploads,
+                "submissions": submissions,
+                "failures": failures,
+                "frames_skipped": framesSkipped,
+                "static_frames": staticFrames,
+                "arrival_frames": arrivalFrames,
+                "completion_frames": completionFrames,
+                "twinkle_frames": twinkleFrames,
+                "current_buffer_bytes": currentBufferBytes,
+                "peak_buffer_bytes": peakBufferBytes,
+            ]
+        }
+    }
 
     private struct TwinkleCounters {
         var hostsCreated: UInt64 = 0
@@ -285,14 +331,18 @@ public final class PerformanceGraphicsDiagnostics {
     /// Must be selected before native views are created. Keeping live tokens
     /// across a mode change would make lifecycle and backing comparisons false.
     public func enable(mode: Mode = .normal) throws {
-        guard canvases.isEmpty, twinkleHosts.isEmpty else { throw ConfigurationError.liveCanvases }
+        guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty else {
+            throw ConfigurationError.liveCanvases
+        }
         reset()
         self.mode = mode
         isEnabled = true
     }
 
     public func disable() throws {
-        guard canvases.isEmpty, twinkleHosts.isEmpty else { throw ConfigurationError.liveCanvases }
+        guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty else {
+            throw ConfigurationError.liveCanvases
+        }
         reset()
         mode = .normal
         isEnabled = false
@@ -310,6 +360,7 @@ public final class PerformanceGraphicsDiagnostics {
         nativeGPUCanvasDraws = 0
         scalarPresentationPublications = 0
         twinkleCounters = TwinkleCounters()
+        metalFullChartCounters = MetalFullChartCounters()
     }
 
     public func canvasCreated(role: Role) -> UInt64? {
@@ -627,10 +678,94 @@ public final class PerformanceGraphicsDiagnostics {
         return (id, canvas)
     }
 
+    /// Executed-work evidence only, never a substitute for measured GPU time.
+    /// Buffer bytes describe retained renderer geometry/descriptor allocations;
+    /// drawable textures, driver allocations and physical GPU memory are excluded.
+    func metalFullChartHostCreated() -> UInt64? {
+        guard isEnabled, mode.usesMetalFullChart else { return nil }
+        nextID += 1
+        metalFullChartHosts[nextID] = 0
+        metalFullChartCounters.hostsCreated += 1
+        metalFullChartCounters.liveHosts += 1
+        metalFullChartCounters.peakHosts = max(
+            metalFullChartCounters.peakHosts, UInt64(metalFullChartHosts.count))
+        return nextID
+    }
+
+    func metalFullChartHostDestroyed(_ id: UInt64?) {
+        guard let id, isEnabled, mode.usesMetalFullChart else { return }
+        guard let bytes = metalFullChartHosts.removeValue(forKey: id) else {
+            invalidEvents += 1
+            return
+        }
+        metalFullChartCounters.hostsDestroyed += 1
+        metalFullChartCounters.liveHosts -= 1
+        metalFullChartCounters.currentBufferBytes -= bytes
+    }
+
+    func metalFullChartGeometryUploaded(_ id: UInt64?, bytes: UInt64) {
+        guard metalFullChartBuffersRetained(id, bytes: bytes) else { return }
+        metalFullChartCounters.geometryUploads += 1
+    }
+
+    /// Refresh accounting when a renderer lazily allocates reusable frame
+    /// scratch buffers; this is not evidence of another geometry upload.
+    @discardableResult
+    func metalFullChartBuffersRetained(_ id: UInt64?, bytes: UInt64) -> Bool {
+        guard let id, isEnabled, mode.usesMetalFullChart else { return false }
+        guard let previous = metalFullChartHosts[id] else {
+            invalidEvents += 1
+            return false
+        }
+        let total = metalFullChartCounters.currentBufferBytes - previous
+        let next = total.addingReportingOverflow(bytes)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return false
+        }
+        metalFullChartHosts[id] = bytes
+        metalFullChartCounters.currentBufferBytes = next.partialValue
+        metalFullChartCounters.peakBufferBytes = max(
+            metalFullChartCounters.peakBufferBytes, next.partialValue)
+        return true
+    }
+
+    func metalFullChartFrameSubmitted(
+        _ id: UInt64?, staticChart: Bool, arrival: Bool, completion: Bool, twinkle: Bool
+    ) {
+        guard let id, isEnabled, mode.usesMetalFullChart else { return }
+        guard metalFullChartHosts[id] != nil else {
+            invalidEvents += 1
+            return
+        }
+        metalFullChartCounters.submissions += 1
+        if staticChart { metalFullChartCounters.staticFrames += 1 }
+        if arrival { metalFullChartCounters.arrivalFrames += 1 }
+        if completion { metalFullChartCounters.completionFrames += 1 }
+        if twinkle { metalFullChartCounters.twinkleFrames += 1 }
+    }
+
+    func metalFullChartFrameSkipped(_ id: UInt64?) {
+        guard let id, isEnabled, mode.usesMetalFullChart else { return }
+        guard metalFullChartHosts[id] != nil else {
+            invalidEvents += 1
+            return
+        }
+        metalFullChartCounters.framesSkipped += 1
+    }
+
+    func metalFullChartFailure(_ id: UInt64? = nil) {
+        guard isEnabled, mode.usesMetalFullChart else { return }
+        if let id, metalFullChartHosts[id] == nil { invalidEvents += 1 }
+        metalFullChartCounters.failures += 1
+    }
+
     public func snapshot() -> [String: Any] {
         var result: [String: Any] = [
             "enabled": isEnabled, "mode": mode.rawValue,
             "holds_static_chart_drawing": mode.usesHeldStaticChart,
+            "metal_full_chart_enabled": isEnabled && mode.usesMetalFullChart,
+            "metal_full_chart": metalFullChartCounters.snapshot,
             "invalid_events": invalidEvents,
             "cpu_glow_fallbacks": cpuGlowFallbacks,
             "gradient_substitutions": gradientSubstitutions,
@@ -660,10 +795,12 @@ public final class PerformanceGraphicsDiagnostics {
             result["layer_bitmap_color_space"] = "device-rgb"
             result["rail_decorations_enabled"] = !mode.omitsRailDecorations
         }
-        if isEnabled, mode.usesNativeGPUCanvas {
+        if isEnabled, mode.usesNativeGPUCanvas || mode.usesMetalFullChart {
             result["native_gpu_backend"] =
-                mode.usesUngroupedNativeCanvas
-                ? "swiftui-canvas" : "swiftui-canvas-drawing-group"
+                mode.usesMetalFullChart
+                ? "metal-persistent-chart"
+                : (mode.usesUngroupedNativeCanvas
+                    ? "swiftui-canvas" : "swiftui-canvas-drawing-group")
             result["scalar_presentation_coalesced"] = mode.usesCoalescedScalarPresentation
             result["retained_twinkles_enabled"] = mode.usesRetainedTwinkles
             result["incremental_history_ordering"] = mode.usesIncrementalHistoryOrdering
@@ -682,7 +819,10 @@ public final class PerformanceGraphicsDiagnostics {
             result["deferred_tool_geometry_enabled"] = mode.usesDeferredToolGeometry
             result["chart_publication_interval_seconds"] = mode.chartPublicationIntervalSeconds
             result["metal_arrival_bursts_enabled"] = mode.usesMetalArrivalBursts
-            result["arrival_backend"] = mode.usesMetalArrivalBursts ? "metal-shader" : "canvas"
+            result["arrival_backend"] =
+                mode.usesMetalFullChart
+                ? "metal-full-chart-shader"
+                : (mode.usesMetalArrivalBursts ? "metal-shader" : "canvas")
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"
