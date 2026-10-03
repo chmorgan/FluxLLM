@@ -26,10 +26,13 @@ def workload_snapshots(mode):
     after["chart_preparations"] += 2
     if mode == memory.NO_ARRIVAL_MODE:
         after["suppressed_arrival_effects"] += 2
+    if mode == memory.METAL_ARRIVAL_MODE:
+        after["metal_arrival_frames"] += 2
+        after["metal_arrival_submissions"] += 2
     if mode == memory.COMPACT_TOOL_PATHS_MODE:
         after["tool_path_input_points"] += 100
         after["tool_path_output_points"] += 30
-    if mode in memory.DEFERRED_TOOL_GEOMETRY_MODES:
+    if mode in memory.DEFERRED_TOOL_GEOMETRY_MODES + (memory.METAL_ARRIVAL_MODE,):
         after["tool_path_input_points"] += 100
         after["tool_path_output_points"] += 100
     if value.get("ordered_chart_publication"):
@@ -78,13 +81,16 @@ def clock_work_report(mode="runtime-canvas-clock"):
         return {"label": label, "snapshot": snapshot, "resource_sample": sample}
     steady = copy.deepcopy(before)
     points = [point("before-traffic", 0, before, 0)]
-    if mode == memory.NO_ARRIVAL_MODE:
-        steady["suppressed_arrival_effects"] = after["suppressed_arrival_effects"]
+    if mode in (memory.NO_ARRIVAL_MODE, memory.METAL_ARRIVAL_MODE):
+        if mode == memory.NO_ARRIVAL_MODE:
+            steady["suppressed_arrival_effects"] = after["suppressed_arrival_effects"]
+        else:
+            steady.update({field: after[field] for field in memory.METAL_ARRIVAL_COUNTERS})
         points.append(point("after-arrival", 2.5, steady, 2))
     else:
         steady["rail_frame_clock_ticks"] += 1
     points += [point("during-6", 6, steady, 2), point("during-19", 19, steady, 2)]
-    if mode == memory.NO_ARRIVAL_MODE:
+    if mode in (memory.NO_ARRIVAL_MODE, memory.METAL_ARRIVAL_MODE):
         points += [point("completion-begin", 25.1, steady, 0), point("during-completion", 27, after, 0)]
     points.append(point("completion-end", 29, after, 0))
     closed = [point("07-both-closed-after-probe", 32, after, 0, False),
@@ -152,7 +158,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled") if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled") if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -246,6 +252,86 @@ class RuntimeWorkTests(unittest.TestCase):
             after["graphics_diagnostics"]["roles"][role]["draws"] = 9
             with self.subTest(role=role), self.assertRaisesRegex(ValueError, "drawing counter moved backwards"):
                 runtime.validate_runtime_work(before, after, "runtime-optimized")
+
+
+class MetalArrivalWorkTests(unittest.TestCase):
+    def test_work_proof_keeps_canvas_counts_separate_and_positive_completion_required(self):
+        mode = memory.METAL_ARRIVAL_MODE
+        before, after = workload_snapshots(mode)
+        work = runtime.validate_runtime_work(before, after, mode)
+        self.assertEqual(work["arrival_backend"], "metal-shader")
+        self.assertEqual(work["deltas"]["metal_arrival_frames"], 2)
+        self.assertEqual(work["deltas"]["metal_arrival_submissions"], 2)
+        self.assertEqual(work["deltas"]["metal_arrival_failures"], 0)
+        self.assertEqual(work["deltas"]["grouped_native_canvas_draws"], 3)
+        for field in ("metal_arrival_frames", "metal_arrival_submissions"):
+            after[field] = before[field]
+        with self.assertRaisesRegex(ValueError, "did not submit rendered frames"):
+            runtime.validate_runtime_work(before, after, mode)
+        before, after = workload_snapshots(mode)
+        after["rail_frame_clock_ticks"] = before["rail_frame_clock_ticks"]
+        with self.assertRaisesRegex(ValueError, "did not execute frame ticks"):
+            runtime.validate_runtime_work(before, after, mode)
+
+    def test_metadata_and_counters_cannot_disappear_or_move_backwards(self):
+        mode = memory.METAL_ARRIVAL_MODE
+        for fault in ("backend", "flag", "counter", "decreasing", "failure"):
+            before, after = workload_snapshots(mode)
+            if fault == "backend":
+                after["graphics_diagnostics"]["arrival_backend"] = "canvas"
+            elif fault == "flag":
+                del after["graphics_diagnostics"]["metal_arrival_bursts_enabled"]
+            elif fault == "counter":
+                del after["metal_arrival_frames"]
+            elif fault == "decreasing":
+                after["metal_arrival_frames"] = after["metal_arrival_submissions"] = 1
+            else:
+                after["metal_arrival_failures"] = 1
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                runtime.validate_runtime_work(before, after, mode)
+
+    def test_phase_proof_requires_real_arrival_submission_and_canvas_completion(self):
+        mode = memory.METAL_ARRIVAL_MODE
+        report = clock_work_report(mode)
+        proof = runtime.validate_canvas_clock_work(report, mode)
+        self.assertEqual(proof["arrival_effects"]["arrival"]["deltas"]["metal_arrival_submissions"], 2)
+        self.assertGreater(proof["arrival_effects"]["completion"]["deltas"]["rail_frame_clock_ticks"], 0)
+        self.assertGreater(proof["arrival_effects"]["completion"]["deltas"]["rail_decorations_draws"], 0)
+        self.assertEqual(proof["steady"]["deltas"]["metal_arrival_frames"], 0)
+        self.assertEqual(proof["closed"]["metal_arrival_deltas"]["metal_arrival_submissions"], 0)
+
+    def test_late_submission_idle_activity_and_missing_phase_proof_are_rejected(self):
+        mode = memory.METAL_ARRIVAL_MODE
+        for fault in ("late", "steady", "closed", "arrival-boundary", "completion-clock", "completion-draw", "backend"):
+            report = clock_work_report(mode)
+            points = report["runtime"]["checkpoints"]
+            by_label = {point["label"]: point for point in points}
+            if fault == "late":
+                for point in points[1:5]:
+                    for field in memory.METAL_ARRIVAL_COUNTERS:
+                        point["snapshot"][field] = points[0]["snapshot"][field]
+            elif fault in ("steady", "closed"):
+                affected = points[3:] + report["checkpoints"] if fault == "steady" else report["checkpoints"][1:]
+                for point in affected:
+                    point["snapshot"]["metal_arrival_frames"] += 1
+                    point["snapshot"]["metal_arrival_submissions"] += 1
+            elif fault == "arrival-boundary":
+                points.remove(by_label["after-arrival"])
+            elif fault == "completion-clock":
+                by_label["completion-begin"]["snapshot"]["rail_frame_clock_ticks"] = by_label["during-completion"]["snapshot"]["rail_frame_clock_ticks"]
+            elif fault == "completion-draw":
+                by_label["during-completion"]["snapshot"]["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] = 0
+            else:
+                by_label["after-arrival"]["snapshot"]["graphics_diagnostics"]["arrival_backend"] = "canvas"
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                runtime.validate_canvas_clock_work(report, mode)
+
+    def test_normal_bracket_accepts_new_control_without_changing_limits(self):
+        mode = memory.METAL_ARRIVAL_MODE
+        args = runtime.parser().parse_args(["compare", "--app-binary", "/app", "--test-bundle", "/tests",
+            "--collector-binary", "/collector", "--provenance", "/provenance", "--baseline-mode", "normal", "--controls", mode])
+        self.assertEqual(runtime.selected_cases(args), [("baseline-before", "normal"), (mode, mode), ("baseline-after", "normal")])
+        self.assertEqual(runtime.MAX_SECONDS, 300)
 
 
 class NoArrivalWorkTests(unittest.TestCase):

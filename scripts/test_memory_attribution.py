@@ -415,7 +415,9 @@ class NextRuntimeContractTests(unittest.TestCase):
                     with self.subTest(mode=mode, field=field, value=invalid), self.assertRaises(InvalidResult):
                         memory.validate_graphics(changed, mode)
             snapshot["rail_frame_clock_ticks"] = 0
-            if mode == memory.NO_ARRIVAL_MODE:
+            if mode in (memory.NO_ARRIVAL_MODE, memory.METAL_ARRIVAL_MODE):
+                # Traffic acknowledgment can precede Canvas completion frames;
+                # authenticated runtime completion separately requires them.
                 self.assertTrue(memory.validate_graphics(snapshot, mode, completed_visible_workload=True)["available"])
             else:
                 with self.assertRaisesRegex(InvalidResult, "did not execute"):

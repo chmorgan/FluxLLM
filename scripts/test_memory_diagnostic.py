@@ -20,12 +20,13 @@ def graphics(mode="normal"):
               "max_width_points", "max_height_points", "max_scale")
     return {**({"shared_chart_normalization_builds": 0, "shared_chart_preparations": 0, "streamed_bodies_without_promises": 0, "chart_preparations": 0}
                if mode in memory.NEXT_RUNTIME_MODES else {}),
+            **(dict.fromkeys(memory.METAL_ARRIVAL_COUNTERS, 0) if mode == memory.METAL_ARRIVAL_MODE else {}),
             **(dict.fromkeys(memory.CANVAS_CLOCK_COUNTERS, 0) if mode in memory.CANVAS_CLOCK_MODES else {}),
             **(dict.fromkeys(memory.ORDERED_PUBLICATION_COUNTERS, 0) if mode in memory.ORDERED_PUBLICATION_MODES else {}),
-            **(dict.fromkeys(memory.DIRECT_TOOL_PLOT_COUNTERS, 0) if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
-            **(dict.fromkeys(memory.NATIVE_CANVAS_GROUP_COUNTERS, 0) if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
-            **(dict.fromkeys(memory.TOOL_PATH_POINT_COUNTERS, 0) if mode in (memory.COMPACT_TOOL_PATHS_MODE,) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
-            **({"suppressed_arrival_effects": 0} if mode in (memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}), "graphics_diagnostics": {
+            **(dict.fromkeys(memory.DIRECT_TOOL_PLOT_COUNTERS, 0) if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.METAL_ARRIVAL_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
+            **(dict.fromkeys(memory.NATIVE_CANVAS_GROUP_COUNTERS, 0) if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.METAL_ARRIVAL_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
+            **(dict.fromkeys(memory.TOOL_PATH_POINT_COUNTERS, 0) if mode in (memory.COMPACT_TOOL_PATHS_MODE, memory.METAL_ARRIVAL_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
+            **({"suppressed_arrival_effects": 0} if mode in (memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.METAL_ARRIVAL_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}), "graphics_diagnostics": {
         "enabled": True, "mode": mode, "invalid_events": 0, "cpu_glow_fallbacks": 0,
         "gradient_substitutions": 0,
         **({"shared_chart_preparation": mode in ("runtime-shared-preparation", "runtime-next-optimized"),
@@ -34,11 +35,14 @@ def graphics(mode="normal"):
            if mode in memory.NEXT_RUNTIME_MODES else {}),
         **({"canvas_frame_clock": True} if mode in memory.CANVAS_CLOCK_MODES else {}),
         **({"ordered_chart_publication": True} if mode in memory.ORDERED_PUBLICATION_MODES else {}),
-        **({"direct_tool_plot": mode == memory.DIRECT_TOOL_PLOT_MODE} if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
-        **({"ungrouped_native_canvas": mode == memory.UNGROUPED_CANVAS_MODE} if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
-        **({"arrival_effects_enabled": mode != memory.NO_ARRIVAL_MODE} if mode in (memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
-        **({"compact_tool_paths_enabled": mode == memory.COMPACT_TOOL_PATHS_MODE} if mode in (memory.COMPACT_TOOL_PATHS_MODE,) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
-        **({"deferred_tool_geometry_enabled": True} if mode in memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
+        **({"direct_tool_plot": mode == memory.DIRECT_TOOL_PLOT_MODE} if mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.METAL_ARRIVAL_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
+        **({"ungrouped_native_canvas": mode == memory.UNGROUPED_CANVAS_MODE} if mode in (memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.METAL_ARRIVAL_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
+        **({"arrival_effects_enabled": mode != memory.NO_ARRIVAL_MODE} if mode in (memory.NO_ARRIVAL_MODE, memory.COMPACT_TOOL_PATHS_MODE, memory.METAL_ARRIVAL_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
+        **({"compact_tool_paths_enabled": mode == memory.COMPACT_TOOL_PATHS_MODE} if mode in (memory.COMPACT_TOOL_PATHS_MODE, memory.METAL_ARRIVAL_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES else {}),
+        **({"deferred_tool_geometry_enabled": mode in memory.DEFERRED_TOOL_GEOMETRY_MODES}
+           if mode in memory.DEFERRED_TOOL_GEOMETRY_MODES + (memory.METAL_ARRIVAL_MODE,) else {}),
+        **({"metal_arrival_bursts_enabled": True, "arrival_backend": "metal-shader", "chart_publication_interval_seconds": 1.0}
+           if mode == memory.METAL_ARRIVAL_MODE else {}),
         **({"chart_publication_interval_seconds": .5} if mode == memory.DEFERRED_TOOL_GEOMETRY_2HZ_MODE else {}),
         **({"incremental_history_ordering": mode in ("runtime-history-order", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
             "optimized_chart_preparation": mode in ("runtime-chart-preparation", "runtime-optimized", "runtime-no-lifecycle") + memory.NEXT_RUNTIME_MODES,
@@ -96,9 +100,11 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
     if mode == memory.COMPACT_TOOL_PATHS_MODE:
         snapshot.update(grouped_native_canvas_draws=3, legacy_tool_plot_builds=3,
                         tool_path_input_points=30, tool_path_output_points=10)
-    if mode in memory.DEFERRED_TOOL_GEOMETRY_MODES:
+    if mode in memory.DEFERRED_TOOL_GEOMETRY_MODES + (memory.METAL_ARRIVAL_MODE,):
         snapshot.update(grouped_native_canvas_draws=3, legacy_tool_plot_builds=3,
                         tool_path_input_points=30, tool_path_output_points=30)
+    if mode == memory.METAL_ARRIVAL_MODE:
+        snapshot.update(metal_arrival_frames=3, metal_arrival_submissions=3)
     if mode in memory.CANVAS_CLOCK_MODES:
         snapshot["rail_frame_clock_ticks"] = 3
     if mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"):
@@ -116,6 +122,84 @@ def native_normal_graphics(*, drawn=False):
     snapshot = drawn_native_gpu_graphics("native-gpu-optimized") if drawn else graphics("native-gpu-optimized")
     snapshot["graphics_diagnostics"]["mode"] = "normal"
     return snapshot
+
+
+class MetalArrivalGraphicsTests(unittest.TestCase):
+    def test_candidate_keeps_normal_paths_and_proves_metal_without_early_canvas_ticks(self):
+        mode = memory.METAL_ARRIVAL_MODE
+        snapshot = drawn_native_gpu_graphics(mode)
+        snapshot["rail_frame_clock_ticks"] = 0  # Completion Canvas has not started at the traffic acknowledgment.
+        result = memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+        self.assertEqual(result["arrival_backend"], "metal-shader")
+        self.assertEqual(result["chart_publication_interval_seconds"], 1.0)
+        flags = result["runtime_feature_contract"]
+        self.assertTrue(flags["arrival_effects_enabled"] and flags["lifecycle_effects_enabled"])
+        self.assertTrue(flags["ordered_chart_publication"] and flags["canvas_frame_clock"])
+        self.assertFalse(flags["deferred_tool_geometry_enabled"] or flags["compact_tool_paths_enabled"])
+        self.assertTrue(all(type(value) is bool for value in flags.values()))
+        self.assertNotIn("arrival_backend", flags)
+
+    def test_required_metadata_rejects_missing_fallback_or_mistyped_values(self):
+        mode = memory.METAL_ARRIVAL_MODE
+        changes = ({"metal_arrival_bursts_enabled": None}, {"metal_arrival_bursts_enabled": False},
+                   {"metal_arrival_bursts_enabled": 1}, {"arrival_backend": None}, {"arrival_backend": "canvas"},
+                   {"deferred_tool_geometry_enabled": True}, {"compact_tool_paths_enabled": True},
+                   {"chart_publication_interval_seconds": None}, {"chart_publication_interval_seconds": .5})
+        for change in changes:
+            snapshot = drawn_native_gpu_graphics(mode)
+            snapshot["graphics_diagnostics"].update(change)
+            with self.subTest(change=change), self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, mode)
+
+    def test_complete_uint64_counters_require_successful_matching_submissions(self):
+        mode = memory.METAL_ARRIVAL_MODE
+        for field in memory.METAL_ARRIVAL_COUNTERS:
+            for invalid in (None, True, -1, 1.0, 2**64):
+                snapshot = drawn_native_gpu_graphics(mode)
+                if invalid is None:
+                    del snapshot[field]
+                else:
+                    snapshot[field] = invalid
+                with self.subTest(field=field, invalid=invalid), self.assertRaises(InvalidResult):
+                    memory.validate_graphics(snapshot, mode)
+        for frames, submissions, failures in ((3, 2, 0), (2, 3, 0), (3, 3, 1), (0, 0, 0)):
+            snapshot = drawn_native_gpu_graphics(mode)
+            snapshot.update(metal_arrival_frames=frames, metal_arrival_submissions=submissions, metal_arrival_failures=failures)
+            with self.subTest(frames=frames, submissions=submissions, failures=failures), self.assertRaises(InvalidResult):
+                memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
+
+    def test_frozen_absence_and_nonnative_zero_counters_remain_compatible(self):
+        self.assertTrue(memory.validate_graphics(native_normal_graphics(), "normal")["available"])
+        snapshot = graphics("empty-drawing")
+        snapshot.update(dict.fromkeys(memory.METAL_ARRIVAL_COUNTERS, 0))
+        self.assertTrue(memory.validate_graphics(snapshot, "empty-drawing")["available"])
+        for field in memory.METAL_ARRIVAL_COUNTERS:
+            changed = copy.deepcopy(snapshot)
+            changed[field] = 1
+            with self.subTest(field=field), self.assertRaises(InvalidResult):
+                memory.validate_graphics(changed, "empty-drawing")
+        del snapshot["metal_arrival_frames"]
+        with self.assertRaises(InvalidResult):
+            memory.validate_graphics(snapshot, "empty-drawing")
+
+    def test_instrumented_normal_requires_canvas_backend_complete_zero_group_and_stability(self):
+        snapshot = drawn_native_gpu_graphics(memory.METAL_ARRIVAL_MODE)
+        snapshot["graphics_diagnostics"].update(mode="normal", metal_arrival_bursts_enabled=False, arrival_backend="canvas")
+        snapshot.update(dict.fromkeys(memory.METAL_ARRIVAL_COUNTERS, 0))
+        diagnostic = memory.MemoryDiagnostic(Path("/unused"), memory.MemoryDeadline(), "normal")
+        self.assertEqual(diagnostic.validate_graphics_snapshot(snapshot)["arrival_backend"], "canvas")
+        self.assertEqual(diagnostic.report["arrival_backend"], "canvas")
+        for change in ({"arrival_backend": "metal-shader"}, {"metal_arrival_bursts_enabled": True}):
+            changed = copy.deepcopy(snapshot)
+            changed["graphics_diagnostics"].update(change)
+            with self.subTest(change=change), self.assertRaises(InvalidResult):
+                diagnostic.validate_graphics_snapshot(changed)
+        for field in memory.METAL_ARRIVAL_COUNTERS:
+            del snapshot[field]
+        for field in ("metal_arrival_bursts_enabled", "arrival_backend"):
+            del snapshot["graphics_diagnostics"][field]
+        with self.assertRaisesRegex(InvalidResult, "Arrival backend metadata changed or disappeared"):
+            diagnostic.validate_graphics_snapshot(snapshot)
 
 
 class ChartPublicationCadenceTests(unittest.TestCase):

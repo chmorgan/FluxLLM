@@ -85,7 +85,20 @@ def validate_runtime_work(before, after, mode, *, required=True):
     publication_interval = memory.chart_publication_interval(after.get("graphics_diagnostics", {}), mode)
     require(publication_interval == memory.chart_publication_interval(before.get("graphics_diagnostics", {}), mode),
             "Runtime chart publication interval metadata changed or disappeared")
+    metal_first = memory.metal_arrival_contract(before, mode)
+    metal_last = memory.metal_arrival_contract(after, mode)
+    require((metal_first is None) == (metal_last is None)
+            and (metal_first is None or metal_first["arrival_backend"] == metal_last["arrival_backend"]),
+            "Runtime arrival backend metadata changed or disappeared")
     delta = {}
+    if metal_first is not None:
+        for field in memory.METAL_ARRIVAL_COUNTERS:
+            first, last = metal_first["counters"][field], metal_last["counters"][field]
+            require(last >= first, f"Runtime {field} counter moved backwards")
+            delta[field] = last - first
+        if mode == memory.METAL_ARRIVAL_MODE:
+            require(delta["metal_arrival_frames"] == delta["metal_arrival_submissions"] > 0,
+                    "Runtime Metal arrival path did not submit rendered frames")
     for field in COUNTERS:
         first = memory.unsigned(before.get(field), f"runtime.before.{field}")
         last = memory.unsigned(after.get(field), f"runtime.after.{field}")
@@ -106,7 +119,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
             require(first["tool_path_output_points"] == first["tool_path_input_points"]
                     and last["tool_path_output_points"] == last["tool_path_input_points"],
                     "Noncompact tool paths changed the input vertex count")
-            if mode in ("normal",) + memory.DEFERRED_TOOL_GEOMETRY_MODES:
+            if mode in ("normal", memory.METAL_ARRIVAL_MODE) + memory.DEFERRED_TOOL_GEOMETRY_MODES:
                 require(delta["tool_path_input_points"] > 0, "Noncompact tool paths did not execute vertex construction")
     if mode == memory.NO_ARRIVAL_MODE or "arrival_effects_enabled" in flags or any("suppressed_arrival_effects" in snapshot for snapshot in (before, after)):
         require("arrival_effects_enabled" in flags, "Arrival suppression counter lacks feature metadata")
@@ -244,6 +257,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
     if not flags["lifecycle_effects_enabled"]:
         require(delta["rail_decorations_draws"] == 0, "No-lifecycle control still drew lifecycle decorations")
     return {"available": True, "features": flags, "deltas": delta,
+            **({"arrival_backend": metal_last["arrival_backend"]} if metal_last is not None else {}),
             **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {})}
 
 
@@ -304,6 +318,7 @@ def validate_canvas_clock_work(report, mode):
     """Use existing authenticated checkpoints; never infer idle from a tail deadline."""
     points = report["runtime"]["checkpoints"]
     flags = memory.runtime_feature_contract(points[0]["snapshot"].get("graphics_diagnostics", {}), mode) or {}
+    metal_initial = memory.metal_arrival_contract(points[0]["snapshot"], mode)
     if (mode not in memory.CANVAS_CLOCK_MODES and "canvas_frame_clock" not in flags
             and not any(field in point["snapshot"] for point in points for field in memory.CANVAS_CLOCK_COUNTERS)):
         return {"available": False, "reason": "Frozen product predates rail frame-clock counters"}
@@ -321,6 +336,10 @@ def validate_canvas_clock_work(report, mode):
                 "Frame-clock checkpoint lacks its authenticated kernel boundary")
         require(memory.runtime_feature_contract(snapshot.get("graphics_diagnostics", {}), mode) == flags,
                 "Frame-clock feature metadata changed during the capture")
+        metal = memory.metal_arrival_contract(snapshot, mode)
+        require((metal_initial is None) == (metal is None)
+                and (metal is None or metal_initial["arrival_backend"] == metal["arrival_backend"]),
+                "Arrival backend metadata changed during phase checkpoints")
         for field in memory.CANVAS_CLOCK_COUNTERS:
             memory.unsigned(snapshot.get(field), field)
         if clock_enabled:
@@ -333,6 +352,9 @@ def validate_canvas_clock_work(report, mode):
     for first, last in zip(points, points[1:]):
         require(all(last["snapshot"][field] >= first["snapshot"][field] for field in memory.CANVAS_CLOCK_COUNTERS),
                 "Frame-clock counters moved backwards during runtime")
+        if metal_initial is not None:
+            require(all(last["snapshot"][field] >= first["snapshot"][field] for field in memory.METAL_ARRIVAL_COUNTERS),
+                    "Metal arrival counters moved backwards during runtime")
     window = report["phase_windows"]["steady"]
     steady = [(point, timestamp) for point, timestamp in zip(points, timestamps)
               if window["start_monotonic_seconds"] < timestamp < window["end_monotonic_seconds"]]
@@ -344,6 +366,11 @@ def validate_canvas_clock_work(report, mode):
         # This exact fixture has only two simultaneous arrivals (0.8s effects)
         # and no completion before 25s. The +5s..+20s interior excludes both.
         require(delta["rail_frame_clock_ticks"] == 0, "Canvas frame clock continued ticking during effect-free steady traffic")
+    if mode == memory.METAL_ARRIVAL_MODE:
+        for field in memory.METAL_ARRIVAL_COUNTERS:
+            delta[field] = last["snapshot"][field] - first["snapshot"][field]
+        require(all(delta[field] == 0 for field in memory.METAL_ARRIVAL_COUNTERS),
+                "Metal arrival renderer continued work during effect-free steady traffic")
     result = {"available": True, "steady": {"start_checkpoint": first["label"], "end_checkpoint": last["label"],
         "start_monotonic_seconds": steady[0][1], "end_monotonic_seconds": steady[-1][1], "deltas": delta,
         "scope": "Interior of the fixed fixture's +5s..+20s steady phase; arrival/completion effects absent"}}
@@ -364,13 +391,18 @@ def validate_canvas_clock_work(report, mode):
                 "Canvas frame clock continued ticking after both windows closed")
         result["closed"] = {"start_checkpoint": closed[0][0]["label"], "end_checkpoint": closed[1][0]["label"],
             "start_monotonic_seconds": closed[0][1], "end_monotonic_seconds": closed[1][1], "rail_frame_clock_ticks_delta": 0}
-    if mode == memory.NO_ARRIVAL_MODE:
+        if mode == memory.METAL_ARRIVAL_MODE:
+            require(all(points[-1]["snapshot"][field] <= closed[0][0]["snapshot"][field]
+                        == closed[1][0]["snapshot"][field] for field in memory.METAL_ARRIVAL_COUNTERS),
+                    "Metal arrival renderer continued work after both windows closed")
+            result["closed"]["metal_arrival_deltas"] = dict.fromkeys(memory.METAL_ARRIVAL_COUNTERS, 0)
+    if mode in (memory.NO_ARRIVAL_MODE, memory.METAL_ARRIVAL_MODE):
         arrival = report["phase_windows"]["arrival"]
         ends = [(point, timestamp) for point, timestamp in zip(points, timestamps)
                 if arrival["end_monotonic_seconds"] <= timestamp < window["start_monotonic_seconds"]]
         require(timestamps[0] <= arrival["start_monotonic_seconds"] and ends
                 and ends[0][0]["snapshot"].get("active_requests") == 2,
-                "No-arrival drawing evidence does not bracket the complete arrival phase")
+                "Arrival drawing evidence does not bracket the complete arrival phase")
 
         def effect_delta(first, last):
             def draws(point):
@@ -380,23 +412,30 @@ def validate_canvas_clock_work(report, mode):
                     "rail_decorations_draws": draws(last) - draws(first)}
 
         arrival_delta = effect_delta(points[0], ends[0][0])
-        suppressed_first = memory.unsigned(points[0]["snapshot"].get("suppressed_arrival_effects"), "arrival.start.suppressed_arrival_effects")
-        suppressed_last = memory.unsigned(ends[0][0]["snapshot"].get("suppressed_arrival_effects"), "arrival.end.suppressed_arrival_effects")
-        arrival_delta["suppressed_arrival_effects"] = suppressed_last - suppressed_first
-        require(arrival_delta["rail_frame_clock_ticks"] == arrival_delta["rail_decorations_draws"] == 0
-                and arrival_delta["suppressed_arrival_effects"] > 0,
-                "No-arrival control did not suppress arrival drawing and clock work")
+        if mode == memory.NO_ARRIVAL_MODE:
+            suppressed_first = memory.unsigned(points[0]["snapshot"].get("suppressed_arrival_effects"), "arrival.start.suppressed_arrival_effects")
+            suppressed_last = memory.unsigned(ends[0][0]["snapshot"].get("suppressed_arrival_effects"), "arrival.end.suppressed_arrival_effects")
+            arrival_delta["suppressed_arrival_effects"] = suppressed_last - suppressed_first
+            require(arrival_delta["rail_frame_clock_ticks"] == arrival_delta["rail_decorations_draws"] == 0
+                    and arrival_delta["suppressed_arrival_effects"] > 0,
+                    "No-arrival control did not suppress arrival drawing and clock work")
+        else:
+            arrival_delta.update({field: ends[0][0]["snapshot"][field] - points[0]["snapshot"][field]
+                                  for field in memory.METAL_ARRIVAL_COUNTERS})
+            require(arrival_delta["metal_arrival_frames"] == arrival_delta["metal_arrival_submissions"] > 0
+                    and arrival_delta["metal_arrival_failures"] == 0,
+                    "Metal arrival phase did not submit rendered frames")
         completion = report["phase_windows"]["completion"]
         began = [(point, timestamp) for point, timestamp in zip(points, timestamps) if point["label"] == "completion-begin"]
         require(len(began) == 1 and completion["start_monotonic_seconds"] <= began[0][1] < completion["end_monotonic_seconds"],
-                "No-arrival control lacks an authenticated completion-start checkpoint inside the phase")
+                "Arrival control lacks an authenticated completion-start checkpoint inside the phase")
         completed = [(point, timestamp) for point, timestamp in zip(points, timestamps)
                      if began[0][1] <= timestamp <= completion["end_monotonic_seconds"]]
         require(len(completed) >= 2 and all(point["snapshot"].get("active_requests") == 0 for point, _ in completed),
-                "No-arrival control lacks interior completion drawing checkpoints")
+                "Arrival control lacks interior completion drawing checkpoints")
         completion_delta = effect_delta(completed[0][0], completed[-1][0])
         require(completion_delta["rail_frame_clock_ticks"] > 0 and completion_delta["rail_decorations_draws"] > 0,
-                "No-arrival control did not preserve completion drawing and clock work")
+                "Arrival control did not preserve completion drawing and clock work")
         result["arrival_effects"] = {
             "arrival": {"start_checkpoint": points[0]["label"], "end_checkpoint": ends[0][0]["label"],
                 "start_monotonic_seconds": timestamps[0], "end_monotonic_seconds": ends[0][1], "deltas": arrival_delta,

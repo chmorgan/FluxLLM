@@ -540,6 +540,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-direct-tool-plot` | Build request-tool plot geometry directly on top of current production behavior. |
 | `runtime-ungrouped-canvas` | Omit `drawingGroup` around native Canvas surfaces while retaining current production behavior elsewhere. |
 | `runtime-no-arrival-effects` | Suppress request-arrival effects while preserving completion effects and active retained twinkles. |
+| `runtime-metal-arrival-bursts` | Render arrival bursts and glints with a Metal shader, preserving completion effects and retained twinkles. |
 | `runtime-compact-tool-paths` | Enable tool-path compaction on top of current production behavior. |
 | `runtime-deferred-tool-geometry` | Construct request-tool paths on their first access from a render callback, preserving 1 Hz chart publication. |
 | `runtime-deferred-tool-geometry-2hz` | Use the same deferred construction with chart publication increased to 2 Hz. |
@@ -593,6 +594,47 @@ disabled. It keeps `lifecycle_effects_enabled = true` and sets
 `--baseline-mode normal --controls runtime-no-arrival-effects`. Production
 `normal` continues to show arrival effects; this diagnostic makes no CPU-gain claim.
 
+
+`runtime-metal-arrival-bursts` is an opt-in experiment inheriting current
+`normal` at 1 Hz chart publication, with deferred geometry and compact tool paths
+disabled. It draws arrival bursts and glints in the existing order; retained
+twinkles remain active and completion uses the original Canvas clock/drawing
+path. Compare the same binary with `runtime compare --baseline-mode normal
+--controls runtime-metal-arrival-bursts` and the existing required product paths,
+which runs normal/candidate/normal. The visible idle Metal host may prewarm
+without starting an active frame clock; that clock stops when the burst ends.
+Production remains unchanged and no performance gain is established.
+
+Run the automated native shader qualification against the same already-built
+Release test bundle from the repository root; this command performs no build:
+
+```sh
+FLUXLLM_METAL_ARRIVAL_FIDELITY=1 \
+FLUXLLM_METAL_ARRIVAL_FIDELITY_OUTPUT="$PWD/.performance-results/metal-arrival-fidelity-r1" \
+  /usr/bin/xcrun xctest \
+  -XCTest FluxLLMTests.MetalArrivalBurstRendererTests \
+  /absolute/products/FluxLLMPackageTests.xctest
+```
+
+`MetalArrivalBurstRendererTests` runs readback calibration, resource-lifetime
+checks, and a **68-case** comparison against independent Canvas rendering. The
+matrix covers burst families and ages, colors, 1×/2× scale, overlapping draw
+order, clipped glints, mixed burst/glint order, and inactive boundaries. Every
+pixel's absolute difference must be at most **2 byte values in each RGBA
+channel**; averages cannot hide a larger difference. The explicit output path
+must stay inside ignored `.performance-results`. Each native gate creates a
+unique subdirectory containing its JSON result and image evidence, without
+overwriting earlier captures. Missing Metal hardware records `unavailable` and
+skips the native test; a skip or successful test-process exit alone does not
+qualify the shader. Read the gate results, including calibration and all 68
+fidelity cases.
+
+Shader qualification establishes offscreen rendering fidelity and the tested
+resource behavior. It does not establish live app CPU or GPU consumption. Use
+the normal/candidate/normal runtime comparison above for unprofiled CPU and the
+existing calibrated GPU trace runner separately, with its 300-second bound.
+App frame/submission counters prove submitted work and are not GPU utilization;
+the 5% CPU and 1% GPU limits remain unchanged.
 
 `runtime-compact-tool-paths` is opt-in and inherits every current `normal` feature,
 changing only `compact_tool_paths_enabled` to `true`; production `normal` keeps
@@ -711,6 +753,23 @@ three-second completion phase. Counter values are never interpolated.
 The traffic acknowledgment may correctly contain zero frame ticks in this mode;
 generic snapshot validation defers tick positivity to the required whole-runtime
 and authenticated completion-phase proofs.
+
+
+Metal-arrival graphics metadata requires `metal_arrival_bursts_enabled = true`
+and `arrival_backend = 'metal-shader'` for this candidate; other instrumented
+native modes require `false` and `'canvas'`. Older modes may omit the entire new
+group. The three top-level UInt64 counters `metal_arrival_frames`,
+`metal_arrival_submissions`, and `metal_arrival_failures` must be complete when
+present; other modes require all three to remain zero. They are separate from
+native Canvas role draw counts. Frames count drawable callbacks eligible for an active burst;
+submissions count successfully encoded and committed command buffers. Valid
+candidate evidence requires equal, positive frame/submission deltas and zero
+failures both across the whole runtime and the authenticated checkpoint superset
+of arrival. Authenticated completion must retain positive original Canvas clock
+and draw activity. These counters prove submitted work, not GPU execution or
+allocation counts. Separate GPU-provider calibration and the 1% GPU limit remain
+unchanged, as do the 5% CPU limit, physical-footprint limit below 64,000,000 bytes,
+fixed workload, and 300-second command bound.
 
 Ordered publication, including current `normal`, requires a positive workload
 delta in top-level
