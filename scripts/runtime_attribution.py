@@ -41,7 +41,7 @@ BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal", memory.ORDER
 
 
 def cpu_acceptance_eligible(mode, *, profile=False):
-    return not profile and mode not in (memory.HELD_STATIC_CHART_MODE, memory.METAL_FULL_CHART_MODE)
+    return not profile and mode not in (memory.HELD_STATIC_CHART_MODE, *memory.METAL_CHART_MODES)
 
 
 def held_static_chart_work(before, after, mode):
@@ -226,12 +226,16 @@ def validate_runtime_work(before, after, mode, *, required=True):
     full_last = memory.metal_full_chart_contract(after, mode)
     require((full_first is None) == (full_last is None), "Full Metal chart instrumentation changed during runtime")
     full_delta = None
-    if mode == memory.METAL_FULL_CHART_MODE:
+    if mode in memory.METAL_CHART_MODES:
+        full_counters = memory.METAL_FULL_CHART_COUNTERS + (memory.METAL_CACHE_COUNTERS
+                        if mode == memory.METAL_CACHED_CHART_MODE else ())
         full_delta = {field: full_last["counters"][field] - full_first["counters"][field]
-                      for field in memory.METAL_FULL_CHART_COUNTERS}
+                      for field in full_counters}
         require(all(count >= 0 for count in full_delta.values()), "Full Metal chart work counters moved backwards")
-        require(all(full_delta[field] > 0 for field in ("geometry_uploads", "submissions", "static_frames",
-                                                       "arrival_frames", "completion_frames", "twinkle_frames")),
+        required_metal_work = ("geometry_uploads", "submissions", "static_frames", "arrival_frames", "completion_frames")
+        if mode == memory.METAL_FULL_CHART_MODE:
+            required_metal_work += ("twinkle_frames",)
+        require(all(full_delta[field] > 0 for field in required_metal_work),
                 "Full Metal chart runtime did not submit all static and animation work")
     if metal_first is not None:
         for field in memory.METAL_ARRIVAL_COUNTERS:
@@ -247,6 +251,18 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {field} counter moved backwards")
         delta[field] = last - first
     require(delta["chart_preparations"] > 0, "Runtime workload did not prepare charts")
+    if mode == memory.METAL_CACHED_CHART_MODE:
+        require(0 < full_delta["static_rasterizations"] < full_delta["static_cache_composites"],
+                "Cached Metal runtime did not reuse rendered static pixels")
+        allowance = max(full_first["counters"]["live_hosts"], full_last["counters"]["live_hosts"])
+        require(full_delta["scene_unclassified_revisions"] == 0,
+                "Cached Metal runtime has unclassified static scene revisions")
+        require(sum(full_delta[field] for field in memory.METAL_SCENE_REVISION_CAUSES)
+                >= full_delta["static_scene_revisions"],
+                "Cached Metal runtime scene revisions lack explicit invalidation causes")
+        require(full_delta["static_rasterizations"] <= full_delta["static_scene_revisions"]
+                + full_delta["static_surface_invalidations"] + allowance,
+                "Cached Metal rasterization exceeds recorded scene and surface invalidations plus boundary updates")
     if (mode in (memory.COMPACT_TOOL_PATHS_MODE,) + memory.DEFERRED_TOOL_GEOMETRY_MODES or "compact_tool_paths_enabled" in flags
             or any(field in snapshot for snapshot in (before, after) for field in memory.TOOL_PATH_POINT_COUNTERS)):
         require("compact_tool_paths_enabled" in flags, "Tool-path point counters lack feature metadata")
@@ -298,7 +314,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
         else:
             require(before["ungrouped_native_canvas_draws"] == after["ungrouped_native_canvas_draws"] == 0,
                     "Grouped native Canvas mode executed ungrouped callbacks")
-            if mode == memory.METAL_FULL_CHART_MODE:
+            if mode in memory.METAL_CHART_MODES:
                 require(delta["grouped_native_canvas_draws"] == 0, "Full Metal chart executed grouped Canvas callbacks")
             else:
                 require(delta["grouped_native_canvas_draws"] > 0, "Baseline native Canvas did not execute grouped callbacks")
@@ -407,7 +423,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {role} drawing counter moved backwards")
         delta[role + "_draws"] = last - first
     held_work = held_static_chart_work(before, after, mode)
-    if held_work is None and mode != memory.METAL_FULL_CHART_MODE:
+    if held_work is None and mode not in memory.METAL_CHART_MODES:
         require(delta["static_chart_draws"] > 0, "Runtime static charts did not redraw")
     if flags.get("canvas_frame_clock", False):
         minimum_draws = max(1, math.floor(.8 * delta["rail_frame_clock_ticks"]) - 2)
@@ -481,8 +497,10 @@ def validate_metal_full_chart_work(report, mode, *,
                                   closed_labels=("07-both-closed-after-probe", "08-closed-after-five-more-seconds"),
                                   minimum_closed_seconds=5, boundary=None):
     """Keep workload, native visibility, phase, and cancellation proofs for Metal."""
-    if mode != memory.METAL_FULL_CHART_MODE:
+    if mode not in memory.METAL_CHART_MODES:
         return None
+    cached = mode == memory.METAL_CACHED_CHART_MODE
+    cumulative = memory.METAL_FULL_CHART_COUNTERS + (memory.METAL_CACHE_COUNTERS if cached else ())
     points = report["runtime"]["checkpoints"]
     require(len(points) >= 2, "Full Metal chart lacks runtime checkpoints")
     if boundary is None:
@@ -521,8 +539,14 @@ def validate_metal_full_chart_work(report, mode, *,
         rows.append((point, boundary(point), counts))
     for first, last in zip(rows, rows[1:]):
         require(last[1] > first[1], "Full Metal chart checkpoints are not ordered")
-        require(all(last[2][field] >= first[2][field] for field in memory.METAL_FULL_CHART_COUNTERS),
+        require(all(last[2][field] >= first[2][field] for field in cumulative),
                 "Full Metal chart counters moved backwards between checkpoints")
+        if cached:
+            first_twinkles = first[0]["snapshot"]["graphics_diagnostics"]["retained_twinkles"]
+            last_twinkles = last[0]["snapshot"]["graphics_diagnostics"]["retained_twinkles"]
+            require(all(last_twinkles[field] >= first_twinkles[field] for field in
+                        ("hosts_created", "hosts_destroyed", "instances_created", "instances_destroyed", "animation_starts")),
+                    "Cached Metal retained twinkle counters moved backwards")
     runtime_rows = rows[:len(points)]
     arrival, steady, completion = (report["phase_windows"][name] for name in ("arrival", "steady", "completion"))
     arrival_end = [row for row in runtime_rows
@@ -543,14 +567,14 @@ def validate_metal_full_chart_work(report, mode, *,
             "Full Metal chart completion lacks idle interior checkpoints")
 
     def delta(first, last):
-        return {field: last[2][field] - first[2][field] for field in memory.METAL_FULL_CHART_COUNTERS}
+        return {field: last[2][field] - first[2][field] for field in cumulative}
 
     arrival_delta = delta(runtime_rows[0], arrival_end[0])
     steady_delta = delta(steady_rows[0], steady_rows[-1])
     completion_delta = delta(completion_rows[0], completion_rows[-1])
     require(arrival_delta["arrival_frames"] > 0 and arrival_delta["static_frames"] > 0,
             "Full Metal chart did not submit arrivals before steady traffic")
-    require(steady_delta["static_frames"] > 0 and steady_delta["twinkle_frames"] > 0
+    require(steady_delta["static_frames"] > 0 and (cached or steady_delta["twinkle_frames"] > 0)
             and steady_delta["geometry_uploads"] > 0,
             "Full Metal chart steady phase did not update charts and animate twinkles")
     require(steady_delta["arrival_frames"] == steady_delta["completion_frames"] == 0,
@@ -560,15 +584,50 @@ def validate_metal_full_chart_work(report, mode, *,
             "Full Metal chart closed observation is too short")
     closed_delta = delta(rows[-2], rows[-1])
     require(all(count == 0 for count in closed_delta.values()), "Full Metal chart continued work after windows closed")
+    cached_work = {}
+    if cached:
+        first, last = steady_rows[0], steady_rows[-1]
+        preparations = memory.unsigned(last[0]["snapshot"].get("chart_preparations"), "steady.last.chart_preparations") - memory.unsigned(
+            first[0]["snapshot"].get("chart_preparations"), "steady.first.chart_preparations")
+        allowance = max(first[2]["live_hosts"], last[2]["live_hosts"])
+        invalidations = steady_delta["static_scene_revisions"] + steady_delta["static_surface_invalidations"]
+        require(preparations > 0 and 0 < steady_delta["static_rasterizations"] <= invalidations + allowance,
+                "Cached Metal steady rasterization exceeds recorded scene and surface invalidations")
+        require(steady_delta["static_cache_composites"] <= invalidations + allowance
+                and steady_delta["submissions"] <= invalidations + allowance,
+                "Cached Metal steady frame submissions exceed invalidation-driven redraws")
+        require(steady_delta["scene_unclassified_revisions"] == 0
+                and sum(steady_delta[field] for field in memory.METAL_SCENE_REVISION_CAUSES)
+                >= steady_delta["static_scene_revisions"],
+                "Cached Metal steady scene revisions lack explicit invalidation causes")
+        require(steady_delta["twinkle_frames"] == steady_delta["effect_clock_ticks"] == 0,
+                "Cached Metal continued shader glints or its effects clock during steady traffic")
+        retained = {}
+        for field in ("instances_created", "animation_starts"):
+            retained[field] = (last[0]["snapshot"]["graphics_diagnostics"]["retained_twinkles"][field]
+                               - first[0]["snapshot"]["graphics_diagnostics"]["retained_twinkles"][field])
+        require(all(value > 0 for value in retained.values()),
+                "Cached Metal steady phase did not execute retained Core Animation glints")
+        first_closed = rows[-2][0]["snapshot"]["graphics_diagnostics"]["retained_twinkles"]
+        last_closed = rows[-1][0]["snapshot"]["graphics_diagnostics"]["retained_twinkles"]
+        require(first_closed == last_closed, "Cached Metal retained glints continued work after windows closed")
+        cached_work = {"cache_publication_proof": {"steady_chart_preparations": preparations,
+                      "steady_static_scene_revisions": steady_delta["static_scene_revisions"],
+                      "steady_static_surface_invalidations": steady_delta["static_surface_invalidations"],
+                      "steady_scene_revision_causes": {field: steady_delta[field] for field in memory.METAL_SCENE_REVISION_CAUSES},
+                      "per_host_boundary_allowance": allowance, "steady_retained_twinkle_deltas": retained,
+                      "steady_effect_clock_stopped": True,
+                      "scope": "Explicit scene/surface invalidation causes, independent chart preparations, and at most one boundary redraw per live host"}}
     return {"available": True, "arrival_deltas": arrival_delta, "steady_deltas": steady_delta,
             "completion_deltas": completion_delta, "closed_deltas": closed_delta,
+            **cached_work,
             "frame_delivery_qualified": rows[-1][2]["frames_skipped"] == 0,
             "scope": "Authenticated visible workload and closed cancellation; submitted work does not measure GPU utilization"}
 
 
 def validate_canvas_clock_work(report, mode):
     """Use existing authenticated checkpoints; never infer idle from a tail deadline."""
-    if mode == memory.METAL_FULL_CHART_MODE:
+    if mode in memory.METAL_CHART_MODES:
         return validate_metal_full_chart_work(report, mode)
     points = report["runtime"]["checkpoints"]
     flags = memory.runtime_feature_contract(points[0]["snapshot"].get("graphics_diagnostics", {}), mode) or {}
@@ -1031,9 +1090,9 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
         report["runtime_cpu_target"] = {"evaluated": eligible, "acceptance_eligible": eligible, "limit_percent": 5.0,
             "within_limit": report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5 if eligible else None,
             "scope": "Contiguous visible traffic and completion only; separate from full resource gate"}
-        if mode in (memory.HELD_STATIC_CHART_MODE, memory.METAL_FULL_CHART_MODE):
+        if mode in (memory.HELD_STATIC_CHART_MODE, *memory.METAL_CHART_MODES):
             report["runtime_cpu_target"]["reason"] = ("Experimental Metal chart needs independent visual and frame-delivery qualification"
-                if mode == memory.METAL_FULL_CHART_MODE else "Held static chart drawing is a diagnostic ablation, not production rendering")
+                if mode in memory.METAL_CHART_MODES else "Held static chart drawing is a diagnostic ablation, not production rendering")
             report["runtime_cpu_target"]["observed_within_limit"] = report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5
             report["cpu_gate_evaluated"] = False
             report.setdefault("workload_cpu", {}).update(acceptance_eligible=False, gate_evaluated=False, within_limit=None)
@@ -1157,7 +1216,7 @@ def parser():
         result.add_argument("--" + name, type=Path,
                             help="Compare frozen versions in reference/candidate/reference order using --baseline-mode")
     result.add_argument("--graphics-mode", choices=BASELINES + memory.RUNTIME_MODES, default="normal")
-    result.add_argument("--baseline-mode", choices=BASELINES, default="native-gpu-optimized")
+    result.add_argument("--baseline-mode", choices=BASELINES + memory.METAL_CHART_MODES, default="native-gpu-optimized")
     result.add_argument("--candidate-mode", choices=BASELINES + memory.RUNTIME_MODES,
                         help="Candidate-only rendering mode for a frozen reference/candidate/reference comparison")
     result.add_argument("--controls", nargs="+", choices=memory.RUNTIME_MODES + ("normal",))

@@ -23,7 +23,7 @@ class RuntimeVersionTests(unittest.TestCase):
                 "--output-dir", str(root / "output")]
 
     def run_comparison(self, directory, *, mismatch=None, mutation=None, visual_mismatch=False,
-                       peaks=(4, 3, 4), deadline_calls=None, candidate_mode=None, seen_modes=None):
+                       peaks=(4, 3, 4), deadline_calls=None, candidate_mode=None, baseline_mode="normal", seen_modes=None):
         root = Path(directory)
         for role in ("reference", "candidate"):
             folder = root / role
@@ -51,7 +51,7 @@ class RuntimeVersionTests(unittest.TestCase):
         def capture(path, mode, paths, provenance, identity, deadline, *, profile):
             self.assertFalse(profile)
             role = paths["app"].parent.name
-            self.assertEqual(mode, candidate_mode if role == "candidate" and candidate_mode else "normal")
+            self.assertEqual(mode, candidate_mode if role == "candidate" and candidate_mode else baseline_mode)
             if seen_modes is not None:
                 seen_modes.append((role, mode))
             self.assertLessEqual(deadline.end - deadline.clock(), runtime.THREE_CASE_SECONDS)
@@ -73,6 +73,7 @@ class RuntimeVersionTests(unittest.TestCase):
                 patch.object(runtime, "RuntimeDeadline", wraps=runtime.RuntimeDeadline) as deadlines, \
                 contextlib.redirect_stdout(io.StringIO()):
             arguments = self.argv(directory)
+            arguments[arguments.index("--baseline-mode") + 1] = baseline_mode
             if candidate_mode is not None:
                 arguments += ["--candidate-mode", candidate_mode]
             code = runtime.run(arguments)
@@ -129,6 +130,18 @@ class RuntimeVersionTests(unittest.TestCase):
         args += ["--candidate-mode", "runtime-metal-full-chart"]
         with self.assertRaises(ValueError):
             runtime.selected_cases(runtime.parser().parse_args(args))
+
+    def test_cached_metal_uses_both_existing_normal_and_full_metal_frozen_controls(self):
+        for baseline in ("normal", "runtime-metal-full-chart"):
+            modes = []
+            with self.subTest(baseline=baseline), tempfile.TemporaryDirectory() as directory:
+                code, report, seen = self.run_comparison(directory, candidate_mode="runtime-metal-cached-chart",
+                    baseline_mode=baseline, seen_modes=modes)
+            self.assertEqual(code, 0)
+            self.assertEqual(modes, [("reference", baseline), ("candidate", "runtime-metal-cached-chart"),
+                                     ("reference", baseline)])
+            self.assertEqual(report["deadline_seconds"], 300)
+            self.assertFalse(report["regression_passed"])
 
     def test_partial_reference_and_profile_or_controls_rejected_before_capture(self):
         for alteration in ("partial", "profile", "controls"):

@@ -513,7 +513,9 @@ class GPUProductModeRoutingTests(unittest.TestCase):
         cases = (([], ["normal", "normal"]),
                  (["--graphics-mode", "runtime-metal-arrival-bursts"], ["runtime-metal-arrival-bursts"] * 2),
                  (["--graphics-mode", "runtime-metal-arrival-bursts", "--reference-mode", "normal",
-                   "--candidate-mode", "runtime-metal-full-chart"], ["normal", "runtime-metal-full-chart"]))
+                   "--candidate-mode", "runtime-metal-full-chart"], ["normal", "runtime-metal-full-chart"]),
+                 (["--reference-mode", "runtime-metal-full-chart", "--candidate-mode", "runtime-metal-cached-chart"],
+                  ["runtime-metal-full-chart", "runtime-metal-cached-chart"]))
         for arguments, modes in cases:
             with self.subTest(arguments=arguments):
                 code, report, seen = self.run_modes(arguments)
@@ -525,10 +527,11 @@ class GPUProductModeRoutingTests(unittest.TestCase):
                 self.assertFalse(report["regression_passed"])
 
     def test_single_case_selection_launches_only_selected_product_with_same_workload_and_limits(self):
-        for selected, mode in (("reference", "normal"), ("candidate", "runtime-metal-full-chart")):
-            with self.subTest(selected=selected):
+        for selected, mode in (("reference", "normal"), ("candidate", "runtime-metal-full-chart"),
+                               ("candidate", "runtime-metal-cached-chart")):
+            with self.subTest(selected=selected, mode=mode):
                 code, report, seen = self.run_modes(["--capture-case", selected,
-                    "--reference-mode", "normal", "--candidate-mode", "runtime-metal-full-chart"])
+                    "--reference-mode", "normal", "--candidate-mode", mode if selected == "candidate" else "runtime-metal-full-chart"])
                 self.assertEqual(code, 0)
                 self.assertEqual(seen, [(selected, mode)])
                 self.assertEqual(report["capture_case"], selected)

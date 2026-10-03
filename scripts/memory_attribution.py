@@ -36,6 +36,14 @@ HELD_STATIC_CHART_COUNTERS = ("drawing_update_attempts", "drawing_updates_applie
 METAL_ARRIVAL_MODE = "runtime-metal-arrival-bursts"
 METAL_ARRIVAL_COUNTERS = ("metal_arrival_frames", "metal_arrival_submissions", "metal_arrival_failures")
 METAL_FULL_CHART_MODE = "runtime-metal-full-chart"
+METAL_CACHED_CHART_MODE = "runtime-metal-cached-chart"
+METAL_CHART_MODES = (METAL_FULL_CHART_MODE, METAL_CACHED_CHART_MODE)
+METAL_SCENE_REVISION_CAUSES = ("scene_initial_revisions", "scene_publication_revisions", "scene_scale_revisions",
+                             "scene_layout_revisions", "scene_appearance_revisions", "scene_rail_revisions",
+                             "scene_unclassified_revisions")
+METAL_CACHE_COUNTERS = ("static_rasterizations", "static_cache_composites", "effect_clock_ticks",
+                        "static_scene_revisions", "static_surface_invalidations") + METAL_SCENE_REVISION_CAUSES
+METAL_CACHE_FIELDS = METAL_CACHE_COUNTERS + ("current_texture_bytes", "peak_texture_bytes")
 METAL_FULL_CHART_COUNTERS = ("hosts_created", "hosts_destroyed", "geometry_uploads", "submissions", "failures",
                            "frames_skipped", "static_frames", "arrival_frames", "completion_frames", "twinkle_frames")
 METAL_FULL_CHART_FIELDS = METAL_FULL_CHART_COUNTERS + ("live_hosts", "peak_hosts", "current_buffer_bytes", "peak_buffer_bytes")
@@ -44,9 +52,9 @@ DEFERRED_TOOL_GEOMETRY_MODE = "runtime-deferred-tool-geometry"
 DEFERRED_TOOL_GEOMETRY_2HZ_MODE = "runtime-deferred-tool-geometry-2hz"
 DEFERRED_TOOL_GEOMETRY_MODES = (DEFERRED_TOOL_GEOMETRY_MODE, DEFERRED_TOOL_GEOMETRY_2HZ_MODE)
 TOOL_PATH_POINT_COUNTERS = ("tool_path_input_points", "tool_path_output_points")
-ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, METAL_FULL_CHART_MODE, HELD_STATIC_CHART_MODE) + DEFERRED_TOOL_GEOMETRY_MODES
-CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + tuple(mode for mode in ORDERED_PUBLICATION_MODES if mode != METAL_FULL_CHART_MODE)
-NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized", METAL_FULL_CHART_MODE) + CANVAS_CLOCK_MODES
+ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE) + DEFERRED_TOOL_GEOMETRY_MODES
+CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + tuple(mode for mode in ORDERED_PUBLICATION_MODES if mode not in METAL_CHART_MODES)
+NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized", *METAL_CHART_MODES) + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
 GRAPHICS_MODES += RUNTIME_MODES
 RUNTIME_FLAGS = ("incremental_history_ordering", "optimized_chart_preparation", "lifecycle_effects_enabled")
@@ -395,11 +403,16 @@ def runtime_feature_contract(value, mode):
     if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing")):
         return None
     extras = {}
-    if mode == METAL_FULL_CHART_MODE or "metal_full_chart_enabled" in value:
+    if mode in METAL_CHART_MODES or "metal_full_chart_enabled" in value:
         require(type(value.get("metal_full_chart_enabled")) is bool
-                and value["metal_full_chart_enabled"] is (mode == METAL_FULL_CHART_MODE),
+                and value["metal_full_chart_enabled"] is (mode in METAL_CHART_MODES),
                 "Graphics metal_full_chart_enabled does not match the requested runtime control")
         extras["metal_full_chart_enabled"] = value["metal_full_chart_enabled"]
+    if mode == METAL_CACHED_CHART_MODE or "metal_static_cache_enabled" in value:
+        require(type(value.get("metal_static_cache_enabled")) is bool
+                and value["metal_static_cache_enabled"] is (mode == METAL_CACHED_CHART_MODE),
+                "Graphics metal_static_cache_enabled does not match the requested runtime control")
+        extras["metal_static_cache_enabled"] = value["metal_static_cache_enabled"]
     promoted_normal = mode == "normal" and value.get("unpromised_stream_body_writes") is True
     if mode in NEXT_RUNTIME_MODES or any(field in value for field in NEXT_RUNTIME_FLAGS):
         expected = {"shared_chart_preparation": mode in ("runtime-shared-preparation", "runtime-next-optimized"),
@@ -486,7 +499,7 @@ def tool_path_point_counts(snapshot):
 
 def chart_publication_interval(value, mode):
     field = "chart_publication_interval_seconds"
-    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, METAL_FULL_CHART_MODE, HELD_STATIC_CHART_MODE):
+    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE):
         return None
     interval = value.get(field)
     expected = .5 if mode == DEFERRED_TOOL_GEOMETRY_2HZ_MODE else 1.0
@@ -539,7 +552,7 @@ def metal_arrival_contract(snapshot, mode, *, completed_visible_workload=False):
         require(type(value.get("metal_arrival_bursts_enabled")) is bool
                 and value["metal_arrival_bursts_enabled"] is enabled,
                 "Metal arrival counters lack matching enabled metadata")
-        backend = "metal-full-chart-shader" if mode == METAL_FULL_CHART_MODE else ("metal-shader" if enabled else "canvas")
+        backend = "metal-full-chart-shader" if mode in METAL_CHART_MODES else ("metal-shader" if enabled else "canvas")
         require(value.get("arrival_backend") == backend, "Arrival backend does not match the requested mode")
     counters = {field: snapshot.get(field) for field in METAL_ARRIVAL_COUNTERS}
     for field, count in counters.items():
@@ -559,7 +572,7 @@ def metal_arrival_contract(snapshot, mode, *, completed_visible_workload=False):
 def metal_full_chart_contract(snapshot, mode, *, completed_visible_workload=False, expected_closed=False):
     """Retained Metal work and lifetime evidence, not measured GPU consumption."""
     value = snapshot.get("graphics_diagnostics", {})
-    enabled = mode == METAL_FULL_CHART_MODE
+    enabled = mode in METAL_CHART_MODES
     if not enabled and not any(field in value for field in ("metal_full_chart_enabled", "metal_full_chart")):
         return None
     require(type(value.get("metal_full_chart_enabled")) is bool and value["metal_full_chart_enabled"] is enabled,
@@ -569,6 +582,31 @@ def metal_full_chart_contract(snapshot, mode, *, completed_visible_workload=Fals
     for field in METAL_FULL_CHART_FIELDS:
         require(type(counts.get(field)) is int and 0 <= counts[field] <= 2**64 - 1,
                 f"graphics.metal_full_chart.{field} must be a complete UInt64 counter")
+    cached = mode == METAL_CACHED_CHART_MODE
+    cache_supplied = cached or any(field in counts for field in METAL_CACHE_FIELDS)
+    if cached or "metal_static_cache_enabled" in value:
+        require(type(value.get("metal_static_cache_enabled")) is bool
+                and value["metal_static_cache_enabled"] is cached,
+                "Metal static cache counters lack matching enabled metadata")
+    if cache_supplied:
+        for field in METAL_CACHE_FIELDS:
+            require(type(counts.get(field)) is int and 0 <= counts[field] <= 2**64 - 1,
+                    f"graphics.metal_full_chart.{field} must be a complete UInt64 counter")
+        if not cached:
+            require(all(counts[field] == 0 for field in METAL_CACHE_FIELDS if field != "effect_clock_ticks"),
+                    "Uncached mode executed cached Metal chart work")
+            require(enabled or counts["effect_clock_ticks"] == 0,
+                    "Non-Metal chart mode executed a Metal effects clock")
+        else:
+            require(all(counts[field] <= counts["static_scene_revisions"] for field in METAL_SCENE_REVISION_CAUSES)
+                    and sum(counts[field] for field in METAL_SCENE_REVISION_CAUSES) >= counts["static_scene_revisions"],
+                    "Cached Metal scene revisions lack complete bounded invalidation causes")
+            require(counts["static_rasterizations"] <= counts["static_cache_composites"] == counts["static_frames"],
+                    "Cached Metal static rasterizations and composites do not reconcile")
+            require(counts["current_texture_bytes"] <= counts["peak_texture_bytes"]
+                    and (counts["live_hosts"] > 0 or counts["current_texture_bytes"] == 0),
+                    "Cached Metal texture lifetime does not reconcile")
+            require(counts["frames_skipped"] == 0, "Cached Metal chart skipped submitted frame work")
     if not enabled:
         require(all(counts[field] == 0 for field in METAL_FULL_CHART_FIELDS),
                 "Non-Metal chart mode executed full Metal chart work")
@@ -602,14 +640,27 @@ def metal_full_chart_contract(snapshot, mode, *, completed_visible_workload=Fals
                 for role in roles.values()), "Full Metal chart created or drew a legacy Canvas role")
     if completed_visible_workload:
         require(counts["geometry_uploads"] > 0 and counts["submissions"] > 0 and counts["static_frames"] > 0
-                and counts["arrival_frames"] > 0 and counts["twinkle_frames"] > 0,
+                and counts["arrival_frames"] > 0 and (cached or counts["twinkle_frames"] > 0),
                 "Full Metal chart workload lacks positive static, arrival, or twinkle submissions")
         require(counts["peak_buffer_bytes"] > 0, "Full Metal chart workload lacks retained geometry allocations")
+        if cached:
+            require(0 < counts["static_rasterizations"] < counts["static_cache_composites"]
+                    and counts["peak_texture_bytes"] > 0,
+                    "Cached Metal workload did not reuse a populated rendered texture")
+    if cached:
+        validate_retained_twinkles(value, mode, completed_visible_workload=completed_visible_workload,
+                                  expected_closed=expected_closed)
     if expected_closed:
         require(counts["live_hosts"] == counts["current_buffer_bytes"] == 0,
                 "Full Metal chart resources remain live after windows closed")
+        if cached:
+            require(counts["current_texture_bytes"] == 0,
+                    "Cached Metal texture resources remain live after windows closed")
     return {"enabled": True, "counters": counts,
             "frame_delivery_qualified": counts["frames_skipped"] == 0,
+            **({"static_cache_enabled": True,
+                "texture_scope": "Retained static render-target allocations; excludes drawables and physical GPU memory"}
+               if cached else {}),
             "buffer_scope": "Retained geometry and descriptor allocations; excludes drawable textures and physical GPU memory"}
 
 
@@ -629,7 +680,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     # Keep the requested mode acknowledgment while applying the complete
     # combined contract to newer production binaries that identify this backend.
     native_normal = mode == "normal" and "native_gpu_backend" in value
-    contract = "native-gpu-optimized" if native_normal or mode in RUNTIME_MODES and mode != METAL_FULL_CHART_MODE else mode
+    contract = "native-gpu-optimized" if native_normal or mode in RUNTIME_MODES and mode not in METAL_CHART_MODES else mode
     runtime_features = runtime_feature_contract(value, mode)
     held_static_chart_counts(value, mode)
     twinkle_delivery_contract(snapshot, mode)
@@ -761,7 +812,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             if contract != "native-gpu-canvas" or field in value:
                 require(type(value.get(field)) is bool and value[field] is expected,
                         f"Graphics {field} does not match the requested native GPU control")
-        expected_backend = ("metal-persistent-chart" if mode == METAL_FULL_CHART_MODE else
+        expected_backend = ("metal-persistent-chart" if mode in METAL_CHART_MODES else
                             "swiftui-canvas" if mode == UNGROUPED_CANVAS_MODE else "swiftui-canvas-drawing-group")
         require(value.get("native_gpu_backend") == expected_backend,
                 "App did not acknowledge the requested native GPU Canvas backend")
@@ -853,7 +904,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     if native_gpu:
         require(native_gpu_draws == sum(role["draws"] for role in roles.values()),
                 "Native GPU Canvas callbacks do not reconcile with drawn role frames")
-        if completed_visible_workload and mode != METAL_FULL_CHART_MODE:
+        if completed_visible_workload and mode not in METAL_CHART_MODES:
             require(native_gpu_draws > 0 and roles["static_chart"]["draws"] > 0,
                     "Completed visible workload did not execute native GPU static-chart drawing")
     return {"available": True, "counters": value,

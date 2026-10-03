@@ -441,14 +441,18 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
                 view.frame = bounds
                 needsRedraw = true
             }
-            if view.drawableSize != size {
-                view.drawableSize = size
-                needsRedraw = true
-            }
-            if drawingScale != scale {
+            if view.drawableSize != size || drawingScale != scale {
+                if view.drawableSize != size { view.drawableSize = size }
                 drawingScale = scale
                 staticCacheRevision &+= 1
                 needsRedraw = true
+                // One backing-scale change can also resize the drawable; it
+                // invalidates the cached image once, independently of scene
+                // publications and the history-preparation counter.
+                if cacheStaticAndRetainTwinkles {
+                    PerformanceGraphicsDiagnostics.shared.metalFullChartSurfaceInvalidated(
+                        lifetime?.id)
+                }
             }
             var uploaded = false
             if needsStaticUpload {

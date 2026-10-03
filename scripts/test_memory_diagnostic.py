@@ -14,14 +14,18 @@ from run_performance_checks import InvalidResult
 
 
 def graphics(mode="normal"):
-    if mode == memory.METAL_FULL_CHART_MODE:
+    if mode in memory.METAL_CHART_MODES:
         snapshot = graphics(memory.METAL_ARRIVAL_MODE)
         snapshot["graphics_diagnostics"].update(mode=mode, metal_full_chart_enabled=True,
             metal_full_chart=dict.fromkeys(memory.METAL_FULL_CHART_FIELDS, 0),
             native_gpu_backend="metal-persistent-chart", arrival_backend="metal-full-chart-shader",
             metal_arrival_bursts_enabled=False, canvas_frame_clock=False,
-            retained_twinkles_enabled=False)
-        del snapshot["graphics_diagnostics"]["retained_twinkle_backend"]
+            retained_twinkles_enabled=mode == memory.METAL_CACHED_CHART_MODE)
+        if mode == memory.METAL_CACHED_CHART_MODE:
+            snapshot["graphics_diagnostics"].update(metal_static_cache_enabled=True)
+            snapshot["graphics_diagnostics"]["metal_full_chart"].update(dict.fromkeys(memory.METAL_CACHE_FIELDS, 0))
+        else:
+            del snapshot["graphics_diagnostics"]["retained_twinkle_backend"]
         return snapshot
     if mode == memory.HELD_STATIC_CHART_MODE:
         snapshot = graphics(memory.METAL_ARRIVAL_MODE)
@@ -96,7 +100,7 @@ def drawn_layer_graphics(mode="bitmap-layer-destination"):
 
 
 def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
-    if mode == memory.METAL_FULL_CHART_MODE:
+    if mode in memory.METAL_CHART_MODES:
         snapshot = graphics(mode)
         snapshot.update(streamed_bodies_without_promises=3, ordered_chart_publication_queries=3,
                         legacy_tool_plot_builds=3, tool_path_input_points=30, tool_path_output_points=30)
@@ -104,6 +108,12 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
         snapshot["graphics_diagnostics"]["metal_full_chart"].update(hosts_created=2, live_hosts=2, peak_hosts=2,
             geometry_uploads=2, submissions=3, static_frames=3, arrival_frames=1, completion_frames=1,
             twinkle_frames=2, current_buffer_bytes=512, peak_buffer_bytes=512)
+        if mode == memory.METAL_CACHED_CHART_MODE:
+            snapshot["graphics_diagnostics"]["metal_full_chart"].update(static_rasterizations=2,
+                static_cache_composites=3, current_texture_bytes=1024, peak_texture_bytes=1024,
+                static_scene_revisions=2, scene_initial_revisions=2)
+            snapshot["graphics_diagnostics"]["retained_twinkles"].update(hosts_created=1, live_hosts=1, peak_hosts=1,
+                instances_created=2, live_instances=2, peak_instances=2, animation_starts=2)
         return snapshot
     snapshot = graphics(mode)
     value = snapshot["graphics_diagnostics"]
@@ -642,6 +652,9 @@ class GraphicsTests(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaisesRegex(InvalidResult, "Retained twinkle resources remain live"):
                 memory.validate_graphics(snapshot, mode, expected_closed=True)
             value["retained_twinkles"].update(hosts_destroyed=1, live_hosts=0, instances_destroyed=2, live_instances=0)
+            if mode == memory.METAL_CACHED_CHART_MODE:
+                value["metal_full_chart"].update(hosts_destroyed=2, live_hosts=0,
+                                                current_buffer_bytes=0, current_texture_bytes=0)
             self.assertTrue(memory.validate_graphics(snapshot, mode, expected_closed=True, completed_visible_workload=True)["available"])
 
     def test_retained_modes_must_create_instances_and_submit_animations_during_visible_work(self):

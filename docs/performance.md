@@ -1239,6 +1239,44 @@ pending or fails. The candidate is opt-in: measured CPU/GPU differences do not
 establish pixel equivalence or grant production promotion. Strict fidelity and
 frame delivery remain separate evidence from resource consumption.
 
+### Cached Metal chart with retained glints
+
+`runtime-metal-cached-chart` is a separate experimental control. It retains a
+private GPU texture containing the static chart, refreshing it when the scene,
+revision, drawable dimensions, or backing scale changes. Animation frames copy
+that texture before drawing transient effects and the cursor. The copy uses a
+texture render pass, with no CPU pixel readback. Texture generations and in-flight
+leases remain bounded and are released when the native host is hidden or closed.
+
+During ordinary streaming, glints use the existing retained Core Animation
+shapes. Their spawn/expiry deadlines update those shapes without starting the
+Metal display clock or redrawing the chart. While lifecycle effects or a cursor
+overlap, the host retains Metal glints to preserve the original drawing order;
+retained glints resume at their original age afterward. Data publication remains
+1 Hz and transient Metal animation remains 30 Hz.
+
+Use `--candidate-mode runtime-metal-cached-chart` in the frozen CPU comparison
+above. Run separate reference/candidate/reference commands with `--baseline-mode
+normal` and `--baseline-mode runtime-metal-full-chart` and their corresponding
+frozen reference products. Each command retains the 300-second ceiling. For the
+independent short GPU capture, use `--candidate-mode runtime-metal-cached-chart
+--capture-case candidate`. Original baseline and prior GPU captures retain their
+own identities and timestamps; they are not relabeled as fresh paired controls.
+
+The automated contract requires positive cached compositions and retained glint
+animations, fewer static rasterizations than compositions, no steady Metal
+animation clock or shader glint frames, submissions bounded by actual scene and
+surface invalidations,
+and complete inactivity/resource release after close. Offscreen tests compare
+cached output with direct Metal output at 1× and 2× and exercise invalidation and
+resource lifetime. Equality to direct Metal does not resolve that renderer's
+separate strict Canvas fidelity requirement or permit production promotion.
+Scene counters classify publication, axis-scale, layout, appearance and rail
+changes; unclassified revisions reject the run. Prepared-history counts alone
+cannot bound rasterization because axis-scale hysteresis can change geometry
+without another history preparation. The 1 Hz preparation and exact-work checks
+remain independent of these cache-invalidation counters.
+
 ## Baselines and comparison artifacts
 
 Record the same workload before changing production behavior:

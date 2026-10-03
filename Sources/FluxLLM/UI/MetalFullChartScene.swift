@@ -375,6 +375,7 @@ final class MetalFullChartScene {
 
 /// One cache per chart. Keys only inspect small presentation values; immutable
 /// frame identity avoids hashing or comparing history samples on hover.
+@MainActor
 final class MetalFullChartSceneCache {
     private struct Key: Equatable {
         let frame: ObjectIdentifier
@@ -392,6 +393,11 @@ final class MetalFullChartSceneCache {
     // allocation at the same address cannot masquerade as that publication.
     private var retainedFrame: LuminousChartGeometryCache.Frame?
     private var retainedCursorFrame: LuminousChartGeometryCache.Frame?
+    private let diagnostics: PerformanceGraphicsDiagnostics
+
+    init(diagnostics: PerformanceGraphicsDiagnostics = .shared) {
+        self.diagnostics = diagnostics
+    }
 
     func scene(
         frame: LuminousChartGeometryCache.Frame, lanes: [RequestLane],
@@ -402,12 +408,40 @@ final class MetalFullChartSceneCache {
             frame: ObjectIdentifier(frame), lanes: lanes, colors: laneColors,
             segments: segments, overflow: overflow, style: style)
         if let retained, retained.0 == key { return retained.1 }
+        recordRevision(key, frame: frame)
         let scene = MetalFullChartScene.make(
             frame: frame, lanes: lanes, laneColors: laneColors,
             segments: segments, overflow: overflow, style: style)
         retainedFrame = frame
         retained = (key, scene)
         return scene
+    }
+
+    private func recordRevision(_ key: Key, frame: LuminousChartGeometryCache.Frame) {
+        guard diagnostics.isEnabled, diagnostics.mode.cachesMetalStaticChart else { return }
+        // History preparation is not a drawing revision: axis hysteresis can
+        // change geometry while the prepared publication remains identical.
+        // Record the actual input changes, separately from texture work, so
+        // the performance harness can explain and bound legitimate redraws.
+        let previous = retained?.0
+        let previousFrame = retainedFrame?.key
+        diagnostics.metalFullChartSceneRevised(
+            initial: previous == nil,
+            publication: previousFrame.map {
+                $0.publicationID != frame.key.publicationID || $0.now != frame.key.now
+            } ?? false,
+            scale: previousFrame.map {
+                $0.tokenUpperBound != frame.key.tokenUpperBound
+                    || $0.toolUpperBound != frame.key.toolUpperBound
+            } ?? false,
+            layout: previousFrame.map {
+                $0.size != frame.key.size || $0.duration != frame.key.duration
+                    || $0.compact != frame.key.compact || $0.hasTools != frame.key.hasTools
+            } ?? false,
+            appearance: previous.map { $0.colors != key.colors || $0.style != key.style } ?? false,
+            rails: previous.map {
+                $0.lanes != key.lanes || $0.segments != key.segments || $0.overflow != key.overflow
+            } ?? false)
     }
 
     func cursor(

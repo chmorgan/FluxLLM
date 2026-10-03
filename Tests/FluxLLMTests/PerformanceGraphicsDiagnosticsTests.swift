@@ -1058,6 +1058,73 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(diagnostics.snapshot() as NSDictionary, disabled)
     }
 
+    func testCachedMetalSceneRevisionsRecordOverlappingCausesAndUnclassifiedWork() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .runtimeMetalCachedChart)
+        diagnostics.metalFullChartSceneRevised(
+            initial: true, publication: false, scale: false, layout: false, appearance: false,
+            rails: false)
+        diagnostics.metalFullChartSceneRevised(
+            initial: false, publication: true, scale: true, layout: true, appearance: true,
+            rails: true)
+        diagnostics.metalFullChartSceneRevised(
+            initial: false, publication: false, scale: false, layout: false, appearance: false,
+            rails: false)
+        var counts = try XCTUnwrap(diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64])
+        XCTAssertEqual(counts["static_scene_revisions"], 3)
+        for key in [
+            "scene_initial_revisions", "scene_publication_revisions", "scene_scale_revisions",
+            "scene_layout_revisions", "scene_appearance_revisions", "scene_rail_revisions",
+            "scene_unclassified_revisions",
+        ] {
+            XCTAssertEqual(counts[key], 1, key)
+        }
+        XCTAssertEqual(counts["static_rasterizations"], 0)
+        XCTAssertEqual(counts["static_surface_invalidations"], 0)
+        let host = try XCTUnwrap(diagnostics.metalFullChartHostCreated())
+        diagnostics.metalFullChartSurfaceInvalidated(host)
+        diagnostics.metalFullChartSurfaceInvalidated(host)
+        diagnostics.metalFullChartSurfaceInvalidated(nil)
+        diagnostics.metalFullChartSurfaceInvalidated(.max)
+        diagnostics.metalFullChartHostDestroyed(host)
+        diagnostics.metalFullChartSurfaceInvalidated(host)
+        counts = try XCTUnwrap(diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64])
+        XCTAssertEqual(counts["static_surface_invalidations"], 2)
+        XCTAssertEqual(counts["static_scene_revisions"], 3)
+        XCTAssertEqual(counts["static_rasterizations"], 0)
+        assertCounter("invalid_events", in: diagnostics.snapshot(), equals: 2)
+        try diagnostics.enable(mode: .runtimeMetalCachedChart)
+        counts = try XCTUnwrap(diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64])
+        XCTAssertTrue(counts.values.allSatisfy { $0 == 0 })
+    }
+
+    func testCachedMetalInvalidationDiagnosticsAreIgnoredWhenDisabledOrInOtherModes() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        let disabled = diagnostics.snapshot() as NSDictionary
+        diagnostics.metalFullChartSceneRevised(
+            initial: true, publication: true, scale: true, layout: true, appearance: true,
+            rails: true)
+        diagnostics.metalFullChartSurfaceInvalidated(123)
+        XCTAssertEqual(diagnostics.snapshot() as NSDictionary, disabled)
+        for mode in PerformanceGraphicsDiagnostics.Mode.allCases
+        where mode != .runtimeMetalCachedChart {
+            try diagnostics.enable(mode: mode)
+            let host = diagnostics.metalFullChartHostCreated()
+            let before = diagnostics.snapshot() as NSDictionary
+            diagnostics.metalFullChartSceneRevised(
+                initial: true, publication: true, scale: true, layout: true, appearance: true,
+                rails: true)
+            diagnostics.metalFullChartSceneRevised(
+                initial: false, publication: false, scale: false, layout: false, appearance: false,
+                rails: false)
+            diagnostics.metalFullChartSurfaceInvalidated(host ?? 123)
+            XCTAssertEqual(diagnostics.snapshot() as NSDictionary, before, mode.rawValue)
+            diagnostics.metalFullChartHostDestroyed(host)
+        }
+        try diagnostics.disable()
+        XCTAssertEqual(diagnostics.snapshot() as NSDictionary, disabled)
+    }
+
     private var layerModes: [PerformanceGraphicsDiagnostics.Mode] {
         [.bitmapLayerDestination, .bitmapLayerBGRA, .bitmapLayerNoDecorations]
     }

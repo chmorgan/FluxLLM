@@ -227,6 +227,39 @@ final class MetalFullChartSceneTests: XCTestCase {
         }
     }
 
+    func testDrawingRevisionReasonsDistinguishAxisChangesWithinOnePublication() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .runtimeMetalCachedChart)
+        let cache = MetalFullChartSceneCache(diagnostics: diagnostics)
+        let initialKey = key()
+        let initial = frame(key: initialKey, buildPaths: false)
+        let first = cachedScene(cache, frame: initial, style: style())
+        XCTAssertTrue(first === cachedScene(cache, frame: initial, style: style()))
+        let scaledKey = Geometry.Key(
+            publicationID: initialKey.publicationID, now: initialKey.now,
+            duration: initialKey.duration, size: initialKey.size, compact: initialKey.compact,
+            hasTools: initialKey.hasTools, tokenUpperBound: initialKey.tokenUpperBound * 2,
+            toolUpperBound: initialKey.toolUpperBound)
+        let scaled = frame(key: scaledKey, buildPaths: false)
+        let second = cachedScene(cache, frame: scaled, style: style())
+        XCTAssertFalse(first === second)
+        var counts = try XCTUnwrap(diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64])
+        XCTAssertEqual(counts["static_scene_revisions"], 2)
+        XCTAssertEqual(counts["scene_initial_revisions"], 1)
+        XCTAssertEqual(counts["scene_scale_revisions"], 1)
+        XCTAssertEqual(
+            counts["scene_publication_revisions"], 0,
+            "An axis change must not pretend a new history publication occurred")
+        XCTAssertEqual(counts["scene_unclassified_revisions"], 0)
+        _ = cachedScene(cache, frame: scaled, style: style(increasedContrast: true))
+        counts = try XCTUnwrap(diagnostics.snapshot()["metal_full_chart"] as? [String: UInt64])
+        XCTAssertEqual(counts["static_scene_revisions"], 3)
+        XCTAssertEqual(counts["scene_appearance_revisions"], 1)
+        XCTAssertEqual(counts["scene_scale_revisions"], 1)
+        XCTAssertEqual(counts["scene_unclassified_revisions"], 0)
+        try diagnostics.disable()
+    }
+
     func testFormerCanvasTextAndCompactVisibilityArePreserved() {
         let frame = frame(buildPaths: false)
         let empty = Scene.make(

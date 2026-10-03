@@ -30,7 +30,7 @@ REQUEST_INDICES = (CYCLE * 32, CYCLE * 32 + 1)
 STAGE = {"activity": "high-rate", "seconds": 8}
 WORK = {"chunks": 3200, "output_tokens": 6434, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
-MODES = ("normal", memory.METAL_ARRIVAL_MODE, memory.METAL_FULL_CHART_MODE)
+MODES = ("normal", memory.METAL_ARRIVAL_MODE, *memory.METAL_CHART_MODES)
 ERRORS = (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError)
 
 
@@ -124,7 +124,7 @@ def phase_windows(report):
 
 def validate_short_clock_work(report, mode):
     """Check the same rendering contracts over the explicitly shorter windows."""
-    if mode == memory.METAL_FULL_CHART_MODE:
+    if mode in memory.METAL_CHART_MODES:
         return runtime.validate_metal_full_chart_work(report, mode,
             closed_labels=("closed-start", "closed-end"), minimum_closed_seconds=2,
             boundary=lambda point: snapshot_time(report, point))
@@ -331,7 +331,7 @@ def validate_report(report, mode):
         memory.validate_popover_animation(point["snapshot"], False)
         require(memory.runtime_feature_contract(point["snapshot"]["graphics_diagnostics"], mode) == report["runtime_work"]["features"],
                 "GPU rendering feature contract changed")
-    require((mode == memory.METAL_FULL_CHART_MODE or workload["after"]["canvas_draws"] > workload["before"]["canvas_draws"])
+    require((mode in memory.METAL_CHART_MODES or workload["after"]["canvas_draws"] > workload["before"]["canvas_draws"])
             and workload["after"]["chart_preparations"] > workload["before"]["chart_preparations"],
             "GPU visible rendering/preparation did not advance")
     exclude_cpu_acceptance(report)
@@ -427,7 +427,7 @@ def qualify_result(result):
                     "Qualified GPU metric lacks a finite conservative maximum")
             return {"evaluated": valid, "limit_percent": 1, "within_limit": upper <= 1 if valid else None}
         row["gpu_target"] = {"runtime": target(workload, available), "lifetime": target(lifetime, life_available)}
-        if row.get("mode") == memory.METAL_FULL_CHART_MODE:
+        if row.get("mode") in memory.METAL_CHART_MODES:
             row.update(promotion_eligible=False,
                        promotion_reason="Experimental renderer requires independent visual and frame-delivery qualification")
         if not available or not life_available:

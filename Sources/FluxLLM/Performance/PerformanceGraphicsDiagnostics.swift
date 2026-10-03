@@ -297,6 +297,15 @@ public final class PerformanceGraphicsDiagnostics {
         var effectClockTicks: UInt64 = 0
         var currentTextureBytes: UInt64 = 0
         var peakTextureBytes: UInt64 = 0
+        var staticSceneRevisions: UInt64 = 0
+        var sceneInitialRevisions: UInt64 = 0
+        var scenePublicationRevisions: UInt64 = 0
+        var sceneScaleRevisions: UInt64 = 0
+        var sceneLayoutRevisions: UInt64 = 0
+        var sceneAppearanceRevisions: UInt64 = 0
+        var sceneRailRevisions: UInt64 = 0
+        var sceneUnclassifiedRevisions: UInt64 = 0
+        var staticSurfaceInvalidations: UInt64 = 0
 
         var snapshot: [String: UInt64] {
             [
@@ -319,6 +328,15 @@ public final class PerformanceGraphicsDiagnostics {
                 "effect_clock_ticks": effectClockTicks,
                 "current_texture_bytes": currentTextureBytes,
                 "peak_texture_bytes": peakTextureBytes,
+                "static_scene_revisions": staticSceneRevisions,
+                "scene_initial_revisions": sceneInitialRevisions,
+                "scene_publication_revisions": scenePublicationRevisions,
+                "scene_scale_revisions": sceneScaleRevisions,
+                "scene_layout_revisions": sceneLayoutRevisions,
+                "scene_appearance_revisions": sceneAppearanceRevisions,
+                "scene_rail_revisions": sceneRailRevisions,
+                "scene_unclassified_revisions": sceneUnclassifiedRevisions,
+                "static_surface_invalidations": staticSurfaceInvalidations,
             ]
         }
     }
@@ -769,6 +787,36 @@ public final class PerformanceGraphicsDiagnostics {
             return
         }
         metalFullChartCounters.effectClockTicks += 1
+    }
+
+    /// A static scene can change independently of chart data preparation.
+    /// Count each rebuilt scene once and retain all applicable causes; cause
+    /// counts overlap when a single revision changes multiple inputs.
+    func metalFullChartSceneRevised(
+        initial: Bool, publication: Bool, scale: Bool, layout: Bool, appearance: Bool, rails: Bool
+    ) {
+        guard isEnabled, mode.cachesMetalStaticChart else { return }
+        metalFullChartCounters.staticSceneRevisions += 1
+        if initial { metalFullChartCounters.sceneInitialRevisions += 1 }
+        if publication { metalFullChartCounters.scenePublicationRevisions += 1 }
+        if scale { metalFullChartCounters.sceneScaleRevisions += 1 }
+        if layout { metalFullChartCounters.sceneLayoutRevisions += 1 }
+        if appearance { metalFullChartCounters.sceneAppearanceRevisions += 1 }
+        if rails { metalFullChartCounters.sceneRailRevisions += 1 }
+        if !initial && !publication && !scale && !layout && !appearance && !rails {
+            metalFullChartCounters.sceneUnclassifiedRevisions += 1
+        }
+    }
+
+    /// Drawable-size or backing-scale changes invalidate the cached pixels
+    /// even when the immutable chart scene itself remains unchanged.
+    func metalFullChartSurfaceInvalidated(_ id: UInt64?) {
+        guard let id, isEnabled, mode.cachesMetalStaticChart else { return }
+        guard metalFullChartHosts[id] != nil else {
+            invalidEvents += 1
+            return
+        }
+        metalFullChartCounters.staticSurfaceInvalidations += 1
     }
 
     /// Cache texture accounting stays separate from geometry buffers and
