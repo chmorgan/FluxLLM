@@ -26,7 +26,9 @@ from run_performance_checks import require, write_json
 
 MAX_SECONDS = 300
 CASE_SECONDS = 54
-NIO_CASE_SECONDS = 70
+# Three-case diagnostics have additional startup/cleanup margin inside MAX_SECONDS.
+THREE_CASE_SECONDS = 70
+NIO_CASE_SECONDS = THREE_CASE_SECONDS
 PROFILE_SECONDS = 120
 PROFILE_SAVE_SECONDS = 30
 PROFILE_POST_SAVE_SECONDS = 18
@@ -1107,7 +1109,7 @@ def _run(args, deadline):
                                         "measurement_identity": product["identity"]} for role, product in products.items()}
         for label, mode in cases:
             seconds = (PROFILE_SECONDS if args.operation == "profile" else
-                       NIO_CASE_SECONDS if args.operation == "nio" else CASE_SECONDS)
+                       THREE_CASE_SECONDS if version_compare or args.operation == "nio" else CASE_SECONDS)
             require(deadline.remaining() >= seconds + 3, "Insufficient remaining time for a complete runtime case")
             require(runtime_source_identity() == sources, "Runtime measurement sources changed during the comparison")
             require(all(runtime_product_identity(product["paths"], product["provenance"]) == product["files"]

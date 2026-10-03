@@ -646,8 +646,12 @@ compare --baseline-mode normal` with the candidate's usual product arguments and
 `--reference-app-binary`, `--reference-test-bundle`, and `--reference-provenance`.
 This runs reference/candidate/reference in the same graphics mode and preserves
 the 25-second traffic workload, completion tail, visibility checks, and 300-second
-deadline. Both versions must use identical common collector bytes, measurement
-sources, and fixture identity. Reference arguments cannot be combined with
+deadline. These three frozen-version cases each allow up to 70 seconds for
+startup, measurement, and cleanup, matching the three-case NIO diagnostic.
+Other unprofiled controls and thread diagnostics retain 54-second case allowances;
+the workload and resource limits are unchanged. Both versions must use identical
+common collector bytes, measurement sources, and fixture identity. Reference
+arguments cannot be combined with
 `--controls` or profiling. Each version's provenance and binary identity remain
 separate; drifted reference runs leave the comparison inconclusive.
 
