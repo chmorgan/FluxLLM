@@ -255,6 +255,7 @@ private struct RequestRailDecorations: View {
     @State private var twinkles: [RequestRailTwinkle] = []
     @State private var animating = false
     @State private var frameClock = RequestRailFrameClock()
+    @State private var primitiveEffectsFailed = false
 
     private var effectsEnabled: Bool {
         isLive && !reduceMotion && !reduceTransparency && contrast != .increased && windowVisible
@@ -325,8 +326,27 @@ private struct RequestRailDecorations: View {
         let metalArrival = RequestRailLifecycleEffects.usesMetalArrival(
             enabled: mode.usesMetalArrivalBursts, drawsLifecycle: drawsLifecycle,
             prepared: prepared, eligibleIDs: eligibility.effectIDs)
+        let primitiveEffects = mode.usesMetalPrimitiveEffects && !primitiveEffectsFailed
+        let primitiveElements: [MetalLifecycleEffectsSurface.Element]? =
+            primitiveEffects && drawsLifecycle && lifecycleVisible
+            ? MetalLifecycleEffectsInput.elements(
+                segments: decoratedSegments, prepared: prepared,
+                eligibleIDs: eligibility.effectIDs, twinkles: twinkles,
+                now: now, duration: duration, rail: rect, color: metalColor(for:))
+            : []
         ZStack(alignment: .topLeading) {
             Color.clear
+            if primitiveEffects && !bounds.isEmpty {
+                // Static chart pixels remain on the established chart surface.
+                // Native lifecycle frames affect only this cropped rail band.
+                MetalLifecycleEffectsSurface(
+                    elements: primitiveElements ?? [], drawingBounds: bounds,
+                    isValid: primitiveElements != nil,
+                    onFailure: { primitiveEffectsFailed = true }
+                )
+                .frame(width: bounds.width, height: bounds.height)
+                .offset(x: bounds.minX, y: bounds.minY)
+            }
             if mode.usesMetalArrivalBursts && !bounds.isEmpty {
                 // Keep the paused host attached while visible so pipeline
                 // initialization occurs before the first measured request.
@@ -347,7 +367,7 @@ private struct RequestRailDecorations: View {
                 )
                 .frame(width: plotSize.width, height: plotSize.height)
             }
-            if needsSurface && !metalArrival && !bounds.isEmpty {
+            if needsSurface && !metalArrival && !primitiveEffects && !bounds.isEmpty {
                 // The stable-host control clears once between effects, then
                 // ignores ordinary glint publications until animation resumes.
                 let revision: AnyHashable? =
