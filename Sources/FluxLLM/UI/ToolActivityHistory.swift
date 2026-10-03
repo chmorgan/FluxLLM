@@ -196,6 +196,12 @@ struct ToolActivityHistory {
                 assignedIDs.insert(calls[callIndex].id)
                 callIndex += 1
             }
+            if firstCallIndex == callIndex {
+                if !run.zeroBuckets.isEmpty { displaySegments.append(run.zeroBuckets) }
+                // Sparse plot keys use ordinals across every coverage run.
+                bucketOrdinal += run.buckets.count
+                continue
+            }
             var bucketCallIndex = firstCallIndex
             var segment: [ToolActivityBucket] = []
             segment.reserveCapacity(run.buckets.count)
@@ -213,9 +219,12 @@ struct ToolActivityHistory {
                 {
                     bucketCallIndex += 1
                 }
-                let prepared = Self.bucket(
-                    start: bucket.start, end: bucket.end,
-                    calls: calls[firstBucketCallIndex..<bucketCallIndex])
+                let prepared =
+                    firstBucketCallIndex == bucketCallIndex
+                    ? bucket.zeroBucket
+                    : Self.bucket(
+                        start: bucket.start, end: bucket.end,
+                        calls: calls[firstBucketCallIndex..<bucketCallIndex])
                 segment.append(prepared)
                 if prepared.observedDuration > 0, prepared.callCount > 0 {
                     nonzeroBuckets.append(

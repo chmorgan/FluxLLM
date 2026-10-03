@@ -12,12 +12,30 @@ struct ToolActivityObservation {
         let key: Double
         let start: Date
         let end: Date
+        let zeroBucket: ToolActivityBucket
+
+        init(key: Double, start: Date, end: Date) {
+            self.key = key
+            self.start = start
+            self.end = end
+            zeroBucket = ToolActivityBucket(
+                start: start, end: end, callCount: 0, callsPerMinute: 0, toolNames: [])
+        }
     }
 
     struct Run {
         let start: Date
         let end: Date
         let buckets: [Bucket]
+        /// Requests share the same zero-rate coverage until a call changes a bin.
+        let zeroBuckets: [ToolActivityBucket]
+
+        init(start: Date, end: Date, buckets: [Bucket]) {
+            self.start = start
+            self.end = end
+            self.buckets = buckets
+            zeroBuckets = buckets.map(\.zeroBucket)
+        }
     }
 
     let interval: TimeInterval
