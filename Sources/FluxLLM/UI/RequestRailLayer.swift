@@ -175,6 +175,9 @@ enum RequestRailLifecycleEffects {
         assignments: [UUID: RequestRailAssignment], now: Date, timestamp: Date,
         previous: [Prepared]
     ) -> [Prepared] {
+        let diagnostics = PerformanceArrivalDiagnostics.shared
+        let measurement = diagnostics.begin(.profilePreparation)
+        defer { diagnostics.end(measurement) }
         let cached = Dictionary(uniqueKeysWithValues: previous.map { ($0.key, $0) })
         return events.compactMap { event in
             guard event.expiresAt > timestamp,
@@ -183,14 +186,19 @@ enum RequestRailLifecycleEffects {
                 (0..<RequestRailState.individualTrackCount).contains(assignment.track)
             else { return nil }
             let key = Key(event)
-            let effect =
-                cached[key]
-                ?? Prepared(
+            let effect: Prepared
+            if let existing = cached[key] {
+                effect = existing
+            } else {
+                let creation = diagnostics.begin(.profileCreate)
+                effect = Prepared(
                     key: key, startedAt: event.startedAt, expiresAt: event.expiresAt,
                     profile: RequestRailEffectProfile(
                         seed: event.seed,
                         requestDuration: (lane.endedAt ?? now).timeIntervalSince(lane.startedAt),
                         completion: event.kind == .completion))
+                diagnostics.end(creation)
+            }
             return effect.visibleUntil > timestamp ? effect : nil
         }
     }
@@ -494,6 +502,9 @@ private struct RequestRailDecorations: View {
     private func metalArrivalElements(
         _ segments: [RequestRailGeometry.Segment]
     ) -> [MetalArrivalBurstSurface.Element] {
+        let diagnostics = PerformanceArrivalDiagnostics.shared
+        let measurement = diagnostics.begin(.metalElements)
+        defer { diagnostics.end(measurement) }
         var elements: [MetalArrivalBurstSurface.Element] = []
         for segment in segments {
             guard let color = metalColor(for: segment.lane) else {
@@ -561,10 +572,13 @@ private struct RequestRailDecorations: View {
                             at: tip, color: color, in: &context)
                     }
                 } else if segment.lane.startedAt >= now.addingTimeInterval(-duration) {
+                    let diagnostics = PerformanceArrivalDiagnostics.shared
+                    let measurement = diagnostics.begin(.canvasArrivalDraw)
                     drawBurst(
                         profile, age: age, duration: profile.burstDuration, scale: 1,
                         at: CGPoint(x: bar.minX + segment.cornerRadius, y: bar.midY),
                         color: color, in: &context)
+                    diagnostics.end(measurement)
                 }
             }
             if segment.isLive {

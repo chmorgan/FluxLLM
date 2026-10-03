@@ -63,6 +63,9 @@ public final class PerformanceApplicationSession {
         // Freeze the diagnostic mode before stores, native hosts or chart
         // canvases can be created. Ordinary launches never enable this path.
         try PerformanceGraphicsDiagnostics.shared.enable(mode: graphicsMode)
+        if ProcessInfo.processInfo.environment["FLUXLLM_PERF_ARRIVAL_TIMING"] == "1" {
+            PerformanceArrivalDiagnostics.shared.enable()
+        }
         let settings = AppSettings(defaults: defaults)
         settings.backendSelection = .ollama
         settings.ollamaHost = "127.0.0.1"
@@ -167,6 +170,7 @@ public final class PerformanceApplicationSession {
             "synthetic_request_identity": requestIdentity.snapshot(),
             "synthetic_animation_policy": PerformanceAnimationRandomness.policy(
                 deterministic: PerformanceGraphicsDiagnostics.shared.isEnabled),
+            "arrival_diagnostics": PerformanceArrivalDiagnostics.shared.snapshot(),
             "requests": usage.requests,
             "completed_requests": usage.requests - usage.activeRequests,
             "output_tokens": usage.outputTokens,

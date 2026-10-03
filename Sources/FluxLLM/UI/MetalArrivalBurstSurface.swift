@@ -188,6 +188,7 @@ final class MetalArrivalBurstView: NSView, MTKViewDelegate {
     private let limiter = MetalArrivalFrameLimiter()
     private var closing = false
     private var failed = false
+    private var hasAcquiredDrawable = false
 
     var lifecyclePhase: MetalArrivalSurfaceLifecycle.Phase { lifecycle.phase }
     var hasNativeResources: Bool { renderer != nil || metalView != nil }
@@ -316,6 +317,9 @@ final class MetalArrivalBurstView: NSView, MTKViewDelegate {
             return
         }
         if renderer == nil {
+            let diagnostics = PerformanceArrivalDiagnostics.shared
+            let measurement = diagnostics.begin(.metalSurfaceSetup)
+            defer { diagnostics.end(measurement) }
             do {
                 // Pipeline compilation occurs on visible idle, before an arrival
                 // needs frames. No draw loop runs until a real arrival is active.
@@ -369,6 +373,9 @@ final class MetalArrivalBurstView: NSView, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
+        let diagnostics = PerformanceArrivalDiagnostics.shared
+        let callback = diagnostics.begin(.metalFrameCallback)
+        defer { diagnostics.end(callback) }
         guard view === metalView, !failed, lifecycle.phase != .stopped else { return }
         let now = Date()
         refreshLifecycle(at: now)
@@ -386,14 +393,24 @@ final class MetalArrivalBurstView: NSView, MTKViewDelegate {
             if active { PerformancePresentationCounters.shared.record(.metalArrivalFailures) }
             return
         }
-        guard let commandBuffer = renderer.commandQueue.makeCommandBuffer(),
-            let drawable = view.currentDrawable
-        else {
+        guard let commandBuffer = renderer.commandQueue.makeCommandBuffer() else {
             limiter.finish(ticket)
             fail()
             return
         }
+        let acquisition = diagnostics.begin(
+            hasAcquiredDrawable ? .metalLaterDrawable : .metalFirstDrawable)
+        let acquired = view.currentDrawable
+        diagnostics.end(acquisition)
+        guard let drawable = acquired else {
+            limiter.finish(ticket)
+            fail()
+            return
+        }
+        hasAcquiredDrawable = true
         do {
+            let measurement = diagnostics.begin(active ? .metalFrameEncode : .metalClear)
+            defer { diagnostics.end(measurement) }
             if active {
                 try renderer.encode(
                     into: commandBuffer, target: drawable.texture,
@@ -420,10 +437,14 @@ final class MetalArrivalBurstView: NSView, MTKViewDelegate {
         let clearRevision = active ? nil : lifecycle.beginClear()
         let limiter = limiter
         commandBuffer.addCompletedHandler { [weak self] buffer in
+            let completion = diagnostics.begin(.metalCompletionCallback)
+            defer { diagnostics.end(completion) }
             limiter.finish(ticket)
             let success = buffer.status == .completed && buffer.error == nil
             if !success { PerformancePresentationCounters.shared.record(.metalArrivalFailures) }
             Task { @MainActor [weak self] in
+                let measurement = diagnostics.begin(.metalCompletionMainActor)
+                defer { diagnostics.end(measurement) }
                 guard let self, self.lifecycle.generation == generation,
                     self.lifecycle.phase != .stopped
                 else { return }
@@ -439,9 +460,11 @@ final class MetalArrivalBurstView: NSView, MTKViewDelegate {
                 if self.lifecycle.needsClear { self.metalView?.draw() }
             }
         }
+        let submission = diagnostics.begin(.metalFrameSubmit)
         commandBuffer.present(drawable)
         if active { lifecycle.submittedArrival() }
         commandBuffer.commit()
+        diagnostics.end(submission)
         if active {
             PerformancePresentationCounters.shared.record(.metalArrivalFrames)
             PerformancePresentationCounters.shared.record(.metalArrivalSubmissions)
@@ -464,6 +487,7 @@ final class MetalArrivalBurstView: NSView, MTKViewDelegate {
         renderer?.removeAll()
         renderer = nil
         needsUpload = true
+        hasAcquiredDrawable = false
     }
 
     func stop() {

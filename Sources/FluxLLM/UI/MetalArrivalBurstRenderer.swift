@@ -144,6 +144,9 @@ final class MetalArrivalBurstRenderer {
     /// Equal publications are a no-op. Invalid publications leave the previous
     /// valid state intact. Buffer contents never change after submission.
     func update(elements newElements: [Element]) throws {
+        let diagnostics = PerformanceArrivalDiagnostics.shared
+        let measurement = diagnostics.begin(.metalDescriptorUpdate)
+        defer { diagnostics.end(measurement) }
         if newElements == elements { return }
         var packed: [SIMD4<Float>] = []
         guard newElements.count <= Self.maximumBursts + Self.maximumTwinkles else {
@@ -176,10 +179,12 @@ final class MetalArrivalBurstRenderer {
             removeAll()
             return
         }
+        let upload = diagnostics.begin(.metalDescriptorUpload)
         let buffer = packed.withUnsafeBytes { bytes in
             device.makeBuffer(
                 bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared)
         }
+        diagnostics.end(upload)
         guard let buffer else { throw RendererError.bufferAllocationFailed }
         buffer.label = "FluxLLM immutable arrival descriptors"
         descriptorBuffer = buffer
