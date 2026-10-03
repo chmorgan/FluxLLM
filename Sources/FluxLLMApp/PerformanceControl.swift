@@ -184,7 +184,9 @@ final class PerformanceControl {
                     fixtureEndingAt: configuration.fixture_ending_at_epoch.map(
                         Date.init(timeIntervalSince1970:)),
                     graphicsMode: configuration.graphics_mode ?? .normal,
-                    popoverAnimationsEnabled: configuration.popover_animations_enabled ?? true)
+                    popoverAnimationsEnabled: configuration.popover_animations_enabled ?? true,
+                    threadCPUAccountingEnabled: ProcessInfo.processInfo.environment[
+                        "FLUXLLM_PERF_THREAD_CPU"] == "1")
             }
             startupTask = task
             do {

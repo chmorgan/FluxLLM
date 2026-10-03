@@ -65,6 +65,21 @@ public final class ProxyManager: ObservableObject {
         eventConsumer?.cancel()
     }
 
+    /// Used once by the isolated performance session after the listener is
+    /// ready. Fail if the proxy gains additional event loops; a partial NIO
+    /// total must never masquerade as the complete networking-thread cost.
+    func performanceEventLoopThreadID() async throws -> UInt64 {
+        guard isRunning, let group = eventLoopGroup else {
+            throw PerformanceSessionError.invalid("The measured proxy is not running")
+        }
+        let loops = Array(group.makeIterator())
+        guard loops.count == 1, let loop = loops.first else {
+            throw PerformanceSessionError.invalid(
+                "Thread CPU accounting requires the complete single-loop proxy")
+        }
+        return try await loop.submit { try PerformanceThreadIdentity.current() }.get()
+    }
+
     public func start() async throws {
         try Task.checkCancellation()
         let previous = lifecycleTask

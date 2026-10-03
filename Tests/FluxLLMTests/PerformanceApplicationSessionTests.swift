@@ -97,6 +97,7 @@ final class PerformanceApplicationSessionTests: XCTestCase {
                 upstream: URL(string: "http://127.0.0.1:\(upstream.port)")!,
                 historyDirectory: directory, preferencesSuite: preferencesSuite, populated: false)
             session = started
+            XCTAssertNil(started.snapshot()["thread_cpu_registration"])
             XCTAssertEqual(started.snapshot()["popover_animations_enabled"] as? Bool, true)
             XCTAssertEqual(started.snapshot()["unique_tool_trace_builds"] as? UInt64, 0)
             XCTAssertEqual(started.snapshot()["reused_tool_trace_builds"] as? UInt64, 0)
@@ -147,8 +148,19 @@ final class PerformanceApplicationSessionTests: XCTestCase {
             let started = try await PerformanceApplicationSession.start(
                 upstream: URL(string: "http://127.0.0.1:\(upstream.port)")!,
                 historyDirectory: directory, preferencesSuite: preferencesSuite, populated: true,
-                popoverAnimationsEnabled: false)
+                popoverAnimationsEnabled: false, threadCPUAccountingEnabled: true)
             session = started
+            let registration = try XCTUnwrap(
+                started.snapshot()["thread_cpu_registration"] as? [String: Any])
+            let roles = try XCTUnwrap(registration["roles"] as? [String: UInt64])
+            XCTAssertEqual(registration["schema_version"] as? Int, 1)
+            XCTAssertEqual(registration["process_id"] as? Int32, getpid())
+            XCTAssertEqual(roles["main"], try PerformanceThreadIdentity.current())
+            XCTAssertGreaterThan(try XCTUnwrap(roles["nio"]), 0)
+            XCTAssertNotEqual(roles["main"], roles["nio"])
+            XCTAssertEqual(
+                (started.snapshot()["thread_cpu_registration"] as? [String: Any])?["roles"]
+                    as? [String: UInt64], roles)
             XCTAssertEqual(started.snapshot()["popover_animations_enabled"] as? Bool, false)
             // The broken adapter left the store in standalone publication mode
             // during seeding and exceeded the app harness's 20-second timeout.

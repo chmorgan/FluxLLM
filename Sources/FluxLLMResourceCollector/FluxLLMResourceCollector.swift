@@ -32,11 +32,21 @@ struct FluxLLMResourceCollector {
         if arguments == ["--resource-exit-self-test-worker"] {
             exit(runResourceExitSelfTestWorker())
         }
+        if arguments == ["--thread-cpu-calibration-worker"] {
+            exit(ThreadCPUCalibration.runWorker())
+        }
         do {
             if arguments == ["--preflight"] {
                 try await preflight()
             } else if arguments == ["--self-test"] {
                 try selfTest()
+            } else if arguments == ["--thread-cpu-self-test"] {
+                try ThreadCPUCalibration.verifyRegistrationAndConversion()
+                let calibration = try ThreadCPUCalibration.run()
+                try emit([
+                    "type": "thread_cpu_self_test", "passed": true,
+                    "registration_and_conversion": true, "calibration": calibration.evidence,
+                ])
             } else if arguments.first == "--terminate-owned" {
                 try terminateOwned(arguments)
             } else {
@@ -70,7 +80,7 @@ struct FluxLLMResourceCollector {
 
     private static func usageError() -> CollectorFailure {
         .message(
-            "Usage: FluxLLMResourceCollector --preflight | --self-test | --app /absolute/FluxLLMApp [--deadline 300] | --terminate-owned PID --birth-time-us MICROSECONDS"
+            "Usage: FluxLLMResourceCollector --preflight | --self-test | --thread-cpu-self-test | --app /absolute/FluxLLMApp [--deadline 300] | --terminate-owned PID --birth-time-us MICROSECONDS"
         )
     }
 
@@ -494,6 +504,7 @@ private final class ApplicationMeasurement {
     private var samplingDeadline = -Double.infinity
     private var child: ControlledProcess?
     private var probe: ProcessResources?
+    private var threadCPU: ThreadCPUResources?
     private var tracer: FileIOTracer?
     private var gpu: GPUResourceProvider?
     private var latestGPU: GPUResourceReading?
@@ -538,11 +549,21 @@ private final class ApplicationMeasurement {
             environment["FLUXLLM_PERFORMANCE_STORAGE_ROOT"]
             ?? FileManager.default.temporaryDirectory.path
         environment["FLUXLLM_PERFORMANCE_STORAGE_ROOT"] = storageRoot
+        let threadCalibration =
+            environment["FLUXLLM_PERF_THREAD_CPU"] == "1"
+            ? try ThreadCPUCalibration.run(
+                deadlineSeconds: max(0, deadline - ProcessResources.monotonicSeconds())) : nil
+        if let threadCalibration {
+            try emit(["type": "thread_cpu_calibration", "calibration": threadCalibration.evidence])
+        }
         let process = try ControlledProcess(executable: executable, environment: environment)
         child = process
         defer { process.terminate() }
         let probe = try ProcessResources(processID: process.pid)
         self.probe = probe
+        if let threadCalibration {
+            threadCPU = ThreadCPUResources(probe: probe, calibration: threadCalibration)
+        }
         let capability = environment["FLUXLLM_PERFORMANCE_GPU_CAPABILITY_JSON"]
             .flatMap { $0.data(using: .utf8) }
             .flatMap { try? JSONDecoder().decode(GPUCapabilityReport.self, from: $0) }
@@ -682,6 +703,9 @@ private final class ApplicationMeasurement {
         var result = try probe.snapshot(
             phase: phase, ownedChild: child, permitZombie: permitZombie,
             recoveryDeadline: samplingDeadline)
+        if !permitZombie, let threads = threadCPU?.snapshot(ownedChild: child) {
+            result["thread_cpu"] = threads
+        }
         if let latestGPU {
             result.merge(try object(latestGPU)) { _, new in new }
         }
@@ -754,6 +778,7 @@ private final class ApplicationMeasurement {
                 throw CollectorFailure.message("App control emitted invalid JSON")
             }
             if event["type"] as? String == "gpu_sample" { ingestNativeGPU(event) }
+            threadCPU?.ingest(event)
             if permitBoundarySample, let identifier = event["command_id"] {
                 try await sample(phase: "control_boundary", commandID: identifier)
             }

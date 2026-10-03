@@ -22,6 +22,7 @@ public final class PerformanceApplicationSession {
     private let defaults: UserDefaults
     private let rawEnd: Date
     private let requestIdentity: PerformanceRequestIdentity
+    private let threadCPURegistration: [String: Any]?
     private var stopped = false
 
     private init(
@@ -31,7 +32,7 @@ public final class PerformanceApplicationSession {
         historyKind: String, proxyPort: Int, clock: PerformanceWorkloadClock,
         defaults: UserDefaults, rawEnd: Date,
         fixtureManifest: PerformanceHistoryFixture.EquivalenceManifest,
-        requestIdentity: PerformanceRequestIdentity
+        requestIdentity: PerformanceRequestIdentity, threadCPURegistration: [String: Any]?
     ) {
         self.store = store
         self.coordinator = coordinator
@@ -46,13 +47,14 @@ public final class PerformanceApplicationSession {
         self.rawEnd = rawEnd
         self.fixtureManifest = fixtureManifest
         self.requestIdentity = requestIdentity
+        self.threadCPURegistration = threadCPURegistration
     }
 
     public static func start(
         upstream: URL, historyDirectory: URL, preferencesSuite: String,
         populated: Bool, fixtureEndingAt: Date? = nil,
         graphicsMode: PerformanceGraphicsDiagnostics.Mode = .normal,
-        popoverAnimationsEnabled: Bool = true
+        popoverAnimationsEnabled: Bool = true, threadCPUAccountingEnabled: Bool = false
     ) async throws -> PerformanceApplicationSession {
         guard upstream.scheme == "http", upstream.host == "127.0.0.1",
             let upstreamPort = upstream.port, (1...65535).contains(upstreamPort)
@@ -111,6 +113,31 @@ public final class PerformanceApplicationSession {
             await coordinator.stop()
             throw PerformanceSessionError.invalid("The isolated fixture failed to become ready")
         }
+        let threadCPURegistration: [String: Any]?
+        do {
+            if threadCPUAccountingEnabled {
+                guard pthread_main_np() == 1, let proxy = proxyHolder.proxy else {
+                    throw PerformanceSessionError.invalid(
+                        "The measured UI thread or proxy is unavailable")
+                }
+                let mainID = try PerformanceThreadIdentity.current()
+                let nioID = try await proxy.performanceEventLoopThreadID()
+                guard mainID != nioID else {
+                    throw PerformanceSessionError.invalid(
+                        "UI and networking thread identities must differ")
+                }
+                threadCPURegistration = [
+                    "schema_version": 1, "process_id": getpid(),
+                    "roles": ["main": mainID, "nio": nioID],
+                ]
+            } else {
+                threadCPURegistration = nil
+            }
+        } catch {
+            controller.stop()
+            await coordinator.stop()
+            throw error
+        }
         if populated {
             PerformanceHistoryFixture.seedRawHistory(store: store, endingAt: rawEnd) {
                 clock.fixed = $0
@@ -154,7 +181,8 @@ public final class PerformanceApplicationSession {
             settings: settings, historyDirectory: historyDirectory,
             preferencesSuite: preferencesSuite, historyKind: populated ? "populated" : "fresh",
             proxyPort: proxyPort, clock: clock, defaults: defaults, rawEnd: rawEnd,
-            fixtureManifest: manifest, requestIdentity: requestIdentity)
+            fixtureManifest: manifest, requestIdentity: requestIdentity,
+            threadCPURegistration: threadCPURegistration)
     }
 
     /// Compact scalar snapshots avoid copying chart histories over the pipe.
@@ -162,7 +190,7 @@ public final class PerformanceApplicationSession {
         let usage = store.usageSummary(in: DateInterval(start: rawEnd, duration: 86400))
         let visibility = menuBarController.performanceVisibility
         let counters = PerformancePresentationCounters.shared.snapshot()
-        return [
+        var snapshot: [String: Any] = [
             "popover_lifecycle_policy": MenuBarController.performancePopoverLifecyclePolicy,
             "fixture_schema_version": PerformanceHistoryFixture.schemaVersion,
             "fixture_equivalence_sha256": fixtureManifest.sha256,
@@ -249,6 +277,8 @@ public final class PerformanceApplicationSession {
             "logging_dropped_records": store.diagnosticLogger.droppedCount,
             "shutdown_error": shutdownError as Any? ?? NSNull(),
         ]
+        if let threadCPURegistration { snapshot["thread_cpu_registration"] = threadCPURegistration }
+        return snapshot
     }
 
     public func stop(progress: ((String) -> Void)? = nil) async {
@@ -335,6 +365,6 @@ private final class PerformanceLoginService: LaunchAtLoginService {
     func openSystemSettings() {}
 }
 
-private enum PerformanceSessionError: Error {
+enum PerformanceSessionError: Error {
     case invalid(String)
 }
