@@ -21,18 +21,21 @@ final class LuminousChartGeometryCache {
     func frame(
         for key: Key, throughput: ChartDisplayHistory, gpu: ChartDisplayHistory,
         requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false,
-        compactToolPaths: Bool = false, deferredToolGeometry: Bool = false
+        compactToolPaths: Bool = false, deferredToolGeometry: Bool = false,
+        buildDrawingPaths: Bool = true
     ) -> Frame {
         if let retained, retained.key == key, retained.directToolPlot == directToolPlot,
             retained.compactToolPaths == compactToolPaths,
-            retained.deferredToolGeometry == deferredToolGeometry
+            retained.deferredToolGeometry == deferredToolGeometry,
+            retained.buildDrawingPaths == buildDrawingPaths
         {
             return retained
         }
         let frame = Frame(
             key: key, throughput: throughput, gpu: gpu, requestTools: requestTools,
             directToolPlot: directToolPlot, compactToolPaths: compactToolPaths,
-            deferredToolGeometry: deferredToolGeometry)
+            deferredToolGeometry: deferredToolGeometry,
+            buildDrawingPaths: buildDrawingPaths)
         retained = frame
         return frame
     }
@@ -77,22 +80,24 @@ final class LuminousChartGeometryCache {
 
         init(
             points: [CGPoint], smoothed: Bool, baseline: CGFloat,
-            compactToolPaths: Bool = false
+            compactToolPaths: Bool = false, buildDrawingPaths: Bool = true
         ) {
             self.points = points
             spans = smoothed ? ChartCurveGeometry.spans(points: points) : []
             var trace = Path()
             var tracePointCount = points.count
             if let first = points.first {
-                trace.move(to: first)
+                if buildDrawingPaths { trace.move(to: first) }
                 if smoothed {
                     tracePointCount = spans.count + 1
-                    for span in spans {
-                        if span.isVertical {
-                            trace.addLine(to: span.end)
-                        } else {
-                            trace.addCurve(
-                                to: span.end, control1: span.control1, control2: span.control2)
+                    if buildDrawingPaths {
+                        for span in spans {
+                            if span.isVertical {
+                                trace.addLine(to: span.end)
+                            } else {
+                                trace.addCurve(
+                                    to: span.end, control1: span.control1, control2: span.control2)
+                            }
                         }
                     }
                 } else if compactToolPaths {
@@ -102,17 +107,19 @@ final class LuminousChartGeometryCache {
                                 points[index - 1], points[index], points[index + 1])
                         {
                             tracePointCount -= 1
-                        } else {
+                        } else if buildDrawingPaths {
                             trace.addLine(to: points[index])
                         }
                     }
-                } else {
+                } else if buildDrawingPaths {
                     for point in points.dropFirst() { trace.addLine(to: point) }
                 }
             }
             self.trace = trace
             self.tracePointCount = tracePointCount
-            if smoothed, points.count > 1, let first = points.first, let last = points.last {
+            if buildDrawingPaths, smoothed, points.count > 1,
+                let first = points.first, let last = points.last
+            {
                 var area = trace
                 area.addLine(to: CGPoint(x: last.x, y: baseline))
                 area.addLine(to: CGPoint(x: first.x, y: baseline))
@@ -156,6 +163,7 @@ final class LuminousChartGeometryCache {
         let directToolPlot: Bool
         let compactToolPaths: Bool
         let deferredToolGeometry: Bool
+        let buildDrawingPaths: Bool
         let layout: Layout
         let generated: [Segment]
         let device: [Segment]
@@ -192,30 +200,37 @@ final class LuminousChartGeometryCache {
         init(
             key: Key, throughput: ChartDisplayHistory, gpu: ChartDisplayHistory,
             requestTools: [UUID: ToolActivityHistory], directToolPlot: Bool = false,
-            compactToolPaths: Bool = false, deferredToolGeometry: Bool = false
+            compactToolPaths: Bool = false, deferredToolGeometry: Bool = false,
+            buildDrawingPaths: Bool = true
         ) {
             self.key = key
             self.directToolPlot = directToolPlot
             self.compactToolPaths = compactToolPaths
             self.deferredToolGeometry = deferredToolGeometry
+            self.buildDrawingPaths = buildDrawingPaths
             let layout = Layout(size: key.size, hasTools: key.hasTools, compact: key.compact)
             self.layout = layout
             generated = Self.segments(
                 throughput.zeroFilledPlotSegments, key: key, rect: layout.main,
-                upperBound: key.tokenUpperBound, smoothed: true)
+                upperBound: key.tokenUpperBound, smoothed: true,
+                buildDrawingPaths: buildDrawingPaths)
             device = Self.segments(
                 gpu.plotSegments, key: key, rect: layout.main,
-                upperBound: 100, smoothed: true)
+                upperBound: 100, smoothed: true, buildDrawingPaths: buildDrawingPaths)
             generatedEndpoint = generated.last?.points.last
             deviceEndpoint = gpu.current.map {
                 Self.project(
                     $0.timestamp, value: $0.value, key: key, rect: layout.main, upperBound: 100)
             }
             let toolGeometry = ToolGeometryHolder {
-                [requestTools, key, toolRect = layout.tools, directToolPlot, compactToolPaths] in
+                [
+                    requestTools, key, toolRect = layout.tools, directToolPlot, compactToolPaths,
+                    buildDrawingPaths
+                ] in
                 Self.makeToolTracks(
                     requestTools, key: key, rect: toolRect,
-                    directToolPlot: directToolPlot, compactToolPaths: compactToolPaths)
+                    directToolPlot: directToolPlot, compactToolPaths: compactToolPaths,
+                    buildDrawingPaths: buildDrawingPaths)
             }
             self.toolGeometry = toolGeometry
             if !deferredToolGeometry { _ = toolGeometry.value() }
@@ -223,7 +238,7 @@ final class LuminousChartGeometryCache {
 
         private static func makeToolTracks(
             _ requestTools: [UUID: ToolActivityHistory], key: Key, rect: CGRect,
-            directToolPlot: Bool, compactToolPaths: Bool
+            directToolPlot: Bool, compactToolPaths: Bool, buildDrawingPaths: Bool
         ) -> [UUID: ToolTrack] {
             var toolPathInputPoints: UInt64 = 0
             var toolPathOutputPoints: UInt64 = 0
@@ -249,7 +264,7 @@ final class LuminousChartGeometryCache {
                     segments = Self.segments(
                         plotSegments, key: key, rect: rect,
                         upperBound: key.toolUpperBound, smoothed: false,
-                        compactToolPaths: compactToolPaths)
+                        compactToolPaths: compactToolPaths, buildDrawingPaths: buildDrawingPaths)
                     if let plotKey = history.reusablePlotKey { sharedTraces[plotKey] = segments }
                 }
                 for segment in segments {
@@ -259,15 +274,16 @@ final class LuminousChartGeometryCache {
                 return ToolTrack(
                     segments: segments,
                     resultPoints: points,
-                    resultDiamonds: points.map { point in
-                        var diamond = Path()
-                        diamond.move(to: CGPoint(x: point.x, y: point.y - 3))
-                        diamond.addLine(to: CGPoint(x: point.x + 3, y: point.y))
-                        diamond.addLine(to: CGPoint(x: point.x, y: point.y + 3))
-                        diamond.addLine(to: CGPoint(x: point.x - 3, y: point.y))
-                        diamond.closeSubpath()
-                        return diamond
-                    })
+                    resultDiamonds: buildDrawingPaths
+                        ? points.map { point in
+                            var diamond = Path()
+                            diamond.move(to: CGPoint(x: point.x, y: point.y - 3))
+                            diamond.addLine(to: CGPoint(x: point.x + 3, y: point.y))
+                            diamond.addLine(to: CGPoint(x: point.x, y: point.y + 3))
+                            diamond.addLine(to: CGPoint(x: point.x - 3, y: point.y))
+                            diamond.closeSubpath()
+                            return diamond
+                        } : [])
             }
             PerformancePresentationCounters.shared.recordToolTraces(
                 unique: uniqueToolTraceBuilds, reused: reusedToolTraceBuilds,
@@ -283,7 +299,7 @@ final class LuminousChartGeometryCache {
 
         private static func segments(
             _ segments: [[ChartDisplayPoint]], key: Key, rect: CGRect, upperBound: Double,
-            smoothed: Bool, compactToolPaths: Bool = false
+            smoothed: Bool, compactToolPaths: Bool = false, buildDrawingPaths: Bool = true
         ) -> [Segment] {
             guard key.duration.isFinite, key.duration > 0, upperBound.isFinite, upperBound > 0
             else {
@@ -296,7 +312,7 @@ final class LuminousChartGeometryCache {
                             $0.timestamp, value: $0.value, key: key, rect: rect,
                             upperBound: upperBound)
                     }, smoothed: smoothed, baseline: rect.maxY,
-                    compactToolPaths: compactToolPaths)
+                    compactToolPaths: compactToolPaths, buildDrawingPaths: buildDrawingPaths)
             }
         }
 
