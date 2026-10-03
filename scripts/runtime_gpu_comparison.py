@@ -30,7 +30,7 @@ REQUEST_INDICES = (CYCLE * 32, CYCLE * 32 + 1)
 STAGE = {"activity": "high-rate", "seconds": 8}
 WORK = {"chunks": 3200, "output_tokens": 6434, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
-MODES = ("normal", memory.METAL_ARRIVAL_MODE)
+MODES = ("normal", memory.METAL_ARRIVAL_MODE, memory.METAL_FULL_CHART_MODE)
 ERRORS = (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError)
 
 
@@ -124,6 +124,10 @@ def phase_windows(report):
 
 def validate_short_clock_work(report, mode):
     """Check the same rendering contracts over the explicitly shorter windows."""
+    if mode == memory.METAL_FULL_CHART_MODE:
+        return runtime.validate_metal_full_chart_work(report, mode,
+            closed_labels=("closed-start", "closed-end"), minimum_closed_seconds=2,
+            boundary=lambda point: snapshot_time(report, point))
     points = report["runtime"]["checkpoints"]
     flags = report["runtime_work"]["features"]
     window = report["phase_windows"]["steady"]
@@ -327,7 +331,7 @@ def validate_report(report, mode):
         memory.validate_popover_animation(point["snapshot"], False)
         require(memory.runtime_feature_contract(point["snapshot"]["graphics_diagnostics"], mode) == report["runtime_work"]["features"],
                 "GPU rendering feature contract changed")
-    require(workload["after"]["canvas_draws"] > workload["before"]["canvas_draws"]
+    require((mode == memory.METAL_FULL_CHART_MODE or workload["after"]["canvas_draws"] > workload["before"]["canvas_draws"])
             and workload["after"]["chart_preparations"] > workload["before"]["chart_preparations"],
             "GPU visible rendering/preparation did not advance")
     exclude_cpu_acceptance(report)
@@ -401,6 +405,9 @@ def register_report(trace, report, label, driver_exited_at):
 
 
 def qualify_result(result):
+    selected = result.get("capture_case", "both")
+    require(selected in ("both", "reference", "candidate"), "Unknown GPU capture selection")
+    expected_labels = ["reference", "candidate"] if selected == "both" else [selected]
     gpu = result.get("gpu_trace", {})
     provider_valid = (gpu.get("valid") is True and gpu.get("recording_complete") is True and gpu.get("lost_events") is False
                       and gpu.get("calibration", {}).get("valid") is True and gpu.get("capture_scope", {}).get("validated") is True)
@@ -420,15 +427,22 @@ def qualify_result(result):
                     "Qualified GPU metric lacks a finite conservative maximum")
             return {"evaluated": valid, "limit_percent": 1, "within_limit": upper <= 1 if valid else None}
         row["gpu_target"] = {"runtime": target(workload, available), "lifetime": target(lifetime, life_available)}
+        if row.get("mode") == memory.METAL_FULL_CHART_MODE:
+            row.update(promotion_eligible=False,
+                       promotion_reason="Experimental renderer requires independent visual and frame-delivery qualification")
         if not available or not life_available:
             result["errors"].append(row["label"] + ": GPU window or owned exit/command-completion proof incomplete")
     if not provider_valid:
         result["errors"].append("GPU provider calibration/ownership/clock/loss validation incomplete: " + "; ".join(gpu.get("invalid", [])))
     result["cpu_acceptance_eligible"] = False
     result["cpu_comparison_available"] = False
-    result["comparison_available"] = (not result["errors"] and [row["label"] for row in result["rows"]] == ["reference", "candidate"]
-                                       and all(row["gpu_window_available"] and row["gpu_lifetime_available"] for row in result["rows"]))
-    result["status"] = "gpu_comparison_complete" if result["comparison_available"] else "gpu_comparison_incomplete"
+    if [row["label"] for row in result["rows"]] != expected_labels:
+        result["errors"].append("GPU capture rows do not exactly match the requested products: " + ", ".join(expected_labels))
+    result["capture_available"] = (not result["errors"] and len(result["rows"]) == len(expected_labels)
+                                   and all(row["gpu_window_available"] and row["gpu_lifetime_available"] for row in result["rows"]))
+    result["comparison_available"] = selected == "both" and result["capture_available"]
+    prefix = "gpu_comparison" if selected == "both" else "gpu_capture"
+    result["status"] = prefix + ("_complete" if result["capture_available"] else "_incomplete")
 
 
 def write_report(output, report):
@@ -441,12 +455,16 @@ def write_report(output, report):
         if value.get("attribution_exact") is True:
             return f"{value[key]:.4f}%"
         return f"{value[key + '_lower_bound']:.4f}–{value[key + '_upper_bound']:.4f}%"
-    lines = ["# Short matched GPU comparison", "", f"Status: `{report['status']}`. Two matching eight-second, 200 Hz × two-stream replays and three seconds of visible completion, in one calibrated trace.", "",
-             "| Product | Runtime GPU mean | Runtime GPU max 1s | Lifetime GPU max 1s | Runtime ≤1% |", "|---|---:|---:|---:|---|"]
+    single = report.get("capture_case", "both") != "both"
+    scope = ("One eight-second, 200 Hz × two-stream replay and three seconds of visible completion, in a calibrated trace. "
+             "This independently captured product is not a paired comparison; comparison availability remains false."
+             if single else "Two matching eight-second, 200 Hz × two-stream replays and three seconds of visible completion, in one calibrated trace.")
+    lines = ["# Short process GPU " + ("capture" if single else "comparison"), "", f"Status: `{report['status']}`. {scope}", "",
+             "| Product | Renderer mode | Runtime GPU mean | Runtime GPU max 1s | Lifetime GPU max 1s | Runtime ≤1% |", "|---|---|---:|---:|---:|---|"]
     for row in report["rows"]:
         target = row.get("gpu_target", {}).get("runtime", {})
         result = ("pass" if target.get("within_limit") else "miss") if target.get("evaluated") else "unavailable"
-        lines.append(f"| {row['label']} | {metric(row, 'gpu_percent')} | {metric(row, 'gpu_rolling_1s_percent')} | {metric(row, 'gpu_rolling_1s_percent', True)} | {result} |")
+        lines.append(f"| {row['label']} | {row.get('mode', report.get('graphics_mode', 'unavailable'))} | {metric(row, 'gpu_percent')} | {metric(row, 'gpu_rolling_1s_percent')} | {metric(row, 'gpu_rolling_1s_percent', True)} | {result} |")
     lines += ["", "GPU percentages are owned-process additive execution time divided by elapsed time, not device utilization. CPU values are perturbed diagnostics and cannot establish CPU acceptance. This short protocol must not be pooled with the ordinary 25-second CPU workload or older GPU runs.", "",
               "| Phase | Absolute deadline from invocation |", "|---|---:|"]
     lines += [f"| {name} | {seconds}s |" for name, seconds in PHASE_SECONDS.items()]
@@ -461,7 +479,13 @@ def parser():
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--reference-products", type=Path, required=True)
     value.add_argument("--candidate-products", type=Path, required=True)
+    value.add_argument("--capture-case", choices=("both", "reference", "candidate"), default="both",
+                       help="Record both products together, or one product in an independent calibrated trace")
     value.add_argument("--graphics-mode", choices=MODES, default="normal")
+    value.add_argument("--reference-mode", choices=MODES,
+                       help="Reference product mode; defaults to --graphics-mode")
+    value.add_argument("--candidate-mode", choices=MODES,
+                       help="Candidate product mode; defaults to --graphics-mode")
     value.add_argument("--output-dir", type=Path)
     value.add_argument("--rebind-measurement", action="store_true",
                        help="Preserve original provenance and explicitly bind current external measurement sources")
@@ -470,14 +494,19 @@ def parser():
 
 def run(argv=None):
     args = parser().parse_args(argv)
+    selected_labels = ("reference", "candidate") if args.capture_case == "both" else (args.capture_case,)
+    incomplete_status = "gpu_comparison_incomplete" if args.capture_case == "both" else "gpu_capture_incomplete"
+    modes = {label: getattr(args, label + "_mode") or args.graphics_mode for label in ("reference", "candidate")}
     deadline = runtime.RuntimeDeadline(MAX_SECONDS, cleanup_reserve=0)
     started = deadline.end - MAX_SECONDS
     output = (args.output_dir or app.ROOT / ".performance-results" /
               ("gpu-comparison-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-") + secrets.token_hex(4))).resolve()
-    report = {"kind": "short-matched-process-gpu-comparison", "schema_version": 1, "status": "gpu_comparison_incomplete",
+    report = {"kind": "short-matched-process-gpu-comparison" if args.capture_case == "both" else "short-independent-process-gpu-capture",
+              "schema_version": 1, "status": incomplete_status, "capture_case": args.capture_case,
+              "capture_scope": "same-trace paired products" if args.capture_case == "both" else "single product; separate captures are not a paired comparison",
               "regression_passed": False, "deadline_seconds": MAX_SECONDS, "phase_budget_seconds": PHASE_SECONDS,
-              "graphics_mode": args.graphics_mode, "rows": [], "attempts": [], "errors": [],
-              "comparison_available": False, "cpu_acceptance_eligible": False, "cpu_comparison_available": False,
+              "graphics_mode": args.graphics_mode, "product_graphics_modes": modes, "rows": [], "attempts": [], "errors": [],
+              "capture_available": False, "comparison_available": False, "cpu_acceptance_eligible": False, "cpu_comparison_available": False,
               "workload_specification": STAGE, "expected_work": WORK}
     created, trace, products, sources = False, None, {}, None
     try:
@@ -512,9 +541,9 @@ def run(argv=None):
             report["trace_start"] = trace.start()
             report["calibration_setup"] = trace.calibrate(candidate["paths"]["collector"])
             require(not trace.invalid, "GPU calibration setup failed: " + "; ".join(trace.invalid))
-            for ordinal, label in enumerate(("reference", "candidate")):
-                require(time.monotonic() + CASE_SECONDS * (2 - ordinal) <= started + PHASE_SECONDS["record"],
-                        "Insufficient recording budget for both matching GPU workloads and owned cleanup")
+            for ordinal, label in enumerate(selected_labels):
+                require(time.monotonic() + CASE_SECONDS * (len(selected_labels) - ordinal) <= started + PHASE_SECONDS["record"],
+                        "Insufficient recording budget for the requested GPU workloads and owned cleanup")
                 require(source_identity() == sources and all(product_identity(value["paths"], value["provenance"]) == value["files"]
                                                             for value in products.values()), "GPU sources or frozen products changed before capture")
                 product = products[label]
@@ -522,7 +551,7 @@ def run(argv=None):
                 report["attempts"].append(attempt)
                 write_report(output, report)
                 case_deadline = runtime.RuntimeDeadline(CASE_SECONDS, cleanup_reserve=5)
-                case = capture_case(output / label, args.graphics_mode, product["paths"], product["provenance"], product["identity"], case_deadline)
+                case = capture_case(output / label, modes[label], product["paths"], product["provenance"], product["identity"], case_deadline)
                 ended = time.monotonic()
                 path = output / label / "runtime-case.json"
                 attempt.update(ended_monotonic_seconds=ended, elapsed_seconds=ended - attempt["started_monotonic_seconds"],
@@ -530,7 +559,7 @@ def run(argv=None):
                 require(source_identity() == sources and all(product_identity(value["paths"], value["provenance"]) == value["files"]
                                                             for value in products.values()), "GPU sources or frozen products changed during capture")
                 require(case["status"] == "diagnostic_captured", label + " short GPU replay is incomplete; see preserved report")
-                row = {"label": label, "mode": args.graphics_mode, "report_path": str(path), "report_sha256": app.path_hash(path),
+                row = {"label": label, "mode": modes[label], "report_path": str(path), "report_sha256": app.path_hash(path),
                        "validated_work": case["workload"]["validated_work"], "visual_work": case["visual_work"],
                        "runtime_work": case["runtime_work"], **register_report(trace, case, label, ended)}
                 report["rows"].append(row)
@@ -553,14 +582,14 @@ def run(argv=None):
                     qualify_result(report)
             except ERRORS as error:
                 report["errors"].append(str(error))
-                report.update(status="gpu_comparison_incomplete", comparison_available=False)
+                report.update(status=incomplete_status, capture_available=False, comparison_available=False)
             report["elapsed_seconds"] = time.monotonic() - started
             if report["elapsed_seconds"] > MAX_SECONDS:
                 report["errors"].append("GPU comparison exceeded the shared 300-second deadline")
-                report.update(status="gpu_comparison_incomplete", comparison_available=False)
+                report.update(status=incomplete_status, capture_available=False, comparison_available=False)
             write_report(output, report)
     print(f"{report['status']}: {output}", flush=True)
-    return 0 if report["status"] == "gpu_comparison_complete" else 1
+    return 0 if report["capture_available"] else 1
 
 
 if __name__ == "__main__":

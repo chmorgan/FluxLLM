@@ -23,7 +23,7 @@ class RuntimeVersionTests(unittest.TestCase):
                 "--output-dir", str(root / "output")]
 
     def run_comparison(self, directory, *, mismatch=None, mutation=None, visual_mismatch=False,
-                       peaks=(4, 3, 4), deadline_calls=None):
+                       peaks=(4, 3, 4), deadline_calls=None, candidate_mode=None, seen_modes=None):
         root = Path(directory)
         for role in ("reference", "candidate"):
             folder = root / role
@@ -50,7 +50,10 @@ class RuntimeVersionTests(unittest.TestCase):
             return paths, provenance, identity
         def capture(path, mode, paths, provenance, identity, deadline, *, profile):
             self.assertFalse(profile)
-            self.assertEqual(mode, "normal")
+            role = paths["app"].parent.name
+            self.assertEqual(mode, candidate_mode if role == "candidate" and candidate_mode else "normal")
+            if seen_modes is not None:
+                seen_modes.append((role, mode))
             self.assertLessEqual(deadline.end - deadline.clock(), runtime.THREE_CASE_SECONDS)
             seen.append(paths["app"].parent.name)
             case = {"status": "diagnostic_captured", "errors": [], "samples": [],
@@ -69,7 +72,10 @@ class RuntimeVersionTests(unittest.TestCase):
                 patch.object(runtime, "capture_case", side_effect=capture), \
                 patch.object(runtime, "RuntimeDeadline", wraps=runtime.RuntimeDeadline) as deadlines, \
                 contextlib.redirect_stdout(io.StringIO()):
-            code = runtime.run(self.argv(directory))
+            arguments = self.argv(directory)
+            if candidate_mode is not None:
+                arguments += ["--candidate-mode", candidate_mode]
+            code = runtime.run(arguments)
         if deadline_calls is not None:
             deadline_calls.extend(deadlines.call_args_list)
         return code, json.loads((root / "output/runtime-report.json").read_text()), seen
@@ -103,6 +109,26 @@ class RuntimeVersionTests(unittest.TestCase):
         self.assertEqual(runtime.CASE_SECONDS, 54)
         self.assertEqual(runtime.PROFILE_SECONDS, 120)
         self.assertLess(3 * runtime.THREE_CASE_SECONDS + 15, runtime.MAX_SECONDS)
+
+    def test_full_metal_candidate_uses_its_mode_between_unchanged_reference_modes(self):
+        modes = []
+        with tempfile.TemporaryDirectory() as directory:
+            code, report, seen = self.run_comparison(directory, candidate_mode="runtime-metal-full-chart", seen_modes=modes)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, ["reference", "candidate", "reference"])
+        self.assertEqual(modes, [("reference", "normal"), ("candidate", "runtime-metal-full-chart"), ("reference", "normal")])
+        self.assertEqual([row["mode"] for row in report["cases"]], [mode for _, mode in modes])
+        self.assertTrue(report["baseline_drift"]["comparison_conclusive"])
+        self.assertFalse(report["regression_passed"])
+
+    def test_candidate_mode_requires_complete_frozen_reference_comparison(self):
+        args = self.argv("/tmp/runtime-candidate-mode-test")
+        for flag in ("--reference-app-binary", "--reference-test-bundle", "--reference-provenance"):
+            offset = args.index(flag)
+            del args[offset:offset + 2]
+        args += ["--candidate-mode", "runtime-metal-full-chart"]
+        with self.assertRaises(ValueError):
+            runtime.selected_cases(runtime.parser().parse_args(args))
 
     def test_partial_reference_and_profile_or_controls_rejected_before_capture(self):
         for alteration in ("partial", "profile", "controls"):

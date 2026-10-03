@@ -1119,10 +1119,20 @@ python3 scripts/run_performance_checks.py gpu-compare \
   --output-dir .performance-results/gpu-version-comparison
 ```
 
+If Instruments cannot finalize a combined recording within the deadline, use
+`--capture-case reference` and `--capture-case candidate` in separate invocations
+with separate output directories. These keep the same eight-second workload,
+calibration, process ownership, completion, and exit checks while recording one
+app replay per trace. A qualified single capture reports `capture_available=true`
+and `comparison_available=false`: its measurements are independently captured,
+not a same-trace comparison. Missing or failed evidence remains unavailable.
+
 Each products directory supplies `FluxLLMApp`, `FluxLLMPackageTests.xctest`,
 `FluxLLMResourceCollector`, resource bundles, and reviewed `provenance.json`.
-`runtime-metal-arrival-bursts` may replace `normal`; both products always use the
-same selected mode. No build is performed.
+`runtime-metal-arrival-bursts` or `runtime-metal-full-chart` may replace `normal`.
+Use `--reference-mode normal --candidate-mode runtime-metal-full-chart` to
+compare different renderers across the frozen products. Each omitted per-product
+mode defaults to `--graphics-mode`. No build is performed.
 
 If reviewed external measurement scripts changed since the products were frozen,
 `--rebind-measurement` preserves a separate provenance binding in the report
@@ -1152,6 +1162,71 @@ result and its raw evidence; it cannot consume the entire remaining budget and
 silently omit later validation. This shorter GPU workload is separately identified
 and must not be pooled with the ordinary 25-second CPU workload or earlier GPU
 captures. The 1% maximum rolling one-second GPU target remains unchanged.
+
+## Persistent full-chart Metal candidate
+
+`runtime-metal-full-chart` replaces the chart's static Canvas, rail decoration
+Canvas, and cursor Canvas with one persistent `MTKView`. SwiftUI retains labels,
+axes, controls, inspection, selection, and accessibility. Immutable scenes retain
+series fills, strokes, glows, endpoints, tool traces, and request bars between
+publications. Cursor movement updates a separate buffer. The geometry cache skips
+unused SwiftUI `Path` construction in this mode only.
+
+Arrival particles and glints evaluate time in shaders. Completion lightning
+uses a GPU compute pass over immutable channel descriptors, followed by a render
+pass; its initial and delayed bursts use the same retained particle descriptors.
+Native scheduling retains the existing receipt lifetimes, twinkle sequence,
+30 Hz animation rate, and 1 Hz chart publication rate. It pauses in idle gaps and
+releases native rendering resources when hidden, detached, minimized, or closed.
+The static renderer batches primitives into one draw call, with bounded retained
+scene versions and buffers. GPU completion releases leases without a successful
+frame publishing a SwiftUI state update.
+
+Run the unprofiled current/candidate/current comparison using frozen Release
+products and reviewed provenance:
+
+```sh
+python3 scripts/run_performance_checks.py runtime compare \
+  --baseline-mode normal --candidate-mode runtime-metal-full-chart \
+  --app-binary /absolute/candidate-products/FluxLLMApp \
+  --test-bundle /absolute/candidate-products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/candidate-products/FluxLLMResourceCollector \
+  --provenance /absolute/candidate-products/provenance.json \
+  --reference-app-binary /absolute/reference-products/FluxLLMApp \
+  --reference-test-bundle /absolute/reference-products/FluxLLMPackageTests.xctest \
+  --reference-provenance /absolute/reference-products/provenance.json \
+  --output-dir .performance-results/full-chart-cpu
+
+python3 scripts/run_performance_checks.py gpu-compare \
+  --reference-products /absolute/reference-products \
+  --candidate-products /absolute/candidate-products \
+  --reference-mode normal --candidate-mode runtime-metal-full-chart \
+  --output-dir .performance-results/full-chart-gpu
+```
+
+The CPU workload remains two concurrent 200 Hz streams for 25 seconds. GPU uses
+the separately identified eight-second workload above; traced CPU cannot pass
+the CPU target. Both commands have a 300-second ceiling. The full-chart contract
+requires actual static, arrival, completion, and twinkle submissions in the
+corresponding phases, zero Canvas/bitmap/frame-clock work, no skipped frames or
+renderer failures, and closed-window inactivity/resource release. A fallback to
+Canvas invalidates the candidate instead of producing a misleading low result.
+
+The independent static-chart fidelity test compares original Canvas cubic paths,
+blur, gradients, dashes, and clips with the retained Metal renderer at 1× and 2×,
+after asymmetric pixel/readback calibration. Enable it with
+`FLUXLLM_FULL_METAL_FIDELITY=1` and an explicit
+`FLUXLLM_FULL_METAL_FIDELITY_OUTPUT=.performance-results/<new-directory>`, then
+run `swift test -c release --filter MetalFullChartFidelityTests`. It preserves all
+Canvas, Metal, and difference PNGs and JSON metrics before asserting the existing
+maximum difference of 2 per channel. Animated effects and text are outside this
+static pixel test; separate functional tests verify effect timing and visible
+GPU output without claiming pixel equivalence.
+
+Measurements are preserved even when independent visual qualification is still
+pending or fails. The candidate is opt-in: measured CPU/GPU differences do not
+establish pixel equivalence or grant production promotion. Strict fidelity and
+frame delivery remain separate evidence from resource consumption.
 
 ## Baselines and comparison artifacts
 

@@ -41,7 +41,7 @@ BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal", memory.ORDER
 
 
 def cpu_acceptance_eligible(mode, *, profile=False):
-    return not profile and mode != memory.HELD_STATIC_CHART_MODE
+    return not profile and mode not in (memory.HELD_STATIC_CHART_MODE, memory.METAL_FULL_CHART_MODE)
 
 
 def held_static_chart_work(before, after, mode):
@@ -222,6 +222,17 @@ def validate_runtime_work(before, after, mode, *, required=True):
             and (metal_first is None or metal_first["arrival_backend"] == metal_last["arrival_backend"]),
             "Runtime arrival backend metadata changed or disappeared")
     delta = {}
+    full_first = memory.metal_full_chart_contract(before, mode)
+    full_last = memory.metal_full_chart_contract(after, mode)
+    require((full_first is None) == (full_last is None), "Full Metal chart instrumentation changed during runtime")
+    full_delta = None
+    if mode == memory.METAL_FULL_CHART_MODE:
+        full_delta = {field: full_last["counters"][field] - full_first["counters"][field]
+                      for field in memory.METAL_FULL_CHART_COUNTERS}
+        require(all(count >= 0 for count in full_delta.values()), "Full Metal chart work counters moved backwards")
+        require(all(full_delta[field] > 0 for field in ("geometry_uploads", "submissions", "static_frames",
+                                                       "arrival_frames", "completion_frames", "twinkle_frames")),
+                "Full Metal chart runtime did not submit all static and animation work")
     if metal_first is not None:
         for field in memory.METAL_ARRIVAL_COUNTERS:
             first, last = metal_first["counters"][field], metal_last["counters"][field]
@@ -287,7 +298,10 @@ def validate_runtime_work(before, after, mode, *, required=True):
         else:
             require(before["ungrouped_native_canvas_draws"] == after["ungrouped_native_canvas_draws"] == 0,
                     "Grouped native Canvas mode executed ungrouped callbacks")
-            require(delta["grouped_native_canvas_draws"] > 0, "Baseline native Canvas did not execute grouped callbacks")
+            if mode == memory.METAL_FULL_CHART_MODE:
+                require(delta["grouped_native_canvas_draws"] == 0, "Full Metal chart executed grouped Canvas callbacks")
+            else:
+                require(delta["grouped_native_canvas_draws"] > 0, "Baseline native Canvas did not execute grouped callbacks")
     if (mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.UNGROUPED_CANVAS_MODE, memory.NO_ARRIVAL_MODE) or "direct_tool_plot" in flags
             or any(field in snapshot for snapshot in (before, after) for field in memory.DIRECT_TOOL_PLOT_COUNTERS)):
         require("direct_tool_plot" in flags, "Tool-plot counters lack feature metadata")
@@ -393,7 +407,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
         require(last >= first, f"Runtime {role} drawing counter moved backwards")
         delta[role + "_draws"] = last - first
     held_work = held_static_chart_work(before, after, mode)
-    if held_work is None:
+    if held_work is None and mode != memory.METAL_FULL_CHART_MODE:
         require(delta["static_chart_draws"] > 0, "Runtime static charts did not redraw")
     if flags.get("canvas_frame_clock", False):
         minimum_draws = max(1, math.floor(.8 * delta["rail_frame_clock_ticks"]) - 2)
@@ -402,6 +416,9 @@ def validate_runtime_work(before, after, mode, *, required=True):
     if not flags["lifecycle_effects_enabled"]:
         require(delta["rail_decorations_draws"] == 0, "No-lifecycle control still drew lifecycle decorations")
     return {"available": True, "features": flags, "deltas": delta,
+            **({"metal_full_chart_deltas": full_delta, "promotion_eligible": False,
+                "promotion_reason": "Experimental renderer requires independent visual fidelity qualification"}
+               if full_delta is not None else {}),
             **({"held_static_chart_work": held_work} if held_work is not None else {}),
             **({"arrival_backend": metal_last["arrival_backend"]} if metal_last is not None else {}),
             **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {})}
@@ -460,8 +477,99 @@ def validate_visual_work(report, *, required):
             "invalid_requests": 0, "real_time_clocks_preserved": True}
 
 
+def validate_metal_full_chart_work(report, mode, *,
+                                  closed_labels=("07-both-closed-after-probe", "08-closed-after-five-more-seconds"),
+                                  minimum_closed_seconds=5, boundary=None):
+    """Keep workload, native visibility, phase, and cancellation proofs for Metal."""
+    if mode != memory.METAL_FULL_CHART_MODE:
+        return None
+    points = report["runtime"]["checkpoints"]
+    require(len(points) >= 2, "Full Metal chart lacks runtime checkpoints")
+    if boundary is None:
+        clocks = report["runtime"]
+        offset = sum(clocks[name]["absolute_minus_monotonic_seconds"] for name in ("mach_clock_start", "mach_clock_end")) / 2
+
+        def boundary(point):
+            snapshot, sample = point["snapshot"], point["resource_sample"]
+            matches = [row for row in report["samples"]
+                       if row["monotonic_seconds"] == snapshot.get("runner_collector_sample_monotonic_seconds")]
+            require(len(matches) == 1 and matches[0] == sample
+                    and all(sample.get(field) == report["owned_identity"][field]
+                            for field in ("process_id", "birth_time_us")),
+                    "Full Metal chart checkpoint lacks its authenticated kernel boundary")
+            return sample["mach_absolute_seconds"] - offset
+
+    initial_flags = memory.runtime_feature_contract(points[0]["snapshot"]["graphics_diagnostics"], mode)
+    closed = []
+    for label in closed_labels:
+        matches = [point for point in report["checkpoints"] if point["label"] == label]
+        require(len(matches) == 1, "Full Metal chart closed checkpoints are missing or duplicated")
+        closed.append(matches[0])
+    all_points = points + closed
+    rows = []
+    for index, point in enumerate(all_points):
+        snapshot = point["snapshot"]
+        is_closed = index >= len(points)
+        require(snapshot.get("dashboard_visible") is (not is_closed)
+                and snapshot.get("popover_visible") is (not is_closed),
+                "Full Metal chart checkpoint lost native window visibility")
+        if is_closed:
+            require(snapshot.get("active_requests") == 0, "Full Metal chart closed checkpoint is not idle")
+        require(memory.runtime_feature_contract(snapshot["graphics_diagnostics"], mode) == initial_flags,
+                "Full Metal chart features changed between checkpoints")
+        counts = memory.metal_full_chart_contract(snapshot, mode, expected_closed=is_closed)["counters"]
+        rows.append((point, boundary(point), counts))
+    for first, last in zip(rows, rows[1:]):
+        require(last[1] > first[1], "Full Metal chart checkpoints are not ordered")
+        require(all(last[2][field] >= first[2][field] for field in memory.METAL_FULL_CHART_COUNTERS),
+                "Full Metal chart counters moved backwards between checkpoints")
+    runtime_rows = rows[:len(points)]
+    arrival, steady, completion = (report["phase_windows"][name] for name in ("arrival", "steady", "completion"))
+    arrival_end = [row for row in runtime_rows
+                   if arrival["end_monotonic_seconds"] <= row[1] < steady["start_monotonic_seconds"]]
+    require(runtime_rows[0][1] <= arrival["start_monotonic_seconds"] and arrival_end,
+            "Full Metal chart arrival work lacks bracketing checkpoints")
+    steady_rows = [row for row in runtime_rows
+                   if steady["start_monotonic_seconds"] < row[1] < steady["end_monotonic_seconds"]]
+    require(len(steady_rows) >= 2 and all(row[0]["snapshot"].get("active_requests") == 2 for row in steady_rows),
+            "Full Metal chart steady phase lacks two active streams and interior checkpoints")
+    completion_start = [row for row in runtime_rows if row[0]["label"] == "completion-begin"]
+    require(len(completion_start) == 1
+            and completion["start_monotonic_seconds"] <= completion_start[0][1] < completion["end_monotonic_seconds"],
+            "Full Metal chart completion work lacks its authenticated start checkpoint")
+    completion_rows = [row for row in runtime_rows
+                       if completion_start[0][1] <= row[1] <= completion["end_monotonic_seconds"]]
+    require(len(completion_rows) >= 2 and all(row[0]["snapshot"].get("active_requests") == 0 for row in completion_rows),
+            "Full Metal chart completion lacks idle interior checkpoints")
+
+    def delta(first, last):
+        return {field: last[2][field] - first[2][field] for field in memory.METAL_FULL_CHART_COUNTERS}
+
+    arrival_delta = delta(runtime_rows[0], arrival_end[0])
+    steady_delta = delta(steady_rows[0], steady_rows[-1])
+    completion_delta = delta(completion_rows[0], completion_rows[-1])
+    require(arrival_delta["arrival_frames"] > 0 and arrival_delta["static_frames"] > 0,
+            "Full Metal chart did not submit arrivals before steady traffic")
+    require(steady_delta["static_frames"] > 0 and steady_delta["twinkle_frames"] > 0
+            and steady_delta["geometry_uploads"] > 0,
+            "Full Metal chart steady phase did not update charts and animate twinkles")
+    require(steady_delta["arrival_frames"] == steady_delta["completion_frames"] == 0,
+            "Full Metal chart lifecycle effects continued through the steady phase")
+    require(completion_delta["completion_frames"] > 0, "Full Metal chart did not preserve completion animation")
+    require(rows[-1][1] - rows[-2][1] >= minimum_closed_seconds,
+            "Full Metal chart closed observation is too short")
+    closed_delta = delta(rows[-2], rows[-1])
+    require(all(count == 0 for count in closed_delta.values()), "Full Metal chart continued work after windows closed")
+    return {"available": True, "arrival_deltas": arrival_delta, "steady_deltas": steady_delta,
+            "completion_deltas": completion_delta, "closed_deltas": closed_delta,
+            "frame_delivery_qualified": rows[-1][2]["frames_skipped"] == 0,
+            "scope": "Authenticated visible workload and closed cancellation; submitted work does not measure GPU utilization"}
+
+
 def validate_canvas_clock_work(report, mode):
     """Use existing authenticated checkpoints; never infer idle from a tail deadline."""
+    if mode == memory.METAL_FULL_CHART_MODE:
+        return validate_metal_full_chart_work(report, mode)
     points = report["runtime"]["checkpoints"]
     flags = memory.runtime_feature_contract(points[0]["snapshot"].get("graphics_diagnostics", {}), mode) or {}
     metal_initial = memory.metal_arrival_contract(points[0]["snapshot"], mode)
@@ -923,8 +1031,11 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
         report["runtime_cpu_target"] = {"evaluated": eligible, "acceptance_eligible": eligible, "limit_percent": 5.0,
             "within_limit": report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5 if eligible else None,
             "scope": "Contiguous visible traffic and completion only; separate from full resource gate"}
-        if mode == memory.HELD_STATIC_CHART_MODE:
-            report["runtime_cpu_target"]["reason"] = "Held static chart drawing is a diagnostic ablation, not production rendering"
+        if mode in (memory.HELD_STATIC_CHART_MODE, memory.METAL_FULL_CHART_MODE):
+            report["runtime_cpu_target"]["reason"] = ("Experimental Metal chart needs independent visual and frame-delivery qualification"
+                if mode == memory.METAL_FULL_CHART_MODE else "Held static chart drawing is a diagnostic ablation, not production rendering")
+            report["runtime_cpu_target"]["observed_within_limit"] = report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5
+            report["cpu_gate_evaluated"] = False
             report.setdefault("workload_cpu", {}).update(acceptance_eligible=False, gate_evaluated=False, within_limit=None)
             for metrics in report["phase_cpu"].values():
                 metrics["acceptance_eligible"] = False
@@ -972,7 +1083,9 @@ def selected_cases(args):
                 "Frozen reference comparison requires all three reference product/provenance arguments")
         require(args.operation == "compare", "Frozen reference comparison cannot run with Time Profiler")
         require(args.controls is None, "Frozen reference comparison cannot be combined with graphics controls")
-        return [(label, args.baseline_mode) for label in ("reference-before", "candidate", "reference-after")]
+        return [("reference-before", args.baseline_mode),
+                ("candidate", getattr(args, "candidate_mode", None) or args.baseline_mode), ("reference-after", args.baseline_mode)]
+    require(getattr(args, "candidate_mode", None) is None, "Candidate mode requires a frozen reference comparison")
     if args.operation == "profile":
         return [("profile", args.graphics_mode)]
     if args.operation in ("threads", "nio"):
@@ -1045,6 +1158,8 @@ def parser():
                             help="Compare frozen versions in reference/candidate/reference order using --baseline-mode")
     result.add_argument("--graphics-mode", choices=BASELINES + memory.RUNTIME_MODES, default="normal")
     result.add_argument("--baseline-mode", choices=BASELINES, default="native-gpu-optimized")
+    result.add_argument("--candidate-mode", choices=BASELINES + memory.RUNTIME_MODES,
+                        help="Candidate-only rendering mode for a frozen reference/candidate/reference comparison")
     result.add_argument("--controls", nargs="+", choices=memory.RUNTIME_MODES + ("normal",))
     result.add_argument("--output-dir", type=Path)
     return result
@@ -1103,6 +1218,8 @@ def _run(args, deadline):
                         "Frozen versions require the same common collector")
                 products["reference"] = {"paths": reference_paths, "provenance": reference_provenance, "identity": reference_identity}
                 report["graphics_mode"] = args.baseline_mode
+                report["product_graphics_modes"] = {"reference": args.baseline_mode,
+                                                    "candidate": args.candidate_mode or args.baseline_mode}
             for product in products.values():
                 product["files"] = runtime_product_identity(product["paths"], product["provenance"])
             report["products"] = {role: {"files": product["files"], "production_provenance": product["provenance"],

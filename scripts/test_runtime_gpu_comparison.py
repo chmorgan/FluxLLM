@@ -1,6 +1,7 @@
 """Offline contracts for bounded GPU comparisons; never launch a native tool."""
 import contextlib
 import copy
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -249,6 +250,40 @@ class GPUWindowRegistrationTests(unittest.TestCase):
 
 
 class GPUQualificationTests(unittest.TestCase):
+    def test_single_product_gpu_is_available_without_claiming_a_paired_comparison(self):
+        for label in ("reference", "candidate"):
+            result = qualified_comparison()
+            result["capture_case"] = label
+            result["rows"] = [row for row in result["rows"] if row["label"] == label]
+            with self.subTest(label=label):
+                gpu.qualify_result(result)
+                self.assertTrue(result["capture_available"])
+                self.assertEqual(result["status"], "gpu_capture_complete")
+                self.assertFalse(result["comparison_available"])
+                self.assertFalse(result["cpu_acceptance_eligible"])
+                self.assertTrue(result["rows"][0]["gpu_target"]["runtime"]["evaluated"])
+                self.assertFalse(result["regression_passed"])
+
+    def test_single_product_missing_extra_wrong_or_duplicate_rows_are_rejected(self):
+        for selected in ("reference", "candidate"):
+            for fault in ("missing", "wrong", "extra", "duplicate", "missing-exit", "uncalibrated"):
+                result = qualified_comparison()
+                result["capture_case"] = selected
+                chosen = next(row for row in result["rows"] if row["label"] == selected)
+                other = next(row for row in result["rows"] if row["label"] != selected)
+                result["rows"] = {"missing": [], "wrong": [other], "extra": [chosen, other],
+                                  "duplicate": [chosen, copy.deepcopy(chosen)]}.get(fault, [chosen])
+                if fault == "missing-exit":
+                    result["gpu_trace"]["final_exit_coverage"][selected + "/lifetime"]["complete"] = False
+                elif fault == "uncalibrated":
+                    result["gpu_trace"]["calibration"]["valid"] = False
+                with self.subTest(selected=selected, fault=fault):
+                    gpu.qualify_result(result)
+                    self.assertFalse(result["capture_available"])
+                    self.assertFalse(result["comparison_available"])
+                    self.assertEqual(result["status"], "gpu_capture_incomplete")
+                    self.assertTrue(result["errors"])
+
     def test_complete_calibrated_pair_is_comparable_but_never_cpu_acceptance(self):
         result = qualified_comparison()
         gpu.qualify_result(result)
@@ -391,6 +426,7 @@ class GPUProductBindingTests(unittest.TestCase):
             self.assertEqual(list(output.iterdir()), [])
             self.assertEqual({path: path.read_bytes() for path in saved}, saved)
 
+
     def test_explicit_binding_validates_original_then_pins_derived_provenance_and_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             products, output, paths, original = self.products(Path(directory))
@@ -425,6 +461,88 @@ class GPUProductBindingTests(unittest.TestCase):
             self.assertEqual(result["files"]["original_provenance_file"]["sha256"], original_hash)
             self.assertEqual(result["files"]["provenance_file"]["sha256"], gpu.app.path_hash(bound_path))
             self.assertEqual({path: path.read_bytes() for path in saved}, saved)
+
+
+class GPUProductModeRoutingTests(unittest.TestCase):
+    def run_modes(self, options):
+        seen = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            products = {}
+            for label in ("reference", "candidate"):
+                folder = root / label
+                folder.mkdir()
+                paths = {name: folder / name for name in ("app", "tests", "collector")}
+                for name, path in paths.items():
+                    path.write_text("common collector" if name == "collector" else label + " " + name)
+                provenance = {"fixture_equivalence_sha256": {"populated": "same-populated-fixture"}}
+                products[label] = {"paths": paths, "provenance": provenance, "identity": {"sha256": "common-measurement"},
+                                   "files": gpu.product_identity(paths, provenance)}
+
+            def capture(output, mode, paths, provenance, identity, deadline):
+                label = paths["app"].parent.name
+                seen.append((label, mode))
+                result = {"status": "diagnostic_captured", "errors": [], "workload": {"validated_work": gpu.WORK},
+                          "visual_work": {"visual_comparison_eligible": True, "requests": [{"index": 480000}]},
+                          "runtime_work": {"features": {}, "deltas": {}}}
+                output.mkdir()
+                gpu.write_json(output / "runtime-case.json", result)
+                return result
+
+            def register(trace, case, label, ended):
+                return {"workload_window_name": label + "/workload", "lifetime_window_name": label + "/lifetime"}
+
+            trace = SimpleNamespace(invalid=[], start=Mock(return_value={}), calibrate=Mock(return_value={}),
+                                    finish=Mock(return_value=qualified_comparison()["gpu_trace"]))
+            output = root / "output"
+            arguments = ["--reference-products", str(root / "reference"), "--candidate-products", str(root / "candidate"),
+                         "--output-dir", str(output), *options]
+            with patch.object(gpu.sys, "platform", "darwin"), \
+                    patch.object(gpu, "source_identity", return_value={}), \
+                    patch.object(gpu, "load_products", side_effect=lambda directory, output, label, **kwargs: products[label]), \
+                    patch.object(gpu, "TraceSession", return_value=trace), \
+                    patch.object(gpu, "capture_case", side_effect=capture), \
+                    patch.object(gpu, "register_report", side_effect=register), contextlib.redirect_stdout(io.StringIO()):
+                code = gpu.run(arguments)
+            report = json.loads((output / "gpu-comparison.json").read_text())
+            trace.start.assert_called_once()
+            trace.finish.assert_called_once()
+        return code, report, seen
+
+    def test_default_and_explicit_per_product_modes_reach_the_selected_frozen_apps(self):
+        cases = (([], ["normal", "normal"]),
+                 (["--graphics-mode", "runtime-metal-arrival-bursts"], ["runtime-metal-arrival-bursts"] * 2),
+                 (["--graphics-mode", "runtime-metal-arrival-bursts", "--reference-mode", "normal",
+                   "--candidate-mode", "runtime-metal-full-chart"], ["normal", "runtime-metal-full-chart"]))
+        for arguments, modes in cases:
+            with self.subTest(arguments=arguments):
+                code, report, seen = self.run_modes(arguments)
+                self.assertEqual(code, 0)
+                self.assertEqual(seen, list(zip(("reference", "candidate"), modes)))
+                self.assertEqual([row["mode"] for row in report["rows"]], modes)
+                self.assertTrue(report["comparison_available"])
+                self.assertFalse(report["cpu_acceptance_eligible"])
+                self.assertFalse(report["regression_passed"])
+
+    def test_single_case_selection_launches_only_selected_product_with_same_workload_and_limits(self):
+        for selected, mode in (("reference", "normal"), ("candidate", "runtime-metal-full-chart")):
+            with self.subTest(selected=selected):
+                code, report, seen = self.run_modes(["--capture-case", selected,
+                    "--reference-mode", "normal", "--candidate-mode", "runtime-metal-full-chart"])
+                self.assertEqual(code, 0)
+                self.assertEqual(seen, [(selected, mode)])
+                self.assertEqual(report["capture_case"], selected)
+                self.assertEqual(report["kind"], "short-independent-process-gpu-capture")
+                self.assertEqual(report["status"], "gpu_capture_complete")
+                self.assertTrue(report["capture_available"])
+                self.assertFalse(report["comparison_available"])
+                self.assertFalse(report["cpu_acceptance_eligible"])
+                self.assertFalse(report["regression_passed"])
+                self.assertEqual(report["deadline_seconds"], 300)
+                self.assertEqual(report["workload_specification"], {"activity": "high-rate", "seconds": 8})
+                self.assertEqual(report["expected_work"], gpu.WORK)
+                self.assertEqual(set(report["products"]), {"reference", "candidate"})
+                self.assertEqual([row["label"] for row in report["attempts"]], [selected])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,15 @@ from run_performance_checks import InvalidResult
 
 
 def graphics(mode="normal"):
+    if mode == memory.METAL_FULL_CHART_MODE:
+        snapshot = graphics(memory.METAL_ARRIVAL_MODE)
+        snapshot["graphics_diagnostics"].update(mode=mode, metal_full_chart_enabled=True,
+            metal_full_chart=dict.fromkeys(memory.METAL_FULL_CHART_FIELDS, 0),
+            native_gpu_backend="metal-persistent-chart", arrival_backend="metal-full-chart-shader",
+            metal_arrival_bursts_enabled=False, canvas_frame_clock=False,
+            retained_twinkles_enabled=False)
+        del snapshot["graphics_diagnostics"]["retained_twinkle_backend"]
+        return snapshot
     if mode == memory.HELD_STATIC_CHART_MODE:
         snapshot = graphics(memory.METAL_ARRIVAL_MODE)
         value = snapshot["graphics_diagnostics"]
@@ -87,6 +96,15 @@ def drawn_layer_graphics(mode="bitmap-layer-destination"):
 
 
 def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
+    if mode == memory.METAL_FULL_CHART_MODE:
+        snapshot = graphics(mode)
+        snapshot.update(streamed_bodies_without_promises=3, ordered_chart_publication_queries=3,
+                        legacy_tool_plot_builds=3, tool_path_input_points=30, tool_path_output_points=30)
+        snapshot["graphics_diagnostics"]["scalar_presentation_publications"] = 3
+        snapshot["graphics_diagnostics"]["metal_full_chart"].update(hosts_created=2, live_hosts=2, peak_hosts=2,
+            geometry_uploads=2, submissions=3, static_frames=3, arrival_frames=1, completion_frames=1,
+            twinkle_frames=2, current_buffer_bytes=512, peak_buffer_bytes=512)
+        return snapshot
     snapshot = graphics(mode)
     value = snapshot["graphics_diagnostics"]
     value.update(native_gpu_canvas_draws=3, live_canvases=1, peak_live_canvases=1,
@@ -388,8 +406,11 @@ class GraphicsTests(unittest.TestCase):
                         changed["graphics_diagnostics"][field] = replacement
                     with self.subTest(mode=mode, field=field, replacement=replacement), self.assertRaises(InvalidResult):
                         memory.validate_graphics(changed, mode)
-            snapshot["graphics_diagnostics"]["retained_twinkles"]["animation_starts"] = 0
-            with self.assertRaisesRegex(InvalidResult, "did not submit"):
+            if mode == memory.METAL_FULL_CHART_MODE:
+                snapshot["graphics_diagnostics"]["metal_full_chart"]["twinkle_frames"] = 0
+            else:
+                snapshot["graphics_diagnostics"]["retained_twinkles"]["animation_starts"] = 0
+            with self.assertRaises(InvalidResult):
                 memory.validate_graphics(snapshot, mode, completed_visible_workload=True)
 
     def test_normal_runtime_contract_preserves_old_and_promoted_paths_but_cannot_disappear(self):
