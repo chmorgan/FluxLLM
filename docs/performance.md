@@ -845,6 +845,65 @@ and exported attribution. `--output-dir` may select a new directory; existing
 artifacts are never overwritten. Consult the authoritative JSON status before
 using any partially written artifacts.
 
+
+## Arrival episode diagnostics
+
+Run the automated first/repeated-arrival diagnostic with frozen Release products:
+
+```sh
+python3 scripts/run_performance_checks.py arrivals \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json \
+  --output-dir .performance-results/arrivals-candidate
+```
+
+`--output-dir` is optional; the four product/provenance arguments are required.
+The command runs four fixed cases serially within **300 seconds**, without
+retries or an expanding matrix:
+
+| Order | Rendering | Detailed timing | CPU comparison |
+|---|---|---|---|
+| 1: normal-before | Production `normal` | Forced off | Eligible |
+| 2: Metal untimed | `runtime-metal-arrival-bursts` | Forced off | Eligible |
+| 3: normal-after | Production `normal` | Forced off | Eligible |
+| 4: Metal timed | `runtime-metal-arrival-bursts` | Enabled | Ineligible |
+
+Each case owns a fresh app process and keeps its dashboard and popover visible
+through three episodes in that same process. Every episode runs two streams at
+200 Hz for five seconds, followed by at least three seconds of completion and
+at least one second of verified quiet before another episode may begin. Episodes
+do not overlap. Fixture cycles are fixed at `15000`, `15001`, and `15002`.
+Each introduces two new synthetic request IDs, giving cumulative unique counts
+of **2, 4, and 6**. Compare corresponding episode ordinals across cases: their
+identities and fixture work match. History, colors, and shapes change between
+ordinals, so first-versus-repeat differences do not isolate a pure cold-start
+cost.
+
+Arrival CPU covers the actual source first-write timestamp through **+2 seconds**.
+Full-case CPU separately covers the acknowledged boundary before episode one
+through the final completion endpoint, including all intervening gaps. These
+intervals answer different questions and are reported separately. The runner
+preserves owned PID/birth authentication, native visibility, exact fixture work
+and per-fragment timing, source capsules and product identity, and clean final
+exit checks. Missing evidence leaves the affected result incomplete.
+
+Only the fourth case sets `FLUXLLM_PERF_ARRIVAL_TIMING=1`; the other three force
+it to `0`, regardless of the inherited environment. Timed results are always
+ineligible for acceptance. The fifteen timing scopes record calling-thread CPU
+and wall durations sampled sequentially, plus setup/resource counters. Every
+scope is inclusive and totals can overlap: do not sum them or subtract nested
+totals. `metal_frame_callback` covers the full draw callback; completion work
+on the main actor can include the final clear-drawable submission.
+`metal_descriptor_upload` measures CPU shared-buffer allocation/copy, and
+`canvas_arrival_draw` measures Canvas command construction. These scopes are
+not exhaustive process-CPU attribution and do not cover driver work outside the
+callbacks. Submitted work and timings do not measure GPU execution or GPU
+transfer; the separate calibrated GPU provider remains necessary. This diagnostic
+does not establish a full resource gate pass or change the **5% CPU**, **1% GPU**,
+or **less than 64,000,000-byte physical-footprint** limits.
+
 ## Baselines and comparison artifacts
 
 Record the same workload before changing production behavior:
