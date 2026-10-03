@@ -97,6 +97,47 @@ final class ToolCallParserTests: XCTestCase {
         XCTAssertEqual(parser.ingest(valid, at: origin).map(\.callID), ["a"])
     }
 
+    func testEscapedDuplicateToolKeysPreserveSelectionAndMalformedArrayAtomicity() throws {
+        let call =
+            #"{"i\u0064":"a","id":"b","funct\u0069on":{"na\u006de":"read_🌊","name":"other","argu\u006dents":{}}}"#
+        let prefix = #"{"mess\u0061ge":{"tool\u005fcalls":["#
+        let valid = prefix + call + "]}}"
+        let malformed = prefix + call + ",null]}}"
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(valid.utf8)) as? [String: Any])
+        let message = try XCTUnwrap(object["message"] as? [String: Any])
+        let calls = try XCTUnwrap(message["tool_calls"] as? [[String: Any]])
+        let selectedCall = try XCTUnwrap(calls.first)
+        let function = try XCTUnwrap(selectedCall["function"] as? [String: Any])
+        let expectedName = try XCTUnwrap(function["name"] as? String)
+        let expectedID = try XCTUnwrap(selectedCall["id"] as? String)
+        var strings = ToolCallParser()
+        var native = ToolCallParser()
+        var borrowed = ToolCallParser()
+
+        for (index, payload) in [malformed, valid, valid].enumerated() {
+            let timestamp = origin.addingTimeInterval(Double(index))
+            let dictionary = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+            let record = try XCTUnwrap(DecodedGenerationRecord(data: Data(payload.utf8)))
+            let results = [
+                strings.ingest(payload, at: timestamp),
+                native.ingest(dictionary, at: timestamp),
+                borrowed.ingest(record, at: timestamp),
+            ]
+            for events in results {
+                if index == 1 {
+                    XCTAssertEqual(events.map(\.kind), [.call])
+                    XCTAssertEqual(events.map(\.name), [expectedName])
+                    XCTAssertEqual(events.map(\.callID), [expectedID])
+                    XCTAssertEqual(events.map(\.timestamp), [timestamp])
+                } else {
+                    XCTAssertTrue(events.isEmpty, payload)
+                }
+            }
+        }
+    }
+
     func testEmitsEachIdentifiedCallOnceWithNameAndObservationTime() {
         var parser = ToolCallParser()
         let payload =

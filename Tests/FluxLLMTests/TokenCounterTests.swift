@@ -248,6 +248,47 @@ final class TokenCounterTests: XCTestCase {
         }
     }
 
+    func testEscapedAndDuplicateProtocolKeysPreserveFoundationAccounting() throws {
+        let clock = TokenCounterTestClock()
+        var strings = TokenState(clock: { clock.now() })
+        var native = TokenState(clock: { clock.now() })
+        var borrowed = TokenState(clock: { clock.now() })
+        let payloads = [
+            #"{"mo\u0064el":"qwen-🌊","model":"duplicate-model","res\u0070onse":"answer","thinking":"reasoning","mess\u0061ge":{"con\u0074ent":"nested","thinking":"thought"},"done":false}"#,
+            #"{"do\u006ee":true,"eval\u005fcount":6,"eval_count":7,"prompt\u005feval_count":true,"eval\u005fduration":1000000000}"#,
+        ]
+        var expectedModel: String?
+        var expectedCount: Int?
+        for (index, payload) in payloads.enumerated() {
+            clock.advance(by: 2)
+            // Read the existing Foundation result with ordinary String keys:
+            // duplicate-key selection must remain Foundation's decision.
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+            strings.ingest(payload)
+            native.ingest(object)
+            borrowed.ingest(try XCTUnwrap(DecodedGenerationRecord(data: Data(payload.utf8))))
+            assertEqualSnapshots(borrowed.snapshot(), native.snapshot(), payload: payload)
+            assertEqualSnapshots(strings.snapshot(), native.snapshot(), payload: payload)
+            if index == 0 {
+                expectedModel = try XCTUnwrap(object["model"] as? String)
+                XCTAssertEqual(borrowed.snapshot().outputTokens, 4)
+                XCTAssertEqual(borrowed.snapshot().model, expectedModel)
+            } else {
+                expectedCount = try XCTUnwrap(object["eval_count"] as? Int)
+            }
+        }
+        let result = borrowed.finish()
+        let count = try XCTUnwrap(expectedCount)
+        XCTAssertEqual(result.model, expectedModel)
+        XCTAssertEqual(result.outputTokens, count)
+        XCTAssertEqual(result.promptTokens, 1, "JSON booleans retain NSNumber-to-Int bridging")
+        XCTAssertEqual(result.authoritativeTPS, Double(count))
+        XCTAssertTrue(result.finished)
+        XCTAssertFalse(result.isEstimated)
+        XCTAssertNil(result.error)
+    }
+
     func testGenerateContentOnlyDeltasProduceAnEstimatedWallClockRate() async {
         let clock = TokenCounterTestClock()
         let counter = TokenCounter(clock: { clock.now() })

@@ -24,22 +24,22 @@ struct ToolCallParser {
     mutating func ingest(_ record: DecodedGenerationRecord, at timestamp: Date)
         -> [ToolActivityEvent]
     {
-        guard let calls = record.message?.dictionaries("tool_calls")
+        guard let calls = record.message?.dictionaries(.toolCalls)
         else { return [] }
 
         return calls.compactMap { call in
-            guard let function = call.dictionary("function"),
-                let name = Self.nonempty(function["name"])
+            guard let function = call.dictionary(.function),
+                let name = Self.nonempty(function[.name])
             else { return nil }
 
-            let callID = Self.nonempty(call["id"])
-            let index = Self.index(function["index"])
+            let callID = Self.nonempty(call[.id])
+            let index = Self.index(function[.index])
             if callID != nil || index != nil {
                 guard shouldEmit(callID: callID, index: index) else { return nil }
             } else {
                 // Native anonymous calls have complete structured arguments.
                 // Incomplete fragments have no reliable identity for merging.
-                guard function.dictionary("arguments") != nil else { return nil }
+                guard function.dictionary(.arguments) != nil else { return nil }
             }
             return ToolActivityEvent(kind: .call, name: name, callID: callID, timestamp: timestamp)
         }
