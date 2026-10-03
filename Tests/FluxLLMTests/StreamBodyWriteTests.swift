@@ -16,8 +16,12 @@ final class StreamBodyWriteTests: XCTestCase {
             let second = "{\"response\":\"second\",\"done\":false}\n"
             for text in [first, second] {
                 let previousFlushes = harness.probe.flushes
+                let previousWrites = harness.wireProbe.writes
                 try harness.sendBody(text)
                 XCTAssertEqual(harness.probe.flushes, previousFlushes + 1)
+                XCTAssertEqual(
+                    harness.wireProbe.writes - previousWrites, optimized ? 1 : 3,
+                    "Count actual encoded IOData writes below the HTTP encoder")
                 XCTAssertEqual(
                     try harness.readWire(),
                     "\(String(text.utf8.count, radix: 16))\r\n\(text)\r\n")
@@ -28,6 +32,42 @@ final class StreamBodyWriteTests: XCTestCase {
             harness.loop.advanceTime(by: .milliseconds(50))
             XCTAssertEqual(harness.events.snapshots.last?.outputTokens, 2)
         }
+    }
+
+    func testInstalledCoalescerDoesNotCombineHEADCONNECTOrUnobservedLifecycleWrites() throws {
+        for method in [HTTPMethod.HEAD, .CONNECT] {
+            let harness = try StreamWriteHarness(optimized: true, method: method)
+            defer { harness.finish() }
+            try harness.sendHead()
+            _ = try harness.readWire()
+            let writes = harness.wireProbe.writes
+            try harness.sendBody("{\"response\":\"one\"}\n")
+            XCTAssertEqual(harness.probe.promisedParts, [true, true])
+            XCTAssertEqual(harness.wireProbe.writes - writes, 3)
+        }
+        let harness = try StreamWriteHarness(optimized: true, installLifecycle: false)
+        defer { harness.finish() }
+        try harness.sendHead()
+        let writes = harness.wireProbe.writes
+        try harness.sendBody("{\"response\":\"one\"}\n")
+        XCTAssertEqual(harness.wireProbe.writes - writes, 3)
+        XCTAssertEqual(harness.probe.promisedParts, [true, true])
+    }
+
+    func testBelowEncoderFailureCancelsBeforeTerminalBodyCanUpdateTelemetry() throws {
+        let harness = try StreamWriteHarness(optimized: true)
+        defer { harness.finish() }
+        try harness.sendHead()
+        _ = try harness.readWire()
+        let writes = harness.wireProbe.writes
+        harness.wireProbe.closeOnNextWrite = true
+        try harness.sendBody(StreamWriteHarness.terminal)
+        XCTAssertEqual(harness.wireProbe.writes - writes, 1)
+        XCTAssertEqual(harness.events.kinds, ["began", "cancelled"])
+        XCTAssertTrue(harness.events.snapshots.isEmpty)
+        XCTAssertFalse(harness.upstream.isActive)
+        XCTAssertFalse(harness.downstream.isActive)
+        XCTAssertEqual(try harness.readWire(), "")
     }
 
     func testHEADAndCONNECTKeepBodyFailurePromises() throws {
@@ -138,6 +178,7 @@ private final class StreamWriteHarness {
     let upstream: EmbeddedChannel
     let downstream: EmbeddedChannel
     let probe = StreamWriteProbe()
+    let wireProbe = StreamWireProbe()
     let events: StreamWriteEvents
     let relay: GenerationRelay
 
@@ -149,7 +190,9 @@ private final class StreamWriteHarness {
         upstream = EmbeddedChannel(loop: loop)
         downstream = EmbeddedChannel(loop: loop)
         relay = GenerationRelay(request: GenerationRequest(), sink: { events.append($0) })
-        try downstream.pipeline.syncOperations.addHandlers(HTTPResponseEncoder(), probe)
+        let coalescer = SmallResponseBodyCoalescer()
+        try downstream.pipeline.syncOperations.addHandlers(
+            wireProbe, coalescer, HTTPResponseEncoder(), probe)
         let lifecycle = optimized ? StreamBodyWriteLifecycle(upstream: upstream, relay: relay) : nil
         if let lifecycle, installLifecycle {
             try downstream.pipeline.syncOperations.addHandler(lifecycle)
@@ -157,7 +200,8 @@ private final class StreamWriteHarness {
         try upstream.pipeline.syncOperations.addHandler(
             StreamTapper(
                 serverChannel: downstream, relay: relay, isGeneration: true,
-                requestMethod: method, bodyWriteLifecycle: lifecycle))
+                requestMethod: method, bodyWriteLifecycle: lifecycle,
+                bodyCoalescer: coalescer))
         let address = try SocketAddress(ipAddress: "127.0.0.1", port: 1)
         upstream.connect(to: address, promise: nil)
         downstream.connect(to: address, promise: nil)
@@ -196,6 +240,25 @@ private final class StreamWriteHarness {
         loop.run()
         _ = try? upstream.finish(acceptAlreadyClosed: true)
         _ = try? downstream.finish(acceptAlreadyClosed: true)
+    }
+}
+
+/// Sits below both the HTTP encoder and coalescer, where writes have their actual
+/// transport shape. A synchronous failure occurs before StreamTapper resumes.
+private final class StreamWireProbe: ChannelOutboundHandler {
+    typealias OutboundIn = IOData
+    var writes = 0
+    var closeOnNextWrite = false
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        writes += 1
+        if closeOnNextWrite {
+            closeOnNextWrite = false
+            promise?.fail(StreamWriteFailure())
+            context.close(promise: nil)
+            return
+        }
+        context.write(data, promise: promise)
     }
 }
 

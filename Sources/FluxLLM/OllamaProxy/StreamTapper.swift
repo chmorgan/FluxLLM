@@ -222,6 +222,7 @@ final class StreamTapper: ChannelInboundHandler {
     private let isGeneration: Bool
     private let requestMethod: HTTPMethod
     private let bodyWriteLifecycle: StreamBodyWriteLifecycle?
+    private let bodyCoalescer: SmallResponseBodyCoalescer?
     private var parser = SSEParser()
     private var counter = TokenState()
     private var toolCalls = ToolCallParser()
@@ -233,13 +234,15 @@ final class StreamTapper: ChannelInboundHandler {
 
     init(
         serverChannel: Channel, relay: GenerationRelay, isGeneration: Bool,
-        requestMethod: HTTPMethod = .POST, bodyWriteLifecycle: StreamBodyWriteLifecycle? = nil
+        requestMethod: HTTPMethod = .POST, bodyWriteLifecycle: StreamBodyWriteLifecycle? = nil,
+        bodyCoalescer: SmallResponseBodyCoalescer? = nil
     ) {
         self.serverChannel = serverChannel
         self.relay = relay
         self.isGeneration = isGeneration
         self.requestMethod = requestMethod
         self.bodyWriteLifecycle = bodyWriteLifecycle
+        self.bodyCoalescer = bodyCoalescer
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
@@ -363,7 +366,13 @@ final class StreamTapper: ChannelInboundHandler {
                 // Flush every incoming body immediately. NIO's chunked encoder
                 // skips its three promises and their combining futures here.
                 PerformancePresentationCounters.shared.record(.streamedBodiesWithoutPromises)
-                downstream.writeAndFlush(part, promise: nil)
+                if let bodyCoalescer, case .body(.byteBuffer(let buffer)) = part {
+                    bodyCoalescer.withBodyWrite(byteCount: buffer.readableBytes) {
+                        downstream.writeAndFlush(part, promise: nil)
+                    }
+                } else {
+                    downstream.writeAndFlush(part, promise: nil)
+                }
                 return
             }
         }

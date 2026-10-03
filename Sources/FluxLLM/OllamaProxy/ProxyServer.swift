@@ -463,21 +463,29 @@ private final class RequestForwarder: ChannelInboundHandler {
                 channel.pipeline.addHTTPClientHandlers().flatMap {
                     channel.eventLoop.submit {
                         let lifecycle: StreamBodyWriteLifecycle?
+                        let bodyCoalescer: SmallResponseBodyCoalescer?
                         if usesUnpromisedStreamBodyWrites,
                             forwardedHead.method != .HEAD, forwardedHead.method != .CONNECT
                         {
                             let observer = StreamBodyWriteLifecycle(upstream: channel, relay: relay)
                             try serverChannel.pipeline.syncOperations.addHandler(observer)
                             lifecycle = observer
+                            let coalescer = SmallResponseBodyCoalescer()
+                            // Below the HTTP encoder, preserving its complete
+                            // framing and response-body validation behavior.
+                            try serverChannel.pipeline.syncOperations.addHandler(
+                                coalescer, position: .first)
+                            bodyCoalescer = coalescer
                         } else {
                             lifecycle = nil
+                            bodyCoalescer = nil
                         }
                         try channel.pipeline.syncOperations.addHandler(
                             StreamTapper(
                                 serverChannel: serverChannel, relay: relay,
                                 isGeneration: isGeneration,
                                 requestMethod: forwardedHead.method,
-                                bodyWriteLifecycle: lifecycle))
+                                bodyWriteLifecycle: lifecycle, bodyCoalescer: bodyCoalescer))
                     }
                 }.map { channel }
             }
