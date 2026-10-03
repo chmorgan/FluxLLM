@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, matched-episode arrival diagnostics; no build or native profiler."""
+"""Bounded, matched-episode arrival comparisons and optional CPU attribution."""
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -16,6 +16,7 @@ import uuid
 import app_performance as app
 import memory_attribution as memory
 import runtime_attribution as runtime
+import runtime_time_profile as time_profile
 from run_performance_checks import require, write_json
 
 MAX_SECONDS = 300
@@ -130,7 +131,10 @@ def validate_quiet(first, last):
                 f"Arrival effects continued during quiet interval: {field}")
 
 
-def validate_replay(report, mode, timed):
+def validate_replay(report, mode, timed, *, profile=False):
+    perturbed = timed or profile
+    require(not (timed and profile), "Time Profiler and scoped timing cannot run together")
+    require(report["runtime"].get("profiled") is perturbed, "Arrival CPU eligibility differs from its measurement mode")
     require(not report["errors"] and len(report["episodes"]) == 3, "Arrival replay capture is incomplete")
     require(report.get("memory_validation", {}).get("problems") == [], "Arrival replay final accounting is invalid")
     memory.validate_sample_identities(report["samples"], report["owned_identity"])
@@ -245,7 +249,7 @@ def validate_replay(report, mode, timed):
     report["phase_windows"] = windows
     report["phase_cpu"] = runtime.phase_cpu(report, windows)
     for metrics in report["phase_cpu"].values():
-        metrics["acceptance_eligible"] = not timed
+        metrics["acceptance_eligible"] = not perturbed
     report["timing_setup"] = timing_delta(report["ready"]["snapshot"], first, timed)
     report["timing_lifetime"] = timing_delta(report["ready"]["snapshot"], report["checkpoints"][-1]["snapshot"], timed)
     if timed:
@@ -263,24 +267,29 @@ def validate_replay(report, mode, timed):
     if timed:
         require(report["timing_closed"]["metrics"]["metal_frame_callback"]["calls"] == 0,
                 "Timed Metal draw callbacks continued after both windows closed")
-    report["cpu_acceptance_eligible"] = not timed
-    report["cpu_targets"] = {name: {"evaluated": not timed, "limit_percent": 5.0,
-        "within_limit": metrics["rolling_1s_percent"] <= 5.0 if not timed else None,
+    if profile:
+        require(report["runtime"].get("profiler_status") == "captured", "Arrival Time Profiler capture is incomplete")
+        require(report["runtime"].get("owned_identity") == report["owned_identity"],
+                "Arrival Time Profiler identity differs from the owned app")
+    report["cpu_acceptance_eligible"] = not perturbed
+    report["cpu_targets"] = {name: {"evaluated": not perturbed, "limit_percent": 5.0,
+        "within_limit": metrics["rolling_1s_percent"] <= 5.0 if not perturbed else None,
         "scope": "Arrival diagnostic interval only; not the full resource gate"}
         for name, metrics in report["phase_cpu"].items() if name.endswith("-arrival") or name == "whole_replay"}
     report["regression_passed"] = False
     return report
 
 
-class ArrivalDiagnostic(memory.MemoryDiagnostic):
-    def __init__(self, output, deadline, mode, timed):
+class ArrivalDiagnostic(runtime.RuntimeDiagnostic):
+    def __init__(self, output, deadline, mode, timed, *, profile=False):
+        require(not (timed and profile), "Time Profiler and scoped timing cannot run together")
         self.timed = timed
-        super().__init__(output, deadline, mode, no_native_inspection=True)
+        super().__init__(output, deadline, mode, profile=profile)
         self.tracking = False
         self.next_checkpoint = None
         self.traffic_start = self.traffic_end = None
-        self.report.update(kind="arrival-replay-case", timing_enabled=timed, episodes=[],
-                           runtime={"profiled": timed, "checkpoints": []})
+        self.runtime.update(profiled=timed or profile, cpu_comparison_available=not (timed or profile))
+        self.report.update(kind="arrival-replay-case", timing_enabled=timed, profiled=profile, episodes=[])
         self.report["base_driver_sha256"] = self.report["driver_sha256"]
         self.report["driver_sha256"] = app.path_hash(Path(__file__))
 
@@ -314,6 +323,8 @@ class ArrivalDiagnostic(memory.MemoryDiagnostic):
         return snapshot
 
     def poll_runtime(self):
+        if self.profile_enabled and self.runtime["profiler_status"] == "recording":
+            require(self.recorder.poll() is None, "Arrival profiler stopped before completion capture")
         now = time.monotonic()
         if not self.tracking or self.next_checkpoint is None or now < self.next_checkpoint:
             return
@@ -352,8 +363,11 @@ class ArrivalDiagnostic(memory.MemoryDiagnostic):
         require(logging.get("logging_enabled") is False and logging.get("drained") is True, "Arrival logging did not disable and drain")
         self.command("show_dashboard")
         self.command("show_popover")
-        self.tracking = True
         self.report["runtime"]["mach_clock_start"] = runtime._mach_clock()
+        if self.profile_enabled:
+            self.begin_profile()
+            self.profile_readiness_guard()
+        self.tracking = True
         self.next_checkpoint = time.monotonic() + 1
         initial = self.record("initial-quiet-start", 0)
         self.collector.wait_until(time.monotonic() + 1.1)
@@ -385,6 +399,11 @@ class ArrivalDiagnostic(memory.MemoryDiagnostic):
             validate_quiet(episode["quiet_start"], episode["quiet_end"])
             self.save()
         self.tracking = False
+        if self.profile_enabled:
+            # Keep the final selected interval inside Running samples on both
+            # sides, then stop before closing the owned windows.
+            self.collector.wait_until(time.monotonic() + .3)
+            self.finish_profile()
         self.command("close_popover")
         self.command("close_dashboard")
         self.collector.wait_until(time.monotonic() + 1)
@@ -395,9 +414,9 @@ class ArrivalDiagnostic(memory.MemoryDiagnostic):
         self.collector.finish()
 
 
-def capture_case(output, mode, timed, paths, provenance, identity, deadline):
+def capture_case(output, mode, timed, paths, provenance, identity, deadline, *, profile=False):
     output.mkdir()
-    diagnostic = ArrivalDiagnostic(output, deadline, mode, timed)
+    diagnostic = ArrivalDiagnostic(output, deadline, mode, timed, profile=profile)
     try:
         with deadline.interrupt_at(deadline.end - deadline.cleanup_reserve):
             diagnostic.perform(paths, provenance, identity)
@@ -412,7 +431,7 @@ def capture_case(output, mode, timed, paths, provenance, identity, deadline):
     report = diagnostic.report
     if report.get("workload_cpu", {}).get("available"):
         report["workload_cpu"].update(interval="Episode3 before-traffic through its traffic acknowledgment; five-second fixture plus start/drain overhead, excludes completion and inter-episode gaps",
-                                      acceptance_eligible=not timed, gate_evaluated=False)
+                                      acceptance_eligible=not (timed or profile), gate_evaluated=False)
     if timed:
         report["timed_last_episode_cpu"] = report.get("workload_cpu")
         if report["timed_last_episode_cpu"] is not None:
@@ -420,7 +439,7 @@ def capture_case(output, mode, timed, paths, provenance, identity, deadline):
             report["timed_last_episode_cpu"]["within_limit"] = None
         report["workload_cpu"] = {"available": False, "gate_evaluated": False, "reason": "Scoped arrival timing perturbs execution"}
     try:
-        validate_replay(report, mode, timed)
+        validate_replay(report, mode, timed, profile=profile)
         report["status"] = "diagnostic_captured"
     except ERRORS as error:
         report["errors"].append(str(error))
@@ -454,7 +473,7 @@ def summary(report):
             arrival = phases.get(f"episode-{ordinal}-arrival", {})
             lines.append(f"| {case['label']} | {ordinal} | {cpu(arrival, 'average_cpu_percent')} | {cpu(arrival, 'rolling_1s_percent')} | "
                          f"{target(f'episode-{ordinal}-arrival')} | {cpu(whole, 'average_cpu_percent')} / {cpu(whole, 'rolling_1s_percent')} | "
-                         f"{target('whole_replay')} | {'unqualified capture' if case.get('status') != 'diagnostic_captured' else 'perturbed; ineligible' if case['timed'] else 'off'} |")
+                         f"{target('whole_replay')} | {'unqualified capture' if case.get('status') != 'diagnostic_captured' else 'profiled; ineligible' if case.get('profiled') else 'perturbed; ineligible' if case['timed'] else 'off'} |")
     lines += ["", "Compare matching episode ordinals across cases. Histories, effect seeds, colors, and shapes change across ordinals; first-minus-repeat is not an isolated first-use cost.",
               "Whole replay includes the gaps between episodes; first2s starts at the fixture's first source write. Timing scopes can overlap and must not be summed. GPU execution is unmeasured."]
     for case in report["cases"]:
@@ -477,6 +496,38 @@ def summary(report):
                   "Arrival timing spans exact acknowledged checkpoints around the2s CPU window. Descriptor upload measures CPU shared-buffer allocation/copy; Canvas arrival draw measures command construction. Driver work outside measured scopes is not attributed."]
     if "baseline_drift" in report:
         lines += ["", "Baseline drift: " + ("within existing tolerance" if report["baseline_drift"]["comparison_conclusive"] else "INCONCLUSIVE comparison")]
+    if report.get("operation") == "profile":
+        lines += ["", "Native capture: " + ("complete" if report.get("native_capture_complete") else "incomplete")
+                  + ". Attribution: " + report.get("attribution_status", "unavailable") + ".",
+                  "Profiled CPU is an attribution cross-check only. No CPU target is evaluated; all threads in the owned app are included."]
+        if report.get("analysis_pending_reasons"):
+            lines += ["", "Quantitative attribution is pending. Raw sample weights and rankings remain unscaled; they do not establish absolute CPU cost.",
+                      *["- " + reason for reason in report["analysis_pending_reasons"]]]
+        attribution = report.get("attribution", {})
+        lines += ["", "| Profile phase | Duration s | Running samples | Sampled CPU % | Same-window kernel CPU % | Agreement |",
+                  "|---|---:|---:|---:|---:|---|"]
+        for phase in attribution.get("phases", []):
+            lines.append(f"| {phase['phase']} | {phase['elapsed_seconds']:.3f} | {phase['total']['sample_count']} | "
+                         f"{phase['total']['cpu_percent_one_core']:.4f}% | {phase['kernel_cpu_same_window']['average_cpu_percent']:.4f}% | "
+                         f"{str(phase['sample_kernel_agreement']['within_tolerance']).lower()} |")
+        lines += ["", "Each worst-second window is selected from kernel counters inside its two-second arrival interval, never from sampled stack weights. "
+                  "The steady reference is episode three's +2 to +4 seconds. Whole replay includes all traffic, completion, and intervening gaps. "
+                  "Phases overlap and must not be summed."]
+        for phase in attribution.get("phases", []):
+            lines += ["", "| " + phase["phase"] + " — selected execution groups | Sampled CPU ms including callees | CPU % of one core |",
+                      "|---|---:|---:|"]
+            for row in phase.get("inclusive", []):
+                if row["sample_count"]:
+                    label = row["execution"].replace("|", "\\|").replace("\n", " ")
+                    lines.append(f"| {label} | {row['cpu_ms']:.4f} | {row['cpu_percent_one_core']:.4f}% |")
+            lines += ["", "| " + phase["phase"] + " — top sampled executions | Scope | Sampled CPU ms | CPU % of one core |",
+                      "|---|---|---:|---:|"]
+            for key, label in (("top_inclusive_symbols", "including synchronous callees"), ("top_leaf_symbols", "self")):
+                for row in phase.get(key, [])[:5]:
+                    symbol = row["symbol"].replace("|", "\\|").replace("\n", " ")
+                    lines.append(f"| {symbol} | {label} | {row['cpu_ms']:.4f} | {row['cpu_percent_one_core']:.4f}% |")
+        lines += ["", "Inclusive execution rows overlap; do not add parents and children. Asynchronous ancestors are not inferred. "
+                  "Full rankings, thread totals, call-tree context, recording quality, and clock/kernel reconciliation are retained in cpu-attribution.json."]
     lines += ["", *report.get("errors", [])]
     return "\n".join(lines) + "\n"
 
@@ -486,14 +537,18 @@ def parser():
     for name in ("app-binary", "test-bundle", "collector-binary", "provenance"):
         value.add_argument("--" + name, type=Path, required=True)
     value.add_argument("--output-dir", type=Path)
+    value.add_argument("--profile", action="store_true",
+                       help="Run one three-episode Metal Time Profiler capture and bounded attribution; never evaluate CPU acceptance")
     return value
 
 
 def _run(args, deadline):
     started = time.monotonic()
+    profile = args.profile
     output = (args.output_dir or app.ROOT / ".performance-results" /
               ("arrival-replay-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-") + secrets.token_hex(4))).resolve()
-    report = {"kind": "matched-arrival-replay", "status": "diagnostic_incomplete", "deadline_seconds": MAX_SECONDS,
+    report = {"kind": "profiled-arrival-replay" if profile else "matched-arrival-replay",
+              "operation": "profile" if profile else "compare", "status": "diagnostic_incomplete", "deadline_seconds": MAX_SECONDS,
               "regression_passed": False, "cases": [], "errors": []}
     created = False
     try:
@@ -513,33 +568,67 @@ def _run(args, deadline):
         with deadline.interrupt_at(deadline.end - deadline.cleanup_reserve):
             paths, provenance, identity = memory.validate_products(args)
             report.update(binary_identity={name: app.path_hash(path) for name, path in paths.items()}, measurement_identity=identity)
-        for label, mode, timed in CASES:
-            require(deadline.remaining() >= CASE_SECONDS + 3, "Insufficient budget for a complete arrival replay case")
+        cases = (("metal-arrivals-profile", memory.METAL_ARRIVAL_MODE, False),) if profile else CASES
+        case_seconds = runtime.PROFILE_SECONDS if profile else CASE_SECONDS
+        for label, mode, timed in cases:
+            require(deadline.remaining() >= case_seconds + 3, "Insufficient budget for a complete arrival replay case")
             require(source_identity() == sources and all(app.path_hash(path) == report["binary_identity"][name] for name, path in paths.items()),
                     "Arrival sources or frozen products changed")
-            print(f"Arrival replay {len(report['cases']) + 1}/4: {label}; timing={'on' if timed else 'off'}; remaining {deadline.remaining():.1f}s", flush=True)
+            print(f"Arrival replay {len(report['cases']) + 1}/{len(cases)}: {label}; timing={'on' if timed else 'off'}; "
+                  f"profile={'on' if profile else 'off'}; remaining {deadline.remaining():.1f}s", flush=True)
             with deadline.interrupt_at(deadline.end - 1):
                 case = capture_case(output / label, mode, timed, paths, provenance, identity,
-                                    runtime.RuntimeDeadline(CASE_SECONDS, cleanup_reserve=8))
+                                    runtime.RuntimeDeadline(case_seconds, cleanup_reserve=8), profile=profile)
             path = output / label / "arrival-case.json"
-            row = {"label": label, "mode": mode, "timed": timed, "status": case["status"], "phase_cpu": case.get("phase_cpu"),
+            row = {"label": label, "mode": mode, "timed": timed, "profiled": profile,
+                   "status": case["status"], "phase_cpu": case.get("phase_cpu"),
                    "report_path": str(path), "report_sha256": app.path_hash(path),
-                   "cpu_acceptance_eligible": case["status"] == "diagnostic_captured" and not timed,
+                   "cpu_acceptance_eligible": case["status"] == "diagnostic_captured" and not (timed or profile),
                    "cpu_targets": case.get("cpu_targets"), "timing_setup": case.get("timing_setup"),
                    "episode_timings": [{"ordinal": episode["ordinal"], "timing": episode["timing"]}
                                        for episode in case["episodes"] if "timing" in episode]}
             report["cases"].append(row)
             write_json(output / "arrival-report.json", report)
             require(case["status"] == "diagnostic_captured", f"Arrival case {label} is incomplete: {case['errors']}")
-        drift = {}
-        for phase in ("whole_replay", "episode-1-arrival", "episode-2-arrival", "episode-3-arrival"):
-            bracket = [{"phase_cpu": {"whole_contiguous_runtime": report["cases"][index]["phase_cpu"][phase]}} for index in (0, 2)]
-            drift[phase] = runtime.baseline_drift(bracket)
-        report["baseline_drift"] = {"comparison_conclusive": all(value["comparison_conclusive"] for value in drift.values()), "phases": drift}
+            if profile:
+                report["native_capture_complete"] = True
+                windows = time_profile.arrival_profile_windows(case)
+                report["profile_phase_windows"] = windows
+                clock = case["runtime"]
+                anchor = clock["clock_anchor"] | {name: clock[name] for name in ("mach_clock_start", "mach_clock_end")}
+                with deadline.interrupt_at(deadline.end - 5):
+                    report["attribution"] = time_profile.analyze_trace(output / label / "cpu.trace", output / label,
+                        case["owned_identity"]["process_id"], windows, anchor, case["samples"], deadline)
+                attribution = report["attribution"]
+                report["attribution_status"] = attribution.get("status")
+                require(attribution.get("status") in ("analysis_pending", "profiled_phase_attribution_available"),
+                        "Arrival Time Profiler analysis returned an unknown completion status")
+                quality = attribution.get("analysis_quality", {})
+                require(type(quality.get("quantitative_attribution_usable")) is bool
+                        and quality["quantitative_attribution_usable"] == (attribution["status"] == "profiled_phase_attribution_available"),
+                        "Arrival Time Profiler analysis status and quantitative quality disagree")
+                if attribution["status"] == "analysis_pending":
+                    reasons = []
+                    if quality.get("sample_kernel_mismatch_phases"):
+                        reasons.append("Sampled CPU and same-window kernel CPU disagree beyond diagnostic tolerance in: "
+                                       + ", ".join(quality["sample_kernel_mismatch_phases"]) + ".")
+                    if quality.get("all_selected_symbols_missing"):
+                        reasons.append("All selected samples lack usable symbols.")
+                    if quality.get("clock_uncertainty_unbracketed_phases"):
+                        reasons.append("Clock uncertainty is not bracketed by Running samples in: "
+                                       + ", ".join(quality["clock_uncertainty_unbracketed_phases"]) + ".")
+                    report["analysis_pending_reasons"] = reasons or ["Time Profiler quantitative attribution quality is unavailable."]
+        if not profile:
+            drift = {}
+            for phase in ("whole_replay", "episode-1-arrival", "episode-2-arrival", "episode-3-arrival"):
+                bracket = [{"phase_cpu": {"whole_contiguous_runtime": report["cases"][index]["phase_cpu"][phase]}} for index in (0, 2)]
+                drift[phase] = runtime.baseline_drift(bracket)
+            report["baseline_drift"] = {"comparison_conclusive": all(value["comparison_conclusive"] for value in drift.values()), "phases": drift}
         require(source_identity() == sources and all(app.path_hash(path) == report["binary_identity"][name] for name, path in paths.items()),
                 "Arrival measurement sources or frozen products changed before finalization")
         require(time.monotonic() < deadline.end - 1, "Arrival replay exceeded its deadline")
-        report["status"] = "diagnostic_captured"
+        report["status"] = ("analysis_pending" if profile and report.get("attribution_status") == "analysis_pending"
+                            else "diagnostic_captured")
     except ERRORS + (KeyboardInterrupt,) as error:
         report["errors"].append(str(error) or "Interrupted")
     finally:

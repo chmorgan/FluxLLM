@@ -492,7 +492,7 @@ class ReplayIsolationTests(unittest.TestCase):
         deadline = SimpleNamespace(end=1000, cleanup_reserve=8,
                                    interrupt_at=lambda end: contextlib.nullcontext())
 
-        def reject_after_cpu_validation(report, mode, timed):
+        def reject_after_cpu_validation(report, mode, timed, *, profile=False):
             report["cpu_acceptance_eligible"] = True
             report["phase_cpu"] = {"whole_replay": {"average_cpu_percent": 99.125,
                 "rolling_1s_percent": 101.25, "acceptance_eligible": True}}
@@ -517,6 +517,209 @@ class ReplayIsolationTests(unittest.TestCase):
             self.assertIn("unqualified", rendered)
             self.assertNotIn("99.1250%", rendered)
             self.assertNotIn("101.2500%", rendered)
+
+
+class ArrivalProfileContractTests(unittest.TestCase):
+    def profiled_report(self):
+        report = replay_report(replay.memory.METAL_ARRIVAL_MODE)
+        report["runtime"].update(profiled=True, profiler_status="captured",
+                                 owned_identity=copy.deepcopy(report["owned_identity"]))
+        return report
+
+    def test_profile_is_explicit_and_default_comparison_remains_available(self):
+        arguments = ReplayIsolationTests().arguments(Path("/tmp/arrival-profile-option"))
+        self.assertFalse(replay.parser().parse_args(arguments).profile)
+        self.assertTrue(replay.parser().parse_args(arguments + ["--profile"]).profile)
+
+    def test_profiled_kernel_cpu_cannot_establish_acceptance_even_below_target(self):
+        result = replay.validate_replay(self.profiled_report(), replay.memory.METAL_ARRIVAL_MODE,
+                                        False, profile=True)
+        self.assertFalse(result["regression_passed"])
+        self.assertFalse(result["cpu_acceptance_eligible"])
+        self.assertEqual(len(result["phase_cpu"]), 7)
+        for metrics in result["phase_cpu"].values():
+            self.assertAlmostEqual(metrics["average_cpu_percent"], 2.0)
+            self.assertFalse(metrics["acceptance_eligible"])
+        for target in result["cpu_targets"].values():
+            self.assertFalse(target["evaluated"])
+            self.assertIsNone(target["within_limit"])
+
+    def test_profile_requires_finalized_trace_and_owned_kernel_identity(self):
+        for fault in ("missing-status", "recording", "failed", "changed-pid", "changed-birth", "trace-identity"):
+            report = self.profiled_report()
+            if fault == "missing-status":
+                del report["runtime"]["profiler_status"]
+            elif fault in ("recording", "failed"):
+                report["runtime"]["profiler_status"] = fault
+            elif fault == "changed-pid":
+                report["samples"][20]["process_id"] += 1
+            elif fault == "changed-birth":
+                report["samples"][20]["birth_time_us"] += 1
+            else:
+                report["runtime"]["owned_identity"]["birth_time_us"] += 1
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                replay.validate_replay(report, replay.memory.METAL_ARRIVAL_MODE, False, profile=True)
+
+    def test_profile_cannot_be_combined_with_scoped_timing_or_mislabeled_as_unprofiled(self):
+        report = self.profiled_report()
+        with self.assertRaises(ValueError):
+            replay.validate_replay(report, replay.memory.METAL_ARRIVAL_MODE, True, profile=True)
+        report["runtime"]["profiled"] = False
+        with self.assertRaises(ValueError):
+            replay.validate_replay(report, replay.memory.METAL_ARRIVAL_MODE, False, profile=True)
+
+    def test_profiler_attachment_rejects_changed_identity_or_insufficient_save_budget(self):
+        for fault in ("birth", "process-group", "deadline"):
+            diagnostic = replay.ArrivalDiagnostic.__new__(replay.ArrivalDiagnostic)
+            diagnostic.verify_identity = lambda: None
+            diagnostic.identity = {"process_id": 123, "birth_time_us": 456}
+            diagnostic.deadline = SimpleNamespace(remaining=lambda: 1 if fault == "deadline" else 300)
+            with self.subTest(fault=fault), \
+                    patch.object(replay.runtime, "_birth_time", return_value=789 if fault == "birth" else 456), \
+                    patch.object(replay.runtime.os, "getpgid", return_value=789 if fault == "process-group" else 123), \
+                    patch.object(replay.runtime, "_Notice") as notice, \
+                    patch.object(replay.runtime.subprocess, "Popen") as process:
+                with self.assertRaises(ValueError):
+                    diagnostic.begin_profile()
+                notice.assert_not_called()
+                process.assert_not_called()
+
+    def run_offline(self, *, profile=True, attribution_status="profiled_phase_attribution_available",
+                    attribution_usable=None, analysis_error=None, budget=300):
+        """Exercise orchestration and persisted outcomes without launching any process."""
+        captures = []
+        phase_windows = {"arrival": {"start_monotonic_seconds": 100.1, "end_monotonic_seconds": 102.1}}
+        attribution = {
+            "status": attribution_status, "regression_passed": False, "process_id": 123, "birth_time_us": 456,
+            "phases": [], "analysis_quality": {
+                "quantitative_attribution_usable": attribution_status == "profiled_phase_attribution_available",
+                "sample_kernel_mismatch_phases": [] if attribution_status == "profiled_phase_attribution_available" else ["arrival"],
+                "all_selected_symbols_missing": False,
+            },
+        }
+        if attribution_usable is not None:
+            attribution["analysis_quality"]["quantitative_attribution_usable"] = attribution_usable
+
+        def bounded_deadline(seconds, cleanup_reserve=15):
+            return SimpleNamespace(end=replay.time.monotonic() + seconds, cleanup_reserve=cleanup_reserve,
+                                   requested_seconds=seconds, remaining=lambda: min(seconds, budget),
+                                   interrupt_at=lambda end: contextlib.nullcontext())
+
+        def capture(output, mode, timed, paths, provenance, identity, deadline, *, profile=False):
+            captures.append((output.name, mode, timed, profile, deadline.requested_seconds))
+            result = replay_report(mode, timed)
+            if profile:
+                result["runtime"].update(profiled=True, profiler_status="captured",
+                                         owned_identity=copy.deepcopy(result["owned_identity"]),
+                                         clock_anchor={"synthetic_anchor": True})
+            replay.validate_replay(result, mode, timed, profile=profile)
+            result["status"] = "diagnostic_captured"
+            output.mkdir()
+            replay.write_json(output / "arrival-case.json", result)
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "capture"
+            arguments = ReplayIsolationTests().arguments(output) + (["--profile"] if profile else [])
+            args = replay.parser().parse_args(arguments)
+            with patch.object(replay.sys, "platform", "darwin"), \
+                    patch.object(replay, "source_identity", return_value={}), \
+                    patch.object(replay.memory, "validate_products", return_value=({}, {}, {})), \
+                    patch.object(replay.runtime, "RuntimeDeadline", side_effect=bounded_deadline), \
+                    patch.object(replay, "capture_case", side_effect=capture), \
+                    patch.object(replay.time_profile, "arrival_profile_windows", return_value=phase_windows) as windows, \
+                    patch.object(replay.time_profile, "analyze_trace", return_value=attribution, side_effect=analysis_error) as analyze, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                exit_code = replay._run(args, bounded_deadline(300))
+            report = json.loads((output / "arrival-report.json").read_text())
+            evidence = {path.parent.name: json.loads(path.read_text()) for path in output.glob("*/arrival-case.json")}
+        return exit_code, report, evidence, captures, windows, analyze
+
+    def test_single_profile_case_uses_bounded_capture_and_owned_analysis_evidence(self):
+        code, report, evidence, captures, windows, analyze = self.run_offline()
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "diagnostic_captured")
+        self.assertFalse(report["regression_passed"])
+        self.assertEqual(captures, [("metal-arrivals-profile", replay.memory.METAL_ARRIVAL_MODE,
+                                     False, True, replay.runtime.PROFILE_SECONDS)])
+        self.assertEqual(report["operation"], "profile")
+        self.assertNotIn("baseline_drift", report)
+        self.assertTrue(report["native_capture_complete"])
+        self.assertEqual(report["attribution_status"], "profiled_phase_attribution_available")
+        self.assertFalse(report["cases"][0]["cpu_acceptance_eligible"])
+        windows.assert_called_once()
+        analyze.assert_called_once()
+        self.assertEqual(windows.call_args.args[0]["owned_identity"], {"process_id": 123, "birth_time_us": 456})
+        self.assertEqual(analyze.call_args.args[2], 123)
+        self.assertEqual(analyze.call_args.args[3], {"arrival": {
+            "start_monotonic_seconds": 100.1, "end_monotonic_seconds": 102.1}})
+        self.assertEqual(analyze.call_args.args[-1].requested_seconds, 300)
+        self.assertEqual(len(evidence), 1)
+        self.assertTrue(all(not metric["acceptance_eligible"] for metric in evidence["metal-arrivals-profile"]["phase_cpu"].values()))
+        rendered = replay.summary(report)
+        self.assertIn("No CPU target is evaluated", rendered)
+        self.assertIn("not evaluated", rendered)
+
+    def test_sample_kernel_mismatch_preserves_raw_capture_but_returns_pending(self):
+        code, report, evidence, captures, windows, analyze = self.run_offline(attribution_status="analysis_pending")
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "analysis_pending")
+        self.assertEqual(report["attribution_status"], "analysis_pending")
+        self.assertTrue(report["native_capture_complete"])
+        self.assertFalse(report["regression_passed"])
+        self.assertEqual(report["attribution"]["analysis_quality"]["sample_kernel_mismatch_phases"], ["arrival"])
+        self.assertEqual(evidence["metal-arrivals-profile"]["status"], "diagnostic_captured")
+        self.assertFalse(report["cases"][0]["cpu_acceptance_eligible"])
+        self.assertEqual(len(captures), 1)
+        self.assertIn("Quantitative attribution is pending", replay.summary(report))
+
+    def test_unknown_or_contradictory_analysis_completion_cannot_qualify_a_capture(self):
+        for status, usable in (("unexpected-status", False), ("profiled_phase_attribution_available", False),
+                               ("analysis_pending", True)):
+            with self.subTest(status=status, usable=usable):
+                code, report, evidence, captures, windows, analyze = self.run_offline(
+                    attribution_status=status, attribution_usable=usable)
+                self.assertEqual(code, 1)
+                self.assertEqual(report["status"], "diagnostic_incomplete")
+                self.assertFalse(report["regression_passed"])
+                self.assertFalse(report["cases"][0]["cpu_acceptance_eligible"])
+                self.assertTrue(report["errors"])
+                self.assertEqual(len(captures), 1)
+
+    def test_missing_or_malformed_trace_fails_without_repeating_native_capture(self):
+        for error in (FileNotFoundError("missing trace export"), ValueError("malformed trace export"),
+                      TimeoutError("bounded export deadline")):
+            with self.subTest(error=str(error)):
+                code, report, evidence, captures, windows, analyze = self.run_offline(analysis_error=error)
+                self.assertEqual(code, 1)
+                self.assertEqual(report["status"], "diagnostic_incomplete")
+                self.assertFalse(report["regression_passed"])
+                self.assertTrue(any(str(error) in value for value in report["errors"]))
+                self.assertEqual(len(captures), 1)
+                self.assertEqual(evidence["metal-arrivals-profile"]["status"], "diagnostic_captured")
+                self.assertFalse(report["cases"][0]["cpu_acceptance_eligible"])
+
+    def test_default_comparison_preserves_control_bracket_without_attaching_profiler(self):
+        code, report, evidence, captures, windows, analyze = self.run_offline(profile=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["operation"], "compare")
+        self.assertEqual(report["status"], "diagnostic_captured")
+        self.assertEqual([(label, mode, timed) for label, mode, timed, _, _ in captures], list(replay.CASES))
+        self.assertTrue(all(not profiled and seconds == replay.CASE_SECONDS for _, _, _, profiled, seconds in captures))
+        self.assertEqual([case["cpu_acceptance_eligible"] for case in report["cases"]], [True, True, True, False])
+        self.assertTrue(report["baseline_drift"]["comparison_conclusive"])
+        self.assertEqual(len(evidence), 4)
+        windows.assert_not_called()
+        analyze.assert_not_called()
+
+    def test_insufficient_profile_budget_prevents_capture_and_analysis(self):
+        code, report, evidence, captures, windows, analyze = self.run_offline(budget=20)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "diagnostic_incomplete")
+        self.assertEqual(captures, [])
+        self.assertEqual(evidence, {})
+        windows.assert_not_called()
+        analyze.assert_not_called()
 
 
 if __name__ == "__main__":

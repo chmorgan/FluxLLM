@@ -904,6 +904,54 @@ transfer; the separate calibrated GPU provider remains necessary. This diagnosti
 does not establish a full resource gate pass or change the **5% CPU**, **1% GPU**,
 or **less than 64,000,000-byte physical-footprint** limits.
 
+For whole-process CPU attribution, add `--profile` to the same command:
+
+```sh
+python3 scripts/run_performance_checks.py arrivals --profile \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json \
+  --output-dir .performance-results/arrivals-profile
+```
+
+This records **one Metal replay** with exactly the same three episodes, request
+identities, history, cadence, native visibility checks, and final accounting as
+the comparison. Detailed timing is forced off. Time Profiler attaches only to
+the runner-owned app after PID/birth authentication; it records all app threads.
+The app's first visible idle state precedes the first episode. Recording uses
+the existing readiness signal and guard, a 45-second native recording ceiling,
+and an explicit stop after the final quiet interval. A 120-second case budget
+includes bounded recorder startup, save, and owned-process cleanup. Capture,
+two bounded exports, analysis, and artifact publication share the same
+**300-second command deadline**, without retries or builds.
+
+The eight analysis windows are fixed:
+
+| Window | Definition |
+|---|---|
+| Three arrivals | Each episode's actual first source write through +2 seconds |
+| Three busiest seconds | The maximum rolling one-second kernel CPU interval inside each arrival |
+| Steady reference | Episode three's first source write +2 through +4 seconds |
+| Whole replay | Before episode one through episode three's completion endpoint, including gaps |
+
+The busiest windows are selected from kernel counters, independently of sampled
+stacks. Selection metadata and paired Mach clock bridges are retained. The
+analyzer reports sampled self CPU, CPU including synchronous callees, thread
+totals, call-tree context, and kernel CPU over identical intervals. Parent and
+child execution rows overlap and must not be summed; asynchronous ancestors
+are not inferred. The single steady reference is contiguous, not pooled across
+episodes, and the eight windows overlap.
+
+All profiled CPU values are diagnostic and ineligible for acceptance. Material
+sample/kernel disagreement or wholly missing symbols yields `analysis_pending`
+and a nonzero exit while preserving the unscaled raw evidence. Trace, exports,
+owned-process reports, source capsule, and full `cpu-attribution.json` remain
+alongside the review tables in `SUMMARY.md`. Missing visibility, stream work,
+recording, clock, identity, or clean-exit evidence leaves the run incomplete.
+Use the unprofiled four-case replay to validate an optimization; profiling does
+not measure GPU execution or establish a performance-gate pass.
+
 ## Baselines and comparison artifacts
 
 Record the same workload before changing production behavior:
