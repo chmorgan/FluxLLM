@@ -227,19 +227,31 @@ final class LuminousChartGeometryCache {
         ) -> [UUID: ToolTrack] {
             var toolPathInputPoints: UInt64 = 0
             var toolPathOutputPoints: UInt64 = 0
+            var uniqueToolTraceBuilds: UInt64 = 0
+            var reusedToolTraceBuilds: UInt64 = 0
+            // Identical rate traces can belong to distinct requests. Share only
+            // immutable geometry within this frame; every lane still draws in
+            // its original order/color and owns its independent result markers.
+            var sharedTraces: [ToolActivityHistory.PlotKey: [Segment]] = [:]
             let tracks = requestTools.mapValues { history in
-                PerformancePresentationCounters.shared.record(
-                    directToolPlot ? .directToolPlotBuilds : .legacyToolPlotBuilds)
-                let plotSegments =
-                    directToolPlot
-                    ? history.directZeroFilledPlotSegments : history.zeroFilledPlotSegments
                 let points = history.resultMarkers.map {
                     Self.project($0.timestamp, value: 0, key: key, rect: rect, upperBound: 1)
                 }
-                let segments = Self.segments(
-                    plotSegments, key: key, rect: rect,
-                    upperBound: key.toolUpperBound, smoothed: false,
-                    compactToolPaths: compactToolPaths)
+                let segments: [Segment]
+                if let plotKey = history.reusablePlotKey, let shared = sharedTraces[plotKey] {
+                    reusedToolTraceBuilds &+= 1
+                    segments = shared
+                } else {
+                    uniqueToolTraceBuilds &+= 1
+                    let plotSegments =
+                        directToolPlot
+                        ? history.directZeroFilledPlotSegments : history.zeroFilledPlotSegments
+                    segments = Self.segments(
+                        plotSegments, key: key, rect: rect,
+                        upperBound: key.toolUpperBound, smoothed: false,
+                        compactToolPaths: compactToolPaths)
+                    if let plotKey = history.reusablePlotKey { sharedTraces[plotKey] = segments }
+                }
                 for segment in segments {
                     toolPathInputPoints &+= UInt64(segment.points.count)
                     toolPathOutputPoints &+= UInt64(segment.tracePointCount)
@@ -257,6 +269,9 @@ final class LuminousChartGeometryCache {
                         return diamond
                     })
             }
+            PerformancePresentationCounters.shared.recordToolTraces(
+                unique: uniqueToolTraceBuilds, reused: reusedToolTraceBuilds,
+                direct: directToolPlot)
             if toolPathInputPoints > 0 {
                 PerformancePresentationCounters.shared.record(
                     .toolPathInputPoints, by: toolPathInputPoints)

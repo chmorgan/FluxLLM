@@ -33,6 +33,7 @@ WORK = {"chunks": 10000, "output_tokens": 20034, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
 COUNTERS = ("optimized_chart_preparations", "history_tool_order_builds", "history_completed_order_builds",
             "history_tool_order_insertions", "history_completed_order_insertions", "chart_preparations")
+TOOL_TRACE_COUNTERS = ("unique_tool_trace_builds", "reused_tool_trace_builds")
 BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal", memory.ORDERED_PUBLICATION_MODE)
 
 
@@ -76,9 +77,10 @@ def runtime_source_identity():
 
 
 def validate_runtime_work(before, after, mode, *, required=True):
+    instrumented_tool_traces = any(field in snapshot for snapshot in (before, after) for field in TOOL_TRACE_COUNTERS)
     flags = memory.runtime_feature_contract(after.get("graphics_diagnostics", {}), mode)
     initial = memory.runtime_feature_contract(before.get("graphics_diagnostics", {}), mode)
-    if flags is None and not required and mode == "normal":
+    if flags is None and not required and mode == "normal" and not instrumented_tool_traces:
         return {"available": False, "reason": "Frozen normal predates runtime-control counters"}
     require(flags is not None and set(memory.RUNTIME_FLAGS) <= set(flags) and flags == initial,
             "Runtime workload lacks a stable complete feature contract")
@@ -172,6 +174,18 @@ def validate_runtime_work(before, after, mode, *, required=True):
             require(before["direct_tool_plot_builds"] == after["direct_tool_plot_builds"] == 0,
                     "Legacy tool-plot mode executed direct geometry builds")
             require(delta["legacy_tool_plot_builds"] > 0, "Baseline tool plot did not execute legacy geometry builds")
+    if instrumented_tool_traces:
+        require(all(field in delta for field in memory.DIRECT_TOOL_PLOT_COUNTERS),
+                "Shared tool trace counters lack matching tool-plot build counters")
+        for field in TOOL_TRACE_COUNTERS:
+            first, last = before.get(field), after.get(field)
+            require(all(type(value) is int and 0 <= value <= 2**64 - 1 for value in (first, last)),
+                    f"Runtime {field} requires UInt64 counters in both snapshots")
+            require(last >= first, f"Runtime {field} counter moved backwards")
+            delta[field] = last - first
+        require(sum(delta[field] for field in TOOL_TRACE_COUNTERS)
+                == sum(delta[field] for field in memory.DIRECT_TOOL_PLOT_COUNTERS),
+                "Unique and reused tool trace builds do not reconcile with tool-plot builds")
     if (mode in memory.ORDERED_PUBLICATION_MODES or "ordered_chart_publication" in flags
             or any(field in snapshot for snapshot in (before, after) for field in memory.ORDERED_PUBLICATION_COUNTERS)):
         require("ordered_chart_publication" in flags, "Ordered-publication counters lack feature metadata")

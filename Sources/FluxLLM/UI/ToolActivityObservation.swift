@@ -3,6 +3,11 @@ import Foundation
 /// Exposure geometry is identical for the combined tool chart and every request
 /// overlay. Prepare it once per publication/window, not once per request.
 struct ToolActivityObservation {
+    /// A value copy keeps this immutable coverage identity. Histories can then
+    /// compare sparse call counts without hashing the same observation buckets.
+    final class PlotIdentity {}
+    let plotIdentity = PlotIdentity()
+
     struct Bucket {
         let key: Double
         let start: Date

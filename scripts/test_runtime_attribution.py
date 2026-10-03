@@ -689,6 +689,74 @@ class DirectToolPlotWorkTests(unittest.TestCase):
             (memory.DIRECT_TOOL_PLOT_MODE, memory.DIRECT_TOOL_PLOT_MODE), ("baseline-after", memory.ORDERED_PUBLICATION_MODE)])
 
 
+class SharedToolTraceWorkTests(unittest.TestCase):
+    def snapshots(self, mode=memory.METAL_ARRIVAL_MODE, unique=1, reused=1):
+        before, after = workload_snapshots(mode)
+        before.update(unique_tool_trace_builds=20, reused_tool_trace_builds=30)
+        after.update(unique_tool_trace_builds=20 + unique, reused_tool_trace_builds=30 + reused)
+        return before, after
+
+    def test_unique_and_reused_deltas_reconcile_for_direct_and_legacy_builders(self):
+        for mode in (memory.DIRECT_TOOL_PLOT_MODE, memory.METAL_ARRIVAL_MODE):
+            for unique, reused in ((2, 0), (1, 1), (0, 2)):
+                with self.subTest(mode=mode, unique=unique, reused=reused):
+                    result = runtime.validate_runtime_work(*self.snapshots(mode, unique, reused), mode)
+                    self.assertEqual(result["deltas"]["unique_tool_trace_builds"], unique)
+                    self.assertEqual(result["deltas"]["reused_tool_trace_builds"], reused)
+                    self.assertEqual(result["deltas"]["direct_tool_plot_builds"]
+                                     + result["deltas"]["legacy_tool_plot_builds"], unique + reused)
+
+    def test_frozen_snapshots_without_both_optional_counters_remain_supported(self):
+        mode = memory.METAL_ARRIVAL_MODE
+        result = runtime.validate_runtime_work(*workload_snapshots(mode), mode)
+        self.assertTrue(result["available"])
+        self.assertNotIn("unique_tool_trace_builds", result["deltas"])
+        self.assertNotIn("reused_tool_trace_builds", result["deltas"])
+
+    def test_partial_counter_groups_in_either_snapshot_are_rejected(self):
+        for index in (0, 1):
+            for fields in (("unique_tool_trace_builds",), ("reused_tool_trace_builds",), runtime.TOOL_TRACE_COUNTERS):
+                snapshots = self.snapshots()
+                for field in fields:
+                    del snapshots[index][field]
+                with self.subTest(snapshot=index, missing=fields), self.assertRaises(ValueError):
+                    runtime.validate_runtime_work(*snapshots, memory.METAL_ARRIVAL_MODE)
+
+    def test_counter_values_require_uint64_without_coercion(self):
+        for index in (0, 1):
+            for field in runtime.TOOL_TRACE_COUNTERS:
+                for invalid in (None, True, False, -1, 1.0, "1", 2**64):
+                    snapshots = self.snapshots()
+                    snapshots[index][field] = invalid
+                    with self.subTest(snapshot=index, field=field, value=invalid), self.assertRaises(ValueError):
+                        runtime.validate_runtime_work(*snapshots, memory.METAL_ARRIVAL_MODE)
+
+    def test_regressions_or_totals_differing_from_tool_plot_work_are_rejected(self):
+        for field in runtime.TOOL_TRACE_COUNTERS:
+            before, after = self.snapshots()
+            after[field] = before[field] - 1
+            with self.subTest(regressed=field), self.assertRaisesRegex(ValueError, "moved backwards"):
+                runtime.validate_runtime_work(before, after, memory.METAL_ARRIVAL_MODE)
+        for unique, reused in ((0, 0), (1, 0), (2, 1)):
+            with self.subTest(unique=unique, reused=reused), self.assertRaisesRegex(ValueError, "do not reconcile"):
+                runtime.validate_runtime_work(*self.snapshots(unique=unique, reused=reused), memory.METAL_ARRIVAL_MODE)
+
+    def test_large_counter_values_preserve_exact_small_deltas(self):
+        before, after = self.snapshots()
+        for field in runtime.TOOL_TRACE_COUNTERS:
+            before[field], after[field] = 2**64 - 2, 2**64 - 1
+        result = runtime.validate_runtime_work(before, after, memory.METAL_ARRIVAL_MODE)
+        self.assertEqual([result["deltas"][field] for field in runtime.TOOL_TRACE_COUNTERS], [1, 1])
+
+    def test_new_trace_evidence_cannot_bypass_validation_as_an_unsupported_frozen_baseline(self):
+        before = drawn_native_gpu_graphics("native-gpu-optimized")
+        after = copy.deepcopy(before)
+        self.assertFalse(runtime.validate_runtime_work(before, after, "normal", required=False)["available"])
+        after["unique_tool_trace_builds"] = 1
+        with self.assertRaises(ValueError):
+            runtime.validate_runtime_work(before, after, "normal", required=False)
+
+
 class NextRuntimeWorkTests(unittest.TestCase):
     def test_promoted_normal_proves_ordered_queries_and_no_workload_full_sorts(self):
         before, after = workload_snapshots(memory.ORDERED_PUBLICATION_MODE)

@@ -14,6 +14,35 @@ struct ToolActivityBucket: Equatable, Sendable {
 
 /// Count-based tool rates, prepared independently of the generated-token averages.
 struct ToolActivityHistory {
+    /// Equal keys describe the exact same reference rate trace. The retained
+    /// identity supplies window, coverage and bucket durations; only nonzero
+    /// rates and the current tail can differ between requests in that coverage.
+    struct PlotKey: Hashable {
+        struct NonzeroBucket: Hashable {
+            let ordinal: Int
+            let callCount: Int
+        }
+
+        let observation: ToolActivityObservation.PlotIdentity
+        let nonzeroBuckets: [NonzeroBucket]
+        let extendsCurrentToNow: Bool
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.observation === rhs.observation
+                && lhs.nonzeroBuckets == rhs.nonzeroBuckets
+                && lhs.extendsCurrentToNow == rhs.extendsCurrentToNow
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(ObjectIdentifier(observation))
+            hasher.combine(nonzeroBuckets)
+            hasher.combine(extendsCurrentToNow)
+        }
+    }
+
+    /// Pending evidence has its own segment ordering and follows the ordinary
+    /// construction path instead of participating in shared trace geometry.
+    let reusablePlotKey: PlotKey?
     let interval: TimeInterval
     /// One canonical allocation holds all buckets. Segment boundaries preserve
     /// gaps without retaining a second copy of every bucket for plotting.
@@ -139,6 +168,7 @@ struct ToolActivityHistory {
         self.cutoff = cutoff
         hasValidWindow = observation.isValid
         guard hasValidWindow else {
+            reusablePlotKey = nil
             segmentRanges = []
             buckets = []
             resultMarkers = []
@@ -155,6 +185,8 @@ struct ToolActivityHistory {
         var displaySegments: [[ToolActivityBucket]] = []
         var assignedIDs: Set<UUID> = []
         var callIndex = 0
+        var bucketOrdinal = 0
+        var nonzeroBuckets: [PlotKey.NonzeroBucket] = []
         for run in observation.runs {
             while callIndex < calls.count && calls[callIndex].timestamp < run.start {
                 callIndex += 1
@@ -181,10 +213,16 @@ struct ToolActivityHistory {
                 {
                     bucketCallIndex += 1
                 }
-                segment.append(
-                    Self.bucket(
-                        start: bucket.start, end: bucket.end,
-                        calls: calls[firstBucketCallIndex..<bucketCallIndex]))
+                let prepared = Self.bucket(
+                    start: bucket.start, end: bucket.end,
+                    calls: calls[firstBucketCallIndex..<bucketCallIndex])
+                segment.append(prepared)
+                if prepared.observedDuration > 0, prepared.callCount > 0 {
+                    nonzeroBuckets.append(
+                        .init(
+                            ordinal: bucketOrdinal, callCount: prepared.callCount))
+                }
+                bucketOrdinal += 1
             }
             if !segment.isEmpty { displaySegments.append(segment) }
         }
@@ -234,6 +272,12 @@ struct ToolActivityHistory {
         } else {
             current = nil
         }
+        reusablePlotKey =
+            pendingCalls.isEmpty
+            ? PlotKey(
+                observation: observation.plotIdentity, nonzeroBuckets: nonzeroBuckets,
+                extendsCurrentToNow: current != nil)
+            : nil
     }
 
     /// Select only a bin supported by coverage at the pointer's exact timestamp.

@@ -17,6 +17,8 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
         case chartPublicationFullSorts = "chart_publication_full_sorts"
         case directToolPlotBuilds = "direct_tool_plot_builds"
         case legacyToolPlotBuilds = "legacy_tool_plot_builds"
+        case uniqueToolTraceBuilds = "unique_tool_trace_builds"
+        case reusedToolTraceBuilds = "reused_tool_trace_builds"
         case ungroupedNativeCanvasDraws = "ungrouped_native_canvas_draws"
         case groupedNativeCanvasDraws = "grouped_native_canvas_draws"
         case suppressedArrivalEffects = "suppressed_arrival_effects"
@@ -52,6 +54,7 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
             .railFrameClockTicks, .railTimelineContentUpdates,
             .orderedChartPublicationQueries, .chartPublicationFullSorts,
             .directToolPlotBuilds, .legacyToolPlotBuilds,
+            .uniqueToolTraceBuilds, .reusedToolTraceBuilds,
             .ungroupedNativeCanvasDraws, .groupedNativeCanvasDraws,
             .suppressedArrivalEffects, .toolPathInputPoints, .toolPathOutputPoints,
             .metalArrivalFrames, .metalArrivalSubmissions, .metalArrivalFailures,
@@ -66,6 +69,18 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
         defer { lock.unlock() }
         guard enabled else { return }
         values[metric.rawValue, default: 0] &+= count
+    }
+
+    /// Publish the partition together so a snapshot taken during deferred
+    /// drawing always sees total tracks equal unique builds plus reuses.
+    func recordToolTraces(unique: UInt64, reused: UInt64, direct: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard enabled else { return }
+        let totalMetric: Metric = direct ? .directToolPlotBuilds : .legacyToolPlotBuilds
+        values[totalMetric.rawValue, default: 0] &+= unique &+ reused
+        values[Metric.uniqueToolTraceBuilds.rawValue, default: 0] &+= unique
+        values[Metric.reusedToolTraceBuilds.rawValue, default: 0] &+= reused
     }
 
     public func snapshot() -> [String: UInt64] {
