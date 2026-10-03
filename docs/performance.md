@@ -904,10 +904,11 @@ transfer; the separate calibrated GPU provider remains necessary. This diagnosti
 does not establish a full resource gate pass or change the **5% CPU**, **1% GPU**,
 or **less than 64,000,000-byte physical-footprint** limits.
 
-For whole-process CPU attribution, add `--profile` to the same command:
+For whole-process CPU attribution, add `--profile`. Select `normal` to profile
+the production renderer:
 
 ```sh
-python3 scripts/run_performance_checks.py arrivals --profile \
+python3 scripts/run_performance_checks.py arrivals --profile --graphics-mode normal \
   --app-binary /absolute/products/FluxLLMApp \
   --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
   --collector-binary /absolute/products/FluxLLMResourceCollector \
@@ -915,11 +916,13 @@ python3 scripts/run_performance_checks.py arrivals --profile \
   --output-dir .performance-results/arrivals-profile
 ```
 
-This records **one Metal replay** with exactly the same three episodes, request
+This records **one replay of the selected renderer** with exactly the same three episodes, request
 identities, history, cadence, native visibility checks, and final accounting as
 the comparison. Detailed timing is forced off. Time Profiler attaches only to
 the runner-owned app after PID/birth authentication; it records all app threads.
-The app's first visible idle state precedes the first episode. Recording uses
+Omitting `--graphics-mode` retains the Metal-arrival default; explicit
+`runtime-metal-arrival-bursts` selects the same behavior. The selected mode is
+recorded in the report. The app's first visible idle state precedes the first episode. Recording uses
 the existing readiness signal and guard, a 45-second native recording ceiling,
 and an explicit stop after the final quiet interval. A 120-second case budget
 includes bounded recorder startup, save, and owned-process cleanup. Capture,

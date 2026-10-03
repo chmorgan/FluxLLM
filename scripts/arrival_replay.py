@@ -552,11 +552,11 @@ def parser():
         value.add_argument("--" + name, type=Path, required=True)
     value.add_argument("--output-dir", type=Path)
     value.add_argument("--profile", action="store_true",
-                       help="Run one three-episode Metal Time Profiler capture and bounded attribution; never evaluate CPU acceptance")
+                       help="Run one three-episode Time Profiler capture and bounded attribution; never evaluate CPU acceptance")
     for name in ("reference-app-binary", "reference-test-bundle", "reference-provenance"):
         value.add_argument("--" + name, type=Path)
     value.add_argument("--graphics-mode", choices=("normal", memory.METAL_ARRIVAL_MODE),
-                       help="Rendering mode for frozen-version comparison only (default: runtime-metal-arrival-bursts)")
+                       help="Rendering mode for profiling or frozen-version comparison (default: runtime-metal-arrival-bursts)")
     return value
 
 
@@ -576,7 +576,8 @@ def _run(args, deadline):
         require(not version_compare or all(value is not None for value in references),
                 "Frozen reference comparison requires all three reference product/provenance arguments")
         require(not (version_compare and profile), "Frozen reference comparison cannot run with Time Profiler")
-        require(args.graphics_mode is None or version_compare, "--graphics-mode requires frozen reference comparison")
+        require(args.graphics_mode is None or version_compare or profile,
+                "--graphics-mode requires profiling or frozen reference comparison")
         require(sys.platform == "darwin", "Arrival replay requires macOS")
         require(not output.exists(), "Never overwrite arrival replay artifacts")
         require(app.ROOT not in output.parents or app.ROOT / ".performance-results" in output.parents,
@@ -614,9 +615,13 @@ def _run(args, deadline):
             report["graphics_mode"] = mode
             cases = (("reference-before", mode, False, "reference"), ("candidate", mode, False, "candidate"),
                      ("reference-after", mode, False, "reference"))
+        elif profile:
+            mode = args.graphics_mode or memory.METAL_ARRIVAL_MODE
+            report["graphics_mode"] = mode
+            label = "normal-profile" if mode == "normal" else "metal-arrivals-profile"
+            cases = ((label, mode, False, "candidate"),)
         else:
-            selected = (("metal-arrivals-profile", memory.METAL_ARRIVAL_MODE, False),) if profile else CASES
-            cases = tuple((label, mode, timed, "candidate") for label, mode, timed in selected)
+            cases = tuple((label, mode, timed, "candidate") for label, mode, timed in CASES)
         case_seconds = runtime.PROFILE_SECONDS if profile else CASE_SECONDS
         for label, mode, timed, role in cases:
             require(deadline.remaining() >= case_seconds + 3, "Insufficient budget for a complete arrival replay case")

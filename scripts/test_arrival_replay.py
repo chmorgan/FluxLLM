@@ -520,8 +520,8 @@ class ReplayIsolationTests(unittest.TestCase):
 
 
 class ArrivalProfileContractTests(unittest.TestCase):
-    def profiled_report(self):
-        report = replay_report(replay.memory.METAL_ARRIVAL_MODE)
+    def profiled_report(self, mode=replay.memory.METAL_ARRIVAL_MODE):
+        report = replay_report(mode)
         report["runtime"].update(profiled=True, profiler_status="captured",
                                  owned_identity=copy.deepcopy(report["owned_identity"]))
         return report
@@ -543,6 +543,16 @@ class ArrivalProfileContractTests(unittest.TestCase):
         for target in result["cpu_targets"].values():
             self.assertFalse(target["evaluated"])
             self.assertIsNone(target["within_limit"])
+
+    def test_production_profile_validates_canvas_work_without_enabling_cpu_acceptance(self):
+        result = replay.validate_replay(self.profiled_report("normal"), "normal", False, profile=True)
+        self.assertFalse(result["cpu_acceptance_eligible"])
+        self.assertTrue(all(not metrics["acceptance_eligible"] for metrics in result["phase_cpu"].values()))
+        self.assertTrue(all(not target["evaluated"] and target["within_limit"] is None
+                            for target in result["cpu_targets"].values()))
+        for episode in result["episodes"]:
+            self.assertEqual(episode["after"]["metal_arrival_submissions"], 0)
+            self.assertGreater(episode["after"]["rail_frame_clock_ticks"], episode["before"]["rail_frame_clock_ticks"])
 
     def test_profile_requires_finalized_trace_and_owned_kernel_identity(self):
         for fault in ("missing-status", "recording", "failed", "changed-pid", "changed-birth", "trace-identity"):
@@ -584,7 +594,7 @@ class ArrivalProfileContractTests(unittest.TestCase):
                 notice.assert_not_called()
                 process.assert_not_called()
 
-    def run_offline(self, *, profile=True, attribution_status="profiled_phase_attribution_available",
+    def run_offline(self, *, profile=True, graphics_mode=None, attribution_status="profiled_phase_attribution_available",
                     attribution_usable=None, analysis_error=None, budget=300):
         """Exercise orchestration and persisted outcomes without launching any process."""
         captures = []
@@ -621,6 +631,8 @@ class ArrivalProfileContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "capture"
             arguments = ReplayIsolationTests().arguments(output) + (["--profile"] if profile else [])
+            if graphics_mode is not None:
+                arguments += ["--graphics-mode", graphics_mode]
             args = replay.parser().parse_args(arguments)
             with patch.object(replay.sys, "platform", "darwin"), \
                     patch.object(replay, "source_identity", return_value={}), \
@@ -659,6 +671,30 @@ class ArrivalProfileContractTests(unittest.TestCase):
         rendered = replay.summary(report)
         self.assertIn("No CPU target is evaluated", rendered)
         self.assertIn("not evaluated", rendered)
+
+    def test_profile_routes_explicit_production_and_metal_modes_without_changing_analysis(self):
+        for mode, label in (("normal", "normal-profile"),
+                            (replay.memory.METAL_ARRIVAL_MODE, "metal-arrivals-profile")):
+            with self.subTest(mode=mode):
+                code, report, evidence, captures, windows, analyze = self.run_offline(graphics_mode=mode)
+                self.assertEqual(code, 0)
+                self.assertEqual(report["graphics_mode"], mode)
+                self.assertEqual(captures, [(label, mode, False, True, replay.runtime.PROFILE_SECONDS)])
+                self.assertEqual(report["cases"][0]["mode"], mode)
+                self.assertFalse(report["cases"][0]["cpu_acceptance_eligible"])
+                self.assertEqual(set(evidence), {label})
+                self.assertFalse(evidence[label]["cpu_acceptance_eligible"])
+                windows.assert_called_once()
+                analyze.assert_called_once()
+                self.assertEqual(analyze.call_args.args[3], report["profile_phase_windows"])
+                self.assertEqual(analyze.call_args.args[-1].requested_seconds, 300)
+
+    def test_profile_rejects_unsupported_rendering_modes_before_capture(self):
+        arguments = ReplayIsolationTests().arguments(Path("/tmp/arrival-profile-invalid-mode"))
+        with patch.object(replay, "capture_case") as capture, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                replay.run(arguments + ["--profile", "--graphics-mode", "runtime-no-lifecycle"])
+        capture.assert_not_called()
 
     def test_sample_kernel_mismatch_preserves_raw_capture_but_returns_pending(self):
         code, report, evidence, captures, windows, analyze = self.run_offline(attribution_status="analysis_pending")
