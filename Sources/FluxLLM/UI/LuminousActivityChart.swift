@@ -30,6 +30,7 @@ struct LuminousActivityChart: View {
     @Environment(\.chartInspectionViewport) private var inspectionViewport
     @State private var tokenScale = ChartScaleState()
     @State private var toolScale = ChartScaleState()
+    @State private var atomicScaleCache = LuminousChartScaleCache()
     @State private var hoverLocation: CGPoint?
     @State private var dragSelection: DragSelection?
     @State private var geometryCache = LuminousChartGeometryCache()
@@ -117,7 +118,19 @@ struct LuminousActivityChart: View {
     private var hasEffects: Bool { contrast != .increased && !reduceTransparency }
     private var strokeWidth: CGFloat { contrast == .increased ? 2.8 : (compact ? 2.2 : 2.7) }
 
+    private var resolvedScales: LuminousChartScaleCache.Scales {
+        guard PerformanceGraphicsDiagnostics.shared.mode.usesAtomicChartScale else {
+            return .init(
+                tokenUpperBound: tokenScale.upperBound, toolUpperBound: toolScale.upperBound)
+        }
+        return atomicScaleCache.resolve(
+            .init(
+                publicationID: geometryPublicationID, now: now, duration: duration,
+                isLive: isLive, tokenPeak: throughput.peak, toolPeak: tools?.peak))
+    }
+
     var body: some View {
+        let scales = resolvedScales
         VStack(spacing: 5) {
             HStack {
                 axisKey("tokens/s", color: generatedColor)
@@ -128,7 +141,7 @@ struct LuminousActivityChart: View {
             .padding(.trailing, 33)
             .accessibilityHidden(true)
             if compact { inFlightPill }
-            plot
+            plot(scales: scales)
                 .zIndex(1)
             HStack {
                 Text(axisTimeLabel(secondsAgo: duration))
@@ -191,7 +204,7 @@ struct LuminousActivityChart: View {
         .lineLimit(1)
     }
 
-    private var plot: some View {
+    private func plot(scales: LuminousChartScaleCache.Scales) -> some View {
         GeometryReader { geometry in
             let usesMetal =
                 PerformanceGraphicsDiagnostics.shared.mode.usesMetalFullChart && !metalFailed
@@ -199,7 +212,7 @@ struct LuminousActivityChart: View {
                 for: .init(
                     publicationID: geometryPublicationID, now: now, duration: duration,
                     size: geometry.size, compact: compact, hasTools: tools != nil,
-                    tokenUpperBound: tokenScale.upperBound, toolUpperBound: toolScale.upperBound),
+                    tokenUpperBound: scales.tokenUpperBound, toolUpperBound: scales.toolUpperBound),
                 throughput: throughput, gpu: gpu, requestTools: requestTools,
                 directToolPlot: PerformanceGraphicsDiagnostics.shared.mode.usesDirectToolPlot,
                 compactToolPaths: PerformanceGraphicsDiagnostics.shared.mode.usesCompactToolPaths,
@@ -315,15 +328,15 @@ struct LuminousActivityChart: View {
                         .accessibilityHidden(true)
                     }
                 }
-                axes(layout: layout)
+                axes(layout: layout, scales: scales)
                 selectionOverlay(layout: layout)
-                if tools != nil { toolHeading(layout: layout) }
+                if tools != nil { toolHeading(layout: layout, scales: scales) }
                 layoutLandmark("main-activity-plot", rect: layout.main)
                 if !compact { layoutLandmark("request-rail-band", rect: layout.lanes) }
                 if let selected {
                     inspection(
                         selected: selected, generated: generated, device: device,
-                        layout: layout, geometry: geometry)
+                        layout: layout, geometry: geometry, tokenUpperBound: scales.tokenUpperBound)
                 }
             }
             .contentShape(Rectangle())
@@ -696,12 +709,12 @@ struct LuminousActivityChart: View {
         }
     }
 
-    private func axes(layout: PlotLayout) -> some View {
+    private func axes(layout: PlotLayout, scales: LuminousChartScaleCache.Scales) -> some View {
         ZStack(alignment: .topLeading) {
             ForEach(0..<3, id: \.self) { index in
                 let fraction = Double(index) / 2
                 let y = layout.main.maxY - fraction * layout.main.height
-                Text(scaleLabel(tokenScale.upperBound * fraction))
+                Text(scaleLabel(scales.tokenUpperBound * fraction))
                     .frame(width: 25, alignment: .trailing)
                     .position(x: 12.5, y: y)
                 Text(String(Int(fraction * 100)))
@@ -709,7 +722,7 @@ struct LuminousActivityChart: View {
                     .position(x: layout.main.maxX + 18, y: y)
             }
             if tools != nil {
-                Text(scaleLabel(toolScale.upperBound))
+                Text(scaleLabel(scales.toolUpperBound))
                     .frame(width: 25, alignment: .trailing)
                     .position(x: 12.5, y: layout.tools.minY)
                 Text("0")
@@ -723,13 +736,15 @@ struct LuminousActivityChart: View {
         .accessibilityHidden(true)
     }
 
-    private func toolHeading(layout: PlotLayout) -> some View {
+    private func toolHeading(layout: PlotLayout, scales: LuminousChartScaleCache.Scales)
+        -> some View
+    {
         // The "Tool calls" label sits just above the tools track. Lane
         // colors are self-evident from the bands, so no palette legend is shown.
         HStack(spacing: 4) {
             Text("Tool calls")
             Spacer(minLength: 4)
-            Text("0–\(scaleLabel(toolScale.upperBound)) calls/min")
+            Text("0–\(scaleLabel(scales.toolUpperBound)) calls/min")
                 .foregroundStyle(.secondary)
         }
         .font(.system(size: 10, weight: .medium))
@@ -743,12 +758,13 @@ struct LuminousActivityChart: View {
     @ViewBuilder
     private func inspection(
         selected: ChartInspectionSelection, generated: [PlotSegment], device: [PlotSegment],
-        layout: PlotLayout, geometry: GeometryProxy
+        layout: PlotLayout, geometry: GeometryProxy, tokenUpperBound: Double
     ) -> some View {
         if let pointer = hoverLocation {
             let bounds = inspectionBounds(in: geometry)
             let content = inspectionContent(
-                selected: selected, generated: generated, device: device, layout: layout)
+                selected: selected, generated: generated, device: device, layout: layout,
+                tokenUpperBound: tokenUpperBound)
             let width = min(230, bounds.width)
             let height = ChartInspectionCard.height(for: content)
             // An impossibly small viewport should not receive a clipped or
@@ -776,7 +792,7 @@ struct LuminousActivityChart: View {
 
     private func inspectionContent(
         selected: ChartInspectionSelection, generated: [PlotSegment], device: [PlotSegment],
-        layout: PlotLayout
+        layout: PlotLayout, tokenUpperBound: Double
     ) -> ChartInspectionContent {
         let timestamp = selected.timestamp
         let active = ChartInspectionGeometry.activeLanes(at: timestamp, now: now, lanes: lanes)
@@ -787,7 +803,7 @@ struct LuminousActivityChart: View {
                 at: timestamp,
                 generated: inspectedValue(
                     atX: x, segments: generated, rect: layout.main,
-                    upperBound: tokenScale.upperBound
+                    upperBound: tokenUpperBound
                 ) ?? 0,
                 gpu: inspectedValue(atX: x, segments: device, rect: layout.main, upperBound: 100),
                 requestCount: active.count)
@@ -825,6 +841,7 @@ struct LuminousActivityChart: View {
         }
     }
     private func updateScales() {
+        guard !PerformanceGraphicsDiagnostics.shared.mode.usesAtomicChartScale else { return }
         if !isLive {
             tokenScale = ChartScaleState()
             toolScale = ChartScaleState()
