@@ -392,6 +392,8 @@ struct LuminousActivityChart: View {
                     lanes: lanes, segments: segments, presentation: requestRails,
                     now: now, duration: duration, rail: frame.layout.lanes, colors: colors,
                     enabled: isLive && !compact && !reduceMotion && hasEffects),
+                cacheStaticAndRetainTwinkles: PerformanceGraphicsDiagnostics.shared.mode
+                    .cachesMetalStaticChart,
                 onFailure: { metalFailed = true })
             ForEach(Array(scene.labels.enumerated()), id: \.offset) { _, label in
                 metalLabel(label)

@@ -201,6 +201,116 @@ final class MetalFullChartSurfaceTests: XCTestCase {
         assertIdle(scheduler)
     }
 
+    func testRetainedGlintsKeepDeadlinesWithoutStartingMetalAnimation() throws {
+        var scheduler = MetalFullChartAnimationScheduler()
+        scheduler.update(input(lanes: [liveLane()]), visible: true, at: origin, deterministic: true)
+        XCTAssertFalse(scheduler.twinkles.isEmpty)
+        XCTAssertTrue(scheduler.schedule.isAnimating, "The existing full Metal mode is unchanged")
+        for _ in 0..<8 {
+            let retained = scheduler.metalSchedule(retainingTwinkles: true)
+            XCTAssertFalse(retained.isAnimating)
+            XCTAssertFalse(scheduler.usesShaderTwinkles(retainingTwinkles: true))
+            XCTAssertEqual(
+                retained.nextUpdate, scheduler.schedule.nextUpdate,
+                "A paused Metal view must still service glint spawn and expiry")
+            XCTAssertEqual(scheduler.metalSchedule(retainingTwinkles: false), scheduler.schedule)
+            let deadline = try XCTUnwrap(retained.nextUpdate)
+            scheduler.advance(at: deadline)
+        }
+    }
+
+    func testCachedLifecycleHandoffKeepsOriginalReceiptsAndTwinkleAges() throws {
+        for kind in [RequestRailEvent.Kind.arrival, .completion] {
+            var scheduler = MetalFullChartAnimationScheduler()
+            scheduler.update(
+                input(lanes: [liveLane()], events: [receipt(kind)]),
+                visible: true, at: origin, deterministic: true)
+            let prepared = try XCTUnwrap(scheduler.prepared.first)
+            XCTAssertTrue(scheduler.metalSchedule(retainingTwinkles: true).isAnimating)
+            XCTAssertTrue(
+                scheduler.usesShaderTwinkles(retainingTwinkles: true),
+                "Lifecycle overlap must retain per-request effect and glint ordering")
+            let latestTwinkleStart = prepared.visibleUntil.addingTimeInterval(-0.01)
+            scheduler.advance(at: latestTwinkleStart)
+            let overlapping = scheduler.twinkles
+            XCTAssertFalse(overlapping.isEmpty)
+            scheduler.advance(at: prepared.visibleUntil)
+            XCTAssertFalse(scheduler.metalSchedule(retainingTwinkles: true).isAnimating)
+            XCTAssertFalse(scheduler.usesShaderTwinkles(retainingTwinkles: true))
+            XCTAssertTrue(
+                scheduler.schedule.isAnimating, "The remaining glint still has visible pixels")
+            XCTAssertEqual(
+                scheduler.twinkles, overlapping,
+                "Switching to retained layers must not recreate or restart glints")
+            XCTAssertNotNil(scheduler.metalSchedule(retainingTwinkles: true).nextUpdate)
+            scheduler.stop(at: prepared.visibleUntil)
+            XCTAssertFalse(scheduler.metalSchedule(retainingTwinkles: true).isAnimating)
+            XCTAssertNil(scheduler.metalSchedule(retainingTwinkles: true).nextUpdate)
+        }
+    }
+
+    func testRetainedScheduleWakesAtLifecycleEndBeforeLongerGlintEnds() throws {
+        var scheduler = MetalFullChartAnimationScheduler()
+        scheduler.update(
+            input(lanes: [liveLane()], events: [receipt(.arrival)]),
+            visible: true, at: origin, deterministic: true)
+        let end = try XCTUnwrap(scheduler.prepared.first?.visibleUntil)
+        scheduler.advance(at: end.addingTimeInterval(-0.001))
+        XCTAssertGreaterThan(try XCTUnwrap(scheduler.twinkles.last?.endsAt), end)
+        XCTAssertEqual(scheduler.metalSchedule(retainingTwinkles: true).nextUpdate, end)
+        XCTAssertTrue(scheduler.metalSchedule(retainingTwinkles: true).isAnimating)
+        scheduler.advance(at: end)
+        XCTAssertFalse(scheduler.metalSchedule(retainingTwinkles: true).isAnimating)
+    }
+
+    func testInspectionUsesShaderGlintsUntilCursorClearsWithoutRestartingThem() throws {
+        var scheduler = MetalFullChartAnimationScheduler()
+        scheduler.update(input(lanes: [liveLane()]), visible: true, at: origin, deterministic: true)
+        let original = scheduler.twinkles
+        XCTAssertFalse(scheduler.metalSchedule(retainingTwinkles: true).isAnimating)
+        XCTAssertTrue(scheduler.metalSchedule(retainingTwinkles: true, hasCursor: true).isAnimating)
+        XCTAssertTrue(
+            scheduler.usesShaderTwinkles(retainingTwinkles: true, hasCursor: true),
+            "Shader decorations preserve cursor-over-glint ordering")
+        XCTAssertFalse(scheduler.usesShaderTwinkles(retainingTwinkles: true))
+        XCTAssertEqual(scheduler.twinkles, original)
+        XCTAssertEqual(
+            scheduler.metalSchedule(retainingTwinkles: true).nextUpdate,
+            scheduler.metalSchedule(retainingTwinkles: true, hasCursor: true).nextUpdate)
+    }
+
+    func testCachedHiddenAndStoppedHostCannotAllocateOrRestartEffects() {
+        let view = MetalFullChartView(frame: CGRect(x: 0, y: 0, width: 300, height: 120))
+        let scene = MetalFullChartScene(size: view.bounds.size, primitives: [])
+        let source = input(lanes: [liveLane()], events: [receipt(.completion)])
+        var failures = 0
+        for cached in [false, true, false, true] {
+            view.update(
+                scene: scene, revision: 1, cursor: nil, cursorRevision: nil,
+                decorations: source, scale: 2, cacheStaticAndRetainTwinkles: cached,
+                onFailure: { failures += 1 })
+            view.isHidden = true
+            view.viewDidHide()
+            view.layout()
+            XCTAssertFalse(view.hasNativeResources)
+            XCTAssertFalse(view.hasScheduledWake)
+            XCTAssertFalse(view.isAnimating)
+        }
+        view.stop()
+        view.isHidden = false
+        view.viewDidUnhide()
+        view.update(
+            scene: scene, revision: 2, cursor: scene, cursorRevision: 1,
+            decorations: source, scale: 1, cacheStaticAndRetainTwinkles: true,
+            onFailure: { failures += 1 })
+        view.layout()
+        XCTAssertFalse(view.hasNativeResources)
+        XCTAssertFalse(view.hasScheduledWake)
+        XCTAssertFalse(view.isAnimating)
+        XCTAssertTrue(view.subviews.isEmpty)
+        XCTAssertEqual(failures, 0)
+    }
+
     func testDetachedAndHiddenHostUpdatesAllocateNoNativeResourcesOrWake() {
         let view = MetalFullChartView(frame: CGRect(x: 0, y: 0, width: 300, height: 120))
         let scene = MetalFullChartScene(size: view.bounds.size, primitives: [])
@@ -327,5 +437,9 @@ final class MetalFullChartSurfaceTests: XCTestCase {
         XCTAssertNil(scheduler.nextTwinkleAt, file: file, line: line)
         XCTAssertFalse(scheduler.schedule.isAnimating, file: file, line: line)
         XCTAssertNil(scheduler.schedule.nextUpdate, file: file, line: line)
+        XCTAssertFalse(
+            scheduler.metalSchedule(retainingTwinkles: true).isAnimating, file: file, line: line)
+        XCTAssertNil(
+            scheduler.metalSchedule(retainingTwinkles: true).nextUpdate, file: file, line: line)
     }
 }

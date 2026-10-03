@@ -36,6 +36,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeDeferredToolGeometry2Hz = "runtime-deferred-tool-geometry-2hz"
         case runtimeMetalArrivalBursts = "runtime-metal-arrival-bursts"
         case runtimeMetalFullChart = "runtime-metal-full-chart"
+        case runtimeMetalCachedChart = "runtime-metal-cached-chart"
         case runtimeHeldStaticChart = "runtime-held-static-chart"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
@@ -69,10 +70,11 @@ public final class PerformanceGraphicsDiagnostics {
         }
 
         var usesRetainedTwinkles: Bool {
-            !usesMetalFullChart
-                && (self == .normal || self == .nativeGPURetainedTwinkles
-                    || self == .nativeGPUOptimized
-                    || isRuntimeControl)
+            cachesMetalStaticChart
+                || (!usesMetalFullChart
+                    && (self == .normal || self == .nativeGPURetainedTwinkles
+                        || self == .nativeGPUOptimized
+                        || isRuntimeControl))
         }
 
         var isRuntimeControl: Bool {
@@ -84,7 +86,7 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                 .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
                 .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts, .runtimeMetalFullChart,
-                .runtimeHeldStaticChart:
+                .runtimeMetalCachedChart, .runtimeHeldStaticChart:
                 true
             default:
                 false
@@ -94,7 +96,10 @@ public final class PerformanceGraphicsDiagnostics {
         var omitsLifecycleEffects: Bool { self == .runtimeNoLifecycle }
         var omitsArrivalEffects: Bool { self == .runtimeNoArrivalEffects }
         var usesMetalArrivalBursts: Bool { self == .runtimeMetalArrivalBursts }
-        var usesMetalFullChart: Bool { self == .runtimeMetalFullChart }
+        var usesMetalFullChart: Bool {
+            self == .runtimeMetalFullChart || self == .runtimeMetalCachedChart
+        }
+        var cachesMetalStaticChart: Bool { self == .runtimeMetalCachedChart }
         /// Causal diagnostic only: the displayed static chart intentionally stops updating.
         var usesHeldStaticChart: Bool { self == .runtimeHeldStaticChart }
 
@@ -264,7 +269,12 @@ public final class PerformanceGraphicsDiagnostics {
     private var scalarPresentationPublications: UInt64 = 0
     private var twinkleHosts: [UInt64: Set<AnyHashable>] = [:]
     private var twinkleCounters = TwinkleCounters()
-    private var metalFullChartHosts: [UInt64: UInt64] = [:]
+    private struct MetalFullChartHost {
+        var bufferBytes: UInt64 = 0
+        var textureBytes: UInt64 = 0
+    }
+
+    private var metalFullChartHosts: [UInt64: MetalFullChartHost] = [:]
     private var metalFullChartCounters = MetalFullChartCounters()
 
     private struct MetalFullChartCounters {
@@ -282,6 +292,11 @@ public final class PerformanceGraphicsDiagnostics {
         var twinkleFrames: UInt64 = 0
         var currentBufferBytes: UInt64 = 0
         var peakBufferBytes: UInt64 = 0
+        var staticRasterizations: UInt64 = 0
+        var staticCacheComposites: UInt64 = 0
+        var effectClockTicks: UInt64 = 0
+        var currentTextureBytes: UInt64 = 0
+        var peakTextureBytes: UInt64 = 0
 
         var snapshot: [String: UInt64] {
             [
@@ -299,6 +314,11 @@ public final class PerformanceGraphicsDiagnostics {
                 "twinkle_frames": twinkleFrames,
                 "current_buffer_bytes": currentBufferBytes,
                 "peak_buffer_bytes": peakBufferBytes,
+                "static_rasterizations": staticRasterizations,
+                "static_cache_composites": staticCacheComposites,
+                "effect_clock_ticks": effectClockTicks,
+                "current_texture_bytes": currentTextureBytes,
+                "peak_texture_bytes": peakTextureBytes,
             ]
         }
     }
@@ -684,7 +704,7 @@ public final class PerformanceGraphicsDiagnostics {
     func metalFullChartHostCreated() -> UInt64? {
         guard isEnabled, mode.usesMetalFullChart else { return nil }
         nextID += 1
-        metalFullChartHosts[nextID] = 0
+        metalFullChartHosts[nextID] = MetalFullChartHost()
         metalFullChartCounters.hostsCreated += 1
         metalFullChartCounters.liveHosts += 1
         metalFullChartCounters.peakHosts = max(
@@ -694,13 +714,14 @@ public final class PerformanceGraphicsDiagnostics {
 
     func metalFullChartHostDestroyed(_ id: UInt64?) {
         guard let id, isEnabled, mode.usesMetalFullChart else { return }
-        guard let bytes = metalFullChartHosts.removeValue(forKey: id) else {
+        guard let host = metalFullChartHosts.removeValue(forKey: id) else {
             invalidEvents += 1
             return
         }
         metalFullChartCounters.hostsDestroyed += 1
         metalFullChartCounters.liveHosts -= 1
-        metalFullChartCounters.currentBufferBytes -= bytes
+        metalFullChartCounters.currentBufferBytes -= host.bufferBytes
+        metalFullChartCounters.currentTextureBytes -= host.textureBytes
     }
 
     func metalFullChartGeometryUploaded(_ id: UInt64?, bytes: UInt64) {
@@ -713,20 +734,65 @@ public final class PerformanceGraphicsDiagnostics {
     @discardableResult
     func metalFullChartBuffersRetained(_ id: UInt64?, bytes: UInt64) -> Bool {
         guard let id, isEnabled, mode.usesMetalFullChart else { return false }
-        guard let previous = metalFullChartHosts[id] else {
+        guard var host = metalFullChartHosts[id] else {
             invalidEvents += 1
             return false
         }
-        let total = metalFullChartCounters.currentBufferBytes - previous
+        let total = metalFullChartCounters.currentBufferBytes - host.bufferBytes
         let next = total.addingReportingOverflow(bytes)
         guard !next.overflow else {
             invalidEvents += 1
             return false
         }
-        metalFullChartHosts[id] = bytes
+        host.bufferBytes = bytes
+        metalFullChartHosts[id] = host
         metalFullChartCounters.currentBufferBytes = next.partialValue
         metalFullChartCounters.peakBufferBytes = max(
             metalFullChartCounters.peakBufferBytes, next.partialValue)
+        return true
+    }
+
+    /// Count a successfully encoded cache composite, optionally preceded by a
+    /// new static rasterization. These are execution counters, not GPU timings.
+    func metalFullChartStaticCacheUsed(_ id: UInt64?, rasterized: Bool, bytes: UInt64) {
+        guard metalFullChartTexturesRetained(id, bytes: bytes) else { return }
+        metalFullChartCounters.staticCacheComposites += 1
+        if rasterized { metalFullChartCounters.staticRasterizations += 1 }
+    }
+
+    /// Distinguish continuous effect-clock callbacks from paused, on-demand
+    /// publication draws in the cached-chart experiment.
+    func metalFullChartEffectClockTick(_ id: UInt64?) {
+        guard let id, isEnabled, mode.cachesMetalStaticChart else { return }
+        guard metalFullChartHosts[id] != nil else {
+            invalidEvents += 1
+            return
+        }
+        metalFullChartCounters.effectClockTicks += 1
+    }
+
+    /// Cache texture accounting stays separate from geometry buffers and
+    /// excludes drawables and driver allocations. Include textures retained by
+    /// in-flight frames until they drain; zero means the last texture lease
+    /// has been released, even when no frame is encoded at that time.
+    @discardableResult
+    func metalFullChartTexturesRetained(_ id: UInt64?, bytes: UInt64) -> Bool {
+        guard let id, isEnabled, mode.cachesMetalStaticChart else { return false }
+        guard var host = metalFullChartHosts[id] else {
+            invalidEvents += 1
+            return false
+        }
+        let total = metalFullChartCounters.currentTextureBytes - host.textureBytes
+        let next = total.addingReportingOverflow(bytes)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return false
+        }
+        host.textureBytes = bytes
+        metalFullChartHosts[id] = host
+        metalFullChartCounters.currentTextureBytes = next.partialValue
+        metalFullChartCounters.peakTextureBytes = max(
+            metalFullChartCounters.peakTextureBytes, next.partialValue)
         return true
     }
 
@@ -765,6 +831,7 @@ public final class PerformanceGraphicsDiagnostics {
             "enabled": isEnabled, "mode": mode.rawValue,
             "holds_static_chart_drawing": mode.usesHeldStaticChart,
             "metal_full_chart_enabled": isEnabled && mode.usesMetalFullChart,
+            "metal_static_cache_enabled": isEnabled && mode.cachesMetalStaticChart,
             "metal_full_chart": metalFullChartCounters.snapshot,
             "invalid_events": invalidEvents,
             "cpu_glow_fallbacks": cpuGlowFallbacks,

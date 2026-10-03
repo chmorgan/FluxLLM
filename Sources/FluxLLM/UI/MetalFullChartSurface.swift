@@ -22,6 +22,8 @@ struct MetalFullChartAnimationScheduler {
     private(set) var twinkles: [RequestRailTwinkle] = []
     private(set) var schedule = RequestRailAnimationSchedule(
         at: .distantPast, visibleUntil: [], nextTwinkleAt: nil)
+    private(set) var retainedTwinkleSchedule = RequestRailAnimationSchedule(
+        at: .distantPast, visibleUntil: [], nextTwinkleAt: nil)
     private(set) var work: RequestRailLifecycleEffects.WorkKey?
     private(set) var nextTwinkleAt: Date?
     private var input: MetalFullChartDecorationInput?
@@ -92,6 +94,24 @@ struct MetalFullChartAnimationScheduler {
             at: timestamp,
             visibleUntil: visible.map(\.visibleUntil) + twinkles.map(\.endsAt),
             nextTwinkleAt: nextTwinkleAt, retainedUntil: prepared.map(\.visibleUntil))
+        // Retained glints need spawn/expiry wakes, but no app animation clock.
+        // Include the lifecycle deadline separately: a longer-lived glint must
+        // not keep Metal running after the last lifecycle pixels disappear.
+        retainedTwinkleSchedule = RequestRailAnimationSchedule(
+            at: timestamp, visibleUntil: visible.map(\.visibleUntil),
+            nextTwinkleAt: schedule.nextUpdate, retainedUntil: prepared.map(\.visibleUntil))
+    }
+
+    func metalSchedule(retainingTwinkles: Bool, hasCursor: Bool = false)
+        -> RequestRailAnimationSchedule
+    {
+        // The cursor is rendered after all decorations in the same Metal
+        // drawable. During inspection, shader glints preserve that ordering.
+        retainingTwinkles && !hasCursor ? retainedTwinkleSchedule : schedule
+    }
+
+    func usesShaderTwinkles(retainingTwinkles: Bool, hasCursor: Bool = false) -> Bool {
+        !retainingTwinkles || hasCursor || retainedTwinkleSchedule.isAnimating
     }
 
     mutating func stop(at timestamp: Date) {
@@ -105,6 +125,7 @@ struct MetalFullChartAnimationScheduler {
         twinkles = []
         nextTwinkleAt = nil
         schedule = RequestRailAnimationSchedule(at: timestamp, visibleUntil: [], nextTwinkleAt: nil)
+        retainedTwinkleSchedule = schedule
     }
 
     private static func seed(_ id: UUID) -> UInt64 {
@@ -120,6 +141,7 @@ struct MetalFullChartSurface: NSViewRepresentable {
     var cursor: MetalFullChartScene? = nil
     var cursorRevision: AnyHashable? = nil
     let decorations: MetalFullChartDecorationInput
+    var cacheStaticAndRetainTwinkles = false
     var onFailure: (@MainActor () -> Void)? = nil
     @Environment(\.displayScale) private var displayScale
 
@@ -133,7 +155,8 @@ struct MetalFullChartSurface: NSViewRepresentable {
         view.update(
             scene: scene, revision: revision, cursor: cursor,
             cursorRevision: cursorRevision, decorations: decorations,
-            scale: displayScale, onFailure: onFailure)
+            scale: displayScale, cacheStaticAndRetainTwinkles: cacheStaticAndRetainTwinkles,
+            onFailure: onFailure)
     }
 
     static func dismantleNSView(_ view: MetalFullChartView, coordinator: ()) { view.stop() }
@@ -210,6 +233,11 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
     private var renderer: MetalFullChartRenderer?
     private var cursorRenderer: MetalFullChartRenderer?
     private var effectsRenderer: MetalFullChartEffectsRenderer?
+    private var staticCache: MetalChartStaticCache?
+    private var staticCacheRevision: UInt64 = 0
+    private var drawingScale: CGFloat?
+    private var retainedTwinkleView: RetainedRequestRailTwinkleView?
+    private var cacheStaticAndRetainTwinkles = false
     private var queue: (any MTLCommandQueue)?
     private var metalView: MTKView?
     private var lifetime: MetalFullChartFrameLifetime?
@@ -225,8 +253,16 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
     private var stopped = false
     private var failed = false
 
-    var hasNativeResources: Bool { metalView != nil || renderer != nil || effectsRenderer != nil }
-    var isAnimating: Bool { scheduler.schedule.isAnimating }
+    var hasNativeResources: Bool {
+        metalView != nil || renderer != nil || effectsRenderer != nil
+            || staticCache != nil || retainedTwinkleView != nil
+    }
+    private var hasCursor: Bool { cursor.map { !$0.primitives.isEmpty } ?? false }
+    private var metalSchedule: RequestRailAnimationSchedule {
+        scheduler.metalSchedule(
+            retainingTwinkles: cacheStaticAndRetainTwinkles, hasCursor: hasCursor)
+    }
+    var isAnimating: Bool { metalSchedule.isAnimating }
     var hasScheduledWake: Bool { wake != nil }
 
     override init(frame frameRect: NSRect) {
@@ -243,6 +279,7 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
         scene: MetalFullChartScene, revision: AnyHashable,
         cursor: MetalFullChartScene?, cursorRevision: AnyHashable?,
         decorations: MetalFullChartDecorationInput, scale: CGFloat,
+        cacheStaticAndRetainTwinkles: Bool = false,
         onFailure: (@MainActor () -> Void)? = nil
     ) {
         guard !stopped else { return }
@@ -254,9 +291,17 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
             fail()
             return
         }
-        if self.revision != revision || self.scene == nil {
+        if self.cacheStaticAndRetainTwinkles != cacheStaticAndRetainTwinkles {
+            releaseResources()
+            self.cacheStaticAndRetainTwinkles = cacheStaticAndRetainTwinkles
+        }
+        if self.revision != revision || self.scene == nil
+            || (cacheStaticAndRetainTwinkles
+                && (self.scene !== scene || self.scene?.size != scene.size))
+        {
             self.scene = scene
             self.revision = revision
+            staticCacheRevision &+= 1
             needsStaticUpload = true
             needsRedraw = true
         }
@@ -375,6 +420,9 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
                     layer.backgroundColor = CGColor(gray: 0, alpha: 0)
                 }
                 self.renderer = renderer
+                if cacheStaticAndRetainTwinkles {
+                    staticCache = try MetalChartStaticCache(device: device)
+                }
                 cursorRenderer = cursor
                 effectsRenderer = effects
                 self.queue = queue
@@ -395,6 +443,11 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
             }
             if view.drawableSize != size {
                 view.drawableSize = size
+                needsRedraw = true
+            }
+            if drawingScale != scale {
+                drawingScale = scale
+                staticCacheRevision &+= 1
                 needsRedraw = true
             }
             var uploaded = false
@@ -432,8 +485,9 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
                             + effectsRenderer.statistics.retainedDescriptorBytes
                             + effectsRenderer.statistics.retainedFrameBytes))
             }
+            reconcileRetainedTwinkles(scale: scale)
             scheduleWake()
-            let paused = !scheduler.schedule.isAnimating
+            let paused = !metalSchedule.isAnimating
             let wasPaused = view.isPaused
             if view.isPaused != paused { view.isPaused = paused }
             // An already active MTKView picks up changed descriptors on its next
@@ -462,7 +516,11 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
                             cornerRadius: segment.cornerRadius,
                             color: color)))
             }
-            if segment.isLive {
+            if segment.isLive
+                && scheduler.usesShaderTwinkles(
+                    retainingTwinkles: cacheStaticAndRetainTwinkles, hasCursor: hasCursor
+                )
+            {
                 for twinkle in scheduler.twinkles where twinkle.requestID == segment.lane.id {
                     guard
                         let placement = twinkle.placement(
@@ -481,6 +539,54 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
         return elements
     }
 
+    private func reconcileRetainedTwinkles(scale: CGFloat) {
+        guard cacheStaticAndRetainTwinkles, let input else { return }
+        guard
+            input.enabled
+                && (!(scheduler.work?.eligibility.liveIDs.isEmpty ?? true)
+                    || !scheduler.prepared.isEmpty || !scheduler.twinkles.isEmpty)
+        else {
+            retainedTwinkleView?.stop()
+            retainedTwinkleView?.removeFromSuperview()
+            retainedTwinkleView = nil
+            return
+        }
+        let view: RetainedRequestRailTwinkleView
+        if let existing = retainedTwinkleView {
+            view = existing
+        } else {
+            view = RetainedRequestRailTwinkleView(frame: bounds)
+            retainedTwinkleView = view
+            addSubview(view)
+        }
+        if view.frame != bounds { view.frame = bounds }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        let descriptors = scheduler.twinkles.suffix(2).compactMap {
+            twinkle -> RetainedTwinkleDescriptor? in
+            guard
+                let segment = input.segments.first(where: {
+                    $0.lane.id == twinkle.requestID && $0.isLive
+                }),
+                let placement = twinkle.placement(
+                    segment: segment, now: input.now, duration: input.duration, rail: input.rail),
+                let rgba = input.colors[segment.lane.id],
+                let color = CGColor(
+                    colorSpace: colorSpace,
+                    components: [
+                        CGFloat(rgba.x), CGFloat(rgba.y), CGFloat(rgba.z), CGFloat(rgba.w),
+                    ])
+            else { return nil }
+            return RetainedTwinkleDescriptor(twinkle: twinkle, placement: placement, color: color)
+        }
+        // Keep the same retained instances and clocks while Metal temporarily
+        // draws glints in per-request lifecycle order. The native layer host
+        // suppresses opacity, then resumes at the original age without replay.
+        view.update(
+            descriptors: descriptors, scale: scale,
+            isPresented: !scheduler.usesShaderTwinkles(
+                retainingTwinkles: true, hasCursor: hasCursor))
+    }
+
     private func cancelWake() {
         wakeGeneration &+= 1
         wake?.cancel()
@@ -489,7 +595,7 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
 
     private func scheduleWake() {
         cancelWake()
-        guard let deadline = scheduler.schedule.nextUpdate else { return }
+        guard let deadline = metalSchedule.nextUpdate else { return }
         let generation = wakeGeneration
         let item = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
@@ -540,8 +646,20 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
         }
         let timestamp = Date()
         do {
-            try renderer.encode(
-                into: buffer, target: drawable.texture, pointSize: scene.size, clear: true)
+            if !view.isPaused {
+                PerformanceGraphicsDiagnostics.shared.metalFullChartEffectClockTick(lifetime.id)
+            }
+            if let staticCache {
+                let rasterized = try staticCache.encode(
+                    into: buffer, target: drawable.texture, renderer: renderer,
+                    scene: scene, revision: staticCacheRevision)
+                PerformanceGraphicsDiagnostics.shared.metalFullChartStaticCacheUsed(
+                    lifetime.id, rasterized: rasterized,
+                    bytes: UInt64(staticCache.statistics.retainedBytes))
+            } else {
+                try renderer.encode(
+                    into: buffer, target: drawable.texture, pointSize: scene.size, clear: true)
+            }
             let content = try effectsRenderer.encode(
                 into: buffer, target: drawable.texture,
                 elapsedTime: timestamp.timeIntervalSince(anchor),
@@ -602,6 +720,9 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
     }
 
     private func releaseResources() {
+        retainedTwinkleView?.stop()
+        retainedTwinkleView?.removeFromSuperview()
+        retainedTwinkleView = nil
         metalView?.isPaused = true
         metalView?.delegate = nil
         metalView?.releaseDrawables()
@@ -611,6 +732,13 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
         renderer?.removeAll()
         cursorRenderer?.removeAll()
         effectsRenderer?.removeAll()
+        staticCache?.removeAll()
+        // In-flight command buffers can still hold old cache textures. The
+        // diagnostic host remains alive until those frame leases drain.
+        PerformanceGraphicsDiagnostics.shared.metalFullChartTexturesRetained(
+            lifetime?.id, bytes: UInt64(staticCache?.statistics.retainedBytes ?? 0))
+        staticCache = nil
+        drawingScale = nil
         renderer = nil
         cursorRenderer = nil
         effectsRenderer = nil
@@ -641,6 +769,8 @@ final class MetalFullChartView: NSView, MTKViewDelegate {
         wake?.cancel()
         metalView?.isPaused = true
         metalView?.delegate = nil
+        retainedTwinkleView?.stop()
+        staticCache?.removeAll()
         lifetime?.close()
     }
 }
