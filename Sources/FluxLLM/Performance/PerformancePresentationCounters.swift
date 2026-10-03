@@ -22,6 +22,9 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
         case suppressedArrivalEffects = "suppressed_arrival_effects"
         case toolPathInputPoints = "tool_path_input_points"
         case toolPathOutputPoints = "tool_path_output_points"
+        case metalArrivalFrames = "metal_arrival_frames"
+        case metalArrivalSubmissions = "metal_arrival_submissions"
+        case metalArrivalFailures = "metal_arrival_failures"
         case historyToolOrderBuilds = "history_tool_order_builds"
         case historyCompletedOrderBuilds = "history_completed_order_builds"
         case historyToolOrderInsertions = "history_tool_order_insertions"
@@ -51,6 +54,7 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
             .directToolPlotBuilds, .legacyToolPlotBuilds,
             .ungroupedNativeCanvasDraws, .groupedNativeCanvasDraws,
             .suppressedArrivalEffects, .toolPathInputPoints, .toolPathOutputPoints,
+            .metalArrivalFrames, .metalArrivalSubmissions, .metalArrivalFailures,
         ] {
             values[metric.rawValue] = 0
         }

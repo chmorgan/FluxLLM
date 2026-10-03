@@ -34,6 +34,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeCompactToolPaths = "runtime-compact-tool-paths"
         case runtimeDeferredToolGeometry = "runtime-deferred-tool-geometry"
         case runtimeDeferredToolGeometry2Hz = "runtime-deferred-tool-geometry-2hz"
+        case runtimeMetalArrivalBursts = "runtime-metal-arrival-bursts"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -76,7 +77,7 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
                 .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                 .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
-                .runtimeDeferredToolGeometry2Hz:
+                .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts:
                 true
             default:
                 false
@@ -85,6 +86,7 @@ public final class PerformanceGraphicsDiagnostics {
 
         var omitsLifecycleEffects: Bool { self == .runtimeNoLifecycle }
         var omitsArrivalEffects: Bool { self == .runtimeNoArrivalEffects }
+        var usesMetalArrivalBursts: Bool { self == .runtimeMetalArrivalBursts }
 
         var usesSharedChartPreparation: Bool {
             self == .runtimeSharedPreparation || self == .runtimeNextOptimized
@@ -101,6 +103,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeNoArrivalEffects
                 || self == .runtimeCompactToolPaths
                 || usesDeferredToolGeometry
+                || usesMetalArrivalBursts
         }
 
         var usesDirectToolPlot: Bool { self == .runtimeDirectToolPlot }
@@ -127,6 +130,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeNoArrivalEffects
                 || self == .runtimeCompactToolPaths
                 || usesDeferredToolGeometry
+                || usesMetalArrivalBursts
         }
 
         var usesCanvasFrameClock: Bool {
@@ -137,6 +141,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeNoArrivalEffects
                 || self == .runtimeCompactToolPaths
                 || usesDeferredToolGeometry
+                || usesMetalArrivalBursts
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -628,6 +633,8 @@ public final class PerformanceGraphicsDiagnostics {
             result["compact_tool_paths_enabled"] = mode.usesCompactToolPaths
             result["deferred_tool_geometry_enabled"] = mode.usesDeferredToolGeometry
             result["chart_publication_interval_seconds"] = mode.chartPublicationIntervalSeconds
+            result["metal_arrival_bursts_enabled"] = mode.usesMetalArrivalBursts
+            result["arrival_backend"] = mode.usesMetalArrivalBursts ? "metal-shader" : "canvas"
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"

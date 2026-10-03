@@ -209,6 +209,9 @@ public final class PerformanceApplicationSession {
                 ?? NSNull(),
             "tool_path_input_points": counters["tool_path_input_points"] as Any? ?? NSNull(),
             "tool_path_output_points": counters["tool_path_output_points"] as Any? ?? NSNull(),
+            "metal_arrival_frames": counters["metal_arrival_frames"] as Any? ?? NSNull(),
+            "metal_arrival_submissions": counters["metal_arrival_submissions"] as Any? ?? NSNull(),
+            "metal_arrival_failures": counters["metal_arrival_failures"] as Any? ?? NSNull(),
             "history_tool_order_builds": counters["history_tool_order_builds"] as Any? ?? NSNull(),
             "history_completed_order_builds": counters["history_completed_order_builds"] as Any?
                 ?? NSNull(),

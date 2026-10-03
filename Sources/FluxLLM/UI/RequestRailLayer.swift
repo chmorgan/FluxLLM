@@ -161,6 +161,15 @@ enum RequestRailLifecycleEffects {
         omitsArrivals ? events.filter { $0.kind != .arrival } : events
     }
 
+    static func usesMetalArrival(
+        enabled: Bool, drawsLifecycle: Bool, prepared: [Prepared],
+        eligibleIDs: [RequestRailEvent.ID]
+    ) -> Bool {
+        guard enabled, drawsLifecycle else { return false }
+        let visible = prepared.filter { eligibleIDs.contains($0.key.eventID) }
+        return !visible.isEmpty && !visible.contains { $0.profile.completion }
+    }
+
     static func prepare(
         _ events: [RequestRailEvent], lanes: [RequestLane],
         assignments: [UUID: RequestRailAssignment], now: Date, timestamp: Date,
@@ -231,6 +240,7 @@ private struct RequestRailDecorations: View {
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.self) private var environment
     @State private var windowVisible = false
     @State private var prepared: [RequestRailLifecycleEffects.Prepared] = []
     @State private var arrivalSuppression = RequestRailArrivalSuppression()
@@ -301,8 +311,24 @@ private struct RequestRailDecorations: View {
                 : effectsEnabled && !lifecycleVisible
                     && (!eligibility.liveIDs.isEmpty || !twinkles.isEmpty))
         let drawsLifecycle = effectsEnabled && animating && (!stableHosts || lifecycleVisible)
+        // A mixed completion episode stays on the original Canvas, preserving
+        // per-request burst/lightning/glint ordering. Arrival-only episodes can
+        // execute the same ordered burst/glint list in one native Metal surface.
+        let metalArrival = RequestRailLifecycleEffects.usesMetalArrival(
+            enabled: mode.usesMetalArrivalBursts, drawsLifecycle: drawsLifecycle,
+            prepared: prepared, eligibleIDs: eligibility.effectIDs)
         ZStack(alignment: .topLeading) {
             Color.clear
+            if mode.usesMetalArrivalBursts && !bounds.isEmpty {
+                // Keep the paused host attached while visible so pipeline
+                // initialization occurs before the first measured request.
+                MetalArrivalBurstSurface(
+                    elements: metalArrival ? metalArrivalElements(decoratedSegments) : [],
+                    drawingBounds: bounds
+                )
+                .frame(width: bounds.width, height: bounds.height)
+                .offset(x: bounds.minX, y: bounds.minY)
+            }
             // During a lifecycle effect, preserve the original per-request
             // ordering of bursts and glints in the existing Canvas. Between
             // effects, the same twinkle instances continue in retained layers.
@@ -313,7 +339,7 @@ private struct RequestRailDecorations: View {
                 )
                 .frame(width: plotSize.width, height: plotSize.height)
             }
-            if needsSurface && !bounds.isEmpty {
+            if needsSurface && !metalArrival && !bounds.isEmpty {
                 // The stable-host control clears once between effects, then
                 // ignores ordinary glint publications until animation resumes.
                 let revision: AnyHashable? =
@@ -461,6 +487,54 @@ private struct RequestRailDecorations: View {
     private func color(for lane: RequestLane) -> Color {
         RequestLanePalette.color(
             at: presentation.assignments[lane.id]?.colorIndex ?? 0, scheme: colorScheme)
+    }
+
+    /// Called only by a publication or lifecycle change, never by a Metal frame.
+    /// Preserve the Canvas's segment → effects → glints composition order.
+    private func metalArrivalElements(
+        _ segments: [RequestRailGeometry.Segment]
+    ) -> [MetalArrivalBurstSurface.Element] {
+        var elements: [MetalArrivalBurstSurface.Element] = []
+        for segment in segments {
+            guard let color = metalColor(for: segment.lane) else {
+                PerformancePresentationCounters.shared.record(.metalArrivalFailures)
+                continue
+            }
+            for effect in prepared where effect.key.requestID == segment.lane.id {
+                guard !effect.profile.completion,
+                    segment.lane.startedAt >= now.addingTimeInterval(-duration)
+                else { continue }
+                elements.append(
+                    .burst(
+                        .init(
+                            id: effect.key, startDate: effect.startedAt, profile: effect.profile,
+                            origin: CGPoint(
+                                x: segment.rect.minX + segment.cornerRadius, y: segment.rect.midY),
+                            color: color)))
+            }
+            if segment.isLive {
+                for twinkle in twinkles where twinkle.requestID == segment.lane.id {
+                    if let placement = twinkle.placement(
+                        segment: segment, now: now, duration: duration, rail: rect)
+                    {
+                        elements.append(
+                            .twinkle(
+                                .init(
+                                    twinkle: twinkle, placement: placement, color: color)))
+                    }
+                }
+            }
+        }
+        return elements
+    }
+
+    private func metalColor(for lane: RequestLane) -> SIMD4<Float>? {
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+            let converted = color(for: lane).resolve(in: environment).cgColor.converted(
+                to: space, intent: .relativeColorimetric, options: nil),
+            let values = converted.components, values.count == 4
+        else { return nil }
+        return SIMD4(Float(values[0]), Float(values[1]), Float(values[2]), Float(values[3]))
     }
 
     private func drawDecorations(

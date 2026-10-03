@@ -17,7 +17,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 33)
+        XCTAssertEqual(Mode.allCases.count, 34)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -116,6 +116,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertFalse(diagnostics.mode.usesUngroupedNativeCanvas)
         XCTAssertFalse(diagnostics.mode.omitsArrivalEffects)
         XCTAssertEqual(diagnostics.mode.chartPublicationIntervalSeconds, 1)
+        XCTAssertFalse(diagnostics.mode.usesMetalArrivalBursts)
         XCTAssertNil(initial["chart_publication_interval_seconds"])
         diagnostics.scalarPresentationPublished()
         XCTAssertNil(diagnostics.retainedTwinkleHostCreated())
@@ -573,11 +574,19 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     snapshot["deferred_tool_geometry_enabled"] as? Bool,
                     mode.usesDeferredToolGeometry)
                 XCTAssertEqual(
+                    snapshot["metal_arrival_bursts_enabled"] as? Bool,
+                    mode == .runtimeMetalArrivalBursts)
+                XCTAssertEqual(
+                    snapshot["arrival_backend"] as? String,
+                    mode == .runtimeMetalArrivalBursts ? "metal-shader" : "canvas")
+                XCTAssertEqual(
                     snapshot["chart_publication_interval_seconds"] as? Double,
                     mode == .runtimeDeferredToolGeometry2Hz ? 0.5 : 1)
             } else {
                 XCTAssertNil(snapshot["native_gpu_backend"])
                 XCTAssertNil(snapshot["chart_publication_interval_seconds"])
+                XCTAssertNil(snapshot["metal_arrival_bursts_enabled"])
+                XCTAssertNil(snapshot["arrival_backend"])
             }
             diagnostics.canvasDestroyed(id)
         }
@@ -641,7 +650,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
             .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
             .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
-            .runtimeDeferredToolGeometry2Hz,
+            .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
         ]
         let runtime: [Mode] =
             [
@@ -685,7 +694,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
-                    .runtimeDeferredToolGeometry2Hz,
+                    .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
@@ -694,7 +703,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
-                    .runtimeDeferredToolGeometry2Hz,
+                    .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesOrderedChartPublication,
@@ -703,7 +712,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
-                    .runtimeDeferredToolGeometry2Hz,
+                    .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
                 ].contains(mode))
             XCTAssertEqual(mode.usesDirectToolPlot, mode == .runtimeDirectToolPlot)
             XCTAssertEqual(mode.usesUngroupedNativeCanvas, mode == .runtimeUngroupedCanvas)
@@ -712,6 +721,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             XCTAssertEqual(
                 mode.usesDeferredToolGeometry,
                 [.runtimeDeferredToolGeometry, .runtimeDeferredToolGeometry2Hz].contains(mode))
+            XCTAssertEqual(mode.usesMetalArrivalBursts, mode == .runtimeMetalArrivalBursts)
             XCTAssertEqual(
                 mode.chartPublicationIntervalSeconds,
                 mode == .runtimeDeferredToolGeometry2Hz ? 0.5 : 1)
