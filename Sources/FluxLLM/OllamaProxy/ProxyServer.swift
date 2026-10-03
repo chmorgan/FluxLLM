@@ -19,6 +19,7 @@ public final class ProxyManager: ObservableObject {
     private let eventEpoch: UUID?
     private let requestIDFactory: (@Sendable (Data) -> UUID)?
     private let nioCPUAccountingEnabled: Bool
+    private let usesBatchedTelemetryDelivery: Bool
     private var nioCPUDiagnostics: PerformanceNIODiagnostics?
 
     private var serverChannel: Channel?
@@ -51,14 +52,17 @@ public final class ProxyManager: ObservableObject {
         self.eventEpoch = eventEpoch
         self.requestIDFactory = requestIDFactory
         self.nioCPUAccountingEnabled = nioCPUAccountingEnabled
+        let batchedTelemetry = PerformanceGraphicsDiagnostics.shared.mode
+            .usesBatchedTelemetryDelivery
+        usesBatchedTelemetryDelivery = batchedTelemetry
         let inbox = GenerationEventInbox()
         eventInbox = inbox
         eventConsumer = Task { @MainActor [weak metricsStore] in
             for await _ in inbox.notifications {
                 guard !Task.isCancelled else { return }
-                for event in inbox.drainReadyEvents() {
-                    metricsStore?.apply(event, epoch: eventEpoch)
-                }
+                Self.applyInboxBatch(
+                    inbox.drainReadyBatch(), to: metricsStore, epoch: eventEpoch,
+                    batched: batchedTelemetry)
             }
         }
         publishEndpoints()
@@ -191,6 +195,15 @@ public final class ProxyManager: ObservableObject {
             let sink: @Sendable (GenerationEvent) -> Void = { event in
                 inbox.submit(event)
             }
+            let cumulativeSink: GenerationRelay.CumulativeSink?
+            if usesBatchedTelemetryDelivery {
+                cumulativeSink = { @Sendable requestID, state, timestamp, tools in
+                    inbox.submit(
+                        requestID: requestID, state: state, at: timestamp, toolEvents: tools)
+                }
+            } else {
+                cumulativeSink = nil
+            }
             let upstreamHost = configuration.upstreamHost
             let upstreamPort = ollamaPort
             let requestIDFactory = self.requestIDFactory
@@ -232,6 +245,7 @@ public final class ProxyManager: ObservableObject {
                                 RequestForwarder(
                                     ollamaHost: upstreamHost, ollamaPort: upstreamPort,
                                     registry: registry, eventSink: sink,
+                                    cumulativeSink: cumulativeSink,
                                     requestIDFactory: requestIDFactory,
                                     usesUnpromisedStreamBodyWrites: usesUnpromisedStreamBodyWrites,
                                     nioDiagnostics: nioDiagnostics))
@@ -299,13 +313,27 @@ public final class ProxyManager: ObservableObject {
         // Channel shutdown emits cancellation and its latest cumulative usage.
         // Apply those events before stop/restart returns, even if a live batch
         // was waiting for its 50 ms delivery deadline.
-        for event in eventInbox.drain() {
-            metricsStore?.apply(event, epoch: eventEpoch)
-        }
+        Self.applyInboxBatch(
+            eventInbox.drainBatch(), to: metricsStore, epoch: eventEpoch,
+            batched: usesBatchedTelemetryDelivery)
         serverChannel = nil
         eventLoopGroup = nil
         nioCPUDiagnostics = nil
         channels = nil
+    }
+
+    private static func applyInboxBatch(
+        _ batch: GenerationEventInbox.Batch, to metricsStore: MetricsStore?,
+        epoch: UUID?, batched: Bool
+    ) {
+        if batched {
+            let diagnostics = PerformanceGraphicsDiagnostics.shared
+            diagnostics.batchedTelemetryStateEnqueued(count: batch.cumulativeStatesEnqueued)
+            diagnostics.batchedTelemetrySnapshotMaterialized(count: batch.snapshotsMaterialized)
+            metricsStore?.applyBatch(batch.events, epoch: epoch)
+        } else {
+            for event in batch.events { metricsStore?.apply(event, epoch: epoch) }
+        }
     }
 
     private func publishEndpoints(listenerHost: String? = nil, upstreamHost: String? = nil) {
@@ -428,6 +456,7 @@ private final class RequestForwarder: ChannelInboundHandler {
     private let ollamaPort: Int
     private let registry: ProxyChannelRegistry
     private let eventSink: @Sendable (GenerationEvent) -> Void
+    private let cumulativeSink: GenerationRelay.CumulativeSink?
     private let requestIDFactory: (@Sendable (Data) -> UUID)?
     private let usesUnpromisedStreamBodyWrites: Bool
     private let nioDiagnostics: PerformanceNIODiagnostics?
@@ -437,6 +466,7 @@ private final class RequestForwarder: ChannelInboundHandler {
     init(
         ollamaHost: String, ollamaPort: Int, registry: ProxyChannelRegistry,
         eventSink: @escaping @Sendable (GenerationEvent) -> Void,
+        cumulativeSink: GenerationRelay.CumulativeSink?,
         requestIDFactory: (@Sendable (Data) -> UUID)?,
         usesUnpromisedStreamBodyWrites: Bool,
         nioDiagnostics: PerformanceNIODiagnostics?
@@ -445,6 +475,7 @@ private final class RequestForwarder: ChannelInboundHandler {
         self.ollamaPort = ollamaPort
         self.registry = registry
         self.eventSink = eventSink
+        self.cumulativeSink = cumulativeSink
         self.requestIDFactory = requestIDFactory
         self.usesUnpromisedStreamBodyWrites = usesUnpromisedStreamBodyWrites
         self.nioDiagnostics = nioDiagnostics
@@ -464,7 +495,7 @@ private final class RequestForwarder: ChannelInboundHandler {
         let relay = GenerationRelay(
             request: isGeneration
                 ? GenerationRequest(id: requestIDFactory?(bodyData) ?? UUID(), model: model) : nil,
-            sink: eventSink)
+            sink: eventSink, cumulativeSink: cumulativeSink)
         if isGeneration {
             relay.toolActivity(
                 ToolCallParser.resultSubmissions(path: request.head.uri, body: body, at: Date()))

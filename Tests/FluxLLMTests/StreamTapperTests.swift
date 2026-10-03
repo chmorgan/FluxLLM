@@ -66,6 +66,32 @@ final class StreamTapperTests: XCTestCase {
         try await verifyLiveForwarding(chat: true)
     }
 
+    func testBatchedTelemetryForwardsGenerateAndChatBytesBeforeCompletion() async throws {
+        try await withBatchedTelemetry {
+            try await verifyLiveForwarding(chat: false)
+            try await verifyLiveForwarding(chat: true)
+        }
+    }
+
+    func testBatchedTelemetryPreservesMalformedBytesToolsAndAuthoritativeCorrection() async throws {
+        try await withBatchedTelemetry {
+            try await verifySharedRecordPreservesTextToolsMalformedBytesAndFinalCorrection()
+        }
+    }
+
+    func testBatchedTelemetryPreservesClientCancellationAndShutdownUsage() async throws {
+        try await withBatchedTelemetry {
+            try await verifyClientCancellation()
+            try await verifyStoppingProxyDuringRequest()
+        }
+    }
+
+    func testBatchedTelemetryPreservesAbortedUpstreamFailureAndAcceptedUsage() async throws {
+        try await withBatchedTelemetry {
+            try await verifyUpstreamAbort()
+        }
+    }
+
     func testUnpromisedBodiesKeepLiveDeliveryAndAuthoritativeCompletion() async throws {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
         let previousMode = diagnostics.mode
@@ -79,6 +105,11 @@ final class StreamTapperTests: XCTestCase {
     }
 
     func testSharedRecordPreservesTextToolsMalformedBytesAndFinalCorrection() async throws {
+        try await verifySharedRecordPreservesTextToolsMalformedBytesAndFinalCorrection()
+    }
+
+    private func verifySharedRecordPreservesTextToolsMalformedBytesAndFinalCorrection() async throws
+    {
         let gate = MockResponseGate()
         let call =
             #"{"id":"call-1","function":{"name":"read_file","arguments":{}}}"#
@@ -317,6 +348,10 @@ final class StreamTapperTests: XCTestCase {
     }
 
     func testUpstreamAbortEndsClientAndMarksGenerationErrored() async throws {
+        try await verifyUpstreamAbort()
+    }
+
+    private func verifyUpstreamAbort() async throws {
         let gate = MockResponseGate()
         var fixture = MockOllamaResponse.generation(gate: gate)
         fixture.remainingBytes = []
@@ -335,6 +370,8 @@ final class StreamTapperTests: XCTestCase {
             }
             XCTAssertEqual(probe.data, Data(fixture.firstBytes))
             XCTAssertNotNil(context.store.generationError)
+            XCTAssertEqual(
+                context.store.outputTokens, 1, "Aborting must flush accepted prefix accounting")
             XCTAssertEqual(context.store.currentTPS, 0)
             XCTAssertNil(context.store.lastMeasuredTPS)
         }
@@ -368,6 +405,9 @@ final class StreamTapperTests: XCTestCase {
             try await waitForCondition("Client cancellation left the generation running") {
                 context.store.activeGeneration?.state == .cancelled
             }
+            XCTAssertEqual(
+                context.store.outputTokens, 1, "Cancelling must flush accepted prefix accounting")
+            XCTAssertEqual(context.store.requestLanes.first?.outputTokens, 1)
             XCTAssertEqual(context.store.currentTPS, 0)
             XCTAssertNil(context.store.lastMeasuredTPS)
             XCTAssertTrue(context.proxy.isRunning)
@@ -376,6 +416,10 @@ final class StreamTapperTests: XCTestCase {
     }
 
     func testStoppingProxyDuringRequestClosesClientAndCancelsGeneration() async throws {
+        try await verifyStoppingProxyDuringRequest()
+    }
+
+    private func verifyStoppingProxyDuringRequest() async throws {
         let gate = MockResponseGate()
         try await withProxy(response: .generation(gate: gate)) { context in
             let probe = StreamingProbe()
@@ -392,9 +436,36 @@ final class StreamTapperTests: XCTestCase {
             XCTAssertFalse(context.proxy.isRunning)
             XCTAssertNil(context.proxy.boundPort)
             XCTAssertEqual(context.store.activeGeneration?.state, .cancelled)
+            XCTAssertEqual(
+                context.store.outputTokens, 1, "Shutdown must flush accepted prefix accounting")
+            XCTAssertEqual(context.store.requestLanes.first?.outputTokens, 1)
             XCTAssertEqual(context.store.currentTPS, 0)
             XCTAssertEqual(context.store.proxyState, .stopped)
             await gate.release()
         }
+    }
+
+    private func withBatchedTelemetry(_ operation: () async throws -> Void) async throws {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        let previousMode = diagnostics.mode
+        let wasEnabled = diagnostics.isEnabled
+        try diagnostics.enable(mode: .runtimeTelemetryBatch)
+        defer {
+            if wasEnabled {
+                try? diagnostics.enable(mode: previousMode)
+            } else {
+                try? diagnostics.disable()
+            }
+        }
+        try await operation()
+        let counters = try XCTUnwrap(
+            diagnostics.snapshot()["batched_telemetry"] as? [String: UInt64])
+        XCTAssertGreaterThan(counters["compact_states_enqueued", default: 0], 0)
+        XCTAssertGreaterThan(counters["snapshots_materialized", default: 0], 0)
+        XCTAssertGreaterThan(counters["batches_applied", default: 0], 0)
+        XCTAssertEqual(counters["projection_refreshes"], counters["batches_applied"])
+        XCTAssertLessThanOrEqual(
+            counters["snapshots_materialized", default: 0],
+            counters["compact_states_enqueued", default: 0])
     }
 }

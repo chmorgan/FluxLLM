@@ -344,19 +344,44 @@ public final class MetricsStore {
         guard epoch == nil || epoch == monitoringEpoch,
             backendKind == nil || backendKind == .ollama
         else { return }
-        defer {
-            refreshObservedProxyActivity()
-            // All request boundaries must flush aggregate usage, including an
-            // older concurrent request that returns before the owning UI path.
-            switch event {
-            case .updated(_, let snapshot) where !snapshot.finished && snapshot.error == nil:
-                break
-            case .toolActivity:
-                break
-            default:
-                publishDashboardScalarPresentation()
-            }
+        applyAuthoritativeEvent(event)
+        refreshObservedProxyActivity()
+        if requiresBoundaryPublication(event) { publishDashboardScalarPresentation() }
+    }
+
+    /// A drained inbox batch is one actor transaction. Exact accounting, request
+    /// ownership, tool history, and logs still consume every event in order;
+    /// derived activity and boundary presentation are refreshed only afterward.
+    func applyBatch(_ events: [GenerationEvent], epoch: UUID? = nil) {
+        guard !events.isEmpty, epoch == nil || epoch == monitoringEpoch,
+            backendKind == nil || backendKind == .ollama
+        else { return }
+        var needsBoundaryPublication = false
+        for event in events {
+            applyAuthoritativeEvent(event)
+            needsBoundaryPublication =
+                needsBoundaryPublication || requiresBoundaryPublication(event)
         }
+        refreshObservedProxyActivity()
+        if needsBoundaryPublication { publishDashboardScalarPresentation() }
+        PerformanceGraphicsDiagnostics.shared.batchedTelemetryBatchApplied(eventCount: events.count)
+        PerformanceGraphicsDiagnostics.shared.batchedTelemetryProjectionRefreshed()
+    }
+
+    private func requiresBoundaryPublication(_ event: GenerationEvent) -> Bool {
+        // An older concurrent request's terminal event also flushes aggregate
+        // usage, even when it does not own the dashboard identity.
+        switch event {
+        case .updated(_, let snapshot) where !snapshot.finished && snapshot.error == nil:
+            return false
+        case .toolActivity:
+            return false
+        default:
+            return true
+        }
+    }
+
+    private func applyAuthoritativeEvent(_ event: GenerationEvent) {
         if diagnosticLogger.isEnabled {
             switch event {
             case .began(let request):

@@ -8,6 +8,9 @@ import NIOHTTP1
 final class GenerationRelay: @unchecked Sendable {
     typealias Scheduler = GenerationEventInbox.Scheduler
     typealias SnapshotFactory = @Sendable (TokenState, Date) -> GenerationSnapshot
+    /// The global inbox owns the only live-update deadline in the batching
+    /// candidate. Tool events and their cumulative state are submitted together.
+    typealias CumulativeSink = @Sendable (UUID, TokenState, Date, [ToolActivityEvent]) -> Void
 
     private struct PendingState {
         let state: TokenState
@@ -17,6 +20,7 @@ final class GenerationRelay: @unchecked Sendable {
     private let request: GenerationRequest?
     private let sink: @Sendable (GenerationEvent) -> Void
     private let makeSnapshot: SnapshotFactory
+    private let cumulativeSink: CumulativeSink?
     private let lock = NSLock()
     private var terminal = false
     private var emittedFirstOutput = false
@@ -28,6 +32,7 @@ final class GenerationRelay: @unchecked Sendable {
     init(
         request: GenerationRequest?, sink: @escaping @Sendable (GenerationEvent) -> Void,
         schedule: Scheduler? = nil,
+        cumulativeSink: CumulativeSink? = nil,
         makeSnapshot: @escaping SnapshotFactory = { state, timestamp in
             state.snapshot(at: timestamp)
         }
@@ -36,6 +41,7 @@ final class GenerationRelay: @unchecked Sendable {
         self.sink = sink
         self.schedule = schedule
         self.makeSnapshot = makeSnapshot
+        self.cumulativeSink = cumulativeSink
         if let request { sink(.began(request)) }
     }
 
@@ -44,7 +50,7 @@ final class GenerationRelay: @unchecked Sendable {
     func setLiveUpdateScheduler(_ schedule: @escaping Scheduler) {
         lock.lock()
         defer { lock.unlock() }
-        guard !terminal, self.schedule == nil else { return }
+        guard !terminal, cumulativeSink == nil, self.schedule == nil else { return }
         self.schedule = schedule
     }
 
@@ -66,6 +72,11 @@ final class GenerationRelay: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !terminal, let request else { return }
+        if let cumulativeSink {
+            terminal = state.isTerminal
+            cumulativeSink(request.id, state, timestamp, toolEvents)
+            return
+        }
         let firstOutput = state.hasOutput && !emittedFirstOutput
         if firstOutput { emittedFirstOutput = true }
         pendingState = PendingState(state: state, timestamp: timestamp)
