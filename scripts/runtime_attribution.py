@@ -186,7 +186,7 @@ class RuntimeDeadline(memory.MemoryDeadline):
 
 
 def runtime_source_identity():
-    names = {"runtime_attribution.py", "runtime_time_profile.py", "memory_attribution.py", "app_performance.py",
+    names = {"runtime_attribution.py", "runtime_time_profile.py", "runtime_thread_cpu.py", "memory_attribution.py", "app_performance.py",
              "run_performance_checks.py", "performance_fixture.py", "performance_gpu_sample.py"}
     names.update(path.name for path in Path(__file__).parent.glob("performance_trace*.py"))
     return {name: app.path_hash(Path(__file__).with_name(name)) for name in sorted(names)}
@@ -644,7 +644,7 @@ def phase_cpu(report, windows):
                                            window["end_monotonic_seconds"] + offset)
         result[name] = {**metrics, "average_cpu_percent": 100 * metrics["cpu_seconds"] / metrics["elapsed_seconds"],
                         "acceptance_eligible": cpu_acceptance_eligible(report.get("graphics_mode"),
-                            profile=report["runtime"].get("profiled", False))}
+                            profile=report["runtime"].get("profiled", False)) and not report.get("thread_cpu_requested", False)}
     return result
 
 
@@ -854,11 +854,27 @@ class RuntimeDiagnostic(memory.MemoryDiagnostic):
                             "reason": "Time Profiler perturbs execution; kernel values are attribution cross-checks only"}
 
 
-def capture_case(output, mode, paths, provenance, identity, deadline, *, profile=False):
+@contextmanager
+def thread_cpu_environment(enabled):
+    previous = os.environ.pop("FLUXLLM_PERF_THREAD_CPU", None)
+    try:
+        if enabled:
+            os.environ["FLUXLLM_PERF_THREAD_CPU"] = "1"
+        yield
+    finally:
+        os.environ.pop("FLUXLLM_PERF_THREAD_CPU", None)
+        if previous is not None:
+            os.environ["FLUXLLM_PERF_THREAD_CPU"] = previous
+
+
+def capture_case(output, mode, paths, provenance, identity, deadline, *, profile=False, thread_cpu=False):
     output.mkdir()
     diagnostic = RuntimeDiagnostic(output, deadline, mode, profile=profile)
+    if thread_cpu:
+        diagnostic.runtime["cpu_comparison_available"] = False
+        diagnostic.report.update(thread_cpu_requested=True, cpu_acceptance_eligible=False, cpu_gate_evaluated=False)
     try:
-        with deadline.interrupt_at(deadline.end - deadline.cleanup_reserve):
+        with deadline.interrupt_at(deadline.end - deadline.cleanup_reserve), thread_cpu_environment(thread_cpu):
             diagnostic.perform(paths, provenance, identity)
     except (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         diagnostic.report["errors"].append(str(error) or "Interrupted")
@@ -889,8 +905,8 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
             report["held_static_chart_work"] = held_work
         report["phase_cpu"] = phase_cpu(report, report["phase_windows"])
         report["runtime_cpu_work_counters"] = runtime_work_counter_diagnostic(report, profile=profile)
-        report["phase_cpu_comparison_available"] = not profile
-        eligible = cpu_acceptance_eligible(mode, profile=profile)
+        report["phase_cpu_comparison_available"] = not profile and not thread_cpu
+        eligible = cpu_acceptance_eligible(mode, profile=profile) and not thread_cpu
         report["cpu_acceptance_eligible"] = eligible
         report["runtime_cpu_target"] = {"evaluated": eligible, "acceptance_eligible": eligible, "limit_percent": 5.0,
             "within_limit": report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5 if eligible else None,
@@ -900,6 +916,14 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
             report.setdefault("workload_cpu", {}).update(acceptance_eligible=False, gate_evaluated=False, within_limit=None)
             for metrics in report["phase_cpu"].values():
                 metrics["acceptance_eligible"] = False
+        if thread_cpu:
+            report["runtime_cpu_target"]["reason"] = "Direct thread counter collection is an instrumented diagnostic"
+            report["cpu_gate_evaluated"] = False
+            report.setdefault("workload_cpu", {}).update(acceptance_eligible=False, gate_evaluated=False, within_limit=None)
+            for metrics in report["phase_cpu"].values():
+                metrics["acceptance_eligible"] = False
+            from runtime_thread_cpu import analyze_report
+            report["thread_cpu_analysis"] = analyze_report(report, required=True)
         if profile:
             require(report["runtime"]["profiler_status"] == "captured", "Time Profiler capture is incomplete")
         report["status"] = "diagnostic_captured"
@@ -932,6 +956,9 @@ def selected_cases(args):
         return [(label, args.baseline_mode) for label in ("reference-before", "candidate", "reference-after")]
     if args.operation == "profile":
         return [("profile", args.graphics_mode)]
+    if args.operation == "threads":
+        require(args.controls is None, "Thread accounting cannot combine graphics controls")
+        return [(label, args.graphics_mode) for label in ("observer-before", "threads", "observer-after")]
     controls = args.controls or ["runtime-optimized"]
     require(1 <= len(controls) <= 3 and len(set(controls)) == len(controls), "Select one to three distinct runtime controls")
     return [("baseline-before", args.baseline_mode), *[(mode, mode) for mode in controls], ("baseline-after", args.baseline_mode)]
@@ -965,7 +992,9 @@ def summary(report):
         peak = case.get("peak_footprint_bytes")
         target = case.get("runtime_cpu_target") or {}
         outcome = str(target.get("within_limit")).lower() if target.get("evaluated") else "not evaluated"
-        lines.append(f"| {case['label']} | {'profiled attribution only' if report['operation'] == 'profile' else 'unprofiled kernel counters'} | "
+        evidence = "profiled attribution only" if report["operation"] == "profile" else (
+            "instrumented direct thread counters" if case.get("thread_cpu_analysis") else "unprofiled kernel counters")
+        lines.append(f"| {case['label']} | {evidence} | "
                      f"{fmt('average_cpu_percent')} | {fmt('rolling_1s_percent')} | {outcome} | {peak / 1e6 if peak is not None else 'unavailable'} |")
     lines += ["", "Whole runtime includes fixture start/end and the three-second visible completion tail. Arrival, steady, completion, and whole-runtime windows are stored separately; selected phase windows must not be summed. GPU and filesystem-write gates are separate."]
     if report["operation"] == "profile" and report.get("native_capture_complete"):
@@ -973,6 +1002,9 @@ def summary(report):
         if report.get("analysis_pending_reasons"):
             lines += ["Quantitative CPU attribution is unavailable; raw sample weights and rankings are retained without rescaling.", "",
                       *["- " + reason for reason in report["analysis_pending_reasons"]]]
+    if report["operation"] == "threads" and report.get("thread_cpu_analysis"):
+        from runtime_thread_cpu import render_summary
+        lines += [""] + render_summary(report["thread_cpu_analysis"])
     if "baseline_drift" in report:
         lines += ["", "Comparison conclusive: " + str(report["baseline_drift"]["comparison_conclusive"]).lower() + ". " + report["baseline_drift"]["policy"]]
     if report["errors"]:
@@ -982,7 +1014,7 @@ def summary(report):
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("operation", choices=("profile", "compare"))
+    result.add_argument("operation", choices=("profile", "compare", "threads"))
     for name in ("app-binary", "test-bundle", "collector-binary", "provenance"):
         result.add_argument("--" + name, required=True, type=Path)
     for name in ("reference-app-binary", "reference-test-bundle", "reference-provenance"):
@@ -1064,12 +1096,16 @@ def _run(args, deadline):
             print(f"Runtime case {len(report['cases']) + 1}/{len(cases)}: {label} ({mode}); remaining {deadline.remaining():.1f}s", flush=True)
             case_deadline = RuntimeDeadline(seconds, cleanup_reserve=8)
             directory = output / label
-            case = capture_case(directory, mode, paths, provenance, identity, case_deadline, profile=args.operation == "profile")
+            capture_options = {"profile": args.operation == "profile"}
+            if args.operation == "threads" and label == "threads":
+                capture_options["thread_cpu"] = True
+            case = capture_case(directory, mode, paths, provenance, identity, case_deadline, **capture_options)
             row = {"label": label, "mode": mode, "product_role": role, "status": case["status"], "report_path": str(directory / "runtime-case.json"),
                    "report_sha256": app.path_hash(directory / "runtime-case.json"), "workload_cpu": case.get("workload_cpu"),
                    "phase_cpu": case.get("phase_cpu"), "runtime_work": case.get("runtime_work"),
                    "runtime_cpu_work_counters": case.get("runtime_cpu_work_counters"),
                    "steady_twinkle_delivery": case.get("steady_twinkle_delivery"),
+                   "thread_cpu_analysis": case.get("thread_cpu_analysis"),
                    "visual_work": case.get("visual_work"),
                    "runtime_cpu_target": case.get("runtime_cpu_target"),
                    "peak_footprint_bytes": (case.get("samples") or [{}])[-1].get("lifetime_peak_footprint_bytes")}
@@ -1082,7 +1118,13 @@ def _run(args, deadline):
                   (" (profiled attribution only)" if args.operation == "profile" else ""), flush=True)
             write_json(output / "runtime-report.json", report)
             require(case["status"] == "diagnostic_captured", f"Runtime case {label} is incomplete: {case['errors']}")
-            if args.operation == "compare":
+            if args.operation == "threads" and label == "threads":
+                report["native_capture_complete"] = True
+                report["thread_cpu_analysis"] = case["thread_cpu_analysis"]
+                report["attribution_status"] = case["thread_cpu_analysis"]["status"]
+                if not case["thread_cpu_analysis"].get("available"):
+                    report["analysis_pending_reasons"] = case["thread_cpu_analysis"].get("errors") or ["Direct thread CPU accounting is unavailable"]
+            if args.operation in ("compare", "threads"):
                 require(row["visual_work"] == report["cases"][0]["visual_work"],
                         "Runtime comparison cases did not execute identical deterministic visual requests")
             if args.operation == "profile":
@@ -1109,14 +1151,24 @@ def _run(args, deadline):
                     if quality.get("all_selected_symbols_missing"):
                         reasons.append("All selected samples lack usable symbols.")
                     report["analysis_pending_reasons"] = reasons or ["Time Profiler quantitative attribution quality is unavailable."]
-        if args.operation == "compare":
+        if args.operation in ("compare", "threads"):
             report["baseline_drift"] = baseline_drift(report["cases"])
+        if args.operation == "threads":
+            before, measured, after = [case["phase_cpu"]["whole_contiguous_runtime"] for case in report["cases"]]
+            report["observer_comparison"] = {
+                "acceptance_eligible": False, "reference_drift": report["baseline_drift"],
+                "metrics": {key: {"before": before[key], "instrumented": measured[key], "after": after[key],
+                    "instrumented_minus_reference_min": measured[key] - min(before[key], after[key]),
+                    "instrumented_minus_reference_max": measured[key] - max(before[key], after[key])}
+                    for key in ("average_cpu_percent", "rolling_1s_percent")},
+                "scope": "Adjacent same-binary observer-off/on/off; drift and differences reported without claiming zero observer disturbance"}
         require(runtime_source_identity() == sources, "Runtime measurement sources changed before finalization")
         require(all(runtime_product_identity(product["paths"], product["provenance"]) == product["files"]
                     for product in products.values()), "Frozen products changed before runtime finalization")
         require(time.monotonic() < deadline.end - 1, "Runtime attribution exceeded its 300-second deadline")
-        report["status"] = ("analysis_pending" if args.operation == "profile"
-                            and report.get("attribution_status") == "analysis_pending" else "diagnostic_captured")
+        pending = (args.operation == "profile" and report.get("attribution_status") == "analysis_pending"
+                   or args.operation == "threads" and not report.get("thread_cpu_analysis", {}).get("available"))
+        report["status"] = "analysis_pending" if pending else "diagnostic_captured"
     except (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         report["errors"].append(str(error) or "Interrupted")
     if output_created:

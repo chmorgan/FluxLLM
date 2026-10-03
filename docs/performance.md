@@ -508,6 +508,49 @@ difference greater than both 20% of kernel CPU and 0.5 percentage points leaves
 attribution pending, retaining the raw weights and rankings without rescaling
 them. Complete recording alone does not establish accurate CPU attribution.
 
+Use direct thread counters when statistical samples do not reconcile:
+
+```sh
+python3 scripts/run_performance_checks.py runtime threads \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json
+```
+
+This command runs the same visible 25-second, two-stream, 200 Hz workload with
+the thread observer **off/on/off**, within the existing 300-second deadline.
+The middle case registers the actual main and sole NIO event-loop thread IDs
+once, then reads their cumulative user/system CPU externally during the existing
+250 ms collector sampling loop. Ordinary launches and the surrounding controls
+do not register or collect thread counters. The diagnostic rejects a future
+multi-loop proxy until every event-loop identity can be accounted for.
+
+Before launching the instrumented app, the collector calibrates external thread
+reads against `CLOCK_THREAD_CPUTIME_ID`, `getrusage`, and process CPU in an owned
+helper with continuous, bursty, and idle work. It also checks rejection of a dead
+thread and records the CPU cost of 200 observer reads. Run this calibration and
+malformed-registration/conversion checks independently with
+`FluxLLMResourceCollector --thread-cpu-self-test`; its deadline is ten seconds.
+
+Each pair of thread reads is enclosed by process CPU counters and Mach timestamps.
+The analyzer validates process birth, stable registered IDs, raw conversions,
+counter monotonicity, calibration, sampling coverage, visibility, and clean exit.
+It retains the counter precision and sequential-read uncertainty in explicit
+CPU bounds, and rejects intervals wider than 0.1 CPU percentage point. The API
+encodes microsecond thread times in nanoseconds; see Apple's
+[fill_taskthreadinfo implementation](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/bsd_kern.c).
+
+`SUMMARY.md` and `runtime-report.json` contain main-thread, NIO-thread, and other
+process CPU for actual read endpoints wholly inside each runtime phase. The
+other-process value is a bounded residual, including unregistered worker threads.
+No interpolation assigns thread CPU to the exact rolling one-second peak.
+Existing whole-process rolling CPU remains separate. The middle case is diagnostic
+and cannot pass CPU acceptance, even when attribution succeeds. Failed attribution
+leaves the command `analysis_pending` and preserves raw process measurements.
+The off/on/off process comparison reports observer disturbance and reference
+drift; a calibration pass does not imply that instrumentation has zero overhead.
+
 Use an unprofiled comparison to measure a candidate against the same frozen binary:
 
 ```sh

@@ -3,6 +3,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -125,6 +126,23 @@ def case(label, average=3.25, peak=4.75):
 
 
 class CaseSelectionTests(unittest.TestCase):
+    def test_thread_accounting_brackets_the_observer_in_bounded_normal_cases(self):
+        self.assertEqual(runtime.selected_cases(options(operation="threads")), [
+            ("observer-before", "normal"), ("threads", "normal"), ("observer-after", "normal")])
+        with self.assertRaisesRegex(ValueError, "controls"):
+            runtime.selected_cases(options(operation="threads", controls=["normal"]))
+
+    def test_thread_observer_environment_is_scoped_and_never_leaks_to_controls(self):
+        with patch.dict(os.environ, {"FLUXLLM_PERF_THREAD_CPU": "inherited"}):
+            with runtime.thread_cpu_environment(True):
+                self.assertEqual(os.environ["FLUXLLM_PERF_THREAD_CPU"], "1")
+            self.assertEqual(os.environ["FLUXLLM_PERF_THREAD_CPU"], "inherited")
+            with self.assertRaisesRegex(ValueError, "test error"):
+                with runtime.thread_cpu_environment(False):
+                    self.assertNotIn("FLUXLLM_PERF_THREAD_CPU", os.environ)
+                    raise ValueError("test error")
+            self.assertEqual(os.environ["FLUXLLM_PERF_THREAD_CPU"], "inherited")
+
     def test_default_compare_brackets_combined_control(self):
         self.assertEqual(runtime.selected_cases(options()), [
             ("baseline-before", "native-gpu-optimized"),
