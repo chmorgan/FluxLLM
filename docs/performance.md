@@ -952,6 +952,42 @@ recording, clock, identity, or clean-exit evidence leaves the run incomplete.
 Use the unprofiled four-case replay to validate an optimization; profiling does
 not measure GPU execution or establish a performance-gate pass.
 
+To compare an implementation change using frozen products, provide all three
+reference arguments. The collector remains the single explicitly supplied
+common collector:
+
+```sh
+python3 scripts/run_performance_checks.py arrivals \
+  --app-binary /absolute/candidate/FluxLLMApp \
+  --test-bundle /absolute/candidate/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/common/FluxLLMResourceCollector \
+  --provenance /absolute/candidate/provenance.json \
+  --reference-app-binary /absolute/reference/FluxLLMApp \
+  --reference-test-bundle /absolute/reference/FluxLLMPackageTests.xctest \
+  --reference-provenance /absolute/reference/provenance.json \
+  --graphics-mode runtime-metal-arrival-bursts \
+  --output-dir .performance-results/arrivals-version-comparison
+```
+
+This runs exactly **reference-before / candidate / reference-after**, with
+detailed timing off in all three cases. Each uses the same three-episode replay
+and a 65-second case allowance inside the shared 300-second command deadline.
+`--graphics-mode` selects `runtime-metal-arrival-bursts` by default or `normal`
+for all three cases; it is only valid with reference products. Reference
+comparison cannot be combined with `--profile`, and partial reference arguments
+are rejected before capture. Omitting reference arguments preserves the existing
+four-case comparison or single profiling invocation.
+
+Both frozen versions must validate against the same measurement identity,
+populated fixture manifest, and common collector. Before each case and at
+finalization, the runner checks its measurement source capsule and both versions'
+binary, test-bundle, provenance, and resource-bundle hashes. The report records
+each case's product role and both product manifests. The existing drift check
+compares only the two reference cases; candidate CPU does not determine whether
+the reference bracket is stable. CPU targets, native visibility, exact work,
+quiet/closed cancellation, and clean-exit checks remain unchanged. GPU execution
+still requires its separate measurement invocation.
+
 ## Baselines and comparison artifacts
 
 Record the same workload before changing production behavior:

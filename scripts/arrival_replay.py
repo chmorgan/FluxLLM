@@ -107,6 +107,16 @@ def source_identity():
     return runtime.runtime_source_identity() | {Path(__file__).name: app.path_hash(Path(__file__))}
 
 
+def product_identity(paths, provenance):
+    """Pin complete validated products, including their provenance and resources."""
+    files = dict(paths)
+    if provenance.get("provenance_file"):
+        files["provenance"] = Path(provenance["provenance_file"])
+    for name in provenance.get("resource_bundle_sha256", {}):
+        files["resource:" + name] = paths["app"].parent / name
+    return {name: {"path": str(path), "sha256": app.path_hash(path)} for name, path in files.items()}
+
+
 def snapshot_time(report, snapshot):
     matches = [sample for sample in report["samples"]
                if sample.get("monotonic_seconds") == snapshot.get("runner_collector_sample_monotonic_seconds")]
@@ -476,6 +486,10 @@ def summary(report):
                          f"{target('whole_replay')} | {'unqualified capture' if case.get('status') != 'diagnostic_captured' else 'profiled; ineligible' if case.get('profiled') else 'perturbed; ineligible' if case['timed'] else 'off'} |")
     lines += ["", "Compare matching episode ordinals across cases. Histories, effect seeds, colors, and shapes change across ordinals; first-minus-repeat is not an isolated first-use cost.",
               "Whole replay includes the gaps between episodes; first2s starts at the fixture's first source write. Timing scopes can overlap and must not be summed. GPU execution is unmeasured."]
+    if report.get("operation") == "version-compare":
+        lines += ["", "Frozen reference-before / candidate / reference-after use the same " + report["graphics_mode"]
+                  + " rendering mode, common collector, populated fixture, and measurement sources. All detailed timing is off. "
+                  "Each case pins its app, test bundle, provenance, and resource bundles in arrival-report.json."]
     for case in report["cases"]:
         if not case["timed"]:
             continue
@@ -539,19 +553,30 @@ def parser():
     value.add_argument("--output-dir", type=Path)
     value.add_argument("--profile", action="store_true",
                        help="Run one three-episode Metal Time Profiler capture and bounded attribution; never evaluate CPU acceptance")
+    for name in ("reference-app-binary", "reference-test-bundle", "reference-provenance"):
+        value.add_argument("--" + name, type=Path)
+    value.add_argument("--graphics-mode", choices=("normal", memory.METAL_ARRIVAL_MODE),
+                       help="Rendering mode for frozen-version comparison only (default: runtime-metal-arrival-bursts)")
     return value
 
 
 def _run(args, deadline):
     started = time.monotonic()
     profile = args.profile
+    references = (args.reference_app_binary, args.reference_test_bundle, args.reference_provenance)
+    version_compare = any(value is not None for value in references)
     output = (args.output_dir or app.ROOT / ".performance-results" /
               ("arrival-replay-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-") + secrets.token_hex(4))).resolve()
-    report = {"kind": "profiled-arrival-replay" if profile else "matched-arrival-replay",
-              "operation": "profile" if profile else "compare", "status": "diagnostic_incomplete", "deadline_seconds": MAX_SECONDS,
+    report = {"kind": "profiled-arrival-replay" if profile else "matched-arrival-version-replay" if version_compare else "matched-arrival-replay",
+              "operation": "profile" if profile else "version-compare" if version_compare else "compare",
+              "status": "diagnostic_incomplete", "deadline_seconds": MAX_SECONDS,
               "regression_passed": False, "cases": [], "errors": []}
     created = False
     try:
+        require(not version_compare or all(value is not None for value in references),
+                "Frozen reference comparison requires all three reference product/provenance arguments")
+        require(not (version_compare and profile), "Frozen reference comparison cannot run with Time Profiler")
+        require(args.graphics_mode is None or version_compare, "--graphics-mode requires frozen reference comparison")
         require(sys.platform == "darwin", "Arrival replay requires macOS")
         require(not output.exists(), "Never overwrite arrival replay artifacts")
         require(app.ROOT not in output.parents or app.ROOT / ".performance-results" in output.parents,
@@ -568,19 +593,45 @@ def _run(args, deadline):
         with deadline.interrupt_at(deadline.end - deadline.cleanup_reserve):
             paths, provenance, identity = memory.validate_products(args)
             report.update(binary_identity={name: app.path_hash(path) for name, path in paths.items()}, measurement_identity=identity)
-        cases = (("metal-arrivals-profile", memory.METAL_ARRIVAL_MODE, False),) if profile else CASES
+            products = {"candidate": {"paths": paths, "provenance": provenance, "identity": identity}}
+            if version_compare:
+                reference_args = argparse.Namespace(**vars(args))
+                reference_args.app_binary, reference_args.test_bundle, reference_args.provenance = references
+                reference_paths, reference_provenance, reference_identity = memory.validate_products(reference_args)
+                require(reference_identity == identity, "Frozen versions have different common measurement identities")
+                candidate_fixture = provenance.get("fixture_equivalence_sha256", {}).get("populated")
+                reference_fixture = reference_provenance.get("fixture_equivalence_sha256", {}).get("populated")
+                require(isinstance(candidate_fixture, str) and candidate_fixture == reference_fixture,
+                        "Frozen versions have different populated fixture identities")
+                require(reference_paths["collector"] == paths["collector"], "Frozen versions require the same common collector")
+                products["reference"] = {"paths": reference_paths, "provenance": reference_provenance, "identity": reference_identity}
+            for product in products.values():
+                product["files"] = product_identity(product["paths"], product["provenance"])
+            report["products"] = {role: {"files": product["files"], "production_provenance": product["provenance"],
+                                        "measurement_identity": product["identity"]} for role, product in products.items()}
+        if version_compare:
+            mode = args.graphics_mode or memory.METAL_ARRIVAL_MODE
+            report["graphics_mode"] = mode
+            cases = (("reference-before", mode, False, "reference"), ("candidate", mode, False, "candidate"),
+                     ("reference-after", mode, False, "reference"))
+        else:
+            selected = (("metal-arrivals-profile", memory.METAL_ARRIVAL_MODE, False),) if profile else CASES
+            cases = tuple((label, mode, timed, "candidate") for label, mode, timed in selected)
         case_seconds = runtime.PROFILE_SECONDS if profile else CASE_SECONDS
-        for label, mode, timed in cases:
+        for label, mode, timed, role in cases:
             require(deadline.remaining() >= case_seconds + 3, "Insufficient budget for a complete arrival replay case")
-            require(source_identity() == sources and all(app.path_hash(path) == report["binary_identity"][name] for name, path in paths.items()),
+            require(source_identity() == sources and all(product_identity(product["paths"], product["provenance"]) == product["files"]
+                                                        for product in products.values()),
                     "Arrival sources or frozen products changed")
+            product = products[role]
+            paths, provenance, identity = (product[key] for key in ("paths", "provenance", "identity"))
             print(f"Arrival replay {len(report['cases']) + 1}/{len(cases)}: {label}; timing={'on' if timed else 'off'}; "
                   f"profile={'on' if profile else 'off'}; remaining {deadline.remaining():.1f}s", flush=True)
             with deadline.interrupt_at(deadline.end - 1):
                 case = capture_case(output / label, mode, timed, paths, provenance, identity,
                                     runtime.RuntimeDeadline(case_seconds, cleanup_reserve=8), profile=profile)
             path = output / label / "arrival-case.json"
-            row = {"label": label, "mode": mode, "timed": timed, "profiled": profile,
+            row = {"label": label, "mode": mode, "timed": timed, "profiled": profile, "product_role": role,
                    "status": case["status"], "phase_cpu": case.get("phase_cpu"),
                    "report_path": str(path), "report_sha256": app.path_hash(path),
                    "cpu_acceptance_eligible": case["status"] == "diagnostic_captured" and not (timed or profile),
@@ -624,7 +675,8 @@ def _run(args, deadline):
                 bracket = [{"phase_cpu": {"whole_contiguous_runtime": report["cases"][index]["phase_cpu"][phase]}} for index in (0, 2)]
                 drift[phase] = runtime.baseline_drift(bracket)
             report["baseline_drift"] = {"comparison_conclusive": all(value["comparison_conclusive"] for value in drift.values()), "phases": drift}
-        require(source_identity() == sources and all(app.path_hash(path) == report["binary_identity"][name] for name, path in paths.items()),
+        require(source_identity() == sources and all(product_identity(product["paths"], product["provenance"]) == product["files"]
+                                                    for product in products.values()),
                 "Arrival measurement sources or frozen products changed before finalization")
         require(time.monotonic() < deadline.end - 1, "Arrival replay exceeded its deadline")
         report["status"] = ("analysis_pending" if profile and report.get("attribution_status") == "analysis_pending"

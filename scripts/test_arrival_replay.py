@@ -722,5 +722,182 @@ class ArrivalProfileContractTests(unittest.TestCase):
         analyze.assert_not_called()
 
 
+class ArrivalVersionComparisonTests(unittest.TestCase):
+    REFERENCE_OPTIONS = ("--reference-app-binary", "--reference-test-bundle", "--reference-provenance")
+
+    def test_incomplete_reference_options_and_incompatible_modes_never_launch_capture(self):
+        selections = [list(range(3))[:count] for count in (1, 2)]
+        selections.extend(([1], [2], [0, 2], [1, 2]))
+        scenarios = [([argument for index in selected for argument in
+                       (self.REFERENCE_OPTIONS[index], "/missing/reference")], "partial") for selected in selections]
+        scenarios.append(([argument for option in self.REFERENCE_OPTIONS for argument in (option, "/missing/reference")]
+                          + ["--profile"], "profile"))
+        scenarios.append((["--graphics-mode", "normal"], "mode-without-reference"))
+        for extras, label in scenarios:
+            with self.subTest(label=label, extras=extras), tempfile.TemporaryDirectory() as directory:
+                arguments = ReplayIsolationTests().arguments(Path(directory) / "output") + extras
+                with patch.object(replay.sys, "platform", "darwin"), \
+                        patch.object(replay.memory, "validate_products") as products, \
+                        patch.object(replay, "capture_case") as capture, \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        code = replay.run(arguments)
+                    except SystemExit as error:
+                        code = error.code
+                self.assertNotEqual(code, 0)
+                products.assert_not_called()
+                capture.assert_not_called()
+
+    def compare_offline(self, *, mode=None, invalid_product=None, mismatched_identity=False,
+                        mismatched_fixture=False, mutate_after=None):
+        """Use distinct real artifact hashes and mocked native captures only."""
+        captures, validated = [], []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            collector = root / "collector"
+            collector.write_text("common collector")
+            products = {}
+            for role in ("candidate", "reference"):
+                folder = root / role
+                folder.mkdir()
+                paths = {"app": folder / "app", "tests": folder / "tests", "collector": collector}
+                paths["app"].write_text(role + " app")
+                paths["tests"].write_text(role + " tests")
+                bundle = folder / "Resources.bundle"
+                bundle.mkdir()
+                (bundle / "resource").write_text("shared resources")
+                provenance = {"resource_bundle_sha256": {bundle.name: replay.app.path_hash(bundle)},
+                              "fixture_equivalence_sha256": {"populated": "different-fixture" if role == "reference"
+                                  and mismatched_fixture else "shared-populated-fixture"}}
+                provenance_path = folder / "provenance.json"
+                provenance["provenance_file"] = str(provenance_path)
+                provenance_path.write_text(json.dumps(provenance))
+                products[role] = {"paths": paths, "provenance": provenance, "provenance_path": provenance_path,
+                                  "identity": {"sha256": "shared-measurement-identity"}, "bundle": bundle}
+            if mismatched_identity:
+                products["reference"]["identity"]["sha256"] = "different-measurement-identity"
+
+            def validate(args):
+                role = args.app_binary.parent.name
+                selected = products[role]
+                validated.append({"role": role, "app": str(args.app_binary), "tests": str(args.test_bundle),
+                                  "collector": str(args.collector_binary), "provenance": str(args.provenance)})
+                if role == invalid_product:
+                    raise ValueError("strict provenance rejected " + role)
+                self.assertEqual(args.app_binary, selected["paths"]["app"])
+                self.assertEqual(args.test_bundle, selected["paths"]["tests"])
+                self.assertEqual(args.collector_binary, collector)
+                self.assertEqual(args.provenance, selected["provenance_path"])
+                return selected["paths"], selected["provenance"], selected["identity"]
+
+            def deadline(seconds, cleanup_reserve=15):
+                return SimpleNamespace(end=replay.time.monotonic() + seconds, cleanup_reserve=cleanup_reserve,
+                    requested_seconds=seconds, remaining=lambda: seconds,
+                    interrupt_at=lambda end: contextlib.nullcontext())
+
+            def capture(output, mode, timed, paths, provenance, identity, budget, *, profile=False):
+                role = paths["app"].parent.name
+                self.assertIs(paths, products[role]["paths"])
+                self.assertIs(provenance, products[role]["provenance"])
+                self.assertIs(identity, products[role]["identity"])
+                captures.append({"label": output.name, "role": role, "mode": mode, "timed": timed,
+                                 "profiled": profile, "seconds": budget.requested_seconds})
+                result = replay_report(mode, timed)
+                if role == "candidate":
+                    # Candidate differs sharply, so drift must use reference endpoints.
+                    for sample in result["samples"]:
+                        sample["cpu_seconds"] *= 10
+                replay.validate_replay(result, mode, timed, profile=profile)
+                result["status"] = "diagnostic_captured"
+                output.mkdir()
+                replay.write_json(output / "arrival-case.json", result)
+                if len(captures) == 1 and mutate_after:
+                    selected = products[mutate_after[0]]
+                    target = (selected["provenance_path"] if mutate_after[1] == "provenance" else
+                              selected["bundle"] / "resource" if mutate_after[1] == "resource" else
+                              selected["paths"][mutate_after[1]])
+                    target.write_text("changed during comparison")
+                return result
+
+            output = root / "output"
+            arguments = ["--app-binary", str(products["candidate"]["paths"]["app"]),
+                         "--test-bundle", str(products["candidate"]["paths"]["tests"]),
+                         "--collector-binary", str(collector),
+                         "--provenance", str(products["candidate"]["provenance_path"]),
+                         "--output-dir", str(output),
+                         "--reference-app-binary", str(products["reference"]["paths"]["app"]),
+                         "--reference-test-bundle", str(products["reference"]["paths"]["tests"]),
+                         "--reference-provenance", str(products["reference"]["provenance_path"])]
+            if mode:
+                arguments += ["--graphics-mode", mode]
+            args = replay.parser().parse_args(arguments)
+            with patch.object(replay.sys, "platform", "darwin"), \
+                    patch.object(replay, "source_identity", return_value={}), \
+                    patch.object(replay.memory, "validate_products", side_effect=validate), \
+                    patch.object(replay.runtime, "RuntimeDeadline", side_effect=deadline), \
+                    patch.object(replay, "capture_case", side_effect=capture), \
+                    patch.object(replay.time_profile, "analyze_trace") as analyze, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = replay._run(args, deadline(300))
+            report = json.loads((output / "arrival-report.json").read_text())
+            analyze.assert_not_called()
+        return code, report, captures, validated
+
+    def test_same_mode_comparison_selects_reference_candidate_reference_and_reference_drift(self):
+        for mode in (None, "normal", replay.memory.METAL_ARRIVAL_MODE):
+            with self.subTest(mode=mode):
+                code, report, captures, validated = self.compare_offline(mode=mode)
+                self.assertEqual(code, 0)
+                self.assertEqual(report["operation"], "version-compare")
+                self.assertEqual(report["status"], "diagnostic_captured")
+                self.assertFalse(report["regression_passed"])
+                self.assertEqual([row["role"] for row in validated], ["candidate", "reference"])
+                self.assertEqual([(row["label"], row["role"]) for row in captures], [
+                    ("reference-before", "reference"), ("candidate", "candidate"), ("reference-after", "reference")])
+                self.assertTrue(all(row["mode"] == (mode or replay.memory.METAL_ARRIVAL_MODE) for row in captures))
+                self.assertTrue(all(not row["timed"] and not row["profiled"] and row["seconds"] == 65 for row in captures))
+                self.assertTrue(all(case["cpu_acceptance_eligible"] for case in report["cases"]))
+                self.assertEqual([case["product_role"] for case in report["cases"]], ["reference", "candidate", "reference"])
+                self.assertEqual(set(report["products"]), {"candidate", "reference"})
+                first, second = (report["products"][role]["files"] for role in ("candidate", "reference"))
+                self.assertNotEqual(first["app"]["sha256"], second["app"]["sha256"])
+                self.assertEqual(first["collector"], second["collector"])
+                self.assertIn("provenance", first)
+                self.assertIn("resource:Resources.bundle", second)
+                self.assertAlmostEqual(report["cases"][1]["phase_cpu"]["whole_replay"]["average_cpu_percent"], 20)
+                self.assertTrue(report["baseline_drift"]["comparison_conclusive"])
+
+    def test_both_product_sets_must_pass_strict_validation_before_any_capture(self):
+        for role in ("candidate", "reference"):
+            with self.subTest(role=role):
+                code, report, captures, validated = self.compare_offline(invalid_product=role)
+                self.assertEqual(code, 1)
+                self.assertEqual(report["status"], "diagnostic_incomplete")
+                self.assertEqual(captures, [])
+                self.assertTrue(any("strict provenance rejected " + role in error for error in report["errors"]))
+
+    def test_different_measurement_identity_cannot_be_compared(self):
+        code, report, captures, validated = self.compare_offline(mismatched_identity=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "diagnostic_incomplete")
+        self.assertEqual(captures, [])
+
+    def test_different_populated_fixture_cannot_be_compared(self):
+        code, report, captures, validated = self.compare_offline(mismatched_fixture=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "diagnostic_incomplete")
+        self.assertEqual(captures, [])
+
+    def test_changed_reference_candidate_or_shared_artifacts_prevent_further_capture(self):
+        for role, field in (("reference", "app"), ("candidate", "app"), ("reference", "tests"),
+                            ("candidate", "collector"), ("reference", "provenance"), ("candidate", "resource")):
+            with self.subTest(role=role, field=field):
+                code, report, captures, validated = self.compare_offline(mutate_after=(role, field))
+                self.assertEqual(code, 1)
+                self.assertEqual(report["status"], "diagnostic_incomplete")
+                self.assertEqual(len(captures), 1)
+                self.assertTrue(report["errors"])
+
+
 if __name__ == "__main__":
     unittest.main()
