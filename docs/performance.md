@@ -551,6 +551,42 @@ leaves the command `analysis_pending` and preserves raw process measurements.
 The off/on/off process comparison reports observer disturbance and reference
 drift; a calibration pass does not imply that instrumentation has zero overhead.
 
+Separate networking work with scoped CPU counters:
+
+```sh
+python3 scripts/run_performance_checks.py runtime nio \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json
+```
+
+This uses the same workload, visibility checks, off/on/off comparison, and
+300-second deadline, with up to 70 seconds per case for startup, measurement,
+and cleanup. Only the middle case enables both external thread counters
+and app-side NIO scopes. Each measured invocation reads the calling thread's
+CPU clock; counters accumulate on the event loop without per-invocation locks.
+Control snapshots collect them on that same loop before returning immutable
+results to the UI thread. Ordinary launches omit the scoped diagnostics.
+
+The report separates framing, JSON decoding, token/tool interpretation, relay
+updates, forwarding, and scheduled relay delivery. The upstream read callback
+includes synchronous HTTP decoding and its child handlers. Forwarding includes
+the small-body coalescer and synchronous downstream pipeline work. The coalescer
+scope wraps the complete body-write call, including encoding and flushing; it
+does not isolate buffer-copy CPU. These nested measurements are shown separately
+and must not be added to their parents.
+Deferred socket operations and other event-loop work remain in the thread's
+unassigned CPU instead of being attributed to a synchronous forwarding scope.
+
+Intervals use actual control-snapshot endpoints and retain clock-read bounds.
+Scoped totals reconcile against the same thread's CPU clock and independently
+bracketing external thread counters. Startup calibration records empty-scope and
+clock-read costs without subtracting them from results; matched controls expose
+the combined observer effect. Invalid counters or attribution leave raw captures
+available but cannot produce CPU acceptance or an exact rolling one-second
+per-stage attribution. `SUMMARY.md` contains the review tables.
+
 Use an unprofiled comparison to measure a candidate against the same frozen binary:
 
 ```sh
