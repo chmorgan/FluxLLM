@@ -5,6 +5,148 @@ import XCTest
 
 @MainActor
 final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
+    func testPrimitiveEffectsCountersTrackOverlappingFramesAndDrainResources() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .runtimeMetalPrimitiveEffects)
+        let first = try XCTUnwrap(diagnostics.metalPrimitiveEffectsHostCreated())
+        let second = try XCTUnwrap(diagnostics.metalPrimitiveEffectsHostCreated())
+        diagnostics.metalPrimitiveEffectsDescriptorsUploaded(first, bytes: 1_024)
+        diagnostics.metalPrimitiveEffectsDescriptorsUploaded(second, bytes: 512)
+        diagnostics.metalPrimitiveEffectsFrameSubmitted(
+            first, arrival: true, completion: false, twinkle: true, clear: false)
+        diagnostics.metalPrimitiveEffectsFrameSubmitted(
+            second, arrival: false, completion: true, twinkle: false, clear: false)
+        diagnostics.metalPrimitiveEffectsFrameSubmitted(
+            first, arrival: false, completion: false, twinkle: false, clear: true)
+        XCTAssertThrowsError(try diagnostics.enable(mode: .normal))
+        XCTAssertThrowsError(try diagnostics.disable())
+        var counts = try XCTUnwrap(
+            diagnostics.snapshot()["metal_primitive_effects"] as? [String: UInt64])
+        XCTAssertEqual(counts["submissions"], 3)
+        XCTAssertEqual(counts["clears"], 1)
+        XCTAssertEqual(counts["arrival_frames"], 1)
+        XCTAssertEqual(counts["completion_frames"], 1)
+        XCTAssertEqual(counts["twinkle_frames"], 1)
+        XCTAssertEqual(counts["current_buffer_bytes"], 1_536)
+        XCTAssertEqual(counts["peak_buffer_bytes"], 1_536)
+        XCTAssertEqual(counts["live_hosts"], 2)
+        diagnostics.metalPrimitiveEffectsBuffersRetained(first, bytes: 0)
+        diagnostics.metalPrimitiveEffectsHostDestroyed(first)
+        diagnostics.metalPrimitiveEffectsHostDestroyed(second)
+        counts = try XCTUnwrap(
+            diagnostics.snapshot()["metal_primitive_effects"] as? [String: UInt64])
+        XCTAssertEqual(counts["live_hosts"], 0)
+        XCTAssertEqual(counts["current_buffer_bytes"], 0)
+        XCTAssertEqual(counts["hosts_destroyed"], 2)
+        XCTAssertEqual(counts["peak_buffer_bytes"], 1_536)
+        assertCounter("invalid_events", in: diagnostics.snapshot(), equals: 0)
+        try diagnostics.disable()
+        XCTAssertEqual(
+            diagnostics.snapshot() as NSDictionary,
+            PerformanceGraphicsDiagnostics().snapshot() as NSDictionary)
+    }
+
+    func testPrimitiveEffectsRejectStaleOwnersOverflowAndInvalidClear() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .runtimeMetalPrimitiveEffects)
+        let first = try XCTUnwrap(diagnostics.metalPrimitiveEffectsHostCreated())
+        let second = try XCTUnwrap(diagnostics.metalPrimitiveEffectsHostCreated())
+        diagnostics.metalPrimitiveEffectsDescriptorsUploaded(first, bytes: .max)
+        let previous = diagnostics.snapshot()["metal_primitive_effects"] as? [String: UInt64]
+        XCTAssertFalse(diagnostics.metalPrimitiveEffectsBuffersRetained(second, bytes: 1))
+        diagnostics.metalPrimitiveEffectsFrameSubmitted(
+            first, arrival: true, completion: false, twinkle: false, clear: true)
+        XCTAssertEqual(
+            diagnostics.snapshot()["metal_primitive_effects"] as? [String: UInt64], previous)
+        diagnostics.metalPrimitiveEffectsHostDestroyed(first)
+        diagnostics.metalPrimitiveEffectsHostDestroyed(second)
+        diagnostics.metalPrimitiveEffectsDescriptorsUploaded(first, bytes: 4)
+        diagnostics.metalPrimitiveEffectsFrameSubmitted(
+            first, arrival: true, completion: false, twinkle: false, clear: false)
+        diagnostics.metalPrimitiveEffectsHostDestroyed(first)
+        diagnostics.metalPrimitiveEffectsFrameSkipped(first)
+        diagnostics.metalPrimitiveEffectsFailure(first)
+        diagnostics.metalPrimitiveEffectsFallback()
+        assertCounter("invalid_events", in: diagnostics.snapshot(), equals: 7)
+        let finished = try XCTUnwrap(
+            diagnostics.snapshot()["metal_primitive_effects"] as? [String: UInt64])
+        XCTAssertEqual(finished["descriptor_uploads"], 1)
+        XCTAssertEqual(finished["submissions"], 0)
+        XCTAssertEqual(finished["failures"], 1)
+        XCTAssertEqual(finished["fallbacks"], 1)
+    }
+
+    func testNewMechanismCountersAreCandidateScopedAndReset() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        let initial = diagnostics.snapshot() as NSDictionary
+        diagnostics.batchedTelemetryStateEnqueued(count: 10)
+        diagnostics.batchedTelemetrySnapshotMaterialized(count: 2)
+        diagnostics.batchedTelemetryBatchApplied(eventCount: 2)
+        diagnostics.batchedTelemetryProjectionRefreshed()
+        diagnostics.recordAtomicChartScaleResolution(changed: true)
+        diagnostics.recordAtomicChartScaleCacheHit()
+        XCTAssertEqual(diagnostics.snapshot() as NSDictionary, initial)
+        for mode in PerformanceGraphicsDiagnostics.Mode.allCases {
+            try diagnostics.enable(mode: mode)
+            let host = diagnostics.metalPrimitiveEffectsHostCreated()
+            XCTAssertEqual(host != nil, mode.usesMetalPrimitiveEffects)
+            diagnostics.metalPrimitiveEffectsDescriptorsUploaded(host, bytes: 256)
+            diagnostics.metalPrimitiveEffectsFrameSubmitted(
+                host, arrival: true, completion: true, twinkle: true, clear: false)
+            diagnostics.metalPrimitiveEffectsFrameSkipped(host)
+            diagnostics.metalPrimitiveEffectsFailure(host)
+            diagnostics.metalPrimitiveEffectsFallback()
+            diagnostics.metalPrimitiveEffectsHostDestroyed(host)
+            diagnostics.batchedTelemetryStateEnqueued(count: 10)
+            diagnostics.batchedTelemetrySnapshotMaterialized(count: 2)
+            diagnostics.batchedTelemetryBatchApplied(eventCount: 2)
+            diagnostics.batchedTelemetryProjectionRefreshed()
+            diagnostics.recordAtomicChartScaleResolution(changed: true)
+            diagnostics.recordAtomicChartScaleResolution(changed: false)
+            diagnostics.recordAtomicChartScaleCacheHit()
+            let snapshot = diagnostics.snapshot()
+            XCTAssertEqual(
+                snapshot["metal_primitive_effects_enabled"] as? Bool, mode.usesMetalPrimitiveEffects
+            )
+            XCTAssertEqual(
+                snapshot["batched_telemetry_delivery_enabled"] as? Bool,
+                mode.usesBatchedTelemetryDelivery)
+            XCTAssertEqual(
+                snapshot["atomic_chart_scale_enabled"] as? Bool, mode.usesAtomicChartScale)
+            let effects = try XCTUnwrap(snapshot["metal_primitive_effects"] as? [String: UInt64])
+            XCTAssertEqual(effects["descriptor_uploads"], mode.usesMetalPrimitiveEffects ? 1 : 0)
+            XCTAssertEqual(effects["submissions"], mode.usesMetalPrimitiveEffects ? 1 : 0)
+            let telemetry = try XCTUnwrap(snapshot["batched_telemetry"] as? [String: UInt64])
+            XCTAssertEqual(
+                telemetry["compact_states_enqueued"], mode.usesBatchedTelemetryDelivery ? 10 : 0)
+            XCTAssertEqual(
+                telemetry["snapshots_materialized"], mode.usesBatchedTelemetryDelivery ? 2 : 0)
+            XCTAssertEqual(telemetry["batches_applied"], mode.usesBatchedTelemetryDelivery ? 1 : 0)
+            XCTAssertEqual(telemetry["events_applied"], mode.usesBatchedTelemetryDelivery ? 2 : 0)
+            XCTAssertEqual(
+                telemetry["projection_refreshes"], mode.usesBatchedTelemetryDelivery ? 1 : 0)
+            let scale = try XCTUnwrap(snapshot["atomic_chart_scale"] as? [String: UInt64])
+            XCTAssertEqual(scale["resolutions"], mode.usesAtomicChartScale ? 2 : 0)
+            XCTAssertEqual(scale["scale_changes"], mode.usesAtomicChartScale ? 1 : 0)
+            XCTAssertEqual(scale["cache_hits"], mode.usesAtomicChartScale ? 1 : 0)
+            assertCounter("invalid_events", in: snapshot, equals: 0)
+        }
+        try diagnostics.disable()
+        XCTAssertEqual(diagnostics.snapshot() as NSDictionary, initial)
+    }
+
+    func testBatchedTelemetryRejectsNegativeAndEmptyInputCounts() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        try diagnostics.enable(mode: .runtimeTelemetryBatch)
+        diagnostics.batchedTelemetryStateEnqueued(count: -1)
+        diagnostics.batchedTelemetrySnapshotMaterialized(count: -1)
+        diagnostics.batchedTelemetryBatchApplied(eventCount: 0)
+        diagnostics.batchedTelemetryBatchApplied(eventCount: -1)
+        let counts = try XCTUnwrap(diagnostics.snapshot()["batched_telemetry"] as? [String: UInt64])
+        XCTAssertTrue(counts.values.allSatisfy { $0 == 0 })
+        assertCounter("invalid_events", in: diagnostics.snapshot(), equals: 4)
+    }
+
     func testModesRoundTripAndRejectUnknownValues() throws {
         typealias Mode = PerformanceGraphicsDiagnostics.Mode
         XCTAssertEqual(Mode.normal.rawValue, "normal")
@@ -20,7 +162,12 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.runtimeHeldStaticChart.rawValue, "runtime-held-static-chart")
         XCTAssertEqual(Mode.runtimeMetalFullChart.rawValue, "runtime-metal-full-chart")
         XCTAssertEqual(Mode.runtimeMetalCachedChart.rawValue, "runtime-metal-cached-chart")
-        XCTAssertEqual(Mode.allCases.count, 37)
+        XCTAssertEqual(
+            Mode.runtimeMetalPrimitiveEffects.rawValue, "runtime-metal-primitive-effects")
+        XCTAssertEqual(Mode.runtimeTelemetryBatch.rawValue, "runtime-telemetry-batch")
+        XCTAssertEqual(Mode.runtimeAtomicChartScale.rawValue, "runtime-atomic-chart-scale")
+        XCTAssertEqual(Mode.runtimeEfficientEffects.rawValue, "runtime-efficient-effects")
+        XCTAssertEqual(Mode.allCases.count, 41)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -586,7 +733,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     mode == .runtimeMetalArrivalBursts)
                 XCTAssertEqual(
                     snapshot["arrival_backend"] as? String,
-                    mode == .runtimeMetalArrivalBursts ? "metal-shader" : "canvas")
+                    mode.usesMetalPrimitiveEffects
+                        ? "metal-primitive-effects"
+                        : (mode == .runtimeMetalArrivalBursts ? "metal-shader" : "canvas"))
                 XCTAssertEqual(
                     snapshot["chart_publication_interval_seconds"] as? Double,
                     mode == .runtimeDeferredToolGeometry2Hz ? 0.5 : 1)
@@ -670,7 +819,8 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
             .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
             .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts, .runtimeMetalFullChart,
-            .runtimeMetalCachedChart, .runtimeHeldStaticChart,
+            .runtimeMetalCachedChart, .runtimeMetalPrimitiveEffects, .runtimeTelemetryBatch,
+            .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart,
         ]
         let runtime: [Mode] =
             [
@@ -716,7 +866,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
                     .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
-                    .runtimeMetalFullChart, .runtimeMetalCachedChart, .runtimeHeldStaticChart,
+                    .runtimeMetalFullChart, .runtimeMetalCachedChart, .runtimeMetalPrimitiveEffects,
+                    .runtimeTelemetryBatch,
+                    .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
@@ -726,7 +878,8 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
                     .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
-                    .runtimeHeldStaticChart,
+                    .runtimeMetalPrimitiveEffects, .runtimeTelemetryBatch,
+                    .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesOrderedChartPublication,
@@ -736,7 +889,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
                     .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
-                    .runtimeMetalFullChart, .runtimeMetalCachedChart, .runtimeHeldStaticChart,
+                    .runtimeMetalFullChart, .runtimeMetalCachedChart, .runtimeMetalPrimitiveEffects,
+                    .runtimeTelemetryBatch,
+                    .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart,
                 ].contains(mode))
             XCTAssertEqual(mode.usesDirectToolPlot, mode == .runtimeDirectToolPlot)
             XCTAssertEqual(mode.usesUngroupedNativeCanvas, mode == .runtimeUngroupedCanvas)
@@ -751,6 +906,15 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 mode.usesMetalFullChart,
                 [.runtimeMetalFullChart, .runtimeMetalCachedChart].contains(mode))
             XCTAssertEqual(mode.cachesMetalStaticChart, mode == .runtimeMetalCachedChart)
+            XCTAssertEqual(
+                mode.usesMetalPrimitiveEffects,
+                [.runtimeMetalPrimitiveEffects, .runtimeEfficientEffects].contains(mode))
+            XCTAssertEqual(
+                mode.usesBatchedTelemetryDelivery,
+                [.runtimeTelemetryBatch, .runtimeEfficientEffects].contains(mode))
+            XCTAssertEqual(
+                mode.usesAtomicChartScale,
+                [.runtimeAtomicChartScale, .runtimeEfficientEffects].contains(mode))
             XCTAssertEqual(
                 mode.chartPublicationIntervalSeconds,
                 mode == .runtimeDeferredToolGeometry2Hz ? 0.5 : 1)

@@ -37,6 +37,10 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeMetalArrivalBursts = "runtime-metal-arrival-bursts"
         case runtimeMetalFullChart = "runtime-metal-full-chart"
         case runtimeMetalCachedChart = "runtime-metal-cached-chart"
+        case runtimeMetalPrimitiveEffects = "runtime-metal-primitive-effects"
+        case runtimeTelemetryBatch = "runtime-telemetry-batch"
+        case runtimeAtomicChartScale = "runtime-atomic-chart-scale"
+        case runtimeEfficientEffects = "runtime-efficient-effects"
         case runtimeHeldStaticChart = "runtime-held-static-chart"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
@@ -86,7 +90,8 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                 .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
                 .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts, .runtimeMetalFullChart,
-                .runtimeMetalCachedChart, .runtimeHeldStaticChart:
+                .runtimeMetalCachedChart, .runtimeMetalPrimitiveEffects, .runtimeTelemetryBatch,
+                .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart:
                 true
             default:
                 false
@@ -100,6 +105,15 @@ public final class PerformanceGraphicsDiagnostics {
             self == .runtimeMetalFullChart || self == .runtimeMetalCachedChart
         }
         var cachesMetalStaticChart: Bool { self == .runtimeMetalCachedChart }
+        var usesMetalPrimitiveEffects: Bool {
+            self == .runtimeMetalPrimitiveEffects || self == .runtimeEfficientEffects
+        }
+        var usesBatchedTelemetryDelivery: Bool {
+            self == .runtimeTelemetryBatch || self == .runtimeEfficientEffects
+        }
+        var usesAtomicChartScale: Bool {
+            self == .runtimeAtomicChartScale || self == .runtimeEfficientEffects
+        }
         /// Causal diagnostic only: the displayed static chart intentionally stops updating.
         var usesHeldStaticChart: Bool { self == .runtimeHeldStaticChart }
 
@@ -120,6 +134,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
                 || usesMetalFullChart
+                || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
                 || usesHeldStaticChart
         }
 
@@ -149,6 +164,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
                 || usesMetalFullChart
+                || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
                 || usesHeldStaticChart
         }
 
@@ -161,6 +177,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeCompactToolPaths
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
+                || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
                 || usesHeldStaticChart
         }
 
@@ -276,6 +293,60 @@ public final class PerformanceGraphicsDiagnostics {
 
     private var metalFullChartHosts: [UInt64: MetalFullChartHost] = [:]
     private var metalFullChartCounters = MetalFullChartCounters()
+    private var metalPrimitiveEffectsHosts: [UInt64: UInt64] = [:]
+    private var metalPrimitiveEffectsCounters = MetalPrimitiveEffectsCounters()
+    private var batchedTelemetryCounters = BatchedTelemetryCounters()
+    private var atomicChartScaleResolutions: UInt64 = 0
+    private var atomicChartScaleChanges: UInt64 = 0
+    private var atomicChartScaleCacheHits: UInt64 = 0
+
+    private struct MetalPrimitiveEffectsCounters {
+        var hostsCreated: UInt64 = 0
+        var hostsDestroyed: UInt64 = 0
+        var liveHosts: UInt64 = 0
+        var peakHosts: UInt64 = 0
+        var descriptorUploads: UInt64 = 0
+        var submissions: UInt64 = 0
+        var clears: UInt64 = 0
+        var arrivalFrames: UInt64 = 0
+        var completionFrames: UInt64 = 0
+        var twinkleFrames: UInt64 = 0
+        var framesSkipped: UInt64 = 0
+        var failures: UInt64 = 0
+        var fallbacks: UInt64 = 0
+        var currentBufferBytes: UInt64 = 0
+        var peakBufferBytes: UInt64 = 0
+
+        var snapshot: [String: UInt64] {
+            [
+                "hosts_created": hostsCreated, "hosts_destroyed": hostsDestroyed,
+                "live_hosts": liveHosts, "peak_hosts": peakHosts,
+                "descriptor_uploads": descriptorUploads, "submissions": submissions,
+                "clears": clears,
+                "arrival_frames": arrivalFrames, "completion_frames": completionFrames,
+                "twinkle_frames": twinkleFrames, "frames_skipped": framesSkipped,
+                "failures": failures, "fallbacks": fallbacks,
+                "current_buffer_bytes": currentBufferBytes, "peak_buffer_bytes": peakBufferBytes,
+            ]
+        }
+    }
+
+    private struct BatchedTelemetryCounters {
+        var compactStatesEnqueued: UInt64 = 0
+        var snapshotsMaterialized: UInt64 = 0
+        var batchesApplied: UInt64 = 0
+        var eventsApplied: UInt64 = 0
+        var projectionRefreshes: UInt64 = 0
+
+        var snapshot: [String: UInt64] {
+            [
+                "compact_states_enqueued": compactStatesEnqueued,
+                "snapshots_materialized": snapshotsMaterialized,
+                "batches_applied": batchesApplied, "events_applied": eventsApplied,
+                "projection_refreshes": projectionRefreshes,
+            ]
+        }
+    }
 
     private struct MetalFullChartCounters {
         var hostsCreated: UInt64 = 0
@@ -369,18 +440,18 @@ public final class PerformanceGraphicsDiagnostics {
     /// Must be selected before native views are created. Keeping live tokens
     /// across a mode change would make lifecycle and backing comparisons false.
     public func enable(mode: Mode = .normal) throws {
-        guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty else {
-            throw ConfigurationError.liveCanvases
-        }
+        guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty,
+            metalPrimitiveEffectsHosts.isEmpty
+        else { throw ConfigurationError.liveCanvases }
         reset()
         self.mode = mode
         isEnabled = true
     }
 
     public func disable() throws {
-        guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty else {
-            throw ConfigurationError.liveCanvases
-        }
+        guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty,
+            metalPrimitiveEffectsHosts.isEmpty
+        else { throw ConfigurationError.liveCanvases }
         reset()
         mode = .normal
         isEnabled = false
@@ -399,6 +470,11 @@ public final class PerformanceGraphicsDiagnostics {
         scalarPresentationPublications = 0
         twinkleCounters = TwinkleCounters()
         metalFullChartCounters = MetalFullChartCounters()
+        metalPrimitiveEffectsCounters = MetalPrimitiveEffectsCounters()
+        batchedTelemetryCounters = BatchedTelemetryCounters()
+        atomicChartScaleResolutions = 0
+        atomicChartScaleChanges = 0
+        atomicChartScaleCacheHits = 0
     }
 
     public func canvasCreated(role: Role) -> UInt64? {
@@ -874,6 +950,143 @@ public final class PerformanceGraphicsDiagnostics {
         metalFullChartCounters.failures += 1
     }
 
+    /// The effects-only surface owns no static chart pixels. Counts describe
+    /// submitted work and retained descriptor buffers, never GPU execution time.
+    func metalPrimitiveEffectsHostCreated() -> UInt64? {
+        guard isEnabled, mode.usesMetalPrimitiveEffects else { return nil }
+        nextID += 1
+        metalPrimitiveEffectsHosts[nextID] = 0
+        metalPrimitiveEffectsCounters.hostsCreated += 1
+        metalPrimitiveEffectsCounters.liveHosts += 1
+        metalPrimitiveEffectsCounters.peakHosts = max(
+            metalPrimitiveEffectsCounters.peakHosts, metalPrimitiveEffectsCounters.liveHosts)
+        return nextID
+    }
+
+    func metalPrimitiveEffectsHostDestroyed(_ id: UInt64?) {
+        guard let id, isEnabled, mode.usesMetalPrimitiveEffects else { return }
+        guard let bytes = metalPrimitiveEffectsHosts.removeValue(forKey: id) else {
+            invalidEvents += 1
+            return
+        }
+        metalPrimitiveEffectsCounters.hostsDestroyed += 1
+        metalPrimitiveEffectsCounters.liveHosts -= 1
+        metalPrimitiveEffectsCounters.currentBufferBytes -= bytes
+    }
+
+    @discardableResult
+    func metalPrimitiveEffectsBuffersRetained(_ id: UInt64?, bytes: UInt64) -> Bool {
+        guard let id, isEnabled, mode.usesMetalPrimitiveEffects else { return false }
+        guard let previous = metalPrimitiveEffectsHosts[id] else {
+            invalidEvents += 1
+            return false
+        }
+        let next = (metalPrimitiveEffectsCounters.currentBufferBytes - previous)
+            .addingReportingOverflow(bytes)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return false
+        }
+        metalPrimitiveEffectsHosts[id] = bytes
+        metalPrimitiveEffectsCounters.currentBufferBytes = next.partialValue
+        metalPrimitiveEffectsCounters.peakBufferBytes = max(
+            metalPrimitiveEffectsCounters.peakBufferBytes, next.partialValue)
+        return true
+    }
+
+    func metalPrimitiveEffectsDescriptorsUploaded(_ id: UInt64?, bytes: UInt64) {
+        guard metalPrimitiveEffectsBuffersRetained(id, bytes: bytes) else { return }
+        metalPrimitiveEffectsCounters.descriptorUploads += 1
+    }
+
+    func metalPrimitiveEffectsFrameSubmitted(
+        _ id: UInt64?, arrival: Bool, completion: Bool, twinkle: Bool, clear: Bool
+    ) {
+        guard let id, isEnabled, mode.usesMetalPrimitiveEffects else { return }
+        guard metalPrimitiveEffectsHosts[id] != nil else {
+            invalidEvents += 1
+            return
+        }
+        guard !clear || (!arrival && !completion && !twinkle) else {
+            invalidEvents += 1
+            return
+        }
+        metalPrimitiveEffectsCounters.submissions += 1
+        if clear { metalPrimitiveEffectsCounters.clears += 1 }
+        if arrival { metalPrimitiveEffectsCounters.arrivalFrames += 1 }
+        if completion { metalPrimitiveEffectsCounters.completionFrames += 1 }
+        if twinkle { metalPrimitiveEffectsCounters.twinkleFrames += 1 }
+    }
+
+    func metalPrimitiveEffectsFrameSkipped(_ id: UInt64?) {
+        guard let id, isEnabled, mode.usesMetalPrimitiveEffects else { return }
+        guard metalPrimitiveEffectsHosts[id] != nil else {
+            invalidEvents += 1
+            return
+        }
+        metalPrimitiveEffectsCounters.framesSkipped += 1
+    }
+
+    func metalPrimitiveEffectsFailure(_ id: UInt64? = nil) {
+        guard isEnabled, mode.usesMetalPrimitiveEffects else { return }
+        if let id, metalPrimitiveEffectsHosts[id] == nil { invalidEvents += 1 }
+        metalPrimitiveEffectsCounters.failures += 1
+    }
+
+    func metalPrimitiveEffectsFallback() {
+        guard isEnabled, mode.usesMetalPrimitiveEffects else { return }
+        metalPrimitiveEffectsCounters.fallbacks += 1
+    }
+
+    func batchedTelemetryStateEnqueued(count: Int = 1) {
+        addBatchedTelemetryCount(count, to: \.compactStatesEnqueued)
+    }
+
+    func batchedTelemetrySnapshotMaterialized(count: Int = 1) {
+        addBatchedTelemetryCount(count, to: \.snapshotsMaterialized)
+    }
+
+    func batchedTelemetryBatchApplied(eventCount: Int) {
+        guard isEnabled, mode.usesBatchedTelemetryDelivery else { return }
+        guard eventCount > 0 else {
+            invalidEvents += 1
+            return
+        }
+        addBatchedTelemetryCount(1, to: \.batchesApplied)
+        addBatchedTelemetryCount(eventCount, to: \.eventsApplied)
+    }
+
+    func batchedTelemetryProjectionRefreshed() {
+        addBatchedTelemetryCount(1, to: \.projectionRefreshes)
+    }
+
+    private func addBatchedTelemetryCount(
+        _ count: Int, to keyPath: WritableKeyPath<BatchedTelemetryCounters, UInt64>
+    ) {
+        guard isEnabled, mode.usesBatchedTelemetryDelivery else { return }
+        guard let count = UInt64(exactly: count) else {
+            invalidEvents += 1
+            return
+        }
+        let next = batchedTelemetryCounters[keyPath: keyPath].addingReportingOverflow(count)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return
+        }
+        batchedTelemetryCounters[keyPath: keyPath] = next.partialValue
+    }
+
+    func recordAtomicChartScaleResolution(changed: Bool) {
+        guard isEnabled, mode.usesAtomicChartScale else { return }
+        atomicChartScaleResolutions += 1
+        if changed { atomicChartScaleChanges += 1 }
+    }
+
+    func recordAtomicChartScaleCacheHit() {
+        guard isEnabled, mode.usesAtomicChartScale else { return }
+        atomicChartScaleCacheHits += 1
+    }
+
     public func snapshot() -> [String: Any] {
         var result: [String: Any] = [
             "enabled": isEnabled, "mode": mode.rawValue,
@@ -881,6 +1094,16 @@ public final class PerformanceGraphicsDiagnostics {
             "metal_full_chart_enabled": isEnabled && mode.usesMetalFullChart,
             "metal_static_cache_enabled": isEnabled && mode.cachesMetalStaticChart,
             "metal_full_chart": metalFullChartCounters.snapshot,
+            "metal_primitive_effects_enabled": isEnabled && mode.usesMetalPrimitiveEffects,
+            "metal_primitive_effects": metalPrimitiveEffectsCounters.snapshot,
+            "batched_telemetry_delivery_enabled": isEnabled && mode.usesBatchedTelemetryDelivery,
+            "batched_telemetry": batchedTelemetryCounters.snapshot,
+            "atomic_chart_scale_enabled": isEnabled && mode.usesAtomicChartScale,
+            "atomic_chart_scale": [
+                "resolutions": atomicChartScaleResolutions,
+                "scale_changes": atomicChartScaleChanges,
+                "cache_hits": atomicChartScaleCacheHits,
+            ],
             "invalid_events": invalidEvents,
             "cpu_glow_fallbacks": cpuGlowFallbacks,
             "gradient_substitutions": gradientSubstitutions,
@@ -937,7 +1160,9 @@ public final class PerformanceGraphicsDiagnostics {
             result["arrival_backend"] =
                 mode.usesMetalFullChart
                 ? "metal-full-chart-shader"
-                : (mode.usesMetalArrivalBursts ? "metal-shader" : "canvas")
+                : (mode.usesMetalPrimitiveEffects
+                    ? "metal-primitive-effects"
+                    : (mode.usesMetalArrivalBursts ? "metal-shader" : "canvas"))
         }
         if isEnabled, mode.usesRetainedTwinkles {
             result["retained_twinkle_backend"] = "core-animation-shape-layers"
