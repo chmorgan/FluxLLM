@@ -37,6 +37,74 @@ TOOL_TRACE_COUNTERS = ("unique_tool_trace_builds", "reused_tool_trace_builds")
 BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal", memory.ORDERED_PUBLICATION_MODE)
 
 
+def cpu_acceptance_eligible(mode, *, profile=False):
+    return not profile and mode != memory.HELD_STATIC_CHART_MODE
+
+
+def held_static_chart_work(before, after, mode):
+    """Prove a drawing-only ablation while full-rate preparation still executes."""
+    if mode != memory.HELD_STATIC_CHART_MODE:
+        return None
+    first = memory.held_static_chart_counts(before.get("graphics_diagnostics", {}), mode)["static_chart"]
+    last = memory.held_static_chart_counts(after.get("graphics_diagnostics", {}), mode)["static_chart"]
+    for snapshot in (before, after):
+        require(memory.chart_publication_interval(snapshot.get("graphics_diagnostics", {}), mode) == 1.0,
+                "Held static drawing must preserve one-second chart publication")
+        require(snapshot.get("dashboard_visible") is True and snapshot.get("popover_visible") is True,
+                "Held static drawing requires both visible native windows")
+    require(all(last[field] >= first[field] for field in memory.HELD_STATIC_CHART_COUNTERS),
+            "Held static chart drawing counter moved backwards")
+    delta = {field: last[field] - first[field] for field in memory.HELD_STATIC_CHART_COUNTERS}
+    before_role, after_role = (snapshot["graphics_diagnostics"]["roles"]["static_chart"] for snapshot in (before, after))
+    require(first["drawing_updates_applied"] > 0 and memory.unsigned(before_role.get("draws"), "held.initial_draws") > 0,
+            "Held static chart lacks an applied and drawn frame before traffic")
+    for field in ("draws", "created", "destroyed"):
+        require(memory.unsigned(after_role.get(field), "held.after." + field)
+                == memory.unsigned(before_role.get(field), "held.before." + field),
+                "Held static chart redrew or changed its host during the workload")
+    require(delta["drawing_updates_applied"] == delta["drawing_hold_resets"] == 0,
+            "Held static chart applied an update or reset during the workload")
+    require(delta["drawing_update_attempts"] == delta["drawing_updates_held"] > 0,
+            "Held static chart did not hold positive drawing update attempts")
+    times = [memory.number(snapshot.get("runner_collector_sample_monotonic_seconds"), "held.boundary")
+             for snapshot in (before, after)]
+    require(times[1] > times[0], "Held static chart lacks ordered authenticated runtime boundaries")
+    preparation_delta = (memory.unsigned(after.get("chart_preparations"), "held.after.chart_preparations")
+                         - memory.unsigned(before.get("chart_preparations"), "held.before.chart_preparations"))
+    # Two endpoint ticks of allowance cover publication scheduling and the
+    # asynchronously acknowledged control boundaries, without permitting a
+    # stopped or substantially reduced chart-preparation cadence.
+    minimum = max(1, math.floor(times[1] - times[0]) - 2)
+    require(preparation_delta >= minimum,
+            "Held static chart did not preserve one-second chart preparation work")
+    return {"available": True, "acceptance_eligible": False, "drawing_only_control": True,
+            "initial_static_draws": before_role["draws"], "static_draws_delta": 0, "deltas": delta,
+            "chart_preparations_delta": preparation_delta, "minimum_chart_preparations": minimum,
+            "chart_publication_interval_seconds": 1.0}
+
+
+def validate_held_static_chart_checkpoints(report, mode):
+    if mode != memory.HELD_STATIC_CHART_MODE:
+        return None
+    points = report["runtime"]["checkpoints"]
+    require(len(points) >= 2, "Held static chart lacks runtime checkpoints")
+    snapshots = [point["snapshot"] for point in points]
+    initial = snapshots[0]
+    result = held_static_chart_work(initial, snapshots[-1], mode)
+    initial_role = initial["graphics_diagnostics"]["roles"]["static_chart"]
+    previous = memory.held_static_chart_counts(initial["graphics_diagnostics"], mode)["static_chart"]
+    for snapshot in snapshots[1:]:
+        role = snapshot["graphics_diagnostics"]["roles"]["static_chart"]
+        counters = memory.held_static_chart_counts(snapshot["graphics_diagnostics"], mode)["static_chart"]
+        require(all(counters[field] >= previous[field] for field in memory.HELD_STATIC_CHART_COUNTERS),
+                "Held static drawing counters moved backwards at an interior checkpoint")
+        require(all(role.get(field) == initial_role.get(field) for field in
+                    ("draws", "created", "destroyed", "drawing_updates_applied", "drawing_hold_resets")),
+                "Held static chart changed drawing or host state at an interior checkpoint")
+        previous = counters
+    return result
+
+
 class RuntimeDeadline(memory.MemoryDeadline):
     def __init__(self, seconds=MAX_SECONDS, cleanup_reserve=15, clock=time.monotonic):
         self.clock, self.end, self.cleanup_reserve = clock, clock() + seconds, cleanup_reserve
@@ -263,7 +331,9 @@ def validate_runtime_work(before, after, mode, *, required=True):
         last = after["graphics_diagnostics"]["roles"][role]["draws"]
         require(last >= first, f"Runtime {role} drawing counter moved backwards")
         delta[role + "_draws"] = last - first
-    require(delta["static_chart_draws"] > 0, "Runtime static charts did not redraw")
+    held_work = held_static_chart_work(before, after, mode)
+    if held_work is None:
+        require(delta["static_chart_draws"] > 0, "Runtime static charts did not redraw")
     if flags.get("canvas_frame_clock", False):
         minimum_draws = max(1, math.floor(.8 * delta["rail_frame_clock_ticks"]) - 2)
         require(delta["rail_decorations_draws"] >= minimum_draws,
@@ -271,6 +341,7 @@ def validate_runtime_work(before, after, mode, *, required=True):
     if not flags["lifecycle_effects_enabled"]:
         require(delta["rail_decorations_draws"] == 0, "No-lifecycle control still drew lifecycle decorations")
     return {"available": True, "features": flags, "deltas": delta,
+            **({"held_static_chart_work": held_work} if held_work is not None else {}),
             **({"arrival_backend": metal_last["arrival_backend"]} if metal_last is not None else {}),
             **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {})}
 
@@ -514,7 +585,8 @@ def phase_cpu(report, windows):
         metrics = app.cpu_interval_metrics(samples, window["start_monotonic_seconds"] + offset,
                                            window["end_monotonic_seconds"] + offset)
         result[name] = {**metrics, "average_cpu_percent": 100 * metrics["cpu_seconds"] / metrics["elapsed_seconds"],
-                        "acceptance_eligible": not report["runtime"].get("profiled", False)}
+                        "acceptance_eligible": cpu_acceptance_eligible(report.get("graphics_mode"),
+                            profile=report["runtime"].get("profiled", False))}
     return result
 
 
@@ -753,12 +825,22 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
             "scope": "whole_contiguous_runtime", "start_checkpoint": points[0]["label"],
             "end_checkpoint": points[-1]["label"], **report["phase_windows"]["whole_contiguous_runtime"]}
         report["canvas_clock_work"] = validate_canvas_clock_work(report, mode)
+        held_work = validate_held_static_chart_checkpoints(report, mode)
+        if held_work is not None:
+            report["held_static_chart_work"] = held_work
         report["phase_cpu"] = phase_cpu(report, report["phase_windows"])
         report["runtime_cpu_work_counters"] = runtime_work_counter_diagnostic(report, profile=profile)
         report["phase_cpu_comparison_available"] = not profile
-        report["runtime_cpu_target"] = {"evaluated": not profile, "limit_percent": 5.0,
-            "within_limit": report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5 if not profile else None,
+        eligible = cpu_acceptance_eligible(mode, profile=profile)
+        report["cpu_acceptance_eligible"] = eligible
+        report["runtime_cpu_target"] = {"evaluated": eligible, "acceptance_eligible": eligible, "limit_percent": 5.0,
+            "within_limit": report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5 if eligible else None,
             "scope": "Contiguous visible traffic and completion only; separate from full resource gate"}
+        if mode == memory.HELD_STATIC_CHART_MODE:
+            report["runtime_cpu_target"]["reason"] = "Held static chart drawing is a diagnostic ablation, not production rendering"
+            report.setdefault("workload_cpu", {}).update(acceptance_eligible=False, gate_evaluated=False, within_limit=None)
+            for metrics in report["phase_cpu"].values():
+                metrics["acceptance_eligible"] = False
         if profile:
             require(report["runtime"]["profiler_status"] == "captured", "Time Profiler capture is incomplete")
         report["status"] = "diagnostic_captured"

@@ -31,6 +31,8 @@ DIRECT_TOOL_PLOT_COUNTERS = ("direct_tool_plot_builds", "legacy_tool_plot_builds
 UNGROUPED_CANVAS_MODE = "runtime-ungrouped-canvas"
 NATIVE_CANVAS_GROUP_COUNTERS = ("ungrouped_native_canvas_draws", "grouped_native_canvas_draws")
 NO_ARRIVAL_MODE = "runtime-no-arrival-effects"
+HELD_STATIC_CHART_MODE = "runtime-held-static-chart"
+HELD_STATIC_CHART_COUNTERS = ("drawing_update_attempts", "drawing_updates_applied", "drawing_updates_held", "drawing_hold_resets")
 METAL_ARRIVAL_MODE = "runtime-metal-arrival-bursts"
 METAL_ARRIVAL_COUNTERS = ("metal_arrival_frames", "metal_arrival_submissions", "metal_arrival_failures")
 COMPACT_TOOL_PATHS_MODE = "runtime-compact-tool-paths"
@@ -38,7 +40,7 @@ DEFERRED_TOOL_GEOMETRY_MODE = "runtime-deferred-tool-geometry"
 DEFERRED_TOOL_GEOMETRY_2HZ_MODE = "runtime-deferred-tool-geometry-2hz"
 DEFERRED_TOOL_GEOMETRY_MODES = (DEFERRED_TOOL_GEOMETRY_MODE, DEFERRED_TOOL_GEOMETRY_2HZ_MODE)
 TOOL_PATH_POINT_COUNTERS = ("tool_path_input_points", "tool_path_output_points")
-ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE) + DEFERRED_TOOL_GEOMETRY_MODES
+ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, HELD_STATIC_CHART_MODE) + DEFERRED_TOOL_GEOMETRY_MODES
 CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + ORDERED_PUBLICATION_MODES
 NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized") + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
@@ -367,7 +369,7 @@ def validate_retained_twinkles(value, mode, *, completed_visible_workload=False,
 
 
 def runtime_feature_contract(value, mode):
-    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled")):
+    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing")):
         return None
     extras = {}
     promoted_normal = mode == "normal" and value.get("unpromised_stream_body_writes") is True
@@ -417,6 +419,11 @@ def runtime_feature_contract(value, mode):
                 and value["metal_arrival_bursts_enabled"] is (mode == METAL_ARRIVAL_MODE),
                 "Graphics metal_arrival_bursts_enabled does not match the requested runtime control")
         extras["metal_arrival_bursts_enabled"] = value["metal_arrival_bursts_enabled"]
+    if mode == HELD_STATIC_CHART_MODE or "holds_static_chart_drawing" in value:
+        require(type(value.get("holds_static_chart_drawing")) is bool
+                and value["holds_static_chart_drawing"] is (mode == HELD_STATIC_CHART_MODE),
+                "Graphics holds_static_chart_drawing does not match the requested runtime control")
+        extras["holds_static_chart_drawing"] = value["holds_static_chart_drawing"]
     if mode == "normal":
         require(all(type(value.get(field)) is bool for field in RUNTIME_FLAGS), "Normal runtime feature metadata is incomplete")
         flags = {field: value[field] for field in RUNTIME_FLAGS}
@@ -451,7 +458,7 @@ def tool_path_point_counts(snapshot):
 
 def chart_publication_interval(value, mode):
     field = "chart_publication_interval_seconds"
-    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE):
+    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, HELD_STATIC_CHART_MODE):
         return None
     interval = value.get(field)
     expected = .5 if mode == DEFERRED_TOOL_GEOMETRY_2HZ_MODE else 1.0
@@ -460,6 +467,35 @@ def chart_publication_interval(value, mode):
     require(type(interval) in (int, float) and interval == expected,
             "Graphics chart_publication_interval_seconds does not match the requested cadence")
     return interval
+
+
+def held_static_chart_counts(value, mode):
+    """Optional on old products; complete and internally consistent once present."""
+    roles = value.get("roles", {})
+    require(isinstance(roles, dict), "Static chart drawing roles must be an object")
+    supplied = any(field in role for role in roles.values() if isinstance(role, dict)
+                   for field in HELD_STATIC_CHART_COUNTERS)
+    if not supplied and mode != HELD_STATIC_CHART_MODE:
+        return None
+    require(type(value.get("holds_static_chart_drawing")) is bool
+            and value["holds_static_chart_drawing"] is (mode == HELD_STATIC_CHART_MODE),
+            "Static chart drawing counters lack matching hold metadata")
+    require(isinstance(roles, dict) and set(roles) == {"static_chart", "cursor", "rail_bars", "rail_decorations"},
+            "Static chart drawing counters lack complete roles")
+    counters = {}
+    for name, role in roles.items():
+        require(isinstance(role, dict), f"Invalid static chart drawing role {name}")
+        counts = {field: role.get(field) for field in HELD_STATIC_CHART_COUNTERS}
+        for field, count in counts.items():
+            require(type(count) is int and 0 <= count <= 2**64 - 1,
+                    f"graphics.{name}.{field} must be a complete UInt64 drawing counter")
+        require(counts["drawing_update_attempts"] == counts["drawing_updates_applied"] + counts["drawing_updates_held"],
+                f"Static chart drawing update counters do not reconcile for {name}")
+        if mode != HELD_STATIC_CHART_MODE or name != "static_chart":
+            require(counts["drawing_updates_held"] == counts["drawing_hold_resets"] == 0,
+                    f"Unexpected held static drawing activity for {name}")
+        counters[name] = counts
+    return counters
 
 
 def metal_arrival_contract(snapshot, mode, *, completed_visible_workload=False):
@@ -510,6 +546,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     native_normal = mode == "normal" and "native_gpu_backend" in value
     contract = "native-gpu-optimized" if native_normal or mode in RUNTIME_MODES else mode
     runtime_features = runtime_feature_contract(value, mode)
+    held_static_chart_counts(value, mode)
     metal_arrival = metal_arrival_contract(snapshot, mode, completed_visible_workload=completed_visible_workload)
     if (mode in (COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "compact_tool_paths_enabled" in value
             or any(field in snapshot for field in TOOL_PATH_POINT_COUNTERS)):
@@ -807,6 +844,10 @@ class MemoryDiagnostic:
                        "errors": [], "checkpoints": [], "probes": [], "inspection_stages": [], "commands": [],
                        "driver_sha256": app.path_hash(Path(__file__)),
                        "caveat": "Native VM/heap inspection and graphics modes perturb runtime. These are attribution diagnostics, not CPU/GPU or regression passes. Pixel/bitmap requests are not measured GPU allocations."}
+        if graphics_mode == HELD_STATIC_CHART_MODE:
+            self.report.update(cpu_acceptance_eligible=False,
+                runtime_cpu_target={"evaluated": False, "within_limit": None, "acceptance_eligible": False,
+                    "reason": "Held static chart drawing is a diagnostic ablation, not production rendering"})
 
     def save(self):
         write_json(self.output / "in-progress.json", self.report)
@@ -1064,6 +1105,8 @@ class MemoryDiagnostic:
                     self.report["workload_cpu"] = workload_cpu_diagnostic(
                         self.collector.samples, self.collector.events, self.report.get("workload", {}),
                         self.identity, self.report["memory_validation"])
+                    if self.graphics_mode == HELD_STATIC_CHART_MODE:
+                        self.report["workload_cpu"].update(acceptance_eligible=False, within_limit=None)
                     cpu = self.report["workload_cpu"]
                     if cpu.get("available"):
                         self.report["workload_cpu_work_counters"] = app.cpu_work_counter_diagnostic(

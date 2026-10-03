@@ -143,6 +143,8 @@ def validate_quiet(first, last):
 
 def validate_replay(report, mode, timed, *, profile=False):
     perturbed = timed or profile
+    require(mode != memory.HELD_STATIC_CHART_MODE,
+            "Held static chart drawing is supported only by the runtime diagnostic, not arrival acceptance")
     require(not (timed and profile), "Time Profiler and scoped timing cannot run together")
     require(report["runtime"].get("profiled") is perturbed, "Arrival CPU eligibility differs from its measurement mode")
     require(not report["errors"] and len(report["episodes"]) == 3, "Arrival replay capture is incomplete")
@@ -259,7 +261,7 @@ def validate_replay(report, mode, timed, *, profile=False):
     report["phase_windows"] = windows
     report["phase_cpu"] = runtime.phase_cpu(report, windows)
     for metrics in report["phase_cpu"].values():
-        metrics["acceptance_eligible"] = not perturbed
+        metrics["acceptance_eligible"] = runtime.cpu_acceptance_eligible(mode, profile=perturbed)
     report["timing_setup"] = timing_delta(report["ready"]["snapshot"], first, timed)
     report["timing_lifetime"] = timing_delta(report["ready"]["snapshot"], report["checkpoints"][-1]["snapshot"], timed)
     if timed:
@@ -281,9 +283,10 @@ def validate_replay(report, mode, timed, *, profile=False):
         require(report["runtime"].get("profiler_status") == "captured", "Arrival Time Profiler capture is incomplete")
         require(report["runtime"].get("owned_identity") == report["owned_identity"],
                 "Arrival Time Profiler identity differs from the owned app")
-    report["cpu_acceptance_eligible"] = not perturbed
-    report["cpu_targets"] = {name: {"evaluated": not perturbed, "limit_percent": 5.0,
-        "within_limit": metrics["rolling_1s_percent"] <= 5.0 if not perturbed else None,
+    eligible = runtime.cpu_acceptance_eligible(mode, profile=perturbed)
+    report["cpu_acceptance_eligible"] = eligible
+    report["cpu_targets"] = {name: {"evaluated": eligible, "limit_percent": 5.0,
+        "within_limit": metrics["rolling_1s_percent"] <= 5.0 if eligible else None,
         "scope": "Arrival diagnostic interval only; not the full resource gate"}
         for name, metrics in report["phase_cpu"].items() if name.endswith("-arrival") or name == "whole_replay"}
     report["regression_passed"] = False
@@ -441,7 +444,7 @@ def capture_case(output, mode, timed, paths, provenance, identity, deadline, *, 
     report = diagnostic.report
     if report.get("workload_cpu", {}).get("available"):
         report["workload_cpu"].update(interval="Episode3 before-traffic through its traffic acknowledgment; five-second fixture plus start/drain overhead, excludes completion and inter-episode gaps",
-                                      acceptance_eligible=not (timed or profile), gate_evaluated=False)
+                                      acceptance_eligible=runtime.cpu_acceptance_eligible(mode, profile=timed or profile), gate_evaluated=False)
     if timed:
         report["timed_last_episode_cpu"] = report.get("workload_cpu")
         if report["timed_last_episode_cpu"] is not None:
@@ -639,7 +642,7 @@ def _run(args, deadline):
             row = {"label": label, "mode": mode, "timed": timed, "profiled": profile, "product_role": role,
                    "status": case["status"], "phase_cpu": case.get("phase_cpu"),
                    "report_path": str(path), "report_sha256": app.path_hash(path),
-                   "cpu_acceptance_eligible": case["status"] == "diagnostic_captured" and not (timed or profile),
+                   "cpu_acceptance_eligible": case["status"] == "diagnostic_captured" and runtime.cpu_acceptance_eligible(mode, profile=timed or profile),
                    "cpu_targets": case.get("cpu_targets"), "timing_setup": case.get("timing_setup"),
                    "episode_timings": [{"ordinal": episode["ordinal"], "timing": episode["timing"]}
                                        for episode in case["episodes"] if "timing" in episode]}

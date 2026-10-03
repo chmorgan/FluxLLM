@@ -35,6 +35,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeDeferredToolGeometry = "runtime-deferred-tool-geometry"
         case runtimeDeferredToolGeometry2Hz = "runtime-deferred-tool-geometry-2hz"
         case runtimeMetalArrivalBursts = "runtime-metal-arrival-bursts"
+        case runtimeHeldStaticChart = "runtime-held-static-chart"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
         case noGradients = "no-gradients"
@@ -77,7 +78,8 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
                 .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
                 .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
-                .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts:
+                .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
+                .runtimeHeldStaticChart:
                 true
             default:
                 false
@@ -87,6 +89,8 @@ public final class PerformanceGraphicsDiagnostics {
         var omitsLifecycleEffects: Bool { self == .runtimeNoLifecycle }
         var omitsArrivalEffects: Bool { self == .runtimeNoArrivalEffects }
         var usesMetalArrivalBursts: Bool { self == .runtimeMetalArrivalBursts }
+        /// Causal diagnostic only: the displayed static chart intentionally stops updating.
+        var usesHeldStaticChart: Bool { self == .runtimeHeldStaticChart }
 
         var usesSharedChartPreparation: Bool {
             self == .runtimeSharedPreparation || self == .runtimeNextOptimized
@@ -104,6 +108,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeCompactToolPaths
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
+                || usesHeldStaticChart
         }
 
         var usesDirectToolPlot: Bool { self == .runtimeDirectToolPlot }
@@ -131,6 +136,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeCompactToolPaths
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
+                || usesHeldStaticChart
         }
 
         var usesCanvasFrameClock: Bool {
@@ -142,6 +148,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || self == .runtimeCompactToolPaths
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
+                || usesHeldStaticChart
         }
 
         var usesIncrementalHistoryOrdering: Bool {
@@ -197,6 +204,10 @@ public final class PerformanceGraphicsDiagnostics {
         var peakLiveRenderers: UInt64 = 0
         var draws: UInt64 = 0
         var skippedDraws: UInt64 = 0
+        var drawingUpdateAttempts: UInt64 = 0
+        var drawingUpdatesApplied: UInt64 = 0
+        var drawingUpdatesHeld: UInt64 = 0
+        var drawingHoldResets: UInt64 = 0
         var pixelArea: UInt64 = 0
         var peakPixelArea: UInt64 = 0
         var bitmapBytes: UInt64 = 0
@@ -216,6 +227,10 @@ public final class PerformanceGraphicsDiagnostics {
                 "renderer_destructions": rendererDestructions,
                 "live_renderers": liveRenderers, "peak_live_renderers": peakLiveRenderers,
                 "draws": draws, "skipped_draws": skippedDraws,
+                "drawing_update_attempts": drawingUpdateAttempts,
+                "drawing_updates_applied": drawingUpdatesApplied,
+                "drawing_updates_held": drawingUpdatesHeld,
+                "drawing_hold_resets": drawingHoldResets,
                 "current_pixel_area": pixelArea, "peak_pixel_area": peakPixelArea,
                 "current_bitmap_bytes": bitmapBytes, "peak_bitmap_bytes": peakBitmapBytes,
                 "current_layer_image_bytes": layerImageBytes,
@@ -437,6 +452,38 @@ public final class PerformanceGraphicsDiagnostics {
         roles[canvas.role]!.updates += 1
     }
 
+    /// Counts requested publications separately from actual Canvas callbacks.
+    /// The held control must prove that data preparation continued while drawing stopped.
+    func staticChartDrawingRequested(applied: Bool, reset: Bool) {
+        guard isEnabled, mode.usesHeldStaticChart else { return }
+        var counters = roles[.staticChart, default: Counters()]
+        let attempts = counters.drawingUpdateAttempts.addingReportingOverflow(1)
+        let appliedCount = counters.drawingUpdatesApplied.addingReportingOverflow(applied ? 1 : 0)
+        let heldCount = counters.drawingUpdatesHeld.addingReportingOverflow(applied ? 0 : 1)
+        let resets = counters.drawingHoldResets.addingReportingOverflow(reset ? 1 : 0)
+        guard !attempts.overflow, !appliedCount.overflow, !heldCount.overflow, !resets.overflow
+        else {
+            invalidEvents += 1
+            return
+        }
+        counters.drawingUpdateAttempts = attempts.partialValue
+        counters.drawingUpdatesApplied = appliedCount.partialValue
+        counters.drawingUpdatesHeld = heldCount.partialValue
+        counters.drawingHoldResets = resets.partialValue
+        roles[.staticChart] = counters
+    }
+
+    func staticChartDrawingReset() {
+        guard isEnabled, mode.usesHeldStaticChart else { return }
+        let next = roles[.staticChart, default: Counters()].drawingHoldResets
+            .addingReportingOverflow(1)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return
+        }
+        roles[.staticChart, default: Counters()].drawingHoldResets = next.partialValue
+    }
+
     public func rendererCreated(_ id: UInt64?) {
         guard let (id, canvas) = registered(id) else { return }
         guard !canvas.hasRenderer else {
@@ -583,6 +630,7 @@ public final class PerformanceGraphicsDiagnostics {
     public func snapshot() -> [String: Any] {
         var result: [String: Any] = [
             "enabled": isEnabled, "mode": mode.rawValue,
+            "holds_static_chart_drawing": mode.usesHeldStaticChart,
             "invalid_events": invalidEvents,
             "cpu_glow_fallbacks": cpuGlowFallbacks,
             "gradient_substitutions": gradientSubstitutions,

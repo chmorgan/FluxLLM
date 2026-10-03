@@ -56,7 +56,13 @@ def workload_snapshots(mode):
     else:
         after["history_tool_order_builds"] += 1
         after["history_completed_order_builds"] += 1
-    after["graphics_diagnostics"]["roles"]["static_chart"]["draws"] += 2
+    if mode == memory.HELD_STATIC_CHART_MODE:
+        before.update(dashboard_visible=True, popover_visible=True, runner_collector_sample_monotonic_seconds=100)
+        after.update(dashboard_visible=True, popover_visible=True, runner_collector_sample_monotonic_seconds=103)
+        after["graphics_diagnostics"]["roles"]["static_chart"]["drawing_update_attempts"] += 2
+        after["graphics_diagnostics"]["roles"]["static_chart"]["drawing_updates_held"] += 2
+    else:
+        after["graphics_diagnostics"]["roles"]["static_chart"]["draws"] += 2
     if value["lifecycle_effects_enabled"]:
         after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 1
     if "ungrouped_native_canvas" in value:
@@ -157,8 +163,8 @@ class RuntimeWorkTests(unittest.TestCase):
                 result = runtime.validate_runtime_work(before, after, mode)
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
-                self.assertEqual(result["deltas"]["static_chart_draws"], 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled") if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["deltas"]["static_chart_draws"], 0 if mode == memory.HELD_STATIC_CHART_MODE else 2)
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing") if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):

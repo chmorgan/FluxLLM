@@ -14,6 +14,14 @@ from run_performance_checks import InvalidResult
 
 
 def graphics(mode="normal"):
+    if mode == memory.HELD_STATIC_CHART_MODE:
+        snapshot = graphics(memory.METAL_ARRIVAL_MODE)
+        value = snapshot["graphics_diagnostics"]
+        value.update(mode=mode, holds_static_chart_drawing=True,
+                     metal_arrival_bursts_enabled=False, arrival_backend="canvas")
+        for role in value["roles"].values():
+            role.update(dict.fromkeys(memory.HELD_STATIC_CHART_COUNTERS, 0))
+        return snapshot
     fields = ("created", "destroyed", "live", "peak_live", "updates", "renderer_creations", "renderer_updates",
               "renderer_destructions", "live_renderers", "peak_live_renderers", "draws", "skipped_draws",
               "current_pixel_area", "peak_pixel_area", "current_bitmap_bytes", "peak_bitmap_bytes",
@@ -100,11 +108,13 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
     if mode == memory.COMPACT_TOOL_PATHS_MODE:
         snapshot.update(grouped_native_canvas_draws=3, legacy_tool_plot_builds=3,
                         tool_path_input_points=30, tool_path_output_points=10)
-    if mode in memory.DEFERRED_TOOL_GEOMETRY_MODES + (memory.METAL_ARRIVAL_MODE,):
+    if mode in memory.DEFERRED_TOOL_GEOMETRY_MODES + (memory.METAL_ARRIVAL_MODE, memory.HELD_STATIC_CHART_MODE):
         snapshot.update(grouped_native_canvas_draws=3, legacy_tool_plot_builds=3,
                         tool_path_input_points=30, tool_path_output_points=30)
     if mode == memory.METAL_ARRIVAL_MODE:
         snapshot.update(metal_arrival_frames=3, metal_arrival_submissions=3)
+    if mode == memory.HELD_STATIC_CHART_MODE:
+        value["roles"]["static_chart"].update(drawing_update_attempts=3, drawing_updates_applied=3)
     if mode in memory.CANVAS_CLOCK_MODES:
         snapshot["rail_frame_clock_ticks"] = 3
     if mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"):

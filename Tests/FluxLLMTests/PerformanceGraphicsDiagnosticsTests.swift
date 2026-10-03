@@ -17,7 +17,8 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.cpuGlow.rawValue, "cpu-glow")
         XCTAssertEqual(Mode.noGradients.rawValue, "no-gradients")
         XCTAssertEqual(Mode.noGradientsOrBlur.rawValue, "no-gradients-or-blur")
-        XCTAssertEqual(Mode.allCases.count, 34)
+        XCTAssertEqual(Mode.runtimeHeldStaticChart.rawValue, "runtime-held-static-chart")
+        XCTAssertEqual(Mode.allCases.count, 35)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -115,9 +116,11 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertFalse(diagnostics.mode.usesDirectToolPlot)
         XCTAssertFalse(diagnostics.mode.usesUngroupedNativeCanvas)
         XCTAssertFalse(diagnostics.mode.omitsArrivalEffects)
+        XCTAssertFalse(diagnostics.mode.usesHeldStaticChart)
         XCTAssertEqual(diagnostics.mode.chartPublicationIntervalSeconds, 1)
         XCTAssertFalse(diagnostics.mode.usesMetalArrivalBursts)
         XCTAssertNil(initial["chart_publication_interval_seconds"])
+        XCTAssertEqual(initial["holds_static_chart_drawing"] as? Bool, false)
         diagnostics.scalarPresentationPublished()
         XCTAssertNil(diagnostics.retainedTwinkleHostCreated())
         diagnostics.retainedTwinkleHostUpdated(
@@ -574,6 +577,9 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     snapshot["deferred_tool_geometry_enabled"] as? Bool,
                     mode.usesDeferredToolGeometry)
                 XCTAssertEqual(
+                    snapshot["holds_static_chart_drawing"] as? Bool,
+                    mode == .runtimeHeldStaticChart)
+                XCTAssertEqual(
                     snapshot["metal_arrival_bursts_enabled"] as? Bool,
                     mode == .runtimeMetalArrivalBursts)
                 XCTAssertEqual(
@@ -586,6 +592,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 XCTAssertNil(snapshot["native_gpu_backend"])
                 XCTAssertNil(snapshot["chart_publication_interval_seconds"])
                 XCTAssertNil(snapshot["metal_arrival_bursts_enabled"])
+                XCTAssertEqual(snapshot["holds_static_chart_drawing"] as? Bool, false)
                 XCTAssertNil(snapshot["arrival_backend"])
             }
             diagnostics.canvasDestroyed(id)
@@ -650,7 +657,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             .runtimeNextOptimized, .runtimeCanvasClock, .runtimeStreamCanvasClock,
             .runtimeOrderedPublication, .runtimeDirectToolPlot, .runtimeUngroupedCanvas,
             .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
-            .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
+            .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts, .runtimeHeldStaticChart,
         ]
         let runtime: [Mode] =
             [
@@ -695,6 +702,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
                     .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
+                    .runtimeHeldStaticChart,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
@@ -704,6 +712,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
                     .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
+                    .runtimeHeldStaticChart,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesOrderedChartPublication,
@@ -713,10 +722,12 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeNoArrivalEffects, .runtimeCompactToolPaths,
                     .runtimeDeferredToolGeometry,
                     .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts,
+                    .runtimeHeldStaticChart,
                 ].contains(mode))
             XCTAssertEqual(mode.usesDirectToolPlot, mode == .runtimeDirectToolPlot)
             XCTAssertEqual(mode.usesUngroupedNativeCanvas, mode == .runtimeUngroupedCanvas)
             XCTAssertEqual(mode.omitsArrivalEffects, mode == .runtimeNoArrivalEffects)
+            XCTAssertEqual(mode.usesHeldStaticChart, mode == .runtimeHeldStaticChart)
             XCTAssertEqual(mode.usesCompactToolPaths, mode == .runtimeCompactToolPaths)
             XCTAssertEqual(
                 mode.usesDeferredToolGeometry,
@@ -726,6 +737,46 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                 mode.chartPublicationIntervalSeconds,
                 mode == .runtimeDeferredToolGeometry2Hz ? 0.5 : 1)
         }
+    }
+
+    func testHeldStaticDrawingCountersAreScopedToTheirDiagnosticAndReset() throws {
+        let diagnostics = PerformanceGraphicsDiagnostics()
+        let initial = diagnostics.snapshot() as NSDictionary
+        diagnostics.staticChartDrawingRequested(applied: true, reset: false)
+        diagnostics.staticChartDrawingRequested(applied: false, reset: true)
+        diagnostics.staticChartDrawingReset()
+        XCTAssertEqual(diagnostics.snapshot() as NSDictionary, initial)
+
+        for mode in PerformanceGraphicsDiagnostics.Mode.allCases {
+            try diagnostics.enable(mode: mode)
+            diagnostics.staticChartDrawingRequested(applied: true, reset: false)
+            diagnostics.staticChartDrawingRequested(applied: false, reset: false)
+            diagnostics.staticChartDrawingRequested(applied: false, reset: false)
+            diagnostics.staticChartDrawingRequested(applied: true, reset: true)
+            diagnostics.staticChartDrawingReset()
+            let snapshot = diagnostics.snapshot()
+            let expected: UInt64 = mode == .runtimeHeldStaticChart ? 1 : 0
+            let chart = try role(.staticChart, in: snapshot)
+            assertCounter("drawing_update_attempts", in: chart, equals: expected * 4)
+            assertCounter("drawing_updates_applied", in: chart, equals: expected * 2)
+            assertCounter("drawing_updates_held", in: chart, equals: expected * 2)
+            assertCounter("drawing_hold_resets", in: chart, equals: expected * 2)
+            for canvasRole in PerformanceGraphicsDiagnostics.Role.allCases
+            where canvasRole != .staticChart {
+                let counters = try role(canvasRole, in: snapshot)
+                for key in [
+                    "drawing_update_attempts", "drawing_updates_applied",
+                    "drawing_updates_held", "drawing_hold_resets",
+                ] {
+                    assertCounter(key, in: counters, equals: 0)
+                }
+            }
+            assertCounter("live_canvases", in: snapshot, equals: 0)
+            assertCounter("native_gpu_canvas_draws", in: snapshot, equals: 0)
+            assertCounter("invalid_events", in: snapshot, equals: 0)
+        }
+        try diagnostics.disable()
+        XCTAssertEqual(diagnostics.snapshot() as NSDictionary, initial)
     }
 
     func testRetainedTwinklesAccountForReplacementAndReleaseAcrossHosts() throws {

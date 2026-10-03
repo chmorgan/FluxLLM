@@ -540,6 +540,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-direct-tool-plot` | Build request-tool plot geometry directly on top of current production behavior. |
 | `runtime-ungrouped-canvas` | Omit `drawingGroup` around native Canvas surfaces while retaining current production behavior elsewhere. |
 | `runtime-no-arrival-effects` | Suppress request-arrival effects while preserving completion effects and active retained twinkles. |
+| `runtime-held-static-chart` | Hold the first usable static chart drawing while continuing 1 Hz preparation, streaming, and all animation roles; diagnostic only, never CPU acceptance eligible. |
 | `runtime-metal-arrival-bursts` | Render arrival bursts and glints with a Metal shader, preserving completion effects and retained twinkles. |
 | `runtime-compact-tool-paths` | Enable tool-path compaction on top of current production behavior. |
 | `runtime-deferred-tool-geometry` | Construct request-tool paths on their first access from a render callback, preserving 1 Hz chart publication. |
@@ -593,6 +594,19 @@ disabled. It keeps `lifecycle_effects_enabled = true` and sets
 `arrival_effects_enabled = false`; compare it with
 `--baseline-mode normal --controls runtime-no-arrival-effects`. Production
 `normal` continues to show arrival effects; this diagnostic makes no CPU-gain claim.
+
+`runtime-held-static-chart` isolates static chart drawing and publication into
+Canvas from chart preparation. Run `runtime compare --baseline-mode normal
+--controls runtime-held-static-chart` with the same frozen product arguments.
+The control retains the first usable drawing; incoming data and prepared chart
+snapshots continue at 1 Hz, while arrival/completion effects and active twinkles
+remain live. The report requires initial static draws, continued preparations
+and held publication attempts, and zero static redraws, applied updates, hold
+resets, or host lifecycle changes during traffic and completion. Size or drawing
+environment changes safely reset the retained drawing and invalidate the causal
+comparison. Hidden hosts release retained closures. Because the displayed static
+data deliberately stops changing, raw CPU differences are diagnostic evidence
+only: target evaluation and CPU acceptance remain disabled for this mode.
 
 
 `runtime-metal-arrival-bursts` is an opt-in experiment inheriting current
