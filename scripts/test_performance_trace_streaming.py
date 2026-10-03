@@ -388,9 +388,10 @@ class StreamingExportTests(unittest.TestCase):
 
     def test_selection_keeps_owned_and_anonymous_gpu_but_drops_proven_unrelated_pairs(self):
         self.write(selection_document(
-            gpu=[gpu_row(123, 17), gpu_row(None, 18), gpu_row(999, 19)],
+            gpu=[gpu_row(123, 17), gpu_row(None, 18), gpu_row(999, 19, command=111, encoder=222)],
             raw=[raw_row(timestamp, sid, function)
-                 for sid in (17, 18, 19) for timestamp, function in ((100, 1), (200, 2))]))
+                 for sid in (17, 18, 19) for timestamp, function in ((100, 1), (200, 2))],
+            mappings=[mapping_row(123, 17), mapping_row(999, 19, command=111, encoder=222)]))
         result = trace.read_table(self.path, GPU, process_ids={123})
         self.assert_valid(result)
         self.assertEqual([row["process"]["pid"] for row in result["rows"]], [123, None])
@@ -412,15 +413,27 @@ class StreamingExportTests(unittest.TestCase):
                 self.assertEqual(len(result["rows"]), count)
                 self.assertEqual(result["selection"]["excluded_known_unrelated_rows"], 0)
 
-    def test_selection_does_not_conflate_different_command_buffer_identities(self):
+    def test_selection_retains_raw_sid_alias_despite_foreign_modeled_command_identity(self):
         self.write(selection_document(
             gpu=[gpu_row(999, command=19)], raw=[raw_row(100, function=1), raw_row(200, function=2)],
             mappings=[mapping_row(123, command=99), mapping_row(999, command=19)]))
         result = trace.read_table(self.path, GPU, process_ids={123})
         self.assert_valid(result)
-        self.assertEqual(result["rows"], [])
+        self.assertEqual(len(result["rows"]), 1)
+        self.assertEqual(result["rows"][0]["process"]["pid"], 999)
+        self.assertEqual(len(trace.read_table(self.path, RAW, process_ids={123})["rows"]), 2)
         metadata = trace.read_table(self.path, MAPPING, process_ids={123})
-        self.assertEqual([row["pid"]["text"] for row in metadata["rows"]], ["123"])
+        self.assertEqual([row["pid"]["text"] for row in metadata["rows"]], ["123", "999"])
+
+    def test_selection_retains_unknown_or_unmapped_sid_even_with_a_foreign_modeled_pid(self):
+        for mappings in ([], [mapping_row(0, command=99), mapping_row(999, command=19)]):
+            with self.subTest(mappings=mappings):
+                trace.clear_cache()
+                self.write(selection_document(gpu=[gpu_row(999)],
+                    raw=[raw_row(100, function=1), raw_row(200, function=2)], mappings=mappings))
+                self.assertEqual(len(trace.read_table(self.path, GPU, process_ids={123})["rows"]), 1)
+                self.assertEqual(len(trace.read_table(self.path, RAW, process_ids={123})["rows"]), 2)
+                self.assertEqual(len(trace.read_table(self.path, MAPPING, process_ids={123})["rows"]), len(mappings))
 
     def test_selection_keeps_raw_pairs_without_modeled_gpu_and_their_metadata(self):
         self.write(selection_document(
@@ -467,9 +480,10 @@ class StreamingExportTests(unittest.TestCase):
 
     def test_selection_cache_is_scoped_to_the_requested_process_ids(self):
         self.write(selection_document(
-            gpu=[gpu_row(123, 17), gpu_row(999, 18)],
+            gpu=[gpu_row(123, 17), gpu_row(999, 18, command=111, encoder=222)],
             raw=[raw_row(timestamp, sid, function)
-                 for sid in (17, 18) for timestamp, function in ((100, 1), (200, 2))]))
+                 for sid in (17, 18) for timestamp, function in ((100, 1), (200, 2))],
+            mappings=[mapping_row(123, 17), mapping_row(999, 18, command=111, encoder=222)]))
         with mock.patch.object(trace, "_parse_export", wraps=trace._parse_export) as parse:
             first = trace.read_table(self.path, GPU, process_ids={123})
             repeated = trace.read_table(self.path, GPU, process_ids={123})

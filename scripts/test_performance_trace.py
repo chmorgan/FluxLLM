@@ -394,6 +394,15 @@ class TraceCoverageTests(unittest.TestCase):
             self.points((100, 17, 1)), {"intervals": []}, 0, 1, {})
         self.assertEqual(result["unattributed_pairs"], [(100, NS)])
 
+    def test_zero_owner_mixed_with_known_owners_keeps_missing_execution_globally_unavailable(self):
+        self.session.processes[456] = {"birth_time_us": 45678}
+        for owners in ({0, 999}, {0, 123}):
+            for points, expected in ((self.points((100, 17, 1), (200, 17, 2)), (100, 200)),
+                                     (self.points((100, 17, 1)), (100, NS))):
+                with self.subTest(owners=owners, expected=expected):
+                    result = self.session._execution_coverage(points, {"intervals": []}, 0, 1, {17: owners})
+                    self.assertIn(expected, result["unattributed_pairs"])
+
     def test_anonymous_modeled_execution_missing_both_raw_boundaries_is_invalid(self):
         result = self.session._execution_coverage(
             self.points(), {"intervals": [], "unattributed": [interval(100, 200, submission=17, pid=None)]}, 0, 1, {})
@@ -461,12 +470,78 @@ class SubmissionOwnershipTests(unittest.TestCase):
                 "cmdbuffer-id": cell(command), "encoder-id": cell(encoder),
                 "commit-id": cell(0), "submission-type": cell(0)}
 
-    def test_matching_command_encoder_resolves_reused_submission_number(self):
+    def test_modeled_command_encoder_cannot_resolve_a_raw_sid_with_multiple_process_owners(self):
         parsed = trace.parse_gpu_intervals(table(row(pid=123, submission=17, command=19, encoder=23)))
         result = trace.reconcile_submission_ownership(parsed, [
             self.submission(999, 17, 111, 222), self.submission(123, 17, 19, 23)])
         self.assertEqual(result["conflicts"], [])
-        self.assertEqual(result["intervals"][0]["pid"], 123)
+        self.assertEqual(result["intervals"], [])
+        self.assertEqual(len(result["unresolved"]), 1)
+        self.assertIsNone(result["unresolved"][0]["pid"])
+        self.assertEqual(result["unresolved"][0]["candidate_pids"], [123, 999])
+
+    def test_alias_join_copies_preserve_one_physical_interval_and_no_false_lower_bound(self):
+        parsed = trace.parse_gpu_intervals(table(
+            row(start=100, duration=200, pid=123, submission=17, command=19, encoder=23),
+            row(start=100, duration=200, pid=999, submission=17, command=111, encoder=222),
+            row(start=100, duration=200, pid=None, submission=17, command=19, encoder=23)))
+        result = trace.reconcile_submission_ownership(parsed, [
+            self.submission(123, 17, 19, 23), self.submission(999, 17, 111, 222)])
+        self.assertEqual(result["intervals"], [])
+        self.assertEqual(len(result["unresolved"]), 1)
+        self.assertEqual(len(result["physical_intervals"]), 1)
+        for pid in (123, 999):
+            metrics = trace.bounded_interval_metrics(result["intervals"], result["unresolved"], pid, 0, NS)
+            self.assertEqual(metrics["gpu_execution_seconds_lower_bound"], 0)
+            self.assertEqual(metrics["gpu_execution_seconds_upper_bound"], 200 / NS)
+
+    def test_candidate_owner_bounds_exclude_other_processes_but_unknown_owners_remain_global(self):
+        known_candidates = {**interval(0, 5_000_000, pid=None), "candidate_pids": [123, 999]}
+        unknown = {**interval(5_000_000, 7_000_000, pid=None), "candidate_pids": None}
+        exact = trace.bounded_interval_metrics([], [known_candidates], 456, 0, NS)
+        self.assertTrue(exact["attribution_exact"])
+        self.assertEqual(exact["gpu_execution_seconds"], 0)
+        bounded = trace.bounded_interval_metrics([], [known_candidates, unknown], 456, 0, NS)
+        self.assertFalse(bounded["attribution_exact"])
+        self.assertEqual(bounded["gpu_execution_seconds_upper_bound"], .002)
+        owned = trace.bounded_interval_metrics([], [known_candidates, unknown], 123, 0, NS)
+        self.assertEqual(owned["gpu_execution_seconds_upper_bound"], .007)
+
+    def test_distinct_physical_channels_or_time_ranges_remain_additive_under_aliases(self):
+        parsed = trace.parse_gpu_intervals(table(row(start=0, duration=5_000_000, channel="Compute"),
+            row(start=0, duration=5_000_000, channel="Fragment"), row(start=5_000_000, duration=2_000_000)))
+        result = trace.reconcile_submission_ownership(parsed, [
+            self.submission(123, 17, 19, 23), self.submission(999, 17, 111, 222)])
+        self.assertEqual(len(result["physical_intervals"]), 3)
+        metrics = trace.bounded_interval_metrics(result["intervals"], result["unresolved"], 123, 0, NS)
+        self.assertEqual(metrics["gpu_execution_seconds_upper_bound"], .012)
+        self.assertEqual(metrics["gpu_busy_union_seconds_upper_bound"], .007)
+
+    def test_unknown_submission_owner_cannot_narrow_an_alias_upper_bound(self):
+        parsed = trace.parse_gpu_intervals(table(row()))
+        result = trace.reconcile_submission_ownership(parsed, [
+            self.submission(123, 17, 19, 23), self.submission(0, 17, 111, 222)])
+        self.assertEqual(result["intervals"], [])
+        self.assertIsNone(result["unresolved"][0]["candidate_pids"])
+        metrics = trace.bounded_interval_metrics(result["intervals"], result["unresolved"], 456, 0, NS)
+        self.assertGreater(metrics["gpu_execution_seconds_upper_bound"], 0)
+
+    def test_modeled_owner_outside_every_raw_candidate_preserves_a_conflict(self):
+        parsed = trace.parse_gpu_intervals(table(row(pid=456)))
+        result = trace.reconcile_submission_ownership(parsed, [
+            self.submission(123, 17, 19, 23), self.submission(999, 17, 111, 222)])
+        self.assertEqual(result["intervals"], [])
+        self.assertTrue(result["conflicts"])
+        self.assertTrue({123, 456, 999} <= set().union(*(item["pids"] for item in result["conflicts"])))
+
+    def test_physical_dedup_cannot_erase_an_unmapped_positive_command_copy(self):
+        values = [row(pid=123, command=19, encoder=23), row(pid=123, command=99, encoder=100)]
+        for ordered in (values, list(reversed(values))):
+            with self.subTest(commands=[value["cmdbuffer-id"]["text"] for value in ordered]):
+                result = trace.reconcile_submission_ownership(trace.parse_gpu_intervals(table(*ordered)),
+                    [self.submission(123, 17, 19, 23)])
+                self.assertTrue(result["conflicts"] or result["invalid"],
+                                "A malformed modeled command must not disappear when another copy resolves")
 
     def test_mismatching_command_identity_is_not_guessed_from_submission_number(self):
         parsed = trace.parse_gpu_intervals(table(row(pid=None, submission=17, command=19, encoder=23)))
@@ -575,6 +650,53 @@ class CommandCompletionProofTests(unittest.TestCase):
         self.assertTrue(result["complete"])
         self.assertEqual(result["completed_command_count"], 2)
 
+    def test_ambiguous_execution_after_fence_is_preserved_without_assigning_it_to_that_command(self):
+        ambiguous = {**trace.parse_gpu_intervals(table(row(start=30_000_000, duration=5_000_000)))["intervals"][0],
+                     "pid": None, "candidate_pids": [123, 999]}
+        submissions = [SubmissionOwnershipTests.submission(123, 17, 19, 23),
+                       SubmissionOwnershipTests.submission(999, 17, 111, 222)]
+        proof = trace.command_buffer_completion_proof({"rows": [command_frame()]},
+            {"rows": [command_completion()]}, submissions, [], {123}, unresolved=[ambiguous])["processes"][123]
+        self.assertTrue(proof["complete"])
+        self.assertEqual(proof["completed_command_count"], 1)
+        self.assertEqual(proof["ambiguous_execution_interval_count"], 1)
+        metrics = trace.bounded_interval_metrics([], [ambiguous], 123, 0, NS)
+        self.assertEqual(metrics["gpu_execution_seconds_upper_bound"], .005)
+        self.assertEqual(metrics["gpu_execution_seconds_lower_bound"], 0)
+
+    def test_certain_process_with_ambiguous_command_cannot_execute_after_all_its_fences(self):
+        submissions = [SubmissionOwnershipTests.submission(123, 17, 19, 23),
+                       SubmissionOwnershipTests.submission(123, 17, 20, 24)]
+        frames = [command_frame(command=19), command_frame(command=20, committed=10_000_000)]
+        completions = [command_completion(command=19), command_completion(command=20, timestamp=41_000_000)]
+        for start, complete in ((30_000_000, True), (42_000_000, False)):
+            with self.subTest(start=start):
+                ownership = trace.reconcile_submission_ownership(
+                    trace.parse_gpu_intervals(table(row(start=start, duration=5_000_000))), submissions)
+                self.assertEqual(len(ownership["intervals"]), 1)
+                self.assertFalse(ownership["intervals"][0]["command_identity_certain"])
+                result = trace.command_buffer_completion_proof({"rows": frames}, {"rows": completions},
+                    submissions, ownership["intervals"], {123})["processes"][123]
+                self.assertEqual(result["complete"], complete)
+                self.assertEqual(result["retired_nonexecuting_candidate_count"], 0)
+
+
+class CalibrationBoundsTests(unittest.TestCase):
+    def measured(self, lower, upper):
+        return {"attribution_exact": lower == upper, "gpu_execution_seconds": lower if lower == upper else None,
+                "gpu_execution_seconds_lower_bound": lower, "gpu_execution_seconds_upper_bound": upper}
+
+    def test_both_bounds_must_agree_with_expected_execution_not_merely_contain_it(self):
+        for lower, upper, passed in ((.009, .011, True), (.01, .01, True),
+                                      (.0079, .01, False), (.01, .0121, False), (0, .02, False)):
+            with self.subTest(lower=lower, upper=upper):
+                self.assertEqual(trace.calibration_bounds(self.measured(lower, upper), .01), passed)
+
+    def test_idle_and_unrelated_controls_use_the_upper_execution_bound(self):
+        for upper, passed in ((0, True), (.0019, True), (.002, True), (.0021, False)):
+            with self.subTest(upper=upper):
+                self.assertEqual(trace.calibration_bounds(self.measured(0, upper), 0), passed)
+
 
 class SentinelLifecycleTests(unittest.TestCase):
     def test_only_owned_verified_sleep_process_is_terminated(self):
@@ -609,7 +731,8 @@ class SentinelLifecycleTests(unittest.TestCase):
 
 class TerminalCoverageTests(unittest.TestCase):
     def evaluate(self, *, anonymous=None, missing_process_identity=False, empty_app=False,
-                 missing_helper_inventory=False, completion_ns=21_000_000, missing_raw_end=False):
+                 missing_helper_inventory=False, completion_ns=21_000_000, missing_raw_end=False,
+                 ambiguous=None, demote_target=False):
         session = object.__new__(trace.TraceSession)
         session.invalid = []
         session.xml = Path("unused.xml")
@@ -641,6 +764,15 @@ class TerminalCoverageTests(unittest.TestCase):
             left, right = anonymous
             gpu["rows"].append(row(start=left, duration=right-left, pid=None, submission=99, command=0, encoder=0))
             points["rows"].extend(TraceCoverageTests.points((left, 99, 1), (right, 99, 2))["rows"])
+        if ambiguous:
+            owner, left, right = ambiguous
+            command, encoder = {123: (19, 23), 345: (20, 24), 456: (21, 25)}[owner]
+            mappings += [SubmissionOwnershipTests.submission(owner, 88, command, encoder),
+                         SubmissionOwnershipTests.submission(999, 88, 888, 889)]
+            gpu["rows"].append(row(start=left, duration=right-left, pid=999, submission=88, command=888, encoder=889))
+            points["rows"].extend(TraceCoverageTests.points((left, 88, 1), (right, 88, 2))["rows"])
+        if demote_target:
+            mappings.append(SubmissionOwnershipTests.submission(999, 18, 888, 889))
         processes = [{"pid": cell(pid), "unique-id": cell(str(pid)), "process": cell(pid=pid, identifier=f"p{pid}"), "timestamp": cell(0)} for pid in (123, 345, 456)]
         if missing_process_identity:
             processes[0]["unique-id"] = cell("")
@@ -663,10 +795,13 @@ class TerminalCoverageTests(unittest.TestCase):
         self.assertTrue(result["windows"]["case/lifetime"]["coverage_complete"])
         self.assertTrue(result["final_exit_coverage"]["case/lifetime"]["complete"])
 
-    def test_unknown_after_proven_quiescence_is_not_owned_tail(self):
+    def test_unknown_after_completion_remains_possible_owned_execution(self):
         result = self.evaluate(anonymous=(1_500_000_000, 1_500_005_000))
         self.assertTrue(result["final_exit_coverage"]["case/lifetime"]["complete"])
-        self.assertEqual(result["windows"]["case/lifetime"]["gpu_execution_seconds_upper_bound"], .01)
+        window = result["windows"]["case/lifetime"]
+        self.assertGreaterEqual(window["gpu_accounting_end_monotonic_seconds"], 1.500005)
+        self.assertAlmostEqual(window["gpu_execution_seconds_upper_bound"], .010005)
+        self.assertFalse(result["final_exit_coverage"]["case/lifetime"]["anonymous_execution_after_quiescence_excluded"])
 
     def test_unknown_tail_before_completion_is_bounded_and_included_in_lifetime_gate(self):
         result = self.evaluate(anonymous=(1_150_000_000, 1_250_000_000), completion_ns=1_300_000_000)
@@ -692,6 +827,37 @@ class TerminalCoverageTests(unittest.TestCase):
         result = self.evaluate(missing_process_identity=True)
         self.assertFalse(result["process_identities"][0]["identity_verified"])
         self.assertFalse(result["windows"]["case/lifetime"]["coverage_complete"])
+
+    def test_possible_owned_alias_after_exit_contributes_to_upper_without_false_quiescence_exclusion(self):
+        result = self.evaluate(ambiguous=(123, 1_500_000_000, 1_550_000_000))
+        window, final = result["windows"]["case/lifetime"], result["final_exit_coverage"]["case/lifetime"]
+        self.assertTrue(result["terminal_command_proof"]["processes"][123]["complete"])
+        self.assertFalse(final["anonymous_execution_after_quiescence_excluded"])
+        self.assertGreaterEqual(window["gpu_accounting_end_monotonic_seconds"], 1.55)
+        self.assertEqual(window["gpu_execution_seconds_lower_bound"], .01)
+        self.assertAlmostEqual(window["gpu_execution_seconds_upper_bound"], .06)
+        self.assertAlmostEqual(window["gpu_percent_upper_bound"], .06 / 1.1 * 100)
+        self.assertAlmostEqual(window["gpu_accounting_duration_seconds"], 1.1)
+        self.assertGreater(final["post_exit_execution_bounds"]["gpu_execution_seconds_upper_bound"], 0)
+
+    def test_ambiguous_calibration_keeps_both_bounds_and_does_not_contaminate_unrelated_app(self):
+        result = self.evaluate(ambiguous=(345, 105_000_000, 106_000_000))
+        calibration = result["calibration"]
+        target = next(value for value in calibration["evidence"] if value["kind"] == "target")
+        self.assertTrue(calibration["valid"])
+        self.assertIsNone(target["trace_execution_seconds"])
+        self.assertEqual(target["trace_execution_seconds_lower_bound"], .01)
+        self.assertAlmostEqual(target["trace_execution_seconds_upper_bound"], .011)
+        self.assertTrue(result["windows"]["case/lifetime"]["attribution_exact"])
+        self.assertEqual(result["windows"]["case/lifetime"]["gpu_execution_seconds"], .01)
+
+    def test_calibration_fails_if_either_nonzero_bound_or_idle_upper_exceeds_tolerance(self):
+        for arguments in ({"ambiguous": (345, 104_000_000, 107_000_000)},
+                          {"ambiguous": (345, 60_000_000, 63_000_000)}, {"demote_target": True}):
+            with self.subTest(arguments=arguments):
+                result = self.evaluate(**arguments)
+                self.assertFalse(result["calibration"]["valid"])
+                self.assertFalse(result["windows"]["case/lifetime"]["coverage_complete"])
 
 
 class TraceRunIssueTests(unittest.TestCase):

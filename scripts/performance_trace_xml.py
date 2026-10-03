@@ -269,6 +269,7 @@ def _select_rows(tables, resolve, process_ids, deadline):
     owned = frozenset(process_ids)
     excluded, metadata_rows, gpu_rows, raw_rows = set(), [], [], []
     composite_owners = defaultdict(set)
+    submission_owners = defaultdict(set)
     modeled_channels, modeled_rows = defaultdict(set), defaultdict(list)
     protected_keys, protected_sids = set(), set()
     all_rows = defaultdict(list)
@@ -324,6 +325,7 @@ def _select_rows(tables, resolve, process_ids, deadline):
             sid = number(values, "gpu-submission-id")
             identity = (sid, command, number(values, "encoder-id"))
             composite_owners[identity].add(pid)
+            submission_owners[sid].add(pid)
             # The terminal proof rejects malformed command/commit mappings.
             # Such evidence must remain visible even when its PID is foreign.
             number(values, "commit-id")
@@ -346,7 +348,9 @@ def _select_rows(tables, resolve, process_ids, deadline):
             modeled_rows[key].append(row)
             gpu_rows.append((row, sid, key))
             owners = composite_owners[identity]
-            if not pid or pid in owned or (owners and pid not in owners) or owners.intersection(owned):
+            if (not pid or pid in owned or (owners and pid not in owners) or owners.intersection(owned)
+                    or not submission_owners[sid] or 0 in submission_owners[sid]
+                    or submission_owners[sid].intersection(owned)):
                 protected_keys.add(key)
         except (ExportError, KeyError):
             pass

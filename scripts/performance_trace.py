@@ -239,12 +239,13 @@ def bounded_interval_metrics(intervals, unresolved, pid, start_ns, end_ns):
     capture coverage separately.
     """
     lower = interval_metrics(intervals, pid, start_ns, end_ns)
-    unknown = [item for item in unresolved if item["start_ns"] < end_ns and item["end_ns"] > start_ns]
+    unknown = [item for item in unresolved if item["start_ns"] < end_ns and item["end_ns"] > start_ns
+               and (item.get("candidate_pids") is None or pid in item["candidate_pids"])]
     upper = interval_metrics([*intervals, *({**item, "pid": pid} for item in unknown)], pid, start_ns, end_ns)
     exact = not unknown
     result = {**lower, "attribution_exact": exact, "unattributed_interval_count": len(unknown),
               "attribution_method": "Exact process attribution" if exact else
-              "Conservative bounds: every unresolved recorded execution interval is assigned to this process in the upper bound"}
+              "Conservative bounds: every unresolved execution with unknown or compatible candidate ownership is assigned to this process in the upper bound"}
     for field in ("gpu_execution_seconds", "gpu_percent", "gpu_rolling_1s_percent",
                   "gpu_busy_union_seconds", "gpu_busy_union_percent"):
         result[field + "_lower_bound"] = lower[field]
@@ -254,17 +255,19 @@ def bounded_interval_metrics(intervals, unresolved, pid, start_ns, end_ns):
 
 
 def reconcile_submission_ownership(parsed, rows, *, deadline=None):
-    """Join command/encoder identities instead of treating submission IDs as unique.
+    """Bound raw SID aliases instead of trusting Instruments' modeled owner join.
 
-    The driver can reuse a submission ID across processes even within microseconds.
-    Modeled execution supplies command-buffer and encoder identities that disambiguate
-    those rows. Truly anonymous driver execution remains bounded, never guessed.
+    IOGPU exports SID and SID+1 alternatives for each command. Another process can
+    own the same raw SID; the modeled command/encoder is itself a join result and
+    cannot disambiguate it. Keep each physical execution once, with all candidate
+    owners, regardless of which modeled owner Instruments happened to select.
     """
     owners = defaultdict(set)
     composite = defaultdict(set)
     submitted = defaultdict(set)
     submitted_identities = defaultdict(set)
     commands = defaultdict(set)
+    identities = defaultdict(set)
     invalid = []
     for index, row in enumerate(rows):
         if index % 4096 == 0:
@@ -278,46 +281,53 @@ def reconcile_submission_ownership(parsed, rows, *, deadline=None):
             encoder = _integer(row["encoder-id"]["text"])
             owners[sid].add(pid)
             composite[(sid, command, encoder)].add(pid)
+            identities[sid].add((pid, command, encoder))
             submitted[pid].add(sid)
             submitted_identities[pid].add((pid, sid, command, encoder))
             commands[pid].add(command)
         except (TraceError, KeyError) as error:
             invalid.append(f"GPU submission identity: {error}")
-    intervals = list(parsed["intervals"])
-    unresolved = []
+    physical = defaultdict(list)
     conflicts = []
     for index, item in enumerate([*parsed["intervals"], *parsed.get("unattributed", [])]):
         if index % 4096 == 0:
             _check_deadline(deadline)
         exact = composite[(item["submission_id"], item["command_buffer_id"], item["encoder_id"])]
+        raw_owners = owners[item["submission_id"]]
         if item["pid"] and item["pid"] > 0:
-            if exact and item["pid"] not in exact:
-                conflicts.append({"pids": exact | {item["pid"]}, "interval": item})
-            continue
-        candidates = exact
-        if not candidates and item["command_buffer_id"] == 0 and item["encoder_id"] == 0:
-            candidates = owners[item["submission_id"]]
-        if len(candidates) == 1 and next(iter(candidates)) > 0:
-            intervals.append({**item, "pid": next(iter(candidates))})
+            if ((exact and item["pid"] not in exact) or (raw_owners and item["pid"] not in raw_owners)
+                    or (len(raw_owners) == 1 and not exact and (item["command_buffer_id"] or item["encoder_id"]))):
+                conflicts.append({"pids": exact | raw_owners | {item["pid"]}, "interval": item})
+        key = tuple(item[name] for name in ("start_ns", "end_ns", "gpu", "channel", "submission_id"))
+        physical[key].append(item)
+    intervals, unresolved, physical_intervals = [], [], []
+    for items in physical.values():
+        item = items[0]
+        sid = item["submission_id"]
+        candidates = owners[sid]
+        modeled_pids = {value["pid"] for value in items if value["pid"] and value["pid"] > 0}
+        # Unknown/mismatched composite rows are retained as genuinely unknown,
+        # even when another joined row happens to carry a known owner.
+        unknown = not candidates or any(not composite[(sid, value["command_buffer_id"], value["encoder_id"])]
+                      and (value["command_buffer_id"] or value["encoder_id"])
+                      and not value["pid"] for value in items)
+        possible = candidates | modeled_pids
+        if len(possible) == 1 and 0 not in possible and not unknown:
+            value = {**item, "pid": next(iter(possible)),
+                     "command_identity_certain": len(identities[sid]) == 1}
+            intervals.append(value)
         else:
-            unresolved.append(item)
-    # Joined exports can repeat the same execution after its identity resolves.
-    interval_keys = set()
-    unique = []
-    for item in intervals:
-        key = tuple(item[name] for name in ("start_ns", "end_ns", "pid", "gpu", "channel", "submission_id", "command_buffer_id", "encoder_id"))
-        if key not in interval_keys:
-            unique.append(item)
-            interval_keys.add(key)
-    identity_fields = ("start_ns", "end_ns", "gpu", "channel", "submission_id", "command_buffer_id", "encoder_id")
-    known_keys = {tuple(item[name] for name in identity_fields) for item in unique}
-    unresolved = [item for item in unresolved if tuple(item[name] for name in identity_fields) not in known_keys]
-    return {"intervals": unique, "unresolved": unresolved, "owners": owners,
+            value = {**item, "pid": None,
+                     "candidate_pids": sorted(possible) if possible and 0 not in possible and not unknown else None,
+                     "command_identity_certain": False}
+            unresolved.append(value)
+        physical_intervals.append(value)
+    return {"intervals": intervals, "unresolved": unresolved, "physical_intervals": physical_intervals, "owners": owners,
             "submitted": submitted, "submitted_identities": submitted_identities,
             "commands": commands, "conflicts": conflicts, "invalid": invalid}
 
 
-def command_buffer_completion_proof(frames, completions, submissions, intervals, process_ids, *, deadline=None):
+def command_buffer_completion_proof(frames, completions, submissions, intervals, process_ids, *, unresolved=(), deadline=None):
     """Close committed Metal work, not every candidate driver submission ID.
 
     Instruments' IOGPU model deliberately emits SID and SID+1 alternatives.
@@ -331,6 +341,7 @@ def command_buffer_completion_proof(frames, completions, submissions, intervals,
     candidates = defaultdict(set)
     execution_commits = defaultdict(set)
     execution_ends = defaultdict(int)
+    certain_process_ends = defaultdict(int)
     executed_candidates = defaultdict(set)
 
     def identity(row):
@@ -388,6 +399,9 @@ def command_buffer_completion_proof(frames, completions, submissions, intervals,
         pid = item["pid"]
         if pid not in process_ids:
             continue
+        certain_process_ends[pid] = max(certain_process_ends[pid], item["end_ns"])
+        if not item.get("command_identity_certain", True):
+            continue
         mapped = execution_commits[(pid, item["submission_id"], item["command_buffer_id"], item["encoder_id"])]
         if item["command_buffer_id"] == 0 or len(mapped) != 1:
             issues[pid].append("Owned GPU execution has no unique command/commit completion identity")
@@ -398,6 +412,10 @@ def command_buffer_completion_proof(frames, completions, submissions, intervals,
     results = {}
     for pid in process_ids:
         pending, closed, retired_candidates = [], [], 0
+        ambiguous_sids = {item["submission_id"] for item in unresolved
+                          if item.get("candidate_pids") is None or pid in item["candidate_pids"]}
+        ambiguous_sids.update(item["submission_id"] for item in intervals
+                              if item["pid"] == pid and not item.get("command_identity_certain", True))
         for (owner, key), times in commits.items():
             if owner != pid:
                 continue
@@ -416,16 +434,32 @@ def command_buffer_completion_proof(frames, completions, submissions, intervals,
                 continue
             closed.append({"command_buffer_id": key[0], "commit_id": key[1],
                            "commit_ns": committed, "completion_ns": fences[0]})
-            retired_candidates += len(candidates[(pid, key)] - executed_candidates[(pid, key)])
+            retired_candidates += sum(candidate not in executed_candidates[(pid, key)] and candidate[0] not in ambiguous_sids
+                                      for candidate in candidates[(pid, key)])
+        latest_completion = max((row["completion_ns"] for row in closed), default=0)
+        if certain_process_ends[pid] > latest_completion:
+            issues[pid].append("Certain process GPU execution extends beyond every verified completion fence")
         errors = sorted(set([*invalid, *issues[pid]]))
         results[pid] = {"complete": not errors, "invalid": errors,
+                        "ambiguous_execution_interval_count": sum(
+                            item.get("candidate_pids") is None or pid in item["candidate_pids"] for item in unresolved),
                         "committed_command_count": sum(owner == pid for owner, _ in commits),
                         "completed_command_count": len(closed), "pending_commands": pending,
                         "retired_nonexecuting_candidate_count": retired_candidates,
-                        "latest_completion_ns": max((row["completion_ns"] for row in closed), default=0),
+                        "latest_completion_ns": latest_completion,
                         "latest_commit_ns": max((next(iter(times)) for (owner, _), times in commits.items() if owner == pid and len(times) == 1), default=0)}
     return {"processes": results, "invalid": sorted(set(invalid)),
-            "method": "Verified process command/commit inventory and completion fences; driver SID/SID+1 alternatives are not counted as required executions"}
+            "method": "Independent process command/commit inventory and unique completion fences; only unambiguous execution identities constrain individual fences, and ambiguous execution remains in GPU upper bounds"}
+
+
+def calibration_bounds(measured, expected):
+    """Every possible attribution must agree with the independent Metal control."""
+    lower = measured["gpu_execution_seconds_lower_bound"]
+    upper = measured["gpu_execution_seconds_upper_bound"]
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+               for value in (lower, upper, expected)) or not 0 <= lower <= upper or expected < 0:
+        return False
+    return (.8 * expected <= lower <= upper <= 1.2 * expected) if expected else upper <= .002
 
 
 def _mach_clock():
@@ -962,11 +996,14 @@ class TraceSession:
         parsed["intervals"] = ownership["intervals"]
         unresolved = ownership["unresolved"]
         submitted, submission_commands = ownership["submitted"], ownership["commands"]
-        result["resolved_unattributed_interval_count"] = len(parsed["unattributed"]) - len(unresolved)
+        result["resolved_unattributed_interval_count"] = max(0, len(parsed["unattributed"]) - len(unresolved))
+        result["ambiguous_execution_interval_count"] = len(unresolved)
+        result["ownership_method"] = "Raw SID candidate-owner union; modeled command/encoder joins cannot disambiguate SID aliases"
         execution = table("metal-gpu-execution-points")
         self.invalid.extend(execution["invalid"])
         result["execution_points"] = len(execution["rows"])
-        result["loss_validation"] = self._execution_coverage(execution, parsed, origin, duration, ownership["owners"])
+        result["loss_validation"] = self._execution_coverage(execution,
+            {"intervals": ownership["physical_intervals"], "unattributed": []}, origin, duration, ownership["owners"])
         self.invalid.extend(result["loss_validation"]["invalid"])
         for conflict in ownership["conflicts"]:
             item = conflict["interval"]
@@ -985,12 +1022,13 @@ class TraceSession:
 
         completion_proof = command_buffer_completion_proof(
             table("metal-command-buffer-frame-assignment"), table("metal-command-buffer-completed"),
-            submissions["rows"], parsed["intervals"], self.processes, deadline=deadline)
+            submissions["rows"], parsed["intervals"], self.processes, unresolved=unresolved, deadline=deadline)
         result["terminal_command_proof"] = completion_proof
 
         def metrics(pid, start, end):
             _check_deadline(deadline)
-            return interval_metrics(intervals_by_pid[pid], pid, round((start - origin) * 1e9), round((end - origin) * 1e9))
+            return bounded_interval_metrics(intervals_by_pid[pid], unresolved, pid,
+                round((start - origin) * 1e9), round((end - origin) * 1e9))
 
         evidence = []
         calibration_errors = []
@@ -998,7 +1036,7 @@ class TraceSession:
             measured = metrics(reference["pid"], reference["start"], reference["end"])
             actual = measured["gpu_execution_seconds"]
             expected = reference["metal_seconds"]
-            passed = abs(actual - expected) / expected <= .20 if expected else actual <= .002
+            passed = calibration_bounds(measured, expected)
             left, right = round((reference["start"] - origin) * 1e9), round((reference["end"] - origin) * 1e9)
             reference_errors = []
             if reference["start"] < origin or reference["end"] > origin + duration:
@@ -1010,10 +1048,14 @@ class TraceSession:
             if any(start < right and end > left for start, end in result["loss_validation"]["unattributed_pairs"]):
                 reference_errors.append("An unresolved execution gap overlaps the calibration window")
             passed = passed and not reference_errors
-            evidence.append({**reference, "trace_execution_seconds": actual, "passed": passed,
+            evidence.append({**reference, "trace_execution_seconds": actual,
+                             "trace_execution_seconds_lower_bound": measured["gpu_execution_seconds_lower_bound"],
+                             "trace_execution_seconds_upper_bound": measured["gpu_execution_seconds_upper_bound"],
+                             "attribution_exact": measured["attribution_exact"], "passed": passed,
                              "invalid": sorted(set(reference_errors))})
             if not passed:
-                calibration_errors.append(f"{reference['kind']} GPU trace calibration failed: trace={actual}s Metal={expected}s")
+                calibration_errors.append(f"{reference['kind']} GPU trace calibration failed: trace bounds="
+                    f"[{measured['gpu_execution_seconds_lower_bound']}, {measured['gpu_execution_seconds_upper_bound']}]s Metal={expected}s")
                 calibration_errors.extend(reference_errors)
         if {row["kind"] for row in self.references} != {"idle", "target", "unrelated", "attribution"}:
             calibration_errors.append("GPU trace calibration did not cover idle, target work, and unrelated work")
@@ -1085,6 +1127,11 @@ class TraceSession:
                 final_invalid.append("An owned completion fence lies beyond the recording boundary")
             quiescence = None
             tail_values = None
+            ambiguity_accounting_end = None
+            # CPU completion fences cannot establish the ownership of an
+            # ambiguous raw execution. Preserve the recorded possible tail.
+            compatible_ambiguity = [item for item in unresolved
+                if item.get("candidate_pids") is None or pid in item["candidate_pids"]]
             if exit_record is not None:
                 # The collector's final sample is taken only after waitid has
                 # verified the child is a zombie, so it bounds kernel exit above.
@@ -1092,20 +1139,34 @@ class TraceSession:
                 if origin + proof["latest_commit_ns"] / 1e9 > exit_time + uncertainty:
                     final_invalid.append("Owned command commit occurs after the verified process exit")
                 quiescence = max(exit_time, latest_completion) + uncertainty
-                if quiescence > origin + duration:
+                ambiguity_accounting_end = max(quiescence,
+                    exit_record["trace_drain_end_monotonic_seconds"],
+                    max((origin + item["end_ns"] / 1e9 for item in compatible_ambiguity), default=quiescence)
+                    ) if compatible_ambiguity else quiescence
+                if ambiguity_accounting_end > origin + duration:
                     final_invalid.append("Trace ended before process exit and all owned command completions were covered")
                 else:
                     exit_ns = round((exit_time - origin) * 1e9)
-                    quiet_ns = round((quiescence - origin) * 1e9)
+                    quiet_ns = round((ambiguity_accounting_end - origin) * 1e9)
                     if any(left < quiet_ns and right > start_ns for left, right in result["loss_validation"]["unattributed_pairs"]):
                         final_invalid.append("An unresolved raw execution gap overlaps the process lifetime or completion tail")
                     if quiet_ns > exit_ns:
                         tail_values = bounded_interval_metrics(owned_intervals, unresolved, pid, exit_ns, quiet_ns)
-                    if name.endswith("/lifetime") and not final_invalid and quiescence > end:
+                    if name.endswith("/lifetime") and not final_invalid and ambiguity_accounting_end > end:
                         values = bounded_interval_metrics(owned_intervals, unresolved, pid, start_ns, quiet_ns)
+                        # Late ambiguous work widens the execution numerator,
+                        # never the denominator: extending both could lower an
+                        # alleged upper bound merely by adding unrelated work.
+                        for percent, seconds in (("gpu_percent", "gpu_execution_seconds"),
+                                                 ("gpu_busy_union_percent", "gpu_busy_union_seconds")):
+                            for suffix in ("_lower_bound", "_upper_bound"):
+                                values[percent + suffix] = values[seconds + suffix] / (end - start) * 100
+                            values[percent] = values[percent + "_lower_bound"] if values["attribution_exact"] else None
                         result["windows"][name].update(values)
-                        result["windows"][name]["gpu_accounting_end_monotonic_seconds"] = quiescence
-                        result["windows"][name]["gpu_accounting_duration_seconds"] = quiescence - start
+                        result["windows"][name]["gpu_accounting_end_monotonic_seconds"] = ambiguity_accounting_end
+                        result["windows"][name]["gpu_accounting_duration_seconds"] = end - start
+                        result["windows"][name]["gpu_execution_coverage_duration_seconds"] = ambiguity_accounting_end - start
+                        result["windows"][name]["gpu_percent_denominator"] = "Fixed registered window duration; possible queued/ambiguous tail only increases execution numerator"
             final_invalid = sorted(set(final_invalid))
             result["final_exit_coverage"][name] = {
                 "complete": not final_invalid, "invalid": final_invalid,
@@ -1113,7 +1174,9 @@ class TraceSession:
                 "exit": exit_record, "submitted_candidate_count": len(submitted[pid]),
                 "command_completion_proof": proof,
                 "quiescence_upper_bound_monotonic_seconds": quiescence,
-                "anonymous_execution_after_quiescence_excluded": not final_invalid,
+                "anonymous_execution_after_quiescence_excluded": not final_invalid and not compatible_ambiguity,
+                "ambiguous_execution_interval_count": len(compatible_ambiguity),
+                "ambiguous_execution_accounting_end_monotonic_seconds": ambiguity_accounting_end,
                 "last_owned_execution_end_monotonic_seconds": last_owned_end,
                 "post_exit_execution_bounds": tail_values,
                 "pending_command_count": len(proof["pending_commands"])}
@@ -1195,13 +1258,13 @@ class TraceSession:
             if owners[submission].intersection(self.processes):
                 process_issue(owners[submission], start, end,
                               "An owned raw GPU execution pair is missing its modeled interval")
-            elif not owners[submission] or owners[submission] == {0}:
+            if not owners[submission] or 0 in owners[submission]:
                 unattributed_pairs.append((start, end))
         for submission, start, end in incomplete:
             if owners[submission].intersection(self.processes):
                 process_issue(owners[submission], start, end,
                               "An owned GPU submission has a missing execution boundary")
-            elif not owners[submission] or owners[submission] == {0}:
+            if not owners[submission] or 0 in owners[submission]:
                 unattributed_pairs.append((start, end))
         # Two different hardware channels with identical submission/time must
         # retain two modeled executions; otherwise the additive total is lost.

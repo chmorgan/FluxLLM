@@ -1163,6 +1163,17 @@ silently omit later validation. This shorter GPU workload is separately identifi
 and must not be pooled with the ordinary 25-second CPU workload or earlier GPU
 captures. The 1% maximum rolling one-second GPU target remains unchanged.
 
+GPU ownership uses the union of raw submission-ID candidates. Instruments can
+join the same driver ID to commands from several processes; its modeled owner
+alone is insufficient to resolve that ambiguity. Each physical execution is
+counted once per hardware channel. Ambiguous execution contributes to compatible
+processes' upper bounds and never their lower bounds; unknown ownership remains
+possible for every process. Both calibration bounds must agree with the independent
+Metal control. Command inventories and completion fences remain separate required
+evidence. Possible execution after process exit stays in the lifetime upper bound
+without extending the registered percentage denominator. Reports preserve these
+bounds instead of substituting a guessed owner or zero.
+
 ## Persistent full-chart Metal candidate
 
 `runtime-metal-full-chart` replaces the chart's static Canvas, rail decoration
