@@ -56,6 +56,7 @@ COALESCED_SCALAR_MODES = ("native-gpu-coalesced-scalars", "native-gpu-optimized"
 RETAINED_TWINKLE_MODES = ("native-gpu-retained-twinkles", "native-gpu-optimized") + RUNTIME_MODES
 RETAINED_TWINKLE_FIELDS = ("hosts_created", "hosts_destroyed", "live_hosts", "peak_hosts",
                           "instances_created", "instances_destroyed", "live_instances", "peak_instances", "animation_starts")
+TWINKLE_DELIVERY_COUNTERS = ("retained_twinkle_direct_updates", "twinkle_state_publications")
 GRADIENT_ABLATION_MODES = ("no-gradients", "no-gradients-or-blur")
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 DEADLINE_SECONDS = 90
@@ -368,6 +369,24 @@ def validate_retained_twinkles(value, mode, *, completed_visible_workload=False,
                 "Retained twinkle resources remain live at a closed checkpoint")
 
 
+def twinkle_delivery_contract(snapshot, mode):
+    value = snapshot.get("graphics_diagnostics", {})
+    field = "direct_retained_twinkle_delivery"
+    if field not in value and not any(name in snapshot for name in TWINKLE_DELIVERY_COUNTERS):
+        return None
+    expected = mode in RETAINED_TWINKLE_MODES or mode == "normal" and "native_gpu_backend" in value
+    require(type(value.get(field)) is bool and value[field] is expected,
+            "Direct retained twinkle delivery counters lack matching backend metadata")
+    counters = {name: snapshot.get(name) for name in TWINKLE_DELIVERY_COUNTERS}
+    for name, count in counters.items():
+        require(type(count) is int and 0 <= count <= 2**64 - 1,
+                f"{name} must be a complete UInt64 twinkle delivery counter")
+    if not expected:
+        require(counters["retained_twinkle_direct_updates"] == 0,
+                "Nonretained backend executed direct twinkle delivery")
+    return {"enabled": expected, "counters": counters}
+
+
 def runtime_feature_contract(value, mode):
     if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing")):
         return None
@@ -547,6 +566,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     contract = "native-gpu-optimized" if native_normal or mode in RUNTIME_MODES else mode
     runtime_features = runtime_feature_contract(value, mode)
     held_static_chart_counts(value, mode)
+    twinkle_delivery_contract(snapshot, mode)
     metal_arrival = metal_arrival_contract(snapshot, mode, completed_visible_workload=completed_visible_workload)
     if (mode in (COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "compact_tool_paths_enabled" in value
             or any(field in snapshot for field in TOOL_PATH_POINT_COUNTERS)):

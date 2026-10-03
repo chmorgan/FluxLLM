@@ -105,6 +105,54 @@ def validate_held_static_chart_checkpoints(report, mode):
     return result
 
 
+def validate_steady_twinkle_delivery(report, mode):
+    """Authenticate native delivery during effect-free steady streaming only."""
+    points = report["runtime"]["checkpoints"]
+    contracts = [memory.twinkle_delivery_contract(point["snapshot"], mode) for point in points]
+    if all(contract is None for contract in contracts):
+        return {"available": False, "reason": "Frozen product predates direct retained twinkle delivery counters"}
+    require(contracts and all(contract is not None for contract in contracts),
+            "Twinkle delivery instrumentation changed or disappeared during runtime")
+    enabled = contracts[0]["enabled"]
+    require(all(contract["enabled"] == enabled for contract in contracts), "Twinkle delivery backend changed during runtime")
+    for first, last in zip(contracts, contracts[1:]):
+        require(all(last["counters"][field] >= first["counters"][field] for field in memory.TWINKLE_DELIVERY_COUNTERS),
+                "Twinkle delivery counters moved backwards during runtime")
+    if not enabled:
+        return {"available": True, "enabled": False, "reason": "This mode does not use retained twinkles"}
+    clocks = report["runtime"]
+    offset = sum(clocks[name]["absolute_minus_monotonic_seconds"] for name in ("mach_clock_start", "mach_clock_end")) / 2
+    window = report["phase_windows"]["steady"]
+    interior = []
+    for point, contract in zip(points, contracts):
+        snapshot, sample = point["snapshot"], point["resource_sample"]
+        matches = [row for row in report["samples"]
+                   if row["monotonic_seconds"] == snapshot.get("runner_collector_sample_monotonic_seconds")]
+        require(len(matches) == 1 and matches[0] == sample
+                and sample["process_id"] == report["owned_identity"]["process_id"]
+                and sample["birth_time_us"] == report["owned_identity"]["birth_time_us"],
+                "Twinkle delivery checkpoint lacks its authenticated kernel boundary")
+        timestamp = sample["mach_absolute_seconds"] - offset
+        if window["start_monotonic_seconds"] < timestamp < window["end_monotonic_seconds"]:
+            require(snapshot.get("dashboard_visible") is True and snapshot.get("popover_visible") is True
+                    and snapshot.get("active_requests") == 2,
+                    "Steady twinkle delivery requires both visible windows and two active streams")
+            interior.append((point, contract, timestamp))
+    require(len(interior) >= 2 and interior[-1][2] - interior[0][2] >= 2,
+            "Steady twinkle delivery lacks two seconds of authenticated interior checkpoints")
+    first, last = interior[0], interior[-1]
+    delta = {field: last[1]["counters"][field] - first[1]["counters"][field]
+             for field in memory.TWINKLE_DELIVERY_COUNTERS}
+    require(delta["retained_twinkle_direct_updates"] > 0,
+            "Steady retained twinkles did not execute native direct deliveries")
+    require(delta["twinkle_state_publications"] == 0,
+            "Steady retained twinkles still published SwiftUI state")
+    return {"available": True, "enabled": True, "start_checkpoint": first[0]["label"], "end_checkpoint": last[0]["label"],
+            "start_monotonic_seconds": first[2], "end_monotonic_seconds": last[2],
+            "start_resource_sample": first[0]["resource_sample"], "end_resource_sample": last[0]["resource_sample"],
+            "deltas": delta, "scope": "Authenticated visible two-stream checkpoints strictly inside the steady phase; no CPU qualification change"}
+
+
 class RuntimeDeadline(memory.MemoryDeadline):
     def __init__(self, seconds=MAX_SECONDS, cleanup_reserve=15, clock=time.monotonic):
         self.clock, self.end, self.cleanup_reserve = clock, clock() + seconds, cleanup_reserve
@@ -142,6 +190,16 @@ def runtime_source_identity():
              "run_performance_checks.py", "performance_fixture.py", "performance_gpu_sample.py"}
     names.update(path.name for path in Path(__file__).parent.glob("performance_trace*.py"))
     return {name: app.path_hash(Path(__file__).with_name(name)) for name in sorted(names)}
+
+
+def runtime_product_identity(paths, provenance):
+    """Pin validated executables, bundles, and the exact provenance file."""
+    files = dict(paths)
+    if provenance.get("provenance_file"):
+        files["provenance"] = Path(provenance["provenance_file"])
+    for name in provenance.get("resource_bundle_sha256", {}):
+        files["resource:" + name] = paths["app"].parent / name
+    return {name: {"path": str(path), "sha256": app.path_hash(path)} for name, path in files.items()}
 
 
 def validate_runtime_work(before, after, mode, *, required=True):
@@ -825,6 +883,7 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
             "scope": "whole_contiguous_runtime", "start_checkpoint": points[0]["label"],
             "end_checkpoint": points[-1]["label"], **report["phase_windows"]["whole_contiguous_runtime"]}
         report["canvas_clock_work"] = validate_canvas_clock_work(report, mode)
+        report["steady_twinkle_delivery"] = validate_steady_twinkle_delivery(report, mode)
         held_work = validate_held_static_chart_checkpoints(report, mode)
         if held_work is not None:
             report["held_static_chart_work"] = held_work
@@ -864,11 +923,22 @@ def runtime_work_counter_diagnostic(report, *, profile=False):
 
 
 def selected_cases(args):
+    references = reference_arguments(args)
+    if any(value is not None for value in references):
+        require(all(value is not None for value in references),
+                "Frozen reference comparison requires all three reference product/provenance arguments")
+        require(args.operation == "compare", "Frozen reference comparison cannot run with Time Profiler")
+        require(args.controls is None, "Frozen reference comparison cannot be combined with graphics controls")
+        return [(label, args.baseline_mode) for label in ("reference-before", "candidate", "reference-after")]
     if args.operation == "profile":
         return [("profile", args.graphics_mode)]
     controls = args.controls or ["runtime-optimized"]
     require(1 <= len(controls) <= 3 and len(set(controls)) == len(controls), "Select one to three distinct runtime controls")
     return [("baseline-before", args.baseline_mode), *[(mode, mode) for mode in controls], ("baseline-after", args.baseline_mode)]
+
+
+def reference_arguments(args):
+    return tuple(getattr(args, name, None) for name in ("reference_app_binary", "reference_test_bundle", "reference_provenance"))
 
 
 def baseline_drift(cases):
@@ -915,6 +985,9 @@ def parser():
     result.add_argument("operation", choices=("profile", "compare"))
     for name in ("app-binary", "test-bundle", "collector-binary", "provenance"):
         result.add_argument("--" + name, required=True, type=Path)
+    for name in ("reference-app-binary", "reference-test-bundle", "reference-provenance"):
+        result.add_argument("--" + name, type=Path,
+                            help="Compare frozen versions in reference/candidate/reference order using --baseline-mode")
     result.add_argument("--graphics-mode", choices=BASELINES + memory.RUNTIME_MODES, default="normal")
     result.add_argument("--baseline-mode", choices=BASELINES, default="native-gpu-optimized")
     result.add_argument("--controls", nargs="+", choices=memory.RUNTIME_MODES + ("normal",))
@@ -934,10 +1007,13 @@ def run(argv=None):
 
 
 def _run(args, deadline):
+    references = reference_arguments(args)
+    version_compare = any(value is not None for value in references)
     output = (args.output_dir or app.ROOT / ".performance-results" /
               ("runtime-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-") + secrets.token_hex(4))).resolve()
     output_created = False
-    report = {"kind": "runtime-cpu-attribution", "operation": args.operation, "status": "diagnostic_incomplete",
+    report = {"kind": "runtime-cpu-version-comparison" if version_compare else "runtime-cpu-attribution",
+              "operation": "version-compare" if version_compare else args.operation, "status": "diagnostic_incomplete",
               "deadline_seconds": MAX_SECONDS, "regression_passed": False, "cases": [], "errors": []}
     try:
         cases = selected_cases(args)
@@ -958,24 +1034,49 @@ def _run(args, deadline):
         with deadline.interrupt_at(deadline.end - deadline.cleanup_reserve):
             paths, provenance, identity = memory.validate_products(args)
             report.update(binary_identity={name: app.path_hash(path) for name, path in paths.items()}, measurement_identity=identity)
+            products = {"candidate": {"paths": paths, "provenance": provenance, "identity": identity}}
+            if version_compare:
+                reference_args = argparse.Namespace(**vars(args))
+                reference_args.app_binary, reference_args.test_bundle, reference_args.provenance = references
+                reference_paths, reference_provenance, reference_identity = memory.validate_products(reference_args)
+                require(reference_identity == identity, "Frozen versions have different common measurement identities")
+                fixture = provenance.get("fixture_equivalence_sha256", {}).get("populated")
+                require(isinstance(fixture, str) and fixture
+                        == reference_provenance.get("fixture_equivalence_sha256", {}).get("populated"),
+                        "Frozen versions have different populated fixture identities")
+                require(reference_paths["collector"] == paths["collector"],
+                        "Frozen versions require the same common collector")
+                products["reference"] = {"paths": reference_paths, "provenance": reference_provenance, "identity": reference_identity}
+                report["graphics_mode"] = args.baseline_mode
+            for product in products.values():
+                product["files"] = runtime_product_identity(product["paths"], product["provenance"])
+            report["products"] = {role: {"files": product["files"], "production_provenance": product["provenance"],
+                                        "measurement_identity": product["identity"]} for role, product in products.items()}
         for label, mode in cases:
             seconds = PROFILE_SECONDS if args.operation == "profile" else CASE_SECONDS
             require(deadline.remaining() >= seconds + 3, "Insufficient remaining time for a complete runtime case")
             require(runtime_source_identity() == sources, "Runtime measurement sources changed during the comparison")
-            require(all(app.path_hash(path) == report["binary_identity"][name] for name, path in paths.items()),
+            require(all(runtime_product_identity(product["paths"], product["provenance"]) == product["files"]
+                        for product in products.values()),
                     "Frozen products changed during runtime comparison")
+            role = "reference" if version_compare and label != "candidate" else "candidate"
+            paths, provenance, identity = (products[role][key] for key in ("paths", "provenance", "identity"))
             print(f"Runtime case {len(report['cases']) + 1}/{len(cases)}: {label} ({mode}); remaining {deadline.remaining():.1f}s", flush=True)
             case_deadline = RuntimeDeadline(seconds, cleanup_reserve=8)
             directory = output / label
             case = capture_case(directory, mode, paths, provenance, identity, case_deadline, profile=args.operation == "profile")
-            row = {"label": label, "mode": mode, "status": case["status"], "report_path": str(directory / "runtime-case.json"),
+            row = {"label": label, "mode": mode, "product_role": role, "status": case["status"], "report_path": str(directory / "runtime-case.json"),
                    "report_sha256": app.path_hash(directory / "runtime-case.json"), "workload_cpu": case.get("workload_cpu"),
                    "phase_cpu": case.get("phase_cpu"), "runtime_work": case.get("runtime_work"),
                    "runtime_cpu_work_counters": case.get("runtime_cpu_work_counters"),
+                   "steady_twinkle_delivery": case.get("steady_twinkle_delivery"),
                    "visual_work": case.get("visual_work"),
                    "runtime_cpu_target": case.get("runtime_cpu_target"),
                    "peak_footprint_bytes": (case.get("samples") or [{}])[-1].get("lifetime_peak_footprint_bytes")}
             report["cases"].append(row)
+            require(runtime_source_identity() == sources, "Runtime measurement sources changed during the capture")
+            require(all(runtime_product_identity(product["paths"], product["provenance"]) == product["files"]
+                        for product in products.values()), "Frozen products changed during the runtime capture")
             whole = (row.get("phase_cpu") or {}).get("whole_contiguous_runtime", {})
             print(f"  {case['status']}: whole-runtime CPU mean={whole.get('average_cpu_percent', 'unavailable')}%, max={whole.get('rolling_1s_percent', 'unavailable')}%" +
                   (" (profiled attribution only)" if args.operation == "profile" else ""), flush=True)
@@ -1011,6 +1112,8 @@ def _run(args, deadline):
         if args.operation == "compare":
             report["baseline_drift"] = baseline_drift(report["cases"])
         require(runtime_source_identity() == sources, "Runtime measurement sources changed before finalization")
+        require(all(runtime_product_identity(product["paths"], product["provenance"]) == product["files"]
+                    for product in products.values()), "Frozen products changed before runtime finalization")
         require(time.monotonic() < deadline.end - 1, "Runtime attribution exceeded its 300-second deadline")
         report["status"] = ("analysis_pending" if args.operation == "profile"
                             and report.get("attribution_status") == "analysis_pending" else "diagnostic_captured")

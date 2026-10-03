@@ -351,6 +351,14 @@ instances. Visible work must create instances and submit animations. Modes
 without retained twinkles reject any such activity when counters are exposed.
 These counters prove layer-animation submission, not GPU execution.
 
+The runtime driver also accepts frozen experimental builds that identify
+`direct_retained_twinkle_delivery`. Their optional
+`retained_twinkle_direct_updates` and `twinkle_state_publications` counters must
+prove positive direct delivery without state publications during an authenticated
+steady interval. Missing instrumentation reports unavailable evidence. This
+contract permits reproducing an experiment; it does not select that delivery path
+in production or establish a CPU improvement.
+
 Select any native GPU mode through the existing automated
 `run_performance_checks.py memory --graphics-mode MODE --no-native-inspection`
 command, supplying the frozen product paths shown above. The runner applies the
@@ -553,6 +561,16 @@ against the preserved previous default with
 then use a separate comparison with
 `--baseline-mode runtime-optimized --controls runtime-next-optimized` for their combination.
 These selections keep the same five-case maximum and 300-second command deadline.
+
+To compare an implementation change across two frozen builds, use `runtime
+compare --baseline-mode normal` with the candidate's usual product arguments and
+`--reference-app-binary`, `--reference-test-bundle`, and `--reference-provenance`.
+This runs reference/candidate/reference in the same graphics mode and preserves
+the 25-second traffic workload, completion tail, visibility checks, and 300-second
+deadline. Both versions must use identical common collector bytes, measurement
+sources, and fixture identity. Reference arguments cannot be combined with
+`--controls` or profiling. Each version's provenance and binary identity remain
+separate; drifted reference runs leave the comparison inconclusive.
 
 The two Canvas-clock controls remain available for isolated comparisons with
 `canvas_frame_clock = true` and shared preparation and stable decoration hosts
