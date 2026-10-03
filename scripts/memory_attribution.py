@@ -38,6 +38,23 @@ METAL_ARRIVAL_COUNTERS = ("metal_arrival_frames", "metal_arrival_submissions", "
 METAL_FULL_CHART_MODE = "runtime-metal-full-chart"
 METAL_CACHED_CHART_MODE = "runtime-metal-cached-chart"
 METAL_CHART_MODES = (METAL_FULL_CHART_MODE, METAL_CACHED_CHART_MODE)
+METAL_PRIMITIVE_EFFECTS_MODE = "runtime-metal-primitive-effects"
+TELEMETRY_BATCH_MODE = "runtime-telemetry-batch"
+ATOMIC_CHART_SCALE_MODE = "runtime-atomic-chart-scale"
+EFFICIENT_EFFECTS_MODE = "runtime-efficient-effects"
+PRIMITIVE_EFFECTS_MODES = (METAL_PRIMITIVE_EFFECTS_MODE, EFFICIENT_EFFECTS_MODE)
+BATCHED_TELEMETRY_MODES = (TELEMETRY_BATCH_MODE, EFFICIENT_EFFECTS_MODE)
+ATOMIC_CHART_SCALE_MODES = (ATOMIC_CHART_SCALE_MODE, EFFICIENT_EFFECTS_MODE)
+NEW_RUNTIME_MODES = (METAL_PRIMITIVE_EFFECTS_MODE, TELEMETRY_BATCH_MODE, ATOMIC_CHART_SCALE_MODE, EFFICIENT_EFFECTS_MODE)
+EFFICIENT_RUNTIME_MODES = NEW_RUNTIME_MODES
+NEW_RUNTIME_FLAGS = ("metal_primitive_effects_enabled", "batched_telemetry_delivery_enabled", "atomic_chart_scale_enabled")
+METAL_PRIMITIVE_EFFECTS_COUNTERS = ("hosts_created", "hosts_destroyed", "descriptor_uploads", "submissions", "clears",
+                                   "arrival_frames", "completion_frames", "twinkle_frames", "frames_skipped", "failures", "fallbacks")
+METAL_PRIMITIVE_EFFECTS_FIELDS = METAL_PRIMITIVE_EFFECTS_COUNTERS + ("live_hosts", "peak_hosts", "current_buffer_bytes", "peak_buffer_bytes")
+BATCHED_TELEMETRY_COUNTERS = ("compact_states_enqueued", "snapshots_materialized", "batches_applied", "events_applied", "projection_refreshes")
+ATOMIC_CHART_SCALE_COUNTERS = ("resolutions", "scale_changes", "cache_hits")
+BATCHED_TELEMETRY_FIELDS = BATCHED_TELEMETRY_COUNTERS
+ATOMIC_CHART_SCALE_FIELDS = ATOMIC_CHART_SCALE_COUNTERS
 METAL_SCENE_REVISION_CAUSES = ("scene_initial_revisions", "scene_publication_revisions", "scene_scale_revisions",
                              "scene_layout_revisions", "scene_appearance_revisions", "scene_rail_revisions",
                              "scene_unclassified_revisions")
@@ -52,7 +69,7 @@ DEFERRED_TOOL_GEOMETRY_MODE = "runtime-deferred-tool-geometry"
 DEFERRED_TOOL_GEOMETRY_2HZ_MODE = "runtime-deferred-tool-geometry-2hz"
 DEFERRED_TOOL_GEOMETRY_MODES = (DEFERRED_TOOL_GEOMETRY_MODE, DEFERRED_TOOL_GEOMETRY_2HZ_MODE)
 TOOL_PATH_POINT_COUNTERS = ("tool_path_input_points", "tool_path_output_points")
-ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE) + DEFERRED_TOOL_GEOMETRY_MODES
+ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE) + DEFERRED_TOOL_GEOMETRY_MODES + NEW_RUNTIME_MODES
 CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + tuple(mode for mode in ORDERED_PUBLICATION_MODES if mode not in METAL_CHART_MODES)
 NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized", *METAL_CHART_MODES) + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
@@ -400,9 +417,14 @@ def twinkle_delivery_contract(snapshot, mode):
 
 
 def runtime_feature_contract(value, mode):
-    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing")):
+    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + NEW_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing")):
         return None
     extras = {}
+    for field, enabled_modes in zip(NEW_RUNTIME_FLAGS, (PRIMITIVE_EFFECTS_MODES, BATCHED_TELEMETRY_MODES, ATOMIC_CHART_SCALE_MODES)):
+        if mode in NEW_RUNTIME_MODES or field in value:
+            require(type(value.get(field)) is bool and value[field] is (mode in enabled_modes),
+                    f"Graphics {field} does not match the requested runtime control")
+            extras[field] = value[field]
     if mode in METAL_CHART_MODES or "metal_full_chart_enabled" in value:
         require(type(value.get("metal_full_chart_enabled")) is bool
                 and value["metal_full_chart_enabled"] is (mode in METAL_CHART_MODES),
@@ -499,7 +521,7 @@ def tool_path_point_counts(snapshot):
 
 def chart_publication_interval(value, mode):
     field = "chart_publication_interval_seconds"
-    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE):
+    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, *NEW_RUNTIME_MODES):
         return None
     interval = value.get(field)
     expected = .5 if mode == DEFERRED_TOOL_GEOMETRY_2HZ_MODE else 1.0
@@ -552,7 +574,9 @@ def metal_arrival_contract(snapshot, mode, *, completed_visible_workload=False):
         require(type(value.get("metal_arrival_bursts_enabled")) is bool
                 and value["metal_arrival_bursts_enabled"] is enabled,
                 "Metal arrival counters lack matching enabled metadata")
-        backend = "metal-full-chart-shader" if mode in METAL_CHART_MODES else ("metal-shader" if enabled else "canvas")
+        backend = ("metal-full-chart-shader" if mode in METAL_CHART_MODES else
+                   "metal-primitive-effects" if mode in PRIMITIVE_EFFECTS_MODES else
+                   "metal-shader" if enabled else "canvas")
         require(value.get("arrival_backend") == backend, "Arrival backend does not match the requested mode")
     counters = {field: snapshot.get(field) for field in METAL_ARRIVAL_COUNTERS}
     for field, count in counters.items():
@@ -664,6 +688,107 @@ def metal_full_chart_contract(snapshot, mode, *, completed_visible_workload=Fals
             "buffer_scope": "Retained geometry and descriptor allocations; excludes drawable textures and physical GPU memory"}
 
 
+def metal_primitive_effects_contract(snapshot, mode, *, completed_visible_workload=False, expected_closed=False):
+    """Bounded native overlay lifetime evidence; static chart pixels remain Canvas work."""
+    value = snapshot.get("graphics_diagnostics", {})
+    enabled = mode in PRIMITIVE_EFFECTS_MODES
+    if not enabled and not any(field in value for field in ("metal_primitive_effects_enabled", "metal_primitive_effects")):
+        return None
+    require(type(value.get("metal_primitive_effects_enabled")) is bool
+            and value["metal_primitive_effects_enabled"] is enabled,
+            "Primitive Metal effects counters lack matching enabled metadata")
+    counts = value.get("metal_primitive_effects")
+    require(isinstance(counts, dict), "Primitive Metal effects counters are missing")
+    for field in METAL_PRIMITIVE_EFFECTS_FIELDS:
+        require(type(counts.get(field)) is int and 0 <= counts[field] <= 2**64 - 1,
+                f"graphics.metal_primitive_effects.{field} must be a complete UInt64 counter")
+    if not enabled:
+        require(all(counts[field] == 0 for field in METAL_PRIMITIVE_EFFECTS_FIELDS),
+                "Nonprimitive mode executed primitive Metal effects work")
+        return {"enabled": False, "counters": counts}
+    require(value.get("native_gpu_backend") == "swiftui-canvas-drawing-group"
+            and value.get("arrival_backend") == "metal-primitive-effects",
+            "Primitive Metal effects backend metadata differs")
+    full_chart = metal_full_chart_contract(snapshot, mode)
+    require(full_chart is not None and full_chart["enabled"] is False,
+            "Primitive Metal effects lack complete inactive full-chart Metal evidence")
+    require(counts["hosts_created"] - counts["hosts_destroyed"] == counts["live_hosts"]
+            and counts["live_hosts"] <= counts["peak_hosts"] <= counts["hosts_created"]
+            and (counts["hosts_created"] == 0 or counts["peak_hosts"] > 0),
+            "Primitive Metal effects host lifecycle does not reconcile")
+    require(counts["current_buffer_bytes"] <= counts["peak_buffer_bytes"]
+            and (counts["live_hosts"] > 0 or counts["current_buffer_bytes"] == 0),
+            "Primitive Metal effects retained buffer lifetime does not reconcile")
+    require(counts["frames_skipped"] == counts["failures"] == counts["fallbacks"] == 0,
+            "Primitive Metal effects reported skipped frames, failures, or fallback drawing")
+    require(all(counts[field] <= counts["submissions"] for field in
+                ("clears", "arrival_frames", "completion_frames", "twinkle_frames")),
+            "Primitive Metal effects frames exceed submitted work")
+    roles = value.get("roles")
+    require(isinstance(roles, dict), "Primitive Metal effects legacy role evidence is incomplete")
+    decoration = roles.get("rail_decorations")
+    require(isinstance(decoration, dict), "Primitive Metal effects decoration role evidence is missing")
+    require(type(decoration.get("draws")) is int and decoration["draws"] == 0
+            and type(decoration.get("skipped_draws")) is int and decoration["skipped_draws"] == 0,
+            "Primitive Metal effects executed legacy Canvas decoration drawing")
+    if completed_visible_workload:
+        # The network completion acknowledgment precedes the animation tail.
+        # Completion frames are proven by runtime phase windows. Synchronized
+        # traffic need not exercise overlapping glints; runtime reports that
+        # coverage separately from the required dedicated fidelity evidence.
+        require(counts["descriptor_uploads"] > 0 and counts["submissions"] > 0
+                and counts["arrival_frames"] > 0 and counts["peak_buffer_bytes"] > 0,
+                "Primitive Metal effects workload lacks positive arrival submissions or retained descriptors")
+    if expected_closed:
+        require(counts["live_hosts"] == counts["current_buffer_bytes"] == 0,
+                "Primitive Metal effects resources remain live after windows closed")
+    return {"enabled": True, "counters": counts, "frame_delivery_qualified": True,
+            "buffer_scope": "Retained primitive and descriptor allocations; excludes drawable textures and physical GPU memory"}
+
+
+def runtime_mechanism_contract(snapshot, mode, namespace, flag, enabled_modes, fields, *, completed_visible_workload=False):
+    """New products prove each delivery mechanism; historical absent metadata stays optional."""
+    value = snapshot.get("graphics_diagnostics", {})
+    enabled = mode in enabled_modes
+    if mode not in NEW_RUNTIME_MODES and flag not in value and namespace not in value:
+        return None
+    require(type(value.get(flag)) is bool and value[flag] is enabled,
+            f"Graphics {namespace} counters lack matching enabled metadata")
+    counts = value.get(namespace)
+    require(isinstance(counts, dict), f"Graphics {namespace} counters are missing")
+    for field in fields:
+        require(type(counts.get(field)) is int and 0 <= counts[field] <= 2**64 - 1,
+                f"graphics.{namespace}.{field} must be a complete UInt64 counter")
+    if not enabled:
+        require(all(counts[field] == 0 for field in fields), f"Inactive {namespace} mode executed mechanism work")
+    elif completed_visible_workload:
+        positive = fields if namespace == "batched_telemetry" else ("resolutions",)
+        require(all(counts[field] > 0 for field in positive),
+                f"Completed visible workload lacks positive {namespace} mechanism evidence")
+    return {"enabled": enabled, "counters": counts}
+
+
+def batched_telemetry_contract(snapshot, mode, *, completed_visible_workload=False):
+    result = runtime_mechanism_contract(snapshot, mode, "batched_telemetry", "batched_telemetry_delivery_enabled",
+        BATCHED_TELEMETRY_MODES, BATCHED_TELEMETRY_COUNTERS, completed_visible_workload=completed_visible_workload)
+    if result is not None:
+        counts = result["counters"]
+        require(counts["snapshots_materialized"] <= counts["compact_states_enqueued"]
+                and counts["projection_refreshes"] == counts["batches_applied"]
+                and counts["events_applied"] >= counts["batches_applied"],
+                "Batched telemetry materialization or projection counters do not reconcile")
+    return result
+
+
+def atomic_chart_scale_contract(snapshot, mode, *, completed_visible_workload=False):
+    result = runtime_mechanism_contract(snapshot, mode, "atomic_chart_scale", "atomic_chart_scale_enabled",
+        ATOMIC_CHART_SCALE_MODES, ATOMIC_CHART_SCALE_COUNTERS, completed_visible_workload=completed_visible_workload)
+    if result is not None:
+        require(result["counters"]["scale_changes"] <= result["counters"]["resolutions"],
+                "Atomic chart scale changes exceed resolutions")
+    return result
+
+
 def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False,
                       require_native_normal=False):
     value = snapshot.get("graphics_diagnostics")
@@ -687,6 +812,10 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     metal_arrival = metal_arrival_contract(snapshot, mode, completed_visible_workload=completed_visible_workload)
     full_chart = metal_full_chart_contract(snapshot, mode, completed_visible_workload=completed_visible_workload,
                                           expected_closed=expected_closed)
+    primitive_effects = metal_primitive_effects_contract(snapshot, mode,
+        completed_visible_workload=completed_visible_workload, expected_closed=expected_closed)
+    batched_telemetry = batched_telemetry_contract(snapshot, mode, completed_visible_workload=completed_visible_workload)
+    atomic_chart_scale = atomic_chart_scale_contract(snapshot, mode, completed_visible_workload=completed_visible_workload)
     if (mode in (COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "compact_tool_paths_enabled" in value
             or any(field in snapshot for field in TOOL_PATH_POINT_COUNTERS)):
         require("compact_tool_paths_enabled" in value or contract not in NATIVE_GPU_MODES,
@@ -751,7 +880,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             # This flag also validates the network-completion acknowledgment,
             # which can precede all completion animation. Controls without
             # Canvas arrivals prove positive ticks in the runtime tail instead.
-            if completed_visible_workload and mode not in (NO_ARRIVAL_MODE, METAL_ARRIVAL_MODE):
+            if completed_visible_workload and mode not in (NO_ARRIVAL_MODE, METAL_ARRIVAL_MODE, *PRIMITIVE_EFFECTS_MODES):
                 require(clock["rail_frame_clock_ticks"] > 0, "Canvas frame-clock mode did not execute frame ticks")
         else:
             require(clock["rail_frame_clock_ticks"] == 0, "Nonclock mode executed Canvas frame ticks")
@@ -909,6 +1038,9 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
                     "Completed visible workload did not execute native GPU static-chart drawing")
     return {"available": True, "counters": value,
             **({"metal_full_chart": full_chart} if full_chart is not None else {}),
+            **({"metal_primitive_effects": primitive_effects} if primitive_effects is not None else {}),
+            **({"batched_telemetry": batched_telemetry} if batched_telemetry is not None else {}),
+            **({"atomic_chart_scale": atomic_chart_scale} if atomic_chart_scale is not None else {}),
             **({"arrival_backend": metal_arrival["arrival_backend"]} if metal_arrival and metal_arrival["arrival_backend"] is not None else {}),
             **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {}),
             **({"runtime_feature_contract": runtime_features} if runtime_features is not None else {}),

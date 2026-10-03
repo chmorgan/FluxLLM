@@ -41,7 +41,56 @@ BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal", memory.ORDER
 
 
 def cpu_acceptance_eligible(mode, *, profile=False):
-    return not profile and mode not in (memory.HELD_STATIC_CHART_MODE, *memory.METAL_CHART_MODES)
+    return not profile and mode not in (memory.HELD_STATIC_CHART_MODE, *memory.PRIMITIVE_EFFECTS_MODES,
+                                       *memory.METAL_CHART_MODES)
+
+
+TRANSACTION_MECHANISMS = (
+    ("batched_telemetry", "batched_telemetry_delivery_enabled", memory.BATCHED_TELEMETRY_MODES,
+     ("compact_states_enqueued", "snapshots_materialized", "batches_applied", "events_applied", "projection_refreshes")),
+    ("atomic_chart_scale", "atomic_chart_scale_enabled", memory.ATOMIC_CHART_SCALE_MODES,
+     ("resolutions", "scale_changes", "cache_hits")),
+)
+
+
+def transaction_mechanism_work(before, after, mode):
+    """Require actual candidate work; optional absence preserves old freezes."""
+    result = {}
+    for namespace, flag, enabled_modes, fields in TRANSACTION_MECHANISMS:
+        values = [snapshot.get("graphics_diagnostics", {}) for snapshot in (before, after)]
+        if mode not in enabled_modes and not any(namespace in value or flag in value for value in values):
+            continue
+        enabled = mode in enabled_modes
+        counts = []
+        for value in values:
+            require(type(value.get(flag)) is bool and value[flag] is enabled,
+                    f"{namespace} mechanism metadata changed or does not match mode")
+            raw = value.get(namespace)
+            require(type(raw) is dict and set(fields) <= set(raw), f"{namespace} counters are incomplete")
+            count = {field: memory.unsigned(raw[field], f"{namespace}.{field}") for field in fields}
+            require(all(number <= 2**64 - 1 for number in count.values()),
+                    f"{namespace} counters exceed UInt64")
+            if namespace == "batched_telemetry":
+                require(count["snapshots_materialized"] <= count["compact_states_enqueued"]
+                        and count["projection_refreshes"] == count["batches_applied"] <= count["events_applied"],
+                        "Batched telemetry cumulative work does not reconcile")
+            else:
+                require(count["scale_changes"] <= count["resolutions"], "Atomic cumulative scale changes exceed resolutions")
+            require(enabled or all(number == 0 for number in count.values()),
+                    f"Inactive {namespace} mechanism executed work")
+            counts.append(count)
+        delta = {field: counts[1][field] - counts[0][field] for field in fields}
+        require(all(number >= 0 for number in delta.values()), f"{namespace} counters moved backwards")
+        if enabled and namespace == "batched_telemetry":
+            require(all(number > 0 for number in delta.values()), "Batched telemetry did not execute every delivery stage")
+            require(delta["snapshots_materialized"] <= delta["compact_states_enqueued"]
+                    and delta["projection_refreshes"] == delta["batches_applied"] <= delta["events_applied"],
+                    "Batched telemetry materialization or projection work exceeds delivery batches")
+        elif enabled:
+            require(delta["resolutions"] > 0, "Atomic chart scales did not resolve publications")
+            require(delta["scale_changes"] <= delta["resolutions"], "Atomic scale changes exceed resolutions")
+        result[namespace] = {"enabled": enabled, "deltas": delta}
+    return result
 
 
 def held_static_chart_work(before, after, mode):
@@ -205,6 +254,17 @@ def runtime_product_identity(paths, provenance):
     return {name: {"path": str(path), "sha256": app.path_hash(path)} for name, path in files.items()}
 
 
+def primitive_overlap_coverage(frames):
+    """Distinguish executed work from a synchronized fixture's coverage gaps."""
+    frames = memory.unsigned(frames, "primitive.lifecycle_glint_overlap_frames")
+    return {"lifecycle_glint_overlap_exercised": frames > 0,
+            "lifecycle_glint_overlap_frames": frames,
+            "dedicated_lifecycle_glint_overlap_evidence_required": True,
+            "lifecycle_glint_overlap_scope":
+                "Synchronized traffic does not guarantee eligible glints during lifecycle effects; "
+                "dedicated mixed-order rendering and strict fidelity evidence remain required before promotion"}
+
+
 def validate_runtime_work(before, after, mode, *, required=True):
     instrumented_tool_traces = any(field in snapshot for snapshot in (before, after) for field in TOOL_TRACE_COUNTERS)
     flags = memory.runtime_feature_contract(after.get("graphics_diagnostics", {}), mode)
@@ -226,6 +286,19 @@ def validate_runtime_work(before, after, mode, *, required=True):
     full_last = memory.metal_full_chart_contract(after, mode)
     require((full_first is None) == (full_last is None), "Full Metal chart instrumentation changed during runtime")
     full_delta = None
+    primitive_first = memory.metal_primitive_effects_contract(before, mode)
+    primitive_last = memory.metal_primitive_effects_contract(after, mode)
+    require((primitive_first is None) == (primitive_last is None),
+            "Primitive Metal effects instrumentation changed during runtime")
+    primitive_delta = None
+    if mode in memory.PRIMITIVE_EFFECTS_MODES:
+        primitive_delta = {field: primitive_last["counters"][field] - primitive_first["counters"][field]
+                           for field in memory.METAL_PRIMITIVE_EFFECTS_COUNTERS}
+        require(all(number >= 0 for number in primitive_delta.values()),
+                "Primitive Metal effects counters moved backwards")
+        require(all(primitive_delta[field] > 0 for field in
+                    ("descriptor_uploads", "submissions", "arrival_frames", "completion_frames")),
+                "Primitive Metal effects did not submit arrivals and completions")
     if mode in memory.METAL_CHART_MODES:
         full_counters = memory.METAL_FULL_CHART_COUNTERS + (memory.METAL_CACHE_COUNTERS
                         if mode == memory.METAL_CACHED_CHART_MODE else ())
@@ -368,7 +441,11 @@ def validate_runtime_work(before, after, mode, *, required=True):
             require(last >= first, f"Runtime {field} counter moved backwards")
             delta[field] = last - first
         if flags.get("canvas_frame_clock", False):
-            require(delta["rail_frame_clock_ticks"] > 0, "Canvas frame-clock path did not execute frame ticks")
+            if mode in memory.PRIMITIVE_EFFECTS_MODES:
+                require(before["rail_frame_clock_ticks"] == after["rail_frame_clock_ticks"] == 0,
+                        "Primitive Metal effects executed the legacy Canvas frame clock")
+            else:
+                require(delta["rail_frame_clock_ticks"] > 0, "Canvas frame-clock path did not execute frame ticks")
             require(before["rail_timeline_content_updates"] == after["rail_timeline_content_updates"] == 0,
                     "Canvas frame-clock mode updated Timeline content")
         else:
@@ -425,13 +502,25 @@ def validate_runtime_work(before, after, mode, *, required=True):
     held_work = held_static_chart_work(before, after, mode)
     if held_work is None and mode not in memory.METAL_CHART_MODES:
         require(delta["static_chart_draws"] > 0, "Runtime static charts did not redraw")
-    if flags.get("canvas_frame_clock", False):
+    if flags.get("canvas_frame_clock", False) and mode not in memory.PRIMITIVE_EFFECTS_MODES:
         minimum_draws = max(1, math.floor(.8 * delta["rail_frame_clock_ticks"]) - 2)
         require(delta["rail_decorations_draws"] >= minimum_draws,
                 "Canvas frame ticks did not produce sufficient native decoration draws")
     if not flags["lifecycle_effects_enabled"]:
         require(delta["rail_decorations_draws"] == 0, "No-lifecycle control still drew lifecycle decorations")
+    if mode in memory.PRIMITIVE_EFFECTS_MODES:
+        require(before["rail_frame_clock_ticks"] == after["rail_frame_clock_ticks"]
+                == before["rail_timeline_content_updates"] == after["rail_timeline_content_updates"] == 0
+                and before["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"]
+                    == after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] == 0,
+                "Primitive Metal effects fell back to Canvas decorations or CPU frame clocks")
+    mechanism_work = transaction_mechanism_work(before, after, mode)
     return {"available": True, "features": flags, "deltas": delta,
+            **({"transaction_mechanisms": mechanism_work} if mechanism_work else {}),
+            **({"metal_primitive_effects_deltas": primitive_delta, "promotion_eligible": False,
+                **primitive_overlap_coverage(primitive_delta["twinkle_frames"]),
+                "promotion_reason": "Experimental renderer requires independent visual fidelity qualification"}
+               if primitive_delta is not None else {}),
             **({"metal_full_chart_deltas": full_delta, "promotion_eligible": False,
                 "promotion_reason": "Experimental renderer requires independent visual fidelity qualification"}
                if full_delta is not None else {}),
@@ -625,10 +714,128 @@ def validate_metal_full_chart_work(report, mode, *,
             "scope": "Authenticated visible workload and closed cancellation; submitted work does not measure GPU utilization"}
 
 
+def validate_metal_primitive_effects_work(report, mode, *,
+                                         closed_labels=("07-both-closed-after-probe", "08-closed-after-five-more-seconds"),
+                                         minimum_closed_seconds=5, boundary=None):
+    """Prove native effect delivery, steady retained glints and complete shutdown."""
+    if mode not in memory.PRIMITIVE_EFFECTS_MODES:
+        return None
+    points = report["runtime"]["checkpoints"]
+    require(len(points) >= 2, "Primitive Metal effects lack runtime checkpoints")
+    if boundary is None:
+        clocks = report["runtime"]
+        offset = sum(clocks[name]["absolute_minus_monotonic_seconds"] for name in ("mach_clock_start", "mach_clock_end")) / 2
+
+        def boundary(point):
+            snapshot, sample = point["snapshot"], point["resource_sample"]
+            matches = [row for row in report["samples"]
+                       if row["monotonic_seconds"] == snapshot.get("runner_collector_sample_monotonic_seconds")]
+            require(len(matches) == 1 and matches[0] == sample
+                    and all(sample.get(field) == report["owned_identity"][field]
+                            for field in ("process_id", "birth_time_us")),
+                    "Primitive Metal effects checkpoint lacks its authenticated kernel boundary")
+            return sample["mach_absolute_seconds"] - offset
+
+    closed = []
+    for label in closed_labels:
+        matches = [point for point in report["checkpoints"] if point["label"] == label]
+        require(len(matches) == 1, "Primitive Metal effects closed checkpoints are missing or duplicated")
+        closed.append(matches[0])
+    initial_flags = memory.runtime_feature_contract(points[0]["snapshot"]["graphics_diagnostics"], mode)
+    rows = []
+    retained_counters = ("hosts_created", "hosts_destroyed", "instances_created", "instances_destroyed", "animation_starts")
+    for index, point in enumerate(points + closed):
+        snapshot = point["snapshot"]
+        hidden = index >= len(points)
+        require(snapshot.get("dashboard_visible") is (not hidden) and snapshot.get("popover_visible") is (not hidden),
+                "Primitive Metal effects checkpoint lost native window visibility")
+        require(not hidden or snapshot.get("active_requests") == 0, "Closed primitive effects are not idle")
+        require(memory.runtime_feature_contract(snapshot["graphics_diagnostics"], mode) == initial_flags,
+                "Primitive Metal effects features changed between checkpoints")
+        counts = memory.metal_primitive_effects_contract(snapshot, mode, expected_closed=hidden)["counters"]
+        require(all(memory.unsigned(snapshot.get(field), "primitive." + field) == 0
+                    for field in memory.CANVAS_CLOCK_COUNTERS),
+                "Primitive Metal effects executed CPU rail clocks or Timeline content")
+        # The cropped overlay must never compose a full static chart texture.
+        full = memory.metal_full_chart_contract(snapshot, mode)
+        require(full is not None and full["enabled"] is False,
+                "Primitive overlay lacks explicit inactive full Metal chart evidence")
+        glints = snapshot["graphics_diagnostics"].get("retained_twinkles")
+        require(type(glints) is dict, "Primitive Metal effects lack retained glint lifetime evidence")
+        require(snapshot["graphics_diagnostics"].get("retained_twinkles_enabled") is True,
+                "Primitive Metal effects disabled retained glints")
+        memory.validate_retained_twinkles(snapshot["graphics_diagnostics"], mode, expected_closed=hidden)
+        for field in retained_counters + ("live_hosts", "live_instances"):
+            memory.unsigned(glints.get(field), "retained_twinkles." + field)
+        require(glints["hosts_created"] - glints["hosts_destroyed"] == glints["live_hosts"]
+                and glints["instances_created"] - glints["instances_destroyed"] == glints["live_instances"],
+                "Primitive retained glint lifetimes do not reconcile")
+        require(not hidden or glints["live_hosts"] == glints["live_instances"] == 0,
+                "Primitive retained glints leaked closed resources")
+        rows.append((point, boundary(point), counts, glints))
+    cumulative = memory.METAL_PRIMITIVE_EFFECTS_COUNTERS
+    for first, last in zip(rows, rows[1:]):
+        require(last[1] > first[1], "Primitive Metal effects checkpoints are not ordered")
+        require(all(last[2][field] >= first[2][field] for field in cumulative)
+                and all(last[3][field] >= first[3][field] for field in retained_counters),
+                "Primitive Metal effects or retained glint counters moved backwards")
+    visible_rows = rows[:len(points)]
+    arrival, steady, completion = (report["phase_windows"][name] for name in ("arrival", "steady", "completion"))
+    arrival_end = [row for row in visible_rows
+                   if arrival["end_monotonic_seconds"] <= row[1] < steady["start_monotonic_seconds"]]
+    require(visible_rows[0][1] <= arrival["start_monotonic_seconds"] and arrival_end,
+            "Primitive Metal arrivals lack bracketing checkpoints")
+    steady_rows = [row for row in visible_rows if steady["start_monotonic_seconds"] < row[1] < steady["end_monotonic_seconds"]]
+    require(len(steady_rows) >= 2 and all(row[0]["snapshot"].get("active_requests") == 2 for row in steady_rows),
+            "Primitive Metal steady phase lacks interior active streams")
+    began = [row for row in visible_rows if row[0]["label"] == "completion-begin"]
+    require(len(began) == 1 and completion["start_monotonic_seconds"] <= began[0][1] < completion["end_monotonic_seconds"],
+            "Primitive Metal completion lacks its authenticated start checkpoint")
+    completion_rows = [row for row in visible_rows if began[0][1] <= row[1] <= completion["end_monotonic_seconds"]]
+    require(len(completion_rows) >= 2 and all(row[0]["snapshot"].get("active_requests") == 0 for row in completion_rows),
+            "Primitive Metal completion lacks idle interior checkpoints")
+
+    def delta(first, last):
+        return {field: last[2][field] - first[2][field] for field in cumulative}
+
+    arrival_delta = delta(visible_rows[0], arrival_end[0])
+    steady_delta = delta(steady_rows[0], steady_rows[-1])
+    completion_delta = delta(completion_rows[0], completion_rows[-1])
+    whole_delta = delta(visible_rows[0], visible_rows[-1])
+    require(arrival_delta["arrival_frames"] > 0 and arrival_delta["submissions"] > 0,
+            "Primitive Metal arrivals did not submit before steady traffic")
+    require(completion_delta["completion_frames"] > 0 and completion_delta["submissions"] > 0,
+            "Primitive Metal completion animation did not submit inside its phase")
+    require(all(number == 0 for number in steady_delta.values()),
+            "Primitive Metal effects continued native work during effect-free steady traffic")
+    retained = {field: steady_rows[-1][3][field] - steady_rows[0][3][field]
+                for field in ("instances_created", "animation_starts")}
+    require(all(number > 0 for number in retained.values()), "Primitive steady phase did not animate retained glints")
+    steady_first, steady_last = (row[0]["snapshot"] for row in (steady_rows[0], steady_rows[-1]))
+    preparations = memory.unsigned(steady_last.get("chart_preparations"), "primitive.steady.last.chart_preparations") - memory.unsigned(
+        steady_first.get("chart_preparations"), "primitive.steady.first.chart_preparations")
+    static_draws = steady_last["graphics_diagnostics"]["roles"]["static_chart"]["draws"] - steady_first[
+        "graphics_diagnostics"]["roles"]["static_chart"]["draws"]
+    require(preparations > 0 and static_draws > 0, "Primitive overlay did not preserve steady static chart publication and drawing")
+    require(rows[-1][1] - rows[-2][1] >= minimum_closed_seconds, "Primitive Metal closed observation is too short")
+    closed_delta = delta(rows[-2], rows[-1])
+    require(all(number == 0 for number in closed_delta.values()) and rows[-2][3] == rows[-1][3],
+            "Primitive Metal effects or retained glints continued work after windows closed")
+    return {"available": True, "arrival_deltas": arrival_delta, "steady_deltas": steady_delta,
+            "completion_deltas": completion_delta, "closed_deltas": closed_delta,
+            "steady_retained_twinkle_deltas": retained, "full_static_chart_composition": False,
+            "steady_chart_preparations": preparations, "steady_static_chart_draws": static_draws,
+            **primitive_overlap_coverage(whole_delta["twinkle_frames"]),
+            "frame_delivery_qualified": True, "promotion_eligible": False,
+            "scope": "Authenticated visible native effects and closed cancellation; submissions do not measure GPU utilization"}
+
+
 def validate_canvas_clock_work(report, mode):
     """Use existing authenticated checkpoints; never infer idle from a tail deadline."""
     if mode in memory.METAL_CHART_MODES:
         return validate_metal_full_chart_work(report, mode)
+    if mode in memory.PRIMITIVE_EFFECTS_MODES:
+        return validate_metal_primitive_effects_work(report, mode)
     points = report["runtime"]["checkpoints"]
     flags = memory.runtime_feature_contract(points[0]["snapshot"].get("graphics_diagnostics", {}), mode) or {}
     metal_initial = memory.metal_arrival_contract(points[0]["snapshot"], mode)
@@ -1090,9 +1297,10 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
         report["runtime_cpu_target"] = {"evaluated": eligible, "acceptance_eligible": eligible, "limit_percent": 5.0,
             "within_limit": report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5 if eligible else None,
             "scope": "Contiguous visible traffic and completion only; separate from full resource gate"}
-        if mode in (memory.HELD_STATIC_CHART_MODE, *memory.METAL_CHART_MODES):
+        if mode in (memory.HELD_STATIC_CHART_MODE, *memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES):
             report["runtime_cpu_target"]["reason"] = ("Experimental Metal chart needs independent visual and frame-delivery qualification"
-                if mode in memory.METAL_CHART_MODES else "Held static chart drawing is a diagnostic ablation, not production rendering")
+                if mode in (*memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES)
+                else "Held static chart drawing is a diagnostic ablation, not production rendering")
             report["runtime_cpu_target"]["observed_within_limit"] = report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5
             report["cpu_gate_evaluated"] = False
             report.setdefault("workload_cpu", {}).update(acceptance_eligible=False, gate_evaluated=False, within_limit=None)
@@ -1216,7 +1424,8 @@ def parser():
         result.add_argument("--" + name, type=Path,
                             help="Compare frozen versions in reference/candidate/reference order using --baseline-mode")
     result.add_argument("--graphics-mode", choices=BASELINES + memory.RUNTIME_MODES, default="normal")
-    result.add_argument("--baseline-mode", choices=BASELINES + memory.METAL_CHART_MODES, default="native-gpu-optimized")
+    result.add_argument("--baseline-mode", choices=BASELINES + memory.METAL_CHART_MODES + memory.NEW_RUNTIME_MODES,
+                        default="native-gpu-optimized")
     result.add_argument("--candidate-mode", choices=BASELINES + memory.RUNTIME_MODES,
                         help="Candidate-only rendering mode for a frozen reference/candidate/reference comparison")
     result.add_argument("--controls", nargs="+", choices=memory.RUNTIME_MODES + ("normal",))

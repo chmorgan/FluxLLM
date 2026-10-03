@@ -14,6 +14,20 @@ from run_performance_checks import InvalidResult
 
 
 def graphics(mode="normal"):
+    if mode in memory.NEW_RUNTIME_MODES:
+        snapshot = graphics(memory.METAL_ARRIVAL_MODE)
+        value = snapshot["graphics_diagnostics"]
+        value.update(mode=mode, metal_arrival_bursts_enabled=False,
+                     arrival_backend="metal-primitive-effects" if mode in memory.PRIMITIVE_EFFECTS_MODES else "canvas",
+                     metal_full_chart_enabled=False, metal_static_cache_enabled=False,
+                     metal_full_chart=dict.fromkeys(memory.METAL_FULL_CHART_FIELDS + memory.METAL_CACHE_FIELDS, 0),
+                     metal_primitive_effects_enabled=mode in memory.PRIMITIVE_EFFECTS_MODES,
+                     metal_primitive_effects=dict.fromkeys(memory.METAL_PRIMITIVE_EFFECTS_FIELDS, 0),
+                     batched_telemetry_delivery_enabled=mode in memory.BATCHED_TELEMETRY_MODES,
+                     batched_telemetry=dict.fromkeys(memory.BATCHED_TELEMETRY_COUNTERS, 0),
+                     atomic_chart_scale_enabled=mode in memory.ATOMIC_CHART_SCALE_MODES,
+                     atomic_chart_scale=dict.fromkeys(memory.ATOMIC_CHART_SCALE_COUNTERS, 0))
+        return snapshot
     if mode in memory.METAL_CHART_MODES:
         snapshot = graphics(memory.METAL_ARRIVAL_MODE)
         snapshot["graphics_diagnostics"].update(mode=mode, metal_full_chart_enabled=True,
@@ -144,7 +158,19 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
     if mode == memory.HELD_STATIC_CHART_MODE:
         value["roles"]["static_chart"].update(drawing_update_attempts=3, drawing_updates_applied=3)
     if mode in memory.CANVAS_CLOCK_MODES:
-        snapshot["rail_frame_clock_ticks"] = 3
+        snapshot["rail_frame_clock_ticks"] = 0 if mode in memory.PRIMITIVE_EFFECTS_MODES else 3
+    if mode in memory.NEW_RUNTIME_MODES:
+        snapshot.update(grouped_native_canvas_draws=3, legacy_tool_plot_builds=3,
+                        tool_path_input_points=30, tool_path_output_points=30)
+        if mode in memory.PRIMITIVE_EFFECTS_MODES:
+            value["metal_primitive_effects"].update(hosts_created=2, live_hosts=2, peak_hosts=2,
+                descriptor_uploads=2, submissions=4, clears=1, arrival_frames=1, completion_frames=1,
+                twinkle_frames=1, current_buffer_bytes=512, peak_buffer_bytes=512)
+        if mode in memory.BATCHED_TELEMETRY_MODES:
+            value["batched_telemetry"].update(compact_states_enqueued=10, snapshots_materialized=2,
+                batches_applied=2, events_applied=4, projection_refreshes=2)
+        if mode in memory.ATOMIC_CHART_SCALE_MODES:
+            value["atomic_chart_scale"].update(resolutions=2, scale_changes=1, cache_hits=0)
     if mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"):
         value.update(live_canvases=2, peak_live_canvases=2)
         value["roles"]["rail_decorations"].update(created=1, live=1, peak_live=1)
@@ -649,6 +675,8 @@ class GraphicsTests(unittest.TestCase):
             value["live_canvases"] = value["current_pixel_area"] = 0
             for role in value["roles"].values():
                 role.update(destroyed=role["created"], live=0, current_pixel_area=0)
+            if mode in memory.PRIMITIVE_EFFECTS_MODES:
+                value["metal_primitive_effects"].update(hosts_destroyed=2, live_hosts=0, current_buffer_bytes=0)
             with self.subTest(mode=mode), self.assertRaisesRegex(InvalidResult, "Retained twinkle resources remain live"):
                 memory.validate_graphics(snapshot, mode, expected_closed=True)
             value["retained_twinkles"].update(hosts_destroyed=1, live_hosts=0, instances_destroyed=2, live_instances=0)

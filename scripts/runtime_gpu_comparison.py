@@ -30,7 +30,7 @@ REQUEST_INDICES = (CYCLE * 32, CYCLE * 32 + 1)
 STAGE = {"activity": "high-rate", "seconds": 8}
 WORK = {"chunks": 3200, "output_tokens": 6434, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
-MODES = ("normal", memory.METAL_ARRIVAL_MODE, *memory.METAL_CHART_MODES)
+MODES = ("normal", memory.METAL_ARRIVAL_MODE, *memory.METAL_CHART_MODES, *memory.NEW_RUNTIME_MODES)
 ERRORS = (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError)
 
 
@@ -126,6 +126,10 @@ def validate_short_clock_work(report, mode):
     """Check the same rendering contracts over the explicitly shorter windows."""
     if mode in memory.METAL_CHART_MODES:
         return runtime.validate_metal_full_chart_work(report, mode,
+            closed_labels=("closed-start", "closed-end"), minimum_closed_seconds=2,
+            boundary=lambda point: snapshot_time(report, point))
+    if mode in memory.PRIMITIVE_EFFECTS_MODES:
+        return runtime.validate_metal_primitive_effects_work(report, mode,
             closed_labels=("closed-start", "closed-end"), minimum_closed_seconds=2,
             boundary=lambda point: snapshot_time(report, point))
     points = report["runtime"]["checkpoints"]
@@ -427,7 +431,7 @@ def qualify_result(result):
                     "Qualified GPU metric lacks a finite conservative maximum")
             return {"evaluated": valid, "limit_percent": 1, "within_limit": upper <= 1 if valid else None}
         row["gpu_target"] = {"runtime": target(workload, available), "lifetime": target(lifetime, life_available)}
-        if row.get("mode") in memory.METAL_CHART_MODES:
+        if row.get("mode") in (*memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES):
             row.update(promotion_eligible=False,
                        promotion_reason="Experimental renderer requires independent visual and frame-delivery qualification")
         if not available or not life_available:

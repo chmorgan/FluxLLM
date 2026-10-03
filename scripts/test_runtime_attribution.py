@@ -42,7 +42,7 @@ def workload_snapshots(mode):
         after["direct_tool_plot_builds"] += 2
     elif "direct_tool_plot" in value:
         after["legacy_tool_plot_builds"] += 2
-    if value.get("canvas_frame_clock"):
+    if value.get("canvas_frame_clock") and mode not in memory.PRIMITIVE_EFFECTS_MODES:
         after["rail_frame_clock_ticks"] += 2
     if value.get("shared_chart_preparation"):
         after["shared_chart_preparations"] += 2
@@ -64,8 +64,21 @@ def workload_snapshots(mode):
         after["graphics_diagnostics"]["roles"]["static_chart"]["drawing_updates_held"] += 2
     elif mode not in memory.METAL_CHART_MODES:
         after["graphics_diagnostics"]["roles"]["static_chart"]["draws"] += 2
-    if value["lifecycle_effects_enabled"] and mode not in memory.METAL_CHART_MODES:
+    if value["lifecycle_effects_enabled"] and mode not in memory.METAL_CHART_MODES + memory.PRIMITIVE_EFFECTS_MODES:
         after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 1
+    if mode in memory.PRIMITIVE_EFFECTS_MODES:
+        effects = after["graphics_diagnostics"]["metal_primitive_effects"]
+        effects["descriptor_uploads"] += 2
+        effects["submissions"] += 4
+        effects["clears"] += 1
+        effects["arrival_frames"] += 1
+        effects["completion_frames"] += 1
+        effects["twinkle_frames"] += 1
+    if mode in memory.BATCHED_TELEMETRY_MODES:
+        after["graphics_diagnostics"]["batched_telemetry"].update(compact_states_enqueued=20,
+            snapshots_materialized=4, batches_applied=4, events_applied=8, projection_refreshes=4)
+    if mode in memory.ATOMIC_CHART_SCALE_MODES:
+        after["graphics_diagnostics"]["atomic_chart_scale"].update(resolutions=4, scale_changes=2, cache_hits=0)
     if mode in memory.METAL_CHART_MODES:
         for field in ("geometry_uploads", "submissions", "static_frames", "arrival_frames", "completion_frames", "twinkle_frames"):
             after["graphics_diagnostics"]["metal_full_chart"][field] += 2
@@ -190,7 +203,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 0 if mode in (memory.HELD_STATIC_CHART_MODE, *memory.METAL_CHART_MODES) else 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "metal_full_chart_enabled", "metal_static_cache_enabled", "holds_static_chart_drawing") if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "metal_full_chart_enabled", "metal_static_cache_enabled", "holds_static_chart_drawing", *memory.NEW_RUNTIME_FLAGS) if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -906,6 +919,9 @@ class NextRuntimeWorkTests(unittest.TestCase):
                 with self.subTest(mode=mode, ticks=ticks, timeline=timeline, draws=draws), self.assertRaises(ValueError):
                     runtime.validate_runtime_work(before, after, mode)
             before, after = workload_snapshots(mode)
+            if mode in memory.PRIMITIVE_EFFECTS_MODES:
+                self.assertTrue(runtime.validate_runtime_work(before, after, mode)["available"])
+                continue
             after["rail_frame_clock_ticks"] = before["rail_frame_clock_ticks"] + 20
             after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] += 13
             if "ungrouped_native_canvas" in after["graphics_diagnostics"]:
@@ -1012,7 +1028,7 @@ class CanvasClockPhaseTests(unittest.TestCase):
                 runtime.validate_canvas_clock_work(changed, "normal")
 
     def test_steady_and_closed_proof_uses_authenticated_interior_checkpoints(self):
-        for mode in memory.CANVAS_CLOCK_MODES:
+        for mode in tuple(mode for mode in memory.CANVAS_CLOCK_MODES if mode not in memory.PRIMITIVE_EFFECTS_MODES):
             report = clock_work_report(mode)
             proof = runtime.validate_canvas_clock_work(report, mode)
             self.assertEqual(proof["steady"]["start_monotonic_seconds"], 106)

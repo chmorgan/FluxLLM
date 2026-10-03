@@ -1277,6 +1277,77 @@ cannot bound rasterization because axis-scale hysteresis can change geometry
 without another history preparation. The 1 Hz preparation and exact-work checks
 remain independent of these cache-invalidation counters.
 
+### Cropped primitive effects and batched updates
+
+Four explicit controls isolate the next implementation from the frozen normal
+renderer. Ordinary chart publication remains 1 Hz, scalar presentation remains
+coalesced, and active streaming keeps exact forwarding and token/tool accounting.
+
+| Mode | Implementation under test | Required executed-work evidence |
+| --- | --- | --- |
+| `runtime-metal-primitive-effects` | Keep the normal static chart and retained streaming glints; draw arrival/completion effects in a cropped native Metal surface using particle quads and lightning segment geometry. | Native arrival/completion submissions, descriptor buffers and transparent clears; zero CPU decoration Canvas clocks/draws, zero full-chart static rasterization/copies, zero steady Metal submissions, complete closed resource release. Lifecycle/glint overlap is reported as exercised or unexercised; dedicated ordered-overlap fidelity evidence is separately required. |
+| `runtime-telemetry-batch` | Coalesce compact cumulative token state in the shared inbox and materialize snapshots only at delivery; apply each ordered inbox batch in one store transaction. | Positive compact inputs, materialized snapshots, applied batches/events and one derived projection refresh per applied batch. Materializations must not exceed compact inputs. |
+| `runtime-atomic-chart-scale` | Resolve scale hysteresis before constructing a chart's immutable render input; reuse the resolution for repeated reads of the same key. | Positive scale resolutions, bounded scale changes, and complete counters. Reuse is verified by resolver unit tests; runtime cache hits may be zero when each input is read only once. |
+| `runtime-efficient-effects` | Enable all three changes together. | Every primitive, telemetry and scale contract above. |
+
+New modes require their exact enabled flags and complete unsigned mechanism
+counters. Nonselected mechanisms must stay zero. Older frozen normal products
+remain valid when all new metadata is absent; an absent candidate counter is
+never treated as zero. The native effects controls remain experimental and
+ineligible for a performance acceptance pass until independent visual fidelity
+has passed. Telemetry and scale controls preserve the normal renderer and remain
+eligible for the unchanged CPU limit after their semantic tests pass.
+
+The synchronized two-stream workload does not guarantee glints overlapping a
+lifecycle effect. An arrival glint can be clipped by the held 1 Hz chart geometry,
+and completed requests cease to be eligible for glints. A measured zero remains
+an explicit `lifecycle_glint_overlap_exercised=false`, with a required complete
+`twinkle_frames` counter; missing or malformed counters still invalidate the run.
+Positive arrival/completion work and ordinary retained glints remain mandatory.
+Dedicated mixed effect/glint ordering tests and strict rendered-pixel comparison
+are required before promotion, even when a traffic capture happens to exercise
+overlap. A capture with no overlap does not qualify that rendering path.
+
+Run each candidate through the existing frozen reference/candidate/reference CPU
+comparison, selecting a new unique ignored results directory each time:
+
+```sh
+python3 scripts/run_performance_checks.py runtime compare \
+  --baseline-mode normal --candidate-mode runtime-metal-primitive-effects \
+  --app-binary /absolute/candidate/FluxLLMApp \
+  --test-bundle /absolute/candidate/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/candidate/FluxLLMResourceCollector \
+  --provenance /absolute/candidate/provenance.json \
+  --reference-app-binary /absolute/reference/FluxLLMApp \
+  --reference-test-bundle /absolute/reference/FluxLLMPackageTests.xctest \
+  --reference-provenance /absolute/reference/provenance.json \
+  --output-dir .performance-results/primitive-effects-cpu-comparison
+```
+
+Replace only `--candidate-mode` and the results directory for the other three
+controls. Each invocation retains the fixed two-stream 25-second workload and
+the shared 300-second ceiling, normally finishing in about two minutes. CPU
+captures run without Instruments. Reference drift, visible windows, phase
+coverage, exact work, ownership, cancellation and clean exit remain mandatory.
+
+Measure GPU separately with the short matched workload and calibrated
+process attribution:
+
+```sh
+python3 scripts/run_performance_checks.py gpu-compare \
+  --reference-products /absolute/reference-products \
+  --candidate-products /absolute/candidate-products \
+  --reference-mode normal --candidate-mode runtime-metal-primitive-effects \
+  --output-dir .performance-results/primitive-effects-gpu-comparison
+```
+
+The existing separate `--capture-case reference` and `--capture-case candidate`
+invocations remain available when a paired trace cannot finalize within five
+minutes. Report those as independent captures, retain both timestamps and
+attribution bounds, and preserve failed attempts. App-attributed GPU time does
+not include compositor-wide execution; moving work between native surfaces and
+Core Animation cannot establish a whole-system energy reduction by itself.
+
 ## Baselines and comparison artifacts
 
 Record the same workload before changing production behavior:
