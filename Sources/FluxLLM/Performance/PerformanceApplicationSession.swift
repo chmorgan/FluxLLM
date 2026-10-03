@@ -23,6 +23,8 @@ public final class PerformanceApplicationSession {
     private let rawEnd: Date
     private let requestIdentity: PerformanceRequestIdentity
     private let threadCPURegistration: [String: Any]?
+    private let nioCPUProxy: ProxyManager?
+    private var nioCPUSnapshot: PerformanceNIODiagnostics.Snapshot?
     private var stopped = false
 
     private init(
@@ -32,7 +34,8 @@ public final class PerformanceApplicationSession {
         historyKind: String, proxyPort: Int, clock: PerformanceWorkloadClock,
         defaults: UserDefaults, rawEnd: Date,
         fixtureManifest: PerformanceHistoryFixture.EquivalenceManifest,
-        requestIdentity: PerformanceRequestIdentity, threadCPURegistration: [String: Any]?
+        requestIdentity: PerformanceRequestIdentity, threadCPURegistration: [String: Any]?,
+        nioCPUProxy: ProxyManager?
     ) {
         self.store = store
         self.coordinator = coordinator
@@ -48,14 +51,20 @@ public final class PerformanceApplicationSession {
         self.fixtureManifest = fixtureManifest
         self.requestIdentity = requestIdentity
         self.threadCPURegistration = threadCPURegistration
+        self.nioCPUProxy = nioCPUProxy
     }
 
     public static func start(
         upstream: URL, historyDirectory: URL, preferencesSuite: String,
         populated: Bool, fixtureEndingAt: Date? = nil,
         graphicsMode: PerformanceGraphicsDiagnostics.Mode = .normal,
-        popoverAnimationsEnabled: Bool = true, threadCPUAccountingEnabled: Bool = false
+        popoverAnimationsEnabled: Bool = true, threadCPUAccountingEnabled: Bool = false,
+        nioCPUAccountingEnabled: Bool = false
     ) async throws -> PerformanceApplicationSession {
+        guard !nioCPUAccountingEnabled || threadCPUAccountingEnabled else {
+            throw PerformanceSessionError.invalid(
+                "Scoped NIO CPU accounting requires direct thread CPU accounting")
+        }
         guard upstream.scheme == "http", upstream.host == "127.0.0.1",
             let upstreamPort = upstream.port, (1...65535).contains(upstreamPort)
         else { throw PerformanceSessionError.invalid("A numeric loopback fixture is required") }
@@ -92,7 +101,8 @@ public final class PerformanceApplicationSession {
                     listenPort: 0, ollamaHost: "127.0.0.1",
                     ollamaPort: configuration.baseURL.port!, metricsStore: store,
                     eventEpoch: epoch,
-                    requestIDFactory: { requestIdentity.requestID(for: $0) })
+                    requestIDFactory: { requestIdentity.requestID(for: $0) },
+                    nioCPUAccountingEnabled: nioCPUAccountingEnabled)
                 proxyHolder.proxy = proxy
                 return proxy
             })
@@ -176,13 +186,35 @@ public final class PerformanceApplicationSession {
         // before wall-clock sampling, exactly as the next successful poll would.
         store.updateConnection(.ready, at: Date())
         store.startSampling()
-        return PerformanceApplicationSession(
+        let session = PerformanceApplicationSession(
             store: store, coordinator: coordinator, controller: controller,
             settings: settings, historyDirectory: historyDirectory,
             preferencesSuite: preferencesSuite, historyKind: populated ? "populated" : "fresh",
             proxyPort: proxyPort, clock: clock, defaults: defaults, rawEnd: rawEnd,
             fixtureManifest: manifest, requestIdentity: requestIdentity,
-            threadCPURegistration: threadCPURegistration)
+            threadCPURegistration: threadCPURegistration,
+            nioCPUProxy: nioCPUAccountingEnabled ? proxyHolder.proxy : nil)
+        do {
+            try await session.refreshPerformanceNIODiagnostics()
+        } catch {
+            await session.stop()
+            throw error
+        }
+        return session
+    }
+
+    /// Await one immutable cut on the owning event loop before a control reply.
+    /// Ordinary sessions perform no submission, clock read, or snapshot copy.
+    public func refreshPerformanceNIODiagnostics() async throws {
+        guard let nioCPUProxy else { return }
+        guard let captured = try await nioCPUProxy.performanceNIOSnapshot(),
+            let roles = threadCPURegistration?["roles"] as? [String: UInt64],
+            captured.threadID == roles["nio"]
+        else {
+            throw PerformanceSessionError.invalid(
+                "Scoped NIO CPU identity does not match registered thread")
+        }
+        nioCPUSnapshot = captured
     }
 
     /// Compact scalar snapshots avoid copying chart histories over the pipe.
@@ -278,6 +310,7 @@ public final class PerformanceApplicationSession {
             "shutdown_error": shutdownError as Any? ?? NSNull(),
         ]
         if let threadCPURegistration { snapshot["thread_cpu_registration"] = threadCPURegistration }
+        if let nioCPUSnapshot { snapshot["nio_cpu"] = nioCPUSnapshot.dictionary }
         return snapshot
     }
 

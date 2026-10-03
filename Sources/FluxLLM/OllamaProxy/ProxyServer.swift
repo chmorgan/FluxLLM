@@ -18,6 +18,8 @@ public final class ProxyManager: ObservableObject {
     private weak var metricsStore: MetricsStore?
     private let eventEpoch: UUID?
     private let requestIDFactory: (@Sendable (Data) -> UUID)?
+    private let nioCPUAccountingEnabled: Bool
+    private var nioCPUDiagnostics: PerformanceNIODiagnostics?
 
     private var serverChannel: Channel?
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
@@ -38,7 +40,8 @@ public final class ProxyManager: ObservableObject {
         ollamaPort: Int = 11434,
         metricsStore: MetricsStore? = nil,
         eventEpoch: UUID? = nil,
-        requestIDFactory: (@Sendable (Data) -> UUID)? = nil
+        requestIDFactory: (@Sendable (Data) -> UUID)? = nil,
+        nioCPUAccountingEnabled: Bool = false
     ) {
         self.listenHost = listenHost
         self.listenPort = listenPort
@@ -47,6 +50,7 @@ public final class ProxyManager: ObservableObject {
         self.metricsStore = metricsStore
         self.eventEpoch = eventEpoch
         self.requestIDFactory = requestIDFactory
+        self.nioCPUAccountingEnabled = nioCPUAccountingEnabled
         let inbox = GenerationEventInbox()
         eventInbox = inbox
         eventConsumer = Task { @MainActor [weak metricsStore] in
@@ -78,6 +82,19 @@ public final class ProxyManager: ObservableObject {
                 "Thread CPU accounting requires the complete single-loop proxy")
         }
         return try await loop.submit { try PerformanceThreadIdentity.current() }.get()
+    }
+
+    func performanceNIOSnapshot() async throws -> PerformanceNIODiagnostics.Snapshot? {
+        guard let diagnostics = nioCPUDiagnostics else { return nil }
+        guard isRunning, let group = eventLoopGroup else {
+            throw PerformanceSessionError.invalid("The measured NIO loop is unavailable")
+        }
+        let loops = Array(group.makeIterator())
+        guard loops.count == 1, let loop = loops.first else {
+            throw PerformanceSessionError.invalid(
+                "Scoped CPU accounting requires one complete NIO loop")
+        }
+        return try await loop.submit { diagnostics.snapshot() }.get()
     }
 
     public func start() async throws {
@@ -179,6 +196,14 @@ public final class ProxyManager: ObservableObject {
             let requestIDFactory = self.requestIDFactory
             let usesUnpromisedStreamBodyWrites =
                 PerformanceGraphicsDiagnostics.shared.mode.usesUnpromisedStreamBodyWrites
+            let nioDiagnostics: PerformanceNIODiagnostics?
+            if nioCPUAccountingEnabled {
+                nioDiagnostics = try await group.next().submit { try PerformanceNIODiagnostics() }
+                    .get()
+            } else {
+                nioDiagnostics = nil
+            }
+            nioCPUDiagnostics = nioDiagnostics
 
             let bootstrap = ServerBootstrap(group: group)
                 .serverChannelOption(
@@ -208,7 +233,8 @@ public final class ProxyManager: ObservableObject {
                                     ollamaHost: upstreamHost, ollamaPort: upstreamPort,
                                     registry: registry, eventSink: sink,
                                     requestIDFactory: requestIDFactory,
-                                    usesUnpromisedStreamBodyWrites: usesUnpromisedStreamBodyWrites))
+                                    usesUnpromisedStreamBodyWrites: usesUnpromisedStreamBodyWrites,
+                                    nioDiagnostics: nioDiagnostics))
                         }
                     }
                 }
@@ -278,6 +304,7 @@ public final class ProxyManager: ObservableObject {
         }
         serverChannel = nil
         eventLoopGroup = nil
+        nioCPUDiagnostics = nil
         channels = nil
     }
 
@@ -403,6 +430,7 @@ private final class RequestForwarder: ChannelInboundHandler {
     private let eventSink: @Sendable (GenerationEvent) -> Void
     private let requestIDFactory: (@Sendable (Data) -> UUID)?
     private let usesUnpromisedStreamBodyWrites: Bool
+    private let nioDiagnostics: PerformanceNIODiagnostics?
     private var hasForwardedRequest = false
     private var requestRelay: GenerationRelay?
 
@@ -410,7 +438,8 @@ private final class RequestForwarder: ChannelInboundHandler {
         ollamaHost: String, ollamaPort: Int, registry: ProxyChannelRegistry,
         eventSink: @escaping @Sendable (GenerationEvent) -> Void,
         requestIDFactory: (@Sendable (Data) -> UUID)?,
-        usesUnpromisedStreamBodyWrites: Bool
+        usesUnpromisedStreamBodyWrites: Bool,
+        nioDiagnostics: PerformanceNIODiagnostics?
     ) {
         self.ollamaHost = ollamaHost
         self.ollamaPort = ollamaPort
@@ -418,6 +447,7 @@ private final class RequestForwarder: ChannelInboundHandler {
         self.eventSink = eventSink
         self.requestIDFactory = requestIDFactory
         self.usesUnpromisedStreamBodyWrites = usesUnpromisedStreamBodyWrites
+        self.nioDiagnostics = nioDiagnostics
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -452,6 +482,7 @@ private final class RequestForwarder: ChannelInboundHandler {
         head.headers.replaceOrAdd(name: "host", value: "\(upstreamHost):\(ollamaPort)")
         let forwardedHead = head
         let usesUnpromisedStreamBodyWrites = self.usesUnpromisedStreamBodyWrites
+        let nioDiagnostics = self.nioDiagnostics
 
         ClientBootstrap(group: serverChannel.eventLoop)
             .connectTimeout(.seconds(10))
@@ -477,6 +508,10 @@ private final class RequestForwarder: ChannelInboundHandler {
                 // Only the winning connection may emit response telemetry.
                 channel.pipeline.addHTTPClientHandlers().flatMap {
                     channel.eventLoop.submit {
+                        if let nioDiagnostics {
+                            try channel.pipeline.syncOperations.addHandler(
+                                PerformanceNIOUpstreamObserver(nioDiagnostics), position: .first)
+                        }
                         let lifecycle: StreamBodyWriteLifecycle?
                         let bodyCoalescer: SmallResponseBodyCoalescer?
                         if usesUnpromisedStreamBodyWrites,
@@ -485,7 +520,8 @@ private final class RequestForwarder: ChannelInboundHandler {
                             let observer = StreamBodyWriteLifecycle(upstream: channel, relay: relay)
                             try serverChannel.pipeline.syncOperations.addHandler(observer)
                             lifecycle = observer
-                            let coalescer = SmallResponseBodyCoalescer()
+                            let coalescer = SmallResponseBodyCoalescer(
+                                nioDiagnostics: nioDiagnostics)
                             // Below the HTTP encoder, preserving its complete
                             // framing and response-body validation behavior.
                             try serverChannel.pipeline.syncOperations.addHandler(
@@ -500,7 +536,8 @@ private final class RequestForwarder: ChannelInboundHandler {
                                 serverChannel: serverChannel, relay: relay,
                                 isGeneration: isGeneration,
                                 requestMethod: forwardedHead.method,
-                                bodyWriteLifecycle: lifecycle, bodyCoalescer: bodyCoalescer))
+                                bodyWriteLifecycle: lifecycle, bodyCoalescer: bodyCoalescer,
+                                nioDiagnostics: nioDiagnostics))
                     }
                 }.map { channel }
             }

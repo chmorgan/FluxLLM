@@ -26,13 +26,15 @@ struct ProxyTestContext {
 @MainActor
 func withProxy(
     response: MockOllamaResponse = .nonStreaming(),
+    nioCPUAccountingEnabled: Bool = false,
     operation: (ProxyTestContext) async throws -> Void
 ) async throws {
     let mock = MockOllamaServer(response: response)
     let store = MetricsStore()
     try await mock.start()
     let proxy = ProxyManager(
-        listenPort: 0, ollamaHost: "127.0.0.1", ollamaPort: mock.port, metricsStore: store)
+        listenPort: 0, ollamaHost: "127.0.0.1", ollamaPort: mock.port, metricsStore: store,
+        nioCPUAccountingEnabled: nioCPUAccountingEnabled)
     do {
         try await proxy.start()
         let port = try XCTUnwrap(proxy.boundPort)

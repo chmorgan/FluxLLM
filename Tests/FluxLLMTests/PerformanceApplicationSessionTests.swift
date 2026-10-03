@@ -6,6 +6,19 @@ import XCTest
 
 @MainActor
 final class PerformanceApplicationSessionTests: XCTestCase {
+    func testScopedNIOAccountingRequiresDirectThreadRegistrationBeforeStartup() async throws {
+        do {
+            _ = try await PerformanceApplicationSession.start(
+                upstream: URL(string: "http://127.0.0.1:1")!,
+                historyDirectory: FileManager.default.temporaryDirectory,
+                preferencesSuite: "FluxLLM.Performance.InvalidNIO.\(UUID().uuidString)",
+                populated: false, nioCPUAccountingEnabled: true)
+            XCTFail("Scoped accounting must reject a missing direct thread registration")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("requires direct thread"))
+        }
+    }
+
     func testBulkFixtureMatchesEveryReferenceObservationAndAccountingState() {
         let end = Date(timeIntervalSince1970: 1_800_000_017.25)
         var replayClock = end.addingTimeInterval(-3_600)
@@ -98,6 +111,9 @@ final class PerformanceApplicationSessionTests: XCTestCase {
                 historyDirectory: directory, preferencesSuite: preferencesSuite, populated: false)
             session = started
             XCTAssertNil(started.snapshot()["thread_cpu_registration"])
+            XCTAssertNil(started.snapshot()["nio_cpu"])
+            try await started.refreshPerformanceNIODiagnostics()
+            XCTAssertNil(started.snapshot()["nio_cpu"])
             XCTAssertEqual(started.snapshot()["popover_animations_enabled"] as? Bool, true)
             XCTAssertEqual(started.snapshot()["unique_tool_trace_builds"] as? UInt64, 0)
             XCTAssertEqual(started.snapshot()["reused_tool_trace_builds"] as? UInt64, 0)
@@ -148,7 +164,8 @@ final class PerformanceApplicationSessionTests: XCTestCase {
             let started = try await PerformanceApplicationSession.start(
                 upstream: URL(string: "http://127.0.0.1:\(upstream.port)")!,
                 historyDirectory: directory, preferencesSuite: preferencesSuite, populated: true,
-                popoverAnimationsEnabled: false, threadCPUAccountingEnabled: true)
+                popoverAnimationsEnabled: false, threadCPUAccountingEnabled: true,
+                nioCPUAccountingEnabled: true)
             session = started
             let registration = try XCTUnwrap(
                 started.snapshot()["thread_cpu_registration"] as? [String: Any])
@@ -158,6 +175,14 @@ final class PerformanceApplicationSessionTests: XCTestCase {
             XCTAssertEqual(roles["main"], try PerformanceThreadIdentity.current())
             XCTAssertGreaterThan(try XCTUnwrap(roles["nio"]), 0)
             XCTAssertNotEqual(roles["main"], roles["nio"])
+            let nio = try XCTUnwrap(started.snapshot()["nio_cpu"] as? [String: Any])
+            XCTAssertEqual(nio["available"] as? Bool, true)
+            XCTAssertEqual(nio["thread_id"] as? UInt64, roles["nio"])
+            try await started.refreshPerformanceNIODiagnostics()
+            let refreshed = try XCTUnwrap(started.snapshot()["nio_cpu"] as? [String: Any])
+            XCTAssertGreaterThan(
+                try XCTUnwrap(refreshed["sequence"] as? UInt64),
+                try XCTUnwrap(nio["sequence"] as? UInt64))
             XCTAssertEqual(
                 (started.snapshot()["thread_cpu_registration"] as? [String: Any])?["roles"]
                     as? [String: UInt64], roles)

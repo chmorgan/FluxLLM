@@ -223,6 +223,7 @@ final class StreamTapper: ChannelInboundHandler {
     private let requestMethod: HTTPMethod
     private let bodyWriteLifecycle: StreamBodyWriteLifecycle?
     private let bodyCoalescer: SmallResponseBodyCoalescer?
+    private let nioDiagnostics: PerformanceNIODiagnostics?
     private var parser = SSEParser()
     private var counter = TokenState()
     private var toolCalls = ToolCallParser()
@@ -235,7 +236,8 @@ final class StreamTapper: ChannelInboundHandler {
     init(
         serverChannel: Channel, relay: GenerationRelay, isGeneration: Bool,
         requestMethod: HTTPMethod = .POST, bodyWriteLifecycle: StreamBodyWriteLifecycle? = nil,
-        bodyCoalescer: SmallResponseBodyCoalescer? = nil
+        bodyCoalescer: SmallResponseBodyCoalescer? = nil,
+        nioDiagnostics: PerformanceNIODiagnostics? = nil
     ) {
         self.serverChannel = serverChannel
         self.relay = relay
@@ -243,16 +245,22 @@ final class StreamTapper: ChannelInboundHandler {
         self.requestMethod = requestMethod
         self.bodyWriteLifecycle = bodyWriteLifecycle
         self.bodyCoalescer = bodyCoalescer
+        self.nioDiagnostics = nioDiagnostics
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
         let eventLoop = context.eventLoop
+        let nioDiagnostics = self.nioDiagnostics
         relay.setLiveUpdateScheduler { delay, action in
             let components = delay.components
             let nanoseconds =
                 components.seconds * 1_000_000_000
                 + components.attoseconds / 1_000_000_000
-            let task = eventLoop.scheduleTask(in: .nanoseconds(nanoseconds)) { action() }
+            let task = eventLoop.scheduleTask(in: .nanoseconds(nanoseconds)) {
+                let scope = nioDiagnostics?.begin(.relayScheduled)
+                defer { nioDiagnostics?.end(scope) }
+                action()
+            }
             return { task.cancel() }
         }
     }
@@ -289,6 +297,8 @@ final class StreamTapper: ChannelInboundHandler {
             let downstream = serverChannel
             let upstream = context.channel
             let relay = relay
+            let cpuScope = nioDiagnostics?.begin(.forwarding, ends: 1)
+            defer { nioDiagnostics?.end(cpuScope) }
             downstream.writeAndFlush(HTTPServerResponsePart.end(trailers)).whenComplete { result in
                 if case .failure = result { relay.cancel() }
                 downstream.close(promise: nil)
@@ -316,7 +326,10 @@ final class StreamTapper: ChannelInboundHandler {
 
     private func tapBody(_ buffer: ByteBuffer) {
         if isStreaming {
-            for payload in parser.feedBytes(buffer.readableBytesView) {
+            let cpuScope = nioDiagnostics?.begin(.framing, bytes: buffer.readableBytes, bodies: 1)
+            let payloads = parser.feedBytes(buffer.readableBytesView)
+            nioDiagnostics?.end(cpuScope, records: payloads.count)
+            for payload in payloads {
                 ingest(payload)
             }
         } else {
@@ -328,11 +341,18 @@ final class StreamTapper: ChannelInboundHandler {
 
     private func finalize() {
         if isStreaming {
-            for payload in parser.finishBytes() { ingest(payload) }
+            let cpuScope = nioDiagnostics?.begin(.framing, ends: 1)
+            let payloads = parser.finishBytes()
+            nioDiagnostics?.end(cpuScope, records: payloads.count)
+            for payload in payloads { ingest(payload) }
         } else if let body = nonStreamBody, SSEParser.isValidUTF8(body.readableBytesView) {
             ingest(Data(body.readableBytesView))
         }
-        if !counter.isTerminal { relay.update(counter.finish()) }
+        if !counter.isTerminal {
+            let cpuScope = nioDiagnostics?.begin(.relayUpdate)
+            relay.update(counter.finish())
+            nioDiagnostics?.end(cpuScope)
+        }
     }
 
     private func ingest(_ payload: Data) {
@@ -340,17 +360,35 @@ final class StreamTapper: ChannelInboundHandler {
         var events: [ToolActivityEvent] = []
         // Both parsers borrow one decoded Foundation record and its message;
         // ordinary text records need no whole-dictionary Swift bridge.
-        if let record = DecodedGenerationRecord(data: payload) {
+        let decodeScope = nioDiagnostics?.begin(.jsonDecode, bytes: payload.count)
+        let record = DecodedGenerationRecord(data: payload)
+        nioDiagnostics?.end(decodeScope, records: record == nil ? 0 : 1)
+        if let record {
+            let interpretationScope = nioDiagnostics?.begin(.interpretation, records: 1)
             events = toolCalls.ingest(record, at: timestamp)
             counter.ingest(record, at: timestamp)
+            nioDiagnostics?.end(interpretationScope)
         }
         // Discrete calls must arrive before a terminal snapshot from the same
         // payload, which closes the request and stops further relay emissions.
         // Malformed records retain the existing cumulative snapshot behavior.
+        let relayScope = nioDiagnostics?.begin(.relayUpdate, records: 1)
         relay.update(counter, at: timestamp, toolEvents: events)
+        nioDiagnostics?.end(relayScope)
     }
 
     private func forward(_ part: HTTPServerResponsePart, upstream: Channel) {
+        let cpuScope: PerformanceNIODiagnostics.Scope?
+        if let nioDiagnostics {
+            if case .body(.byteBuffer(let buffer)) = part {
+                cpuScope = nioDiagnostics.begin(.forwarding, bytes: buffer.readableBytes, bodies: 1)
+            } else {
+                cpuScope = nioDiagnostics.begin(.forwarding)
+            }
+        } else {
+            cpuScope = nil
+        }
+        defer { nioDiagnostics?.end(cpuScope) }
         let downstream = serverChannel
         let relay = relay
         if let bodyWriteLifecycle, case .body = part,

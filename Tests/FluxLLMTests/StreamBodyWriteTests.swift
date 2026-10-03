@@ -6,6 +6,73 @@ import XCTest
 @testable import FluxLLM
 
 final class StreamBodyWriteTests: XCTestCase {
+    func testScopedNIOCPUInstrumentationPreservesSynchronousFailureAndImmediateDelivery() throws {
+        for fail in [false, true] {
+            let diagnostics = try PerformanceNIODiagnostics()
+            let harness = try StreamWriteHarness(optimized: true, nioDiagnostics: diagnostics)
+            defer { harness.finish() }
+            try harness.sendHead()
+            _ = try harness.readWire()
+            harness.wireProbe.closeOnNextWrite = fail
+            let flushes = harness.probe.flushes
+            try harness.sendBody(StreamWriteHarness.terminal)
+            let snapshot = diagnostics.snapshot()
+            XCTAssertNil(snapshot.error)
+            XCTAssertEqual(
+                snapshot.counters[PerformanceNIODiagnostics.Metric.forwarding.index].bodies, 1)
+            XCTAssertEqual(
+                snapshot.counters[PerformanceNIODiagnostics.Metric.coalescer.index].calls, 1)
+            XCTAssertEqual(
+                snapshot.counters[PerformanceNIODiagnostics.Metric.jsonDecode.index].records, 1)
+            if fail {
+                XCTAssertEqual(harness.events.kinds, ["began", "cancelled"])
+                XCTAssertTrue(harness.events.snapshots.isEmpty)
+                XCTAssertFalse(harness.upstream.isActive)
+                XCTAssertEqual(try harness.readWire(), "")
+            } else {
+                XCTAssertEqual(harness.probe.flushes, flushes + 1)
+                XCTAssertEqual(harness.events.kinds, ["began", "finished:7"])
+                XCTAssertEqual(
+                    try harness.readWire(),
+                    "\(String(StreamWriteHarness.terminal.utf8.count, radix: 16))\r\n\(StreamWriteHarness.terminal)\r\n"
+                )
+            }
+        }
+    }
+
+    func testScopedNIOCPUCountsFragmentedMalformedAndUnterminatedRecords() throws {
+        let diagnostics = try PerformanceNIODiagnostics()
+        let harness = try StreamWriteHarness(optimized: true, nioDiagnostics: diagnostics)
+        defer { harness.finish() }
+        try harness.sendHead()
+        let first = #"{"response":"one","done":false}"# + "\n{bad}\n{\"res"
+        let second =
+            #"ponse":"two","done":false}"# + "\n" + String(StreamWriteHarness.terminal.dropLast())
+        try harness.sendBody(first)
+        try harness.sendBody(second)
+        harness.loop.advanceTime(by: .milliseconds(50))
+        try harness.sendEnd()
+        let snapshot = diagnostics.snapshot()
+        XCTAssertNil(snapshot.error)
+        let framing = snapshot.counters[PerformanceNIODiagnostics.Metric.framing.index]
+        let decode = snapshot.counters[PerformanceNIODiagnostics.Metric.jsonDecode.index]
+        let relay = snapshot.counters[PerformanceNIODiagnostics.Metric.relayUpdate.index]
+        XCTAssertEqual(framing.calls, 3)
+        XCTAssertEqual(framing.bodies, 2)
+        XCTAssertEqual(framing.ends, 1)
+        XCTAssertEqual(framing.records, 4)
+        XCTAssertEqual(decode.calls, 4)
+        XCTAssertEqual(decode.records, 3)
+        XCTAssertEqual(relay.calls, 4)
+        XCTAssertEqual(relay.records, 4)
+        XCTAssertEqual(
+            snapshot.counters[PerformanceNIODiagnostics.Metric.interpretation.index].records, 3)
+        XCTAssertEqual(
+            snapshot.counters[PerformanceNIODiagnostics.Metric.relayScheduled.index].calls, 1)
+        XCTAssertEqual(snapshot.counters[PerformanceNIODiagnostics.Metric.forwarding.index].ends, 1)
+        XCTAssertEqual(harness.events.snapshots.last?.outputTokens, 7)
+    }
+
     func testBodyOptimizationPreservesEncodedBytesAndImmediateFlushes() throws {
         for optimized in [false, true] {
             let harness = try StreamWriteHarness(optimized: optimized)
@@ -181,8 +248,13 @@ private final class StreamWriteHarness {
     let wireProbe = StreamWireProbe()
     let events: StreamWriteEvents
     let relay: GenerationRelay
+    let nioDiagnostics: PerformanceNIODiagnostics?
 
-    init(optimized: Bool, method: HTTPMethod = .POST, installLifecycle: Bool = true) throws {
+    init(
+        optimized: Bool, method: HTTPMethod = .POST, installLifecycle: Bool = true,
+        nioDiagnostics: PerformanceNIODiagnostics? = nil
+    ) throws {
+        self.nioDiagnostics = nioDiagnostics
         let loop = EmbeddedEventLoop()
         self.loop = loop
         let events = StreamWriteEvents()
@@ -190,7 +262,7 @@ private final class StreamWriteHarness {
         upstream = EmbeddedChannel(loop: loop)
         downstream = EmbeddedChannel(loop: loop)
         relay = GenerationRelay(request: GenerationRequest(), sink: { events.append($0) })
-        let coalescer = SmallResponseBodyCoalescer()
+        let coalescer = SmallResponseBodyCoalescer(nioDiagnostics: nioDiagnostics)
         try downstream.pipeline.syncOperations.addHandlers(
             wireProbe, coalescer, HTTPResponseEncoder(), probe)
         let lifecycle = optimized ? StreamBodyWriteLifecycle(upstream: upstream, relay: relay) : nil
@@ -201,13 +273,15 @@ private final class StreamWriteHarness {
             StreamTapper(
                 serverChannel: downstream, relay: relay, isGeneration: true,
                 requestMethod: method, bodyWriteLifecycle: lifecycle,
-                bodyCoalescer: coalescer))
+                bodyCoalescer: coalescer, nioDiagnostics: nioDiagnostics))
         let address = try SocketAddress(ipAddress: "127.0.0.1", port: 1)
         upstream.connect(to: address, promise: nil)
         downstream.connect(to: address, promise: nil)
     }
 
     func sendHead() throws {
+        let scope = nioDiagnostics?.begin(.upstreamRead)
+        defer { nioDiagnostics?.end(scope) }
         try upstream.writeInbound(
             HTTPClientResponsePart.head(
                 HTTPResponseHead(
@@ -219,7 +293,15 @@ private final class StreamWriteHarness {
     }
 
     func sendBody(_ text: String) throws {
+        let scope = nioDiagnostics?.begin(.upstreamRead, bytes: text.utf8.count)
+        defer { nioDiagnostics?.end(scope) }
         try upstream.writeInbound(HTTPClientResponsePart.body(ByteBuffer(string: text)))
+    }
+
+    func sendEnd() throws {
+        let scope = nioDiagnostics?.begin(.upstreamRead)
+        defer { nioDiagnostics?.end(scope) }
+        try upstream.writeInbound(HTTPClientResponsePart.end(nil))
     }
 
     func readWire() throws -> String {

@@ -6,6 +6,49 @@ import XCTest
 
 @MainActor
 final class StreamTapperTests: XCTestCase {
+    func testScopedNIOCPUUsesRealRegisteredLoopAndPreservesLiveForwarding() async throws {
+        let gate = MockResponseGate()
+        let fixture = MockOllamaResponse.generation(chat: true, gate: gate)
+        try await withProxy(response: fixture, nioCPUAccountingEnabled: true) { context in
+            let beforeValue = try await context.proxy.performanceNIOSnapshot()
+            let before = try XCTUnwrap(beforeValue)
+            let probe = StreamingProbe()
+            let session = URLSession(configuration: .ephemeral, delegate: probe, delegateQueue: nil)
+            defer { session.invalidateAndCancel() }
+            session.dataTask(with: context.request(path: "/api/chat")).resume()
+            try await waitForCondition("Instrumented bytes must arrive before completion") {
+                probe.data == Data(fixture.firstBytes)
+            }
+            XCTAssertFalse(probe.isComplete)
+            await gate.release()
+            try await waitForCondition("Instrumented stream must finish with exact accounting") {
+                probe.isComplete && context.store.activeGeneration?.state == .completed
+            }
+            XCTAssertNil(probe.error)
+            XCTAssertEqual(probe.data, fixture.body)
+            XCTAssertEqual(context.store.outputTokens, 12)
+            let afterValue = try await context.proxy.performanceNIOSnapshot()
+            let after = try XCTUnwrap(afterValue)
+            let threadID = try await context.proxy.performanceEventLoopThreadID()
+            XCTAssertEqual(after.threadID, threadID)
+            XCTAssertNil(after.error)
+            XCTAssertGreaterThan(after.sequence, before.sequence)
+            let metrics = after.counters
+            XCTAssertGreaterThan(
+                metrics[PerformanceNIODiagnostics.Metric.upstreamRead.index].calls, 0)
+            XCTAssertGreaterThan(
+                metrics[PerformanceNIODiagnostics.Metric.upstreamReadComplete.index].calls, 0)
+            XCTAssertEqual(
+                metrics[PerformanceNIODiagnostics.Metric.forwarding.index].bytes,
+                UInt64(fixture.body.count))
+            XCTAssertEqual(
+                metrics[PerformanceNIODiagnostics.Metric.framing.index].bytes,
+                UInt64(fixture.body.count))
+            XCTAssertEqual(metrics[PerformanceNIODiagnostics.Metric.forwarding.index].ends, 1)
+            XCTAssertEqual(metrics[PerformanceNIODiagnostics.Metric.framing.index].ends, 1)
+        }
+    }
+
     func testOnlyNativeGenerationPathsAreTracked() {
         let body = ByteBuffer(string: "{\"stream\":true}")
         XCTAssertTrue(StreamTapper.isGenerationRequest(path: "/api/generate", body: body))

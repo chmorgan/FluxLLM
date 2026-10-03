@@ -186,7 +186,9 @@ final class PerformanceControl {
                     graphicsMode: configuration.graphics_mode ?? .normal,
                     popoverAnimationsEnabled: configuration.popover_animations_enabled ?? true,
                     threadCPUAccountingEnabled: ProcessInfo.processInfo.environment[
-                        "FLUXLLM_PERF_THREAD_CPU"] == "1")
+                        "FLUXLLM_PERF_THREAD_CPU"] == "1",
+                    nioCPUAccountingEnabled: ProcessInfo.processInfo.environment[
+                        "FLUXLLM_PERF_NIO_CPU"] == "1")
             }
             startupTask = task
             do {
@@ -197,6 +199,7 @@ final class PerformanceControl {
                     configuration.logging_enabled ?? false,
                     directory: try validatedLoggingDirectory())
                 gpuReporter?.sample()
+                try await started.refreshPerformanceNIODiagnostics()
                 send([
                     "type": "ready", "command_id": command.command_id, "protocol_version": 1,
                     "proxy_port": started.proxyPort,
@@ -295,6 +298,12 @@ final class PerformanceControl {
             fail(
                 "Unknown or repeated control command: \(command.command)",
                 commandID: command.command_id)
+            return
+        }
+        do {
+            try await session.refreshPerformanceNIODiagnostics()
+        } catch {
+            fail("NIO CPU control checkpoint failed: \(error)", commandID: command.command_id)
             return
         }
         var event: [String: Any] = [

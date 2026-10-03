@@ -16,6 +16,11 @@ final class SmallResponseBodyCoalescer: ChannelOutboundHandler {
     private var capacityLimit = 0
     private var firstBuffer: ByteBuffer?
     private var combinedBuffer: ByteBuffer?
+    private let nioDiagnostics: PerformanceNIODiagnostics?
+
+    init(nioDiagnostics: PerformanceNIODiagnostics? = nil) {
+        self.nioDiagnostics = nioDiagnostics
+    }
 
     func handlerAdded(context: ChannelHandlerContext) {
         self.context = context
@@ -29,6 +34,10 @@ final class SmallResponseBodyCoalescer: ChannelOutboundHandler {
     /// Called only around the ordinary same-event-loop, unpromised body path.
     /// Unsupported and nested writes retain their ordinary pipeline behavior.
     func withBodyWrite(byteCount: Int, _ write: () -> Void) {
+        // Inclusive subset of forwarding: this includes the encoder and
+        // immediate downstream write/flush, not just this handler's copying.
+        let cpuScope = nioDiagnostics?.begin(.coalescer, bytes: byteCount, bodies: 1)
+        defer { nioDiagnostics?.end(cpuScope) }
         guard let context, context.eventLoop.inEventLoop else {
             write()
             return
