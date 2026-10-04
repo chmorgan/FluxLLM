@@ -93,6 +93,103 @@ def transaction_mechanism_work(before, after, mode):
     return result
 
 
+def reuse_cache_mechanism_work(before, after, mode, *, require_positive=True):
+    first = memory.reuse_cache_contract(before, mode)
+    last = memory.reuse_cache_contract(after, mode)
+    require((first is None) == (last is None), "Reuse cache instrumentation changed during runtime")
+    if first is None:
+        return None
+    result = {}
+    for namespace, _flag, enabled_modes, counters, _maximum in memory.REUSE_CACHE_SPECS:
+        left, right = first[namespace]["counters"], last[namespace]["counters"]
+        monotonic = counters + ("peak_entries",) + (("peak_caches",) if namespace == "rail_geometry_cache" else ())
+        require(all(right[field] >= left[field] for field in monotonic),
+                f"{namespace} counters moved backwards")
+        delta = {field: right[field] - left[field] for field in counters}
+        if mode in enabled_modes and require_positive:
+            require(all(count > 0 for count in delta.values()),
+                    f"{namespace} did not execute builds and reuse during runtime")
+        result[namespace] = {"enabled": mode in enabled_modes, "deltas": delta,
+                             "current_entries": right["current_entries"], "peak_entries": right["peak_entries"],
+                             **({field: right[field] for field in ("current_caches", "peak_caches", "max_entries_per_cache")}
+                                if namespace == "rail_geometry_cache" else {})}
+    return result
+
+
+def validate_reuse_cache_phase_work(report, mode, *, closed_labels=("07-both-closed-after-probe", "08-closed-after-five-more-seconds"),
+                                    minimum_closed_seconds=5, boundary=None):
+    """Do not let cache reuse replace visible arrivals, completions or glints."""
+    if mode not in memory.REUSE_RUNTIME_MODES:
+        return None
+    points = report["runtime"]["checkpoints"]
+    if boundary is None:
+        clocks = report["runtime"]
+        offset = sum(clocks[name]["absolute_minus_monotonic_seconds"] for name in ("mach_clock_start", "mach_clock_end")) / 2
+        boundary = lambda point: point["resource_sample"]["mach_absolute_seconds"] - offset
+    stamps = [boundary(point) for point in points]
+    work = reuse_cache_mechanism_work(points[0]["snapshot"], points[-1]["snapshot"], mode)
+    closed = []
+    for label in closed_labels:
+        matches = [point for point in report["checkpoints"] if point["label"] == label]
+        require(len(matches) == 1, "Reuse cache closed checkpoints are missing or duplicated")
+        point = matches[0]
+        snapshot = point["snapshot"]
+        require(snapshot.get("dashboard_visible") is False and snapshot.get("popover_visible") is False
+                and snapshot.get("active_requests") == 0, "Reuse cache closed checkpoint is not hidden and idle")
+        memory.reuse_cache_contract(snapshot, mode, expected_closed=True)
+        closed.append(point)
+    require(boundary(closed[-1]) - boundary(closed[0]) >= minimum_closed_seconds,
+            "Reuse cache closed observation is shorter than its required interval")
+    rows = points + closed
+    for point in points:
+        require(point["snapshot"].get("dashboard_visible") is True and point["snapshot"].get("popover_visible") is True,
+                "Reuse cache runtime windows were not both visible")
+        memory.reuse_cache_contract(point["snapshot"], mode)
+    for first, last in zip(rows, rows[1:]):
+        reuse_cache_mechanism_work(first["snapshot"], last["snapshot"], mode, require_positive=False)
+    first_closed = memory.reuse_cache_contract(closed[0]["snapshot"], mode)
+    last_closed = memory.reuse_cache_contract(closed[-1]["snapshot"], mode)
+    require(first_closed == last_closed, "Reuse caches performed work after windows closed")
+
+    def drawn(first, last):
+        left, right = first["snapshot"], last["snapshot"]
+        ticks = memory.unsigned(right.get("rail_frame_clock_ticks"), "reuse.rail_frame_clock_ticks") - memory.unsigned(
+            left.get("rail_frame_clock_ticks"), "reuse.rail_frame_clock_ticks")
+        draws = memory.unsigned(right["graphics_diagnostics"]["roles"]["rail_decorations"].get("draws"), "reuse.rail.draws") - memory.unsigned(
+            left["graphics_diagnostics"]["roles"]["rail_decorations"].get("draws"), "reuse.rail.draws")
+        require(ticks > 0 and draws > 0, "Reuse caches did not preserve lifecycle Canvas drawing and frame ticks")
+        return {"rail_frame_clock_ticks": ticks, "rail_decorations_draws": draws}
+
+    arrival, steady, completion = (report["phase_windows"][name] for name in ("arrival", "steady", "completion"))
+    arrival_ends = [point for point, stamp in zip(points, stamps)
+                    if arrival["end_monotonic_seconds"] <= stamp < steady["start_monotonic_seconds"]]
+    require(stamps[0] <= arrival["start_monotonic_seconds"] and arrival_ends,
+            "Reuse caches lack complete arrival phase drawing evidence")
+    arrival_work = drawn(points[0], arrival_ends[0])
+    during = [point for point, stamp in zip(points, stamps)
+              if steady["start_monotonic_seconds"] < stamp < steady["end_monotonic_seconds"]]
+    require(len(during) >= 2 and all(point["snapshot"].get("active_requests") == 2 for point in during),
+            "Reuse caches lack interior active-stream checkpoints")
+    glints = []
+    for point in during:
+        value = point["snapshot"]["graphics_diagnostics"]
+        memory.validate_retained_twinkles(value, mode)
+        glints.append(value["retained_twinkles"]["animation_starts"])
+    require(glints[-1] > glints[0], "Reuse caches did not preserve ordinary retained streaming glints")
+    began = [(point, stamp) for point, stamp in zip(points, stamps) if point["label"] == "completion-begin"]
+    require(len(began) == 1 and completion["start_monotonic_seconds"] <= began[0][1] < completion["end_monotonic_seconds"],
+            "Reuse caches lack authenticated completion-begin evidence")
+    finished = [point for point, stamp in zip(points, stamps) if began[0][1] <= stamp <= completion["end_monotonic_seconds"]]
+    require(len(finished) >= 2 and all(point["snapshot"].get("active_requests") == 0 for point in finished),
+            "Reuse caches lack interior completion drawing evidence")
+    completion_work = drawn(finished[0], finished[-1])
+    return {"mechanisms": work, "arrival_deltas": arrival_work, "completion_deltas": completion_work,
+            "steady_retained_twinkle_animation_starts": glints[-1] - glints[0],
+            "closed_current_entries": dict.fromkeys((spec[0] for spec in memory.REUSE_CACHE_SPECS), 0),
+            "semantic_parity_required": True,
+            "scope": "Executed bounded caches with unchanged visible Canvas effects and retained glints; counters do not measure CPU or GPU"}
+
+
 def held_static_chart_work(before, after, mode):
     """Prove a drawing-only ablation while full-rate preparation still executes."""
     if mode != memory.HELD_STATIC_CHART_MODE:
@@ -515,8 +612,10 @@ def validate_runtime_work(before, after, mode, *, required=True):
                     == after["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] == 0,
                 "Primitive Metal effects fell back to Canvas decorations or CPU frame clocks")
     mechanism_work = transaction_mechanism_work(before, after, mode)
+    reuse_work = reuse_cache_mechanism_work(before, after, mode)
     return {"available": True, "features": flags, "deltas": delta,
             **({"transaction_mechanisms": mechanism_work} if mechanism_work else {}),
+            **({"reuse_caches": reuse_work} if reuse_work is not None else {}),
             **({"metal_primitive_effects_deltas": primitive_delta, "promotion_eligible": False,
                 **primitive_overlap_coverage(primitive_delta["twinkle_frames"]),
                 "promotion_reason": "Experimental renderer requires independent visual fidelity qualification"}
@@ -963,6 +1062,9 @@ def validate_canvas_clock_work(report, mode):
             "completion": {"start_checkpoint": completed[0][0]["label"], "end_checkpoint": completed[-1][0]["label"],
                 "start_monotonic_seconds": completed[0][1], "end_monotonic_seconds": completed[-1][1], "deltas": completion_delta,
                 "scope": "Authenticated checkpoint interval inside the three-second completion phase"}}
+    reuse_work = validate_reuse_cache_phase_work(report, mode)
+    if reuse_work is not None:
+        result["reuse_caches"] = reuse_work
     return result
 
 

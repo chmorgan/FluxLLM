@@ -632,6 +632,9 @@ compares the history and preparation optimizations separately and together again
 | `runtime-compact-tool-paths` | Enable tool-path compaction on top of current production behavior. |
 | `runtime-deferred-tool-geometry` | Construct request-tool paths on their first access from a render callback, preserving 1 Hz chart publication. |
 | `runtime-deferred-tool-geometry-2hz` | Use the same deferred construction with chart publication increased to 2 Hz. |
+| `runtime-completed-lane-cache` | Cache the selected completed request lanes, rebuild live lanes, and merge their ordered results. |
+| `runtime-cached-rail-geometry` | Cache invariant normal-Canvas particle directions and lightning geometry by receipt profile and exact rectangle. |
+| `runtime-reuse-caches` | Combine completed-lane and normal-Canvas effect geometry caching. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -1347,6 +1350,54 @@ minutes. Report those as independent captures, retain both timestamps and
 attribution bounds, and preserve failed attempts. App-attributed GPU time does
 not include compositor-wide execution; moving work between native surfaces and
 Core Animation cannot establish a whole-system energy reduction by itself.
+
+### Completed-lane and normal-Canvas geometry reuse
+
+The three reuse controls preserve the current normal renderer, 1 Hz chart data
+publication, 30 Hz transient effects, and ordinary retained glints. They do not
+enable the telemetry batching, atomic scale, or Metal effects experiments.
+Measure the two individual controls before deciding whether to test their
+combination or change production behavior.
+
+| Control | Retained work | Correctness and executed-work requirements |
+| --- | --- | --- |
+| `runtime-completed-lane-cache` | One bounded completed-lane result sorted by start time and UUID. Membership bounds allow a moving viewport to reuse its result until a record boundary is crossed. Live lanes are always rebuilt and merged. | Reference parity for rolling and inclusive endpoints, long requests, equal-start ordering, source changes, authoritative corrections, completion/cancellation, pruning, and cache release. Positive cache builds, hits, and visited records; at most 20,000 entries, zero after closing. |
+| `runtime-cached-rail-geometry` | At most 24 receipt entries per chart, each keyed by the immutable effect profile and exact bar rectangle. Retain perimeter geometry, weighted knot positions, sampled normals, full-reach fork points, particle directions, and star rotation. | Exact parity with the original frame calculation. Head/tail positions, crackle blending, clipped fork reach, energy, and timing remain dynamic. Positive cache builds and hits; accurate aggregate entries across chart owners, zero after hiding or closing. |
+| `runtime-reuse-caches` | Both caches above. | Both semantic parity and executed-work contracts. |
+
+The new controls require complete, correctly typed unsigned counters and exact
+enabled flags. Cumulative work counters must be monotonic; current/peak entry
+gauges must respect their bounds. Rail diagnostics sum entries across owners
+and record current/peak nonempty cache counts; clearing one chart cannot hide
+another chart's retained entries. Nonselected mechanisms remain zero. Older
+frozen normal products may omit all reuse metadata; missing candidate metadata
+invalidates a capture. Closed phases require released entries and quiet counters.
+Counters prove execution, not CPU or GPU savings.
+
+Run the separate normal-Canvas pixel fixture with
+`FLUXLLM_RUN_RAIL_GEOMETRY_FIDELITY=1` and an explicit ignored
+`FLUXLLM_RAIL_GEOMETRY_FIDELITY_OUTPUT` directory, selecting
+`MetalPrimitiveEffectsFidelityTests/testCachedRailGeometryAgainstIndependentCanvasOptIn`.
+It compares cached drawing against the independent original Canvas at 1× and
+2×, including ordered overlaps, fractional crop origins, clipping, and blank
+endpoints. Its channel-error limit is zero; visible calibration and fixture
+content must be verified. This gate is separate from the existing Metal fidelity
+gate and from measured CPU/GPU acceptance.
+
+Use the preceding frozen-product `runtime compare` command with each reuse
+candidate mode and a new ignored results directory. Each individual CPU result
+uses its own normal/candidate/normal bracket, without Instruments, and excludes
+startup. Measure GPU separately with `gpu-compare`, selecting the same candidate
+mode and calibrated process attribution. A CPU comparison normally takes about
+130 seconds and a matched GPU pair about 110 seconds; each command retains the
+300-second ceiling. Do not pool controls across different comparisons or use
+traced CPU as an acceptance result.
+
+The unchanged targets are 5% maximum rolling one-second runtime CPU and 1%
+maximum rolling app GPU execution. Memory remains report-only. These controls
+preserve the normal rendering path and remain eligible for CPU acceptance after
+their semantic parity tests pass. Promotion still requires measured benefit and
+no GPU regression; successful cache counters alone do not establish either.
 
 ## Baselines and comparison artifacts
 

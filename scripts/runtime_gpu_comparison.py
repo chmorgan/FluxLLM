@@ -30,7 +30,7 @@ REQUEST_INDICES = (CYCLE * 32, CYCLE * 32 + 1)
 STAGE = {"activity": "high-rate", "seconds": 8}
 WORK = {"chunks": 3200, "output_tokens": 6434, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
-MODES = ("normal", memory.METAL_ARRIVAL_MODE, *memory.METAL_CHART_MODES, *memory.NEW_RUNTIME_MODES)
+MODES = ("normal", memory.METAL_ARRIVAL_MODE, *memory.METAL_CHART_MODES, *memory.NEW_RUNTIME_MODES, *memory.REUSE_RUNTIME_MODES)
 ERRORS = (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError)
 
 
@@ -175,7 +175,11 @@ def validate_short_clock_work(report, mode):
         quiet += list(memory.METAL_ARRIVAL_COUNTERS)
     require(all(points[-1]["snapshot"][field] <= closed[0]["snapshot"][field] == closed[-1]["snapshot"][field]
                 for field in quiet), "GPU animation work continued after windows closed")
+    reuse_work = runtime.validate_reuse_cache_phase_work(report, mode,
+        closed_labels=("closed-start", "closed-end"), minimum_closed_seconds=2,
+        boundary=lambda point: snapshot_time(report, point))
     return {"steady_deltas": delta, "closed_deltas": dict.fromkeys(quiet, 0),
+            **({"reuse_caches": reuse_work} if reuse_work is not None else {}),
             "scope": "Two completed streams; no inference about cancellation of active network requests"}
 
 

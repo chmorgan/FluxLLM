@@ -79,6 +79,12 @@ def workload_snapshots(mode):
             snapshots_materialized=4, batches_applied=4, events_applied=8, projection_refreshes=4)
     if mode in memory.ATOMIC_CHART_SCALE_MODES:
         after["graphics_diagnostics"]["atomic_chart_scale"].update(resolutions=4, scale_changes=2, cache_hits=0)
+    if mode in memory.COMPLETED_LANE_CACHE_MODES:
+        after["graphics_diagnostics"]["completed_lane_cache"].update(builds=4, hits=5,
+            visited_records=480, current_entries=240, peak_entries=240)
+    if mode in memory.CACHED_RAIL_GEOMETRY_MODES:
+        after["graphics_diagnostics"]["rail_geometry_cache"].update(builds=4, hits=5,
+            current_entries=2, peak_entries=2)
     if mode in memory.METAL_CHART_MODES:
         for field in ("geometry_uploads", "submissions", "static_frames", "arrival_frames", "completion_frames", "twinkle_frames"):
             after["graphics_diagnostics"]["metal_full_chart"][field] += 2
@@ -95,6 +101,9 @@ def workload_snapshots(mode):
 
 
 def clock_work_report(mode="runtime-canvas-clock"):
+    if mode in memory.REUSE_RUNTIME_MODES:
+        from test_runtime_reuse_caches import cache_report
+        return cache_report(mode)
     before, after = workload_snapshots(mode)
     samples = []
     def point(label, elapsed, snapshot, active, visible=True):
@@ -203,7 +212,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 0 if mode in (memory.HELD_STATIC_CHART_MODE, *memory.METAL_CHART_MODES) else 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "metal_full_chart_enabled", "metal_static_cache_enabled", "holds_static_chart_drawing", *memory.NEW_RUNTIME_FLAGS) if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "metal_full_chart_enabled", "metal_static_cache_enabled", "holds_static_chart_drawing", *memory.NEW_RUNTIME_FLAGS, *memory.REUSE_RUNTIME_FLAGS) if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):

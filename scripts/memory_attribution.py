@@ -47,6 +47,22 @@ BATCHED_TELEMETRY_MODES = (TELEMETRY_BATCH_MODE, EFFICIENT_EFFECTS_MODE)
 ATOMIC_CHART_SCALE_MODES = (ATOMIC_CHART_SCALE_MODE, EFFICIENT_EFFECTS_MODE)
 NEW_RUNTIME_MODES = (METAL_PRIMITIVE_EFFECTS_MODE, TELEMETRY_BATCH_MODE, ATOMIC_CHART_SCALE_MODE, EFFICIENT_EFFECTS_MODE)
 EFFICIENT_RUNTIME_MODES = NEW_RUNTIME_MODES
+COMPLETED_LANE_CACHE_MODE = "runtime-completed-lane-cache"
+CACHED_RAIL_GEOMETRY_MODE = "runtime-cached-rail-geometry"
+REUSE_CACHES_MODE = "runtime-reuse-caches"
+REUSE_RUNTIME_MODES = (COMPLETED_LANE_CACHE_MODE, CACHED_RAIL_GEOMETRY_MODE, REUSE_CACHES_MODE)
+COMPLETED_LANE_CACHE_MODES = (COMPLETED_LANE_CACHE_MODE, REUSE_CACHES_MODE)
+CACHED_RAIL_GEOMETRY_MODES = (CACHED_RAIL_GEOMETRY_MODE, REUSE_CACHES_MODE)
+REUSE_RUNTIME_FLAGS = ("completed_lane_cache_enabled", "rail_geometry_cache_enabled")
+COMPLETED_LANE_CACHE_COUNTERS = ("builds", "hits", "visited_records")
+CACHED_RAIL_GEOMETRY_COUNTERS = ("builds", "hits")
+REUSE_CACHE_GAUGES = ("current_entries", "peak_entries")
+REUSE_CACHE_SPECS = (
+    ("completed_lane_cache", "completed_lane_cache_enabled", COMPLETED_LANE_CACHE_MODES,
+     COMPLETED_LANE_CACHE_COUNTERS, 20_000),
+    ("rail_geometry_cache", "rail_geometry_cache_enabled", CACHED_RAIL_GEOMETRY_MODES,
+     CACHED_RAIL_GEOMETRY_COUNTERS, 48),
+)
 NEW_RUNTIME_FLAGS = ("metal_primitive_effects_enabled", "batched_telemetry_delivery_enabled", "atomic_chart_scale_enabled")
 METAL_PRIMITIVE_EFFECTS_COUNTERS = ("hosts_created", "hosts_destroyed", "descriptor_uploads", "submissions", "clears",
                                    "arrival_frames", "completion_frames", "twinkle_frames", "frames_skipped", "failures", "fallbacks")
@@ -69,7 +85,7 @@ DEFERRED_TOOL_GEOMETRY_MODE = "runtime-deferred-tool-geometry"
 DEFERRED_TOOL_GEOMETRY_2HZ_MODE = "runtime-deferred-tool-geometry-2hz"
 DEFERRED_TOOL_GEOMETRY_MODES = (DEFERRED_TOOL_GEOMETRY_MODE, DEFERRED_TOOL_GEOMETRY_2HZ_MODE)
 TOOL_PATH_POINT_COUNTERS = ("tool_path_input_points", "tool_path_output_points")
-ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE) + DEFERRED_TOOL_GEOMETRY_MODES + NEW_RUNTIME_MODES
+ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE) + DEFERRED_TOOL_GEOMETRY_MODES + NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES
 CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + tuple(mode for mode in ORDERED_PUBLICATION_MODES if mode not in METAL_CHART_MODES)
 NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized", *METAL_CHART_MODES) + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
@@ -417,11 +433,16 @@ def twinkle_delivery_contract(snapshot, mode):
 
 
 def runtime_feature_contract(value, mode):
-    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + NEW_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing")):
+    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + NEW_RUNTIME_FLAGS + REUSE_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing")):
         return None
     extras = {}
     for field, enabled_modes in zip(NEW_RUNTIME_FLAGS, (PRIMITIVE_EFFECTS_MODES, BATCHED_TELEMETRY_MODES, ATOMIC_CHART_SCALE_MODES)):
-        if mode in NEW_RUNTIME_MODES or field in value:
+        if mode in NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES or field in value:
+            require(type(value.get(field)) is bool and value[field] is (mode in enabled_modes),
+                    f"Graphics {field} does not match the requested runtime control")
+            extras[field] = value[field]
+    for field, enabled_modes in zip(REUSE_RUNTIME_FLAGS, (COMPLETED_LANE_CACHE_MODES, CACHED_RAIL_GEOMETRY_MODES)):
+        if mode in REUSE_RUNTIME_MODES or field in value:
             require(type(value.get(field)) is bool and value[field] is (mode in enabled_modes),
                     f"Graphics {field} does not match the requested runtime control")
             extras[field] = value[field]
@@ -521,7 +542,7 @@ def tool_path_point_counts(snapshot):
 
 def chart_publication_interval(value, mode):
     field = "chart_publication_interval_seconds"
-    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, *NEW_RUNTIME_MODES):
+    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, *NEW_RUNTIME_MODES, *REUSE_RUNTIME_MODES):
         return None
     interval = value.get(field)
     expected = .5 if mode == DEFERRED_TOOL_GEOMETRY_2HZ_MODE else 1.0
@@ -789,6 +810,49 @@ def atomic_chart_scale_contract(snapshot, mode, *, completed_visible_workload=Fa
     return result
 
 
+def reuse_cache_contract(snapshot, mode, *, completed_visible_workload=False, expected_closed=False):
+    """Bounded executed reuse, separate from semantic parity and resource use."""
+    value = snapshot.get("graphics_diagnostics", {})
+    supplied = any(flag in value or namespace in value for namespace, flag, *_ in REUSE_CACHE_SPECS)
+    if mode not in REUSE_RUNTIME_MODES and not supplied:
+        return None
+    result = {}
+    for namespace, flag, enabled_modes, counters, maximum in REUSE_CACHE_SPECS:
+        enabled = mode in enabled_modes
+        require(type(value.get(flag)) is bool and value[flag] is enabled,
+                f"Graphics {namespace} counters lack matching enabled metadata")
+        raw = value.get(namespace)
+        require(isinstance(raw, dict), f"Graphics {namespace} counters are missing")
+        fields = counters + REUSE_CACHE_GAUGES + (("current_caches", "peak_caches", "max_entries_per_cache")
+                                                 if namespace == "rail_geometry_cache" else ())
+        counts = {field: raw.get(field) for field in fields}
+        for field, count in counts.items():
+            require(type(count) is int and 0 <= count <= 2**64 - 1,
+                    f"graphics.{namespace}.{field} must be a complete UInt64 counter")
+        require(counts["current_entries"] <= counts["peak_entries"] <= maximum,
+                f"{namespace} entries exceed the bounded cache capacity")
+        if namespace == "rail_geometry_cache":
+            require(counts["max_entries_per_cache"] == 24, "Rail geometry cache capacity changed")
+            require(counts["current_caches"] <= counts["peak_caches"] <= 2
+                    and counts["current_caches"] <= counts["current_entries"] <= 24 * counts["current_caches"]
+                    and counts["peak_caches"] <= counts["peak_entries"] <= 24 * counts["peak_caches"],
+                    "Rail geometry cache owner accounting is incomplete or exceeds both fixed visible chart instances")
+            require(type(value.get("rail_geometry_cache_used")) is bool
+                    and value["rail_geometry_cache_used"] is (counts["builds"] > 0),
+                    "Rail geometry cache used metadata does not match executed builds")
+        if not enabled:
+            inactive = counters + REUSE_CACHE_GAUGES + (("current_caches", "peak_caches") if namespace == "rail_geometry_cache" else ())
+            require(all(counts[field] == 0 for field in inactive),
+                    f"Inactive {namespace} mode executed cache work")
+        elif completed_visible_workload:
+            require(all(counts[field] > 0 for field in counters) and counts["peak_entries"] > 0,
+                    f"Completed visible workload lacks positive {namespace} reuse evidence")
+        if expected_closed:
+            require(counts["current_entries"] == 0, f"{namespace} entries remain live after windows closed")
+        result[namespace] = {"enabled": enabled, "counters": counts}
+    return result
+
+
 def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False,
                       require_native_normal=False):
     value = snapshot.get("graphics_diagnostics")
@@ -816,6 +880,8 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
         completed_visible_workload=completed_visible_workload, expected_closed=expected_closed)
     batched_telemetry = batched_telemetry_contract(snapshot, mode, completed_visible_workload=completed_visible_workload)
     atomic_chart_scale = atomic_chart_scale_contract(snapshot, mode, completed_visible_workload=completed_visible_workload)
+    reuse_caches = reuse_cache_contract(snapshot, mode, completed_visible_workload=completed_visible_workload,
+                                       expected_closed=expected_closed)
     if (mode in (COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "compact_tool_paths_enabled" in value
             or any(field in snapshot for field in TOOL_PATH_POINT_COUNTERS)):
         require("compact_tool_paths_enabled" in value or contract not in NATIVE_GPU_MODES,
@@ -1041,6 +1107,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             **({"metal_primitive_effects": primitive_effects} if primitive_effects is not None else {}),
             **({"batched_telemetry": batched_telemetry} if batched_telemetry is not None else {}),
             **({"atomic_chart_scale": atomic_chart_scale} if atomic_chart_scale is not None else {}),
+            **({"reuse_caches": reuse_caches} if reuse_caches is not None else {}),
             **({"arrival_backend": metal_arrival["arrival_backend"]} if metal_arrival and metal_arrival["arrival_backend"] is not None else {}),
             **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {}),
             **({"runtime_feature_contract": runtime_features} if runtime_features is not None else {}),
