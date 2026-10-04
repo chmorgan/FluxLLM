@@ -12,32 +12,82 @@ public enum ChartPresentationConsumer: Hashable, Sendable {
 @Observable
 public final class MetricsStore {
     public let diagnosticLogger = DiagnosticLogger()
+    /// Views observe only their displayed leaves, never the store reference or
+    /// raw telemetry timestamp behind those leaves.
+    @ObservationIgnored let liveScalars = DashboardLiveScalars()
     public private(set) var activeGeneration: ActiveGeneration?
     public private(set) var currentTPS: Double = 0
     /// The numeric rate and meter deliberately update more slowly than raw
     /// streamed telemetry. Chart history continues to use `currentTPS`.
-    public private(set) var displayTPS: Double?
+    public private(set) var displayTPS: Double? {
+        didSet {
+            if displayTPS != oldValue {
+                liveScalars.updateRate(displayTPS, activity: backendActivity)
+            }
+        }
+    }
     public private(set) var displayRateIsEstimated = false
     public private(set) var displayUpdatedAt: Date?
-    public private(set) var currentModel: String?
+    public private(set) var currentModel: String? {
+        didSet { if currentModel != oldValue { liveScalars.updateModel(currentModel) } }
+    }
     public private(set) var promptTokens: Int?
     public private(set) var outputTokens: Int = 0
     public private(set) var outputIsEstimated = false
     public private(set) var lastMeasuredTPS: Double?
     public private(set) var generationError: String?
 
-    public private(set) var backendKind: BackendKind?
+    public private(set) var backendKind: BackendKind? {
+        didSet {
+            guard backendKind != oldValue else { return }
+            liveScalars.updateBackend(backendKind)
+            liveScalars.updateThroughputHelp(basis: throughputBasis, backend: backendKind)
+            refreshLiveActivity()
+        }
+    }
     public private(set) var monitoringEpoch = UUID()
-    public private(set) var connectionState: BackendConnectionState = .detecting
+    public private(set) var connectionState: BackendConnectionState = .detecting {
+        didSet { if connectionState != oldValue { refreshLiveActivity() } }
+    }
     public private(set) var connectionMessage: String?
     public private(set) var detectedBackends: [DetectedBackend] = []
     public private(set) var selectionNotice: String?
-    public private(set) var throughputBasis: ThroughputBasis = .estimated
+    public private(set) var throughputBasis: ThroughputBasis = .estimated {
+        didSet {
+            if throughputBasis != oldValue {
+                liveScalars.updateThroughputHelp(basis: throughputBasis, backend: backendKind)
+            }
+        }
+    }
     public private(set) var rateIsAvailable = false
-    public private(set) var backendOutputTokens: Int?
-    public private(set) var backendPromptTokens: Int?
-    public private(set) var runningRequests: Int?
-    public private(set) var queuedRequests: Int?
+    public private(set) var backendOutputTokens: Int? {
+        didSet {
+            if backendOutputTokens != oldValue {
+                liveScalars.updateBackendOutput(backendOutputTokens)
+            }
+        }
+    }
+    public private(set) var backendPromptTokens: Int? {
+        didSet {
+            if backendPromptTokens != oldValue {
+                liveScalars.updateBackendPrompt(backendPromptTokens)
+            }
+        }
+    }
+    public private(set) var runningRequests: Int? {
+        didSet {
+            if runningRequests != oldValue {
+                liveScalars.updateRequestCounts(running: runningRequests, queued: queuedRequests)
+            }
+        }
+    }
+    public private(set) var queuedRequests: Int? {
+        didSet {
+            if queuedRequests != oldValue {
+                liveScalars.updateRequestCounts(running: runningRequests, queued: queuedRequests)
+            }
+        }
+    }
     public private(set) var inferenceGPUPercent: Double?
     public private(set) var gpuSource: String?
     public private(set) var backendGPUActivity: GPUActivitySample?
@@ -60,7 +110,10 @@ public final class MetricsStore {
     }
     public var usageScope: UsageScope = .sinceLaunch {
         didSet {
-            if usageScope != oldValue { publishDashboardScalarPresentation() }
+            if usageScope != oldValue {
+                liveScalars.updateUsageScope(usageScope)
+                publishDashboardScalarPresentation()
+            }
         }
     }
     public private(set) var historySource = BackendKind.ollama.rawValue
@@ -171,7 +224,13 @@ public final class MetricsStore {
         _ = historyBufferRevision
         return toolObservationSamples.elements
     }
-    public private(set) var sampleDate = Date()
+    public private(set) var sampleDate = Date() {
+        didSet {
+            if sampleDate != oldValue {
+                liveScalars.updateActivity(backendActivity, at: sampleDate)
+            }
+        }
+    }
     /// All chart series and their time axis advance together once per second.
     /// The raw half-second histories above retain every captured peak and gap.
     public private(set) var chartPresentation: ChartPresentationSnapshot
@@ -231,13 +290,17 @@ public final class MetricsStore {
     private var openProxyRequests: [UUID: ObservedProxyRequest] = [:]
     // Activity consumers need lifecycle changes, not every token/rate mutation
     // of the request dictionary. Keep an equality-checked observable projection.
-    private var observedProxyActivity: BackendActivity?
+    private var observedProxyActivity: BackendActivity? {
+        didSet { if observedProxyActivity != oldValue { refreshLiveActivity() } }
+    }
     /// Terminal lanes that finished within the chart window, newest first, kept
     /// so a request's lane stays visible as it scrolls off the time axis.
     @ObservationIgnored private var retiredRequestLanes: [RequestLane] = []
     @ObservationIgnored private var seenProxyRequestIDs: Set<UUID> = []
     @ObservationIgnored private var retiredProxyRequestIDs: [UUID] = []
-    private var nativeActivity: BackendActivity = .unknown
+    private var nativeActivity: BackendActivity = .unknown {
+        didSet { if nativeActivity != oldValue { refreshLiveActivity() } }
+    }
     @ObservationIgnored private var nativeActivityObservedAt: Date?
     @ObservationIgnored private var lastRatePublicationAt: Date?
     @ObservationIgnored private var lastChartPublicationAt: Date?
@@ -551,7 +614,10 @@ public final class MetricsStore {
 
     /// Changing sources never joins unrelated rates into one continuous trace.
     public func beginBackendSession(kind: BackendKind?, epoch: UUID, sourceID: String? = nil) {
-        defer { publishDashboardScalarPresentation() }
+        defer {
+            refreshLiveGPU()
+            publishDashboardScalarPresentation()
+        }
         let now = clock()
         usageHistory.finishOpenRequests(source: historySource, at: now)
         chartArchive.endSession(source: historySource, at: now)
@@ -652,6 +718,7 @@ public final class MetricsStore {
         guard epoch == monitoringEpoch, backendKind != nil || sample.scope == .system,
             lastGPUSampleAt.map({ sample.timestamp >= $0 }) ?? true
         else { return }
+        defer { refreshLiveGPU() }
         lastGPUSampleAt = sample.timestamp
         if gpuHistoryScope != sample.scope
             || (sample.activityPercent != nil && gpuHistorySource != sample.source)
@@ -914,6 +981,7 @@ public final class MetricsStore {
                 isAvailable: supportsToolActivity && proxyState == .listening
                     && (backendKind == nil || connectionState == .ready)))
         publishChartPresentationIfDue(at: date)
+        refreshLiveGPU()
         publishDashboardScalarPresentation()
     }
 
@@ -927,6 +995,7 @@ public final class MetricsStore {
         guard !presentationDemandIsManaged || !presentationConsumers.isEmpty else {
             if dashboardScalarPresentation != .empty {
                 dashboardScalarPresentation = .empty
+                liveScalars.updateCoalesced(.empty)
                 PerformanceGraphicsDiagnostics.shared.scalarPresentationPublished()
             }
             return
@@ -954,8 +1023,27 @@ public final class MetricsStore {
             historyPersistenceError: usageHistory.persistenceError ?? chartArchive.persistenceError)
         if next != dashboardScalarPresentation {
             dashboardScalarPresentation = next
+            liveScalars.updateCoalesced(next)
             PerformanceGraphicsDiagnostics.shared.scalarPresentationPublished()
         }
+    }
+
+    /// Raw activity changes only on lifecycle, first-output or native-count
+    /// boundaries. Ordinary streamed token/rate updates never reach this path.
+    private func refreshLiveActivity() {
+        let activity = backendActivity
+        liveScalars.updateActivity(activity, at: sampleDate)
+        liveScalars.updateStatus(activity: activity, connection: connectionState)
+        liveScalars.updateRate(displayTPS, activity: activity)
+    }
+
+    /// An accepted GPU sample may contain a new timestamp with identical label
+    /// and help text. The two leaves have independent equality-checked values.
+    private func refreshLiveGPU() {
+        let value = systemGPUUtilizationPercent
+        liveScalars.updateGPUValue(value)
+        liveScalars.updateGPUHelp(
+            available: value != nil, unavailableMessage: gpuAvailabilityMessage)
     }
 
     /// Sampling continues while idle so completed activity ages off the chart.
