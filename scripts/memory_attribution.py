@@ -46,7 +46,6 @@ HELD_USAGE_GAUGES = ("current_owners", "peak_owners")
 HELD_USAGE_VALUE_COUNTS = ("input_tokens", "unknown_input_requests", "output_tokens", "tool_calls", "requests", "active_requests")
 HELD_USAGE_VALUE_FLAGS = ("output_is_estimated", "is_partial")
 SCALAR_LEAVES = ("header", "metrics", "details", "card_footer", "app_footer")
-SCALAR_METRICS = ("rate", "gpu")
 SCALAR_PRESENTATION_COUNTERS = ("layout_size_calls", "layout_place_calls", "layout_child_measurements",
                                 "freezes_captured", "freezes_released")
 SCALAR_PRESENTATION_GAUGES = ("current_frozen_owners", "peak_frozen_owners")
@@ -916,18 +915,6 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
 
     leaves = leaf_counts(raw.get("leaf_body_updates"), "scalar_presentation.leaf_body_updates")
 
-    def metric_counts(values, label):
-        require(isinstance(values, dict) and set(values) == set(SCALAR_METRICS),
-                f"{label} requires both metric child counters")
-        require(all(type(count) is int and 0 <= count <= 2**64 - 1 for count in values.values()),
-                f"{label} must contain complete UInt64 counters")
-        return values
-
-    # Older frozen products have no child instrumentation. Keep that evidence
-    # unavailable rather than fabricating zero child work for the control.
-    metrics = metric_counts(raw["metric_body_updates"], "scalar_presentation.metric_body_updates") \
-        if "metric_body_updates" in raw else None
-
     def frames(values, label):
         require(isinstance(values, dict) and len(values) <= 16, f"{label} frame inventory is invalid")
         for name, rect in values.items():
@@ -959,10 +946,6 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
             else:
                 frames(entry.get("current_frames"), "Scalar current")
                 leaf_counts(entry.get("leaf_body_updates"), "Scalar owner leaf_body_updates")
-                require(("metric_body_updates" in entry) == (metrics is not None),
-                        "Scalar metric child instrumentation is partial")
-                if metrics is not None:
-                    metric_counts(entry["metric_body_updates"], "Scalar owner metric_body_updates")
                 if "presented_values" in entry or mode in (HELD_USAGE_MODE, RETAINED_USAGE_MODE):
                     presented_scalar_values(entry.get("presented_values"))
         require(len(roles) == len(set(roles)), f"Scalar {name} owner roles are duplicated")
@@ -975,9 +958,6 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
         require(entry["role"] == owners[owner]["role"], "Frozen scalar owner role differs from live presentation")
     require(all(sum(entry["leaf_body_updates"][leaf] for entry in owners.values()) <= leaves[leaf] for leaf in SCALAR_LEAVES),
             "Scalar owner body updates exceed aggregate counters")
-    if metrics is not None:
-        require(all(sum(entry["metric_body_updates"][metric] for entry in owners.values()) <= metrics[metric]
-                    for metric in SCALAR_METRICS), "Scalar owner metric child updates exceed aggregate counters")
     if not enabled:
         require(not frozen and all(counts[field] == 0 for field in
                     ("freezes_captured", "freezes_released") + SCALAR_PRESENTATION_GAUGES),
@@ -985,8 +965,6 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
     if not instrumented:
         require(not owners and all(count == 0 for count in counts.values()) and all(count == 0 for count in leaves.values()),
                 "Inactive scalar instrumentation executed work")
-        require(metrics is None or all(count == 0 for count in metrics.values()),
-                "Inactive scalar instrumentation executed metric child work")
     native = value.get("native_canvas_frames")
     native_draws = value.get("native_canvas_draws")
     require(isinstance(native, dict) and len(native) <= 2, "Scalar diagnostic native chart frame inventory is incomplete")
@@ -1008,8 +986,7 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
         require(not owners and not frozen and not native and counts["current_frozen_owners"] == 0,
                 "Scalar diagnostic owners or native charts remain live after closing")
     return {"enabled": enabled, "instrumented": instrumented, "counters": counts,
-            "leaf_body_updates": leaves, "metric_body_updates": metrics,
-            "frozen_owners": frozen, "presentation_owners": owners,
+            "leaf_body_updates": leaves, "frozen_owners": frozen, "presentation_owners": owners,
             "native_canvas_frames": native, "native_canvas_draws": native_draws,
             "acceptance_eligible": mode not in (FROZEN_SCALARS_MODE, HELD_USAGE_MODE)}
 

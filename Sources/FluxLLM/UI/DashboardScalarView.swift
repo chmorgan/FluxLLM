@@ -51,20 +51,20 @@ struct DashboardScalarView: View, Equatable {
             narrow
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: density.value(12, 8)))
             : AnyLayout(HStackLayout(alignment: .top, spacing: 16))
-        // A new active lifetime must admit both displayed fields again, even
-        // when an epoch transition leaves one formatted value unchanged.
-        let generation = presentation.scalarFrameGeneration
         return metricLayout {
-            DashboardMetricColumn(
-                metric: .rate, presentation: presentation,
-                isCompact: isCompact, density: density, scalarMode: scalarMode,
-                presentationGeneration: generation
-            ).equatable()
-            DashboardMetricColumn(
-                metric: .gpu, presentation: presentation,
-                isCompact: isCompact, density: density, scalarMode: scalarMode,
-                presentationGeneration: generation
-            ).equatable()
+            VStack(alignment: .leading, spacing: isCompact ? 6 : density.metricLabelSpacing) {
+                sectionHeader("Generated", color: throughputColor)
+                throughputValue(size: isCompact ? 32 : density.value(40, 28))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: isCompact ? 6 : density.metricLabelSpacing) {
+                sectionHeader("System GPU", color: gpuColor)
+                gpuValue(
+                    size: isCompact ? 30 : density.value(38, 28),
+                    height: isCompact ? 40 : density.metricValueHeight)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(gpuHelp)
         }
         .frame(height: narrow ? nil : (isCompact ? 60 : density.metricRowHeight), alignment: .top)
     }
@@ -169,6 +169,42 @@ struct DashboardScalarView: View, Equatable {
                 .accessibilityIdentifier("backend-settings")
         } else {
             statusBadge
+        }
+    }
+
+    private func throughputValue(size: CGFloat) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Text(rateLabel)
+                .font(.system(size: size, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1).minimumScaleFactor(0.7)
+            Text("tokens/s").font(.system(size: 13, weight: .medium))
+            Spacer(minLength: 0)
+        }
+        .frame(height: ceil(size * 1.25))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Generated")
+        .accessibilityValue("\(rateLabel) tokens per second")
+        .accessibilityIdentifier("throughput-value")
+        .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
+            ["throughput-value": $0]
+        }
+        .accessibilityHint(throughputHelp)
+        .help(throughputHelp)
+    }
+
+    private func gpuValue(size: CGFloat, height: CGFloat) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Text(gpuLabel)
+                .font(.system(size: size, weight: .medium, design: .rounded))
+                .monospacedDigit()
+            Text("%").font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+        .frame(height: height)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("system-gpu-value")
+        .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
+            ["gpu-value": $0]
         }
     }
 
@@ -358,6 +394,14 @@ struct DashboardScalarView: View, Equatable {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    private func sectionHeader(_ title: String, color: Color) -> some View {
+        HStack(spacing: 6) {
+            Capsule().fill(color).frame(width: 14, height: 3)
+            Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+        }
+        .frame(height: 14)
+    }
+
     private var statusBadge: some View {
         HStack(spacing: 5) {
             Circle().fill(statusColor).frame(width: 6, height: 6)
@@ -438,12 +482,32 @@ struct DashboardScalarView: View, Equatable {
         }
     }
 
-    private var metricPresentation: DashboardMetricPresentation {
-        DashboardMetricPresentation(
-            store: store, presentation: presentation, scalarMode: scalarMode)
+    private var gpuIsAvailable: Bool {
+        store.systemGPUUtilizationPercent != nil
     }
-    private var gpuHelp: String { metricPresentation.gpuHelp }
-    private var throughputHelp: String { metricPresentation.throughputHelp }
+
+    private var gpuHelp: String {
+        if let frozen = frozenScalars { return frozen.gpuHelp }
+        if let live = liveScalars { return live.gpuHelp }
+        return gpuIsAvailable ? GPUActivityPresentation.explanation : store.gpuAvailabilityMessage
+    }
+
+    private var throughputHelp: String {
+        if let frozen = frozenScalars { return frozen.throughputHelp }
+        if let live = liveScalars { return live.throughputHelp }
+        return switch store.throughputBasis {
+        case .estimated:
+            if store.backendKind == .ollama {
+                "Generated and tool-call rates follow the latest request via FluxLLM. Active includes all open monitored requests. Live token rate is approximate until the backend reports final token counts."
+            } else {
+                "Live token rate is approximate until the backend reports final token counts."
+            }
+        case .serverAggregate:
+            "Total token throughput across requests reported by this backend."
+        case .serverReportedAverage:
+            "Average token rate reported by this backend."
+        }
+    }
 
     private var modelLabel: String {
         if let frozen = frozenScalars { return frozen.modelLabel }
@@ -490,9 +554,7 @@ struct DashboardScalarView: View, Equatable {
                 "activity": activityDetail as Any? ?? NSNull(),
             ]
         case .metrics:
-            // Each column reports only the value it actually renders. Reading
-            // both here would enroll this parent in both independent sources.
-            return
+            values = ["rate": rateLabel, "gpu": gpuLabel]
         case .details where isCompact && scalarBackendKind == .ollama:
             values = ["response": responseTokensLabel]
         case .details where !isCompact && scalarBackendKind == .ollama:
@@ -557,6 +619,18 @@ struct DashboardScalarView: View, Equatable {
         return BackendPresentation.statusTitle(store: store)
     }
 
+    private var rateLabel: String {
+        if let frozen = frozenScalars { return frozen.rateLabel }
+        if let live = liveScalars { return live.rateLabel }
+        return BackendPresentation.rateLabel(store: store)
+    }
+
+    private var gpuLabel: String {
+        if let frozen = frozenScalars { return frozen.gpuLabel }
+        if let live = liveScalars { return live.gpuLabel }
+        return GPUActivityPresentation.valueLabel(store.systemGPUUtilizationPercent)
+    }
+
     private var backendOutputTokensLabel: String {
         if let frozen = frozenScalars { return frozen.backendOutputTokensLabel }
         if let live = liveScalars { return live.backendOutputTokensLabel }
@@ -587,157 +661,5 @@ struct DashboardScalarView: View, Equatable {
         return store.backendKind
     }
     private var throughputColor: Color { TelemetryPalette.throughput(colorScheme) }
-}
-
-/// The two columns read their own displayed values inside separate tracked
-/// bodies. Their shared row receives only immutable layout and lifetime inputs.
-private struct DashboardMetricColumn: View, Equatable {
-    @Environment(MetricsStore.self) private var store
-    @Environment(\.colorScheme) private var colorScheme
-    let metric: PerformanceGraphicsDiagnostics.ScalarMetric
-    let presentation: DashboardPresentationState
-    let isCompact: Bool
-    let density: DashboardHeightPolicy
-    let scalarMode: PerformanceGraphicsDiagnostics.Mode
-    let presentationGeneration: UInt64
-
-    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.metric == rhs.metric && lhs.presentation === rhs.presentation
-            && lhs.isCompact == rhs.isCompact && lhs.density == rhs.density
-            && lhs.scalarMode == rhs.scalarMode
-            && lhs.presentationGeneration == rhs.presentationGeneration
-    }
-
-    var body: some View {
-        let source = DashboardMetricPresentation(
-            store: store, presentation: presentation, scalarMode: scalarMode)
-        let value: String
-        let help: String
-        switch metric {
-        case .rate:
-            value = source.rateLabel
-            help = source.throughputHelp
-        case .gpu:
-            value = source.gpuLabel
-            help = source.gpuHelp
-        }
-        if PerformanceGraphicsDiagnostics.shared.isEnabled, presentation.isActive {
-            PerformanceGraphicsDiagnostics.shared.recordScalarMetricBody(
-                metric, owner: presentation.scalarPerformanceOwnerID, value: value)
-        }
-        return column(value: value, help: help)
-    }
-
-    @ViewBuilder private func column(value: String, help: String) -> some View {
-        switch metric {
-        case .rate:
-            VStack(alignment: .leading, spacing: isCompact ? 6 : density.metricLabelSpacing) {
-                sectionHeader("Generated", color: TelemetryPalette.throughput(colorScheme))
-                throughputValue(value, help: help, size: isCompact ? 32 : density.value(40, 28))
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        case .gpu:
-            VStack(alignment: .leading, spacing: isCompact ? 6 : density.metricLabelSpacing) {
-                sectionHeader("System GPU", color: TelemetryPalette.gpu(colorScheme))
-                gpuValue(
-                    value, size: isCompact ? 30 : density.value(38, 28),
-                    height: isCompact ? 40 : density.metricValueHeight)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .help(help)
-        }
-    }
-
-    private func sectionHeader(_ title: String, color: Color) -> some View {
-        HStack(spacing: 6) {
-            Capsule().fill(color).frame(width: 14, height: 3)
-            Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-        }
-        .frame(height: 14)
-    }
-
-    private func throughputValue(_ value: String, help: String, size: CGFloat) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 7) {
-            Text(value)
-                .font(.system(size: size, weight: .medium, design: .rounded))
-                .monospacedDigit()
-                .lineLimit(1).minimumScaleFactor(0.7)
-            Text("tokens/s").font(.system(size: 13, weight: .medium))
-            Spacer(minLength: 0)
-        }
-        .frame(height: ceil(size * 1.25))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Generated")
-        .accessibilityValue("\(value) tokens per second")
-        .accessibilityIdentifier("throughput-value")
-        .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
-            ["throughput-value": $0]
-        }
-        .accessibilityHint(help)
-        .help(help)
-    }
-
-    private func gpuValue(_ value: String, size: CGFloat, height: CGFloat) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 5) {
-            Text(value)
-                .font(.system(size: size, weight: .medium, design: .rounded))
-                .monospacedDigit()
-            Text("%").font(.system(size: 11)).foregroundStyle(.secondary)
-        }
-        .frame(height: height)
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("system-gpu-value")
-        .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
-            ["gpu-value": $0]
-        }
-    }
-}
-
-/// Shared fallback formatting is evaluated only by the field that needs it.
-/// Constructing this source reads no observable values.
-@MainActor
-private struct DashboardMetricPresentation {
-    let store: MetricsStore
-    let presentation: DashboardPresentationState
-    let scalarMode: PerformanceGraphicsDiagnostics.Mode
-
-    private var frozen: DashboardFrozenScalars? {
-        scalarMode.usesFrozenScalarPresentation ? presentation.frozenScalars : nil
-    }
-    private var live: DashboardLiveScalars? {
-        scalarMode.usesCoalescedScalarPresentation ? store.liveScalars : nil
-    }
-
-    var rateLabel: String {
-        if let frozen { return frozen.rateLabel }
-        if let live { return live.rateLabel }
-        return BackendPresentation.rateLabel(store: store)
-    }
-    var gpuLabel: String {
-        if let frozen { return frozen.gpuLabel }
-        if let live { return live.gpuLabel }
-        return GPUActivityPresentation.valueLabel(store.systemGPUUtilizationPercent)
-    }
-    var gpuHelp: String {
-        if let frozen { return frozen.gpuHelp }
-        if let live { return live.gpuHelp }
-        return store.systemGPUUtilizationPercent != nil
-            ? GPUActivityPresentation.explanation : store.gpuAvailabilityMessage
-    }
-    var throughputHelp: String {
-        if let frozen { return frozen.throughputHelp }
-        if let live { return live.throughputHelp }
-        return switch store.throughputBasis {
-        case .estimated:
-            if store.backendKind == .ollama {
-                "Generated and tool-call rates follow the latest request via FluxLLM. Active includes all open monitored requests. Live token rate is approximate until the backend reports final token counts."
-            } else {
-                "Live token rate is approximate until the backend reports final token counts."
-            }
-        case .serverAggregate:
-            "Total token throughput across requests reported by this backend."
-        case .serverReportedAverage:
-            "Average token rate reported by this backend."
-        }
-    }
+    private var gpuColor: Color { TelemetryPalette.gpu(colorScheme) }
 }

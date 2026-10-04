@@ -250,10 +250,6 @@ public final class PerformanceGraphicsDiagnostics {
         case appFooter = "app_footer"
     }
 
-    enum ScalarMetric: String, CaseIterable, Sendable {
-        case rate, gpu
-    }
-
     /// SwiftUI can perform Layout callbacks off the main actor. A performance
     /// session injects this bounded probe once; ordinary layouts receive nil.
     /// All mutable state, including retirement, is protected by the same lock.
@@ -349,8 +345,6 @@ public final class PerformanceGraphicsDiagnostics {
         var role: String? = nil
         var frames: [String: CGRect] = [:]
         var leafBodyUpdates: [ScalarLeaf: UInt64] = [:]
-        var metricBodyUpdates: [ScalarMetric: UInt64] = [:]
-        var metricPresentedFields: [ScalarMetric: String] = [:]
         var presentedValues: [String: [String: Any]] = [:]
     }
 
@@ -385,7 +379,6 @@ public final class PerformanceGraphicsDiagnostics {
     }
 
     private var scalarLeafBodyUpdates: [ScalarLeaf: UInt64] = [:]
-    private var scalarMetricBodyUpdates: [ScalarMetric: UInt64] = [:]
     private var scalarPresentationOwners: [UUID: ScalarPresentationOwner] = [:]
     private var frozenScalarOwners: [UUID: FrozenScalarOwner] = [:]
     private var heldUsageOwners: [UUID: DashboardHeldUsage] = [:]
@@ -706,7 +699,6 @@ public final class PerformanceGraphicsDiagnostics {
         railGeometryCacheOwners.removeAll(keepingCapacity: false)
         railGeometryCachePeakOwners = 0
         scalarLeafBodyUpdates.removeAll(keepingCapacity: false)
-        scalarMetricBodyUpdates.removeAll(keepingCapacity: false)
         scalarPresentationOwners.removeAll(keepingCapacity: false)
         frozenScalarOwners.removeAll(keepingCapacity: false)
         heldUsageOwners.removeAll(keepingCapacity: false)
@@ -1444,35 +1436,6 @@ public final class PerformanceGraphicsDiagnostics {
         scalarLeafBodyUpdates[leaf] = total.partialValue
     }
 
-    /// Separate child bodies report only the label they actually render. Merge
-    /// their bounded receipts without observing either telemetry projection in
-    /// the parent metrics body or sampling the other child's current value.
-    func recordScalarMetricBody(_ metric: ScalarMetric, owner: UUID, value: String) {
-        guard scalarInstrumentationEnabled else { return }
-        guard var receipt = scalarPresentationOwners[owner], value.utf8.count <= 4096
-        else {
-            invalidEvents += 1
-            return
-        }
-        let total = scalarMetricBodyUpdates[metric, default: 0].addingReportingOverflow(1)
-        let local = receipt.metricBodyUpdates[metric, default: 0].addingReportingOverflow(1)
-        guard !total.overflow, !local.overflow else {
-            invalidEvents += 1
-            return
-        }
-        receipt.metricBodyUpdates[metric] = local.partialValue
-        receipt.metricPresentedFields[metric] = value
-        scalarPresentationOwners[owner] = receipt
-        scalarMetricBodyUpdates[metric] = total.partialValue
-        if let rate = receipt.metricPresentedFields[.rate],
-            let gpu = receipt.metricPresentedFields[.gpu]
-        {
-            recordScalarPresentedValues(
-                .metrics, owner: owner, compact: false,
-                values: ["rate": rate, "gpu": gpu])
-        }
-    }
-
     /// Authenticated native leaf callbacks report displayed values, never raw
     /// counters sampled behind an independently held or coalesced presentation.
     func recordScalarPresentedValues(
@@ -1831,13 +1794,6 @@ public final class PerformanceGraphicsDiagnostics {
             uniqueKeysWithValues: ScalarLeaf.allCases.map { ($0.rawValue, counts[$0, default: 0]) })
     }
 
-    private func scalarMetricsSnapshot(_ counts: [ScalarMetric: UInt64]) -> [String: UInt64] {
-        Dictionary(
-            uniqueKeysWithValues: ScalarMetric.allCases.map {
-                ($0.rawValue, counts[$0, default: 0])
-            })
-    }
-
     private func scalarPresentationSnapshot(layout: LayoutCounters.Snapshot) -> [String: Any] {
         let frozen = Dictionary(
             uniqueKeysWithValues: frozenScalarOwners.map { id, receipt in
@@ -1857,14 +1813,12 @@ public final class PerformanceGraphicsDiagnostics {
                         "role": receipt.role as Any? ?? NSNull(),
                         "current_frames": scalarFramesSnapshot(receipt.frames),
                         "leaf_body_updates": scalarLeavesSnapshot(receipt.leafBodyUpdates),
-                        "metric_body_updates": scalarMetricsSnapshot(receipt.metricBodyUpdates),
                         "presented_values": receipt.presentedValues,
                     ] as [String: Any]
                 )
             })
         return [
             "leaf_body_updates": scalarLeavesSnapshot(scalarLeafBodyUpdates),
-            "metric_body_updates": scalarMetricsSnapshot(scalarMetricBodyUpdates),
             "layout_size_calls": layout.sizeCalls, "layout_place_calls": layout.placeCalls,
             "layout_child_measurements": layout.childMeasurements,
             "freezes_captured": scalarFreezesCaptured, "freezes_released": scalarFreezesReleased,

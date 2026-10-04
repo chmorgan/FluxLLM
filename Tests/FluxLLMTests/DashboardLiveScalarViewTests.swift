@@ -52,20 +52,22 @@ final class DashboardLiveScalarViewTests: XCTestCase {
         store.sample(at: origin.addingTimeInterval(1))
         try host.settle()
         let before = try leafCounts(state)
-        let beforeMetrics = try metricCounts(state)
+        let frames = state.scalarPerformanceFrames
+        let values = try presentedValues(state)
         try host.settle()
         XCTAssertEqual(try leafCounts(state), before, "The no-update control must remain quiet")
         for second in 2...4 {
             let publication = store.chartPresentation.publicationID
             store.sample(at: origin.addingTimeInterval(TimeInterval(second)))
-            try host.settle(forceLayout: false)
+            try host.settle()
             XCTAssertNotEqual(store.chartPresentation.publicationID, publication)
             XCTAssertEqual(
                 try leafCounts(state), before,
                 "A changing chart timestamp must not become a scalar-child input")
+            XCTAssertEqual(state.scalarPerformanceFrames, frames)
             XCTAssertEqual(
-                try metricCounts(state), beforeMetrics,
-                "Chart-only publications must also leave both metric columns quiet")
+                try presentedValues(state), values,
+                "Actual rendered scalar witnesses must remain unchanged")
         }
     }
 
@@ -90,8 +92,6 @@ final class DashboardLiveScalarViewTests: XCTestCase {
         try compact.settle()
         let beforeFull = try leafCounts(fullState)
         let beforeCompact = try leafCounts(compactState)
-        let beforeFullMetrics = try metricCounts(fullState)
-        let beforeCompactMetrics = try metricCounts(compactState)
         let publication = store.chartPresentation.publicationID
         store.applyGPUSample(
             GPUActivitySample(
@@ -106,8 +106,6 @@ final class DashboardLiveScalarViewTests: XCTestCase {
             try leafCounts(fullState), beforeFull,
             "Same displayed GPU percentage must not publish its raw timestamp")
         XCTAssertEqual(try leafCounts(compactState), beforeCompact)
-        XCTAssertEqual(try metricCounts(fullState), beforeFullMetrics)
-        XCTAssertEqual(try metricCounts(compactState), beforeCompactMetrics)
 
         store.applyGPUSample(
             GPUActivitySample(
@@ -122,16 +120,7 @@ final class DashboardLiveScalarViewTests: XCTestCase {
         for (before, after) in [(beforeFull, gpuFull), (beforeCompact, gpuCompact)] {
             XCTAssertEqual(after["header"], before["header"])
             XCTAssertEqual(after["details"], before["details"])
-            XCTAssertEqual(
-                after["metrics"], before["metrics"],
-                "The shared metric row must not observe either column's value or help")
-        }
-        for (before, after) in [
-            (beforeFullMetrics, try metricCounts(fullState)),
-            (beforeCompactMetrics, try metricCounts(compactState)),
-        ] {
-            XCTAssertEqual(after["rate"], before["rate"])
-            XCTAssertGreaterThan(try XCTUnwrap(after["gpu"]), try XCTUnwrap(before["gpu"]))
+            XCTAssertGreaterThan(try XCTUnwrap(after["metrics"]), try XCTUnwrap(before["metrics"]))
         }
         store.usageScope = .today
         try full.settle()
@@ -144,95 +133,6 @@ final class DashboardLiveScalarViewTests: XCTestCase {
             "Compact latest-response tokens must not observe unrelated usage totals or scope")
         XCTAssertEqual(usageCompact["header"], gpuCompact["header"])
         XCTAssertEqual(usageCompact["metrics"], gpuCompact["metrics"])
-    }
-
-    func testRateAndGPUColumnsObserveOnlyTheirOwnDisplayedFields() throws {
-        try PerformanceGraphicsDiagnostics.shared.enable(mode: .normal)
-        let store = makeStore(.ollama)
-        let fullState = DashboardPresentationState()
-        let compactState = DashboardPresentationState()
-        let full = LiveScalarDashboardHost(
-            store: store, state: fullState, compact: false,
-            size: CGSize(width: 740, height: 700))
-        let compact = LiveScalarDashboardHost(
-            store: store, state: compactState, compact: true,
-            size: CGSize(width: 360, height: 550))
-        defer {
-            full.close()
-            compact.close()
-            drain()
-            try? PerformanceGraphicsDiagnostics.shared.disable()
-        }
-        try full.settle()
-        try compact.settle()
-        let beforeLeaves = try [leafCounts(fullState), leafCounts(compactState)]
-        let beforeMetrics = try [metricCounts(fullState), metricCounts(compactState)]
-
-        store.applyGPUSample(
-            GPUActivitySample(
-                timestamp: origin.addingTimeInterval(0.7),
-                activityPercent: 83, source: "independent metric GPU", scope: .system),
-            epoch: store.monitoringEpoch)
-        try full.settle(forceLayout: false)
-        try compact.settle(forceLayout: false)
-        let gpuMetrics = try [metricCounts(fullState), metricCounts(compactState)]
-        for index in beforeMetrics.indices {
-            XCTAssertEqual(gpuMetrics[index]["rate"], beforeMetrics[index]["rate"])
-            XCTAssertGreaterThan(
-                try XCTUnwrap(gpuMetrics[index]["gpu"]),
-                try XCTUnwrap(beforeMetrics[index]["gpu"]))
-        }
-        XCTAssertEqual(
-            try [leafCounts(fullState), leafCounts(compactState)], beforeLeaves,
-            "A GPU-only displayed change must not rebuild the enclosing scalar leaves")
-
-        // The projection consumer is tested directly here; source tests retain
-        // their independent assertions for sampling and immediate boundaries.
-        store.liveScalars.updateRate(47.2, activity: .idle)
-        try full.settle(forceLayout: false)
-        try compact.settle(forceLayout: false)
-        let rateMetrics = try [metricCounts(fullState), metricCounts(compactState)]
-        for index in gpuMetrics.indices {
-            XCTAssertEqual(rateMetrics[index]["gpu"], gpuMetrics[index]["gpu"])
-            XCTAssertGreaterThan(
-                try XCTUnwrap(rateMetrics[index]["rate"]),
-                try XCTUnwrap(gpuMetrics[index]["rate"]))
-        }
-        XCTAssertEqual(
-            try [leafCounts(fullState), leafCounts(compactState)], beforeLeaves,
-            "A rate-only displayed change must not rebuild the enclosing scalar leaves")
-        for state in [fullState, compactState] {
-            XCTAssertEqual(
-                try metricWitness(state), ["rate": "47.2", "gpu": "83"],
-                "The merged witness must retain the sibling's actually rendered value")
-        }
-    }
-
-    func testVisibleLifetimeRebindAdmitsBothUnchangedMetricValues() throws {
-        try PerformanceGraphicsDiagnostics.shared.enable(mode: .normal)
-        let store = makeStore(.vllm)
-        let context = ScalarParentContext(store: store, leaf: .metrics)
-        let host = LiveScalarLeafHost(context: context)
-        defer {
-            host.close()
-            drain()
-            try? PerformanceGraphicsDiagnostics.shared.disable()
-        }
-        try host.settle()
-        let before = try metricTotals()
-        let values = try metricWitness(context.presentation)
-        context.presentation.setActive(false, store: store)
-        context.presentation.setActive(true, store: store)
-        try host.settle(forceLayout: false)
-        let after = try metricTotals()
-        let readmitted = try metricCounts(context.presentation)
-        for metric in ["rate", "gpu"] {
-            XCTAssertGreaterThan(
-                try XCTUnwrap(after[metric]), try XCTUnwrap(before[metric]),
-                "An unchanged metric must render again for the new presentation lifetime")
-            XCTAssertGreaterThan(try XCTUnwrap(readmitted[metric]), 0)
-        }
-        XCTAssertEqual(try metricWitness(context.presentation), values)
     }
 
     func testEqualChildRemainsLiveForEnvironmentStoreReplacementAndObservedValues() throws {
@@ -248,22 +148,20 @@ final class DashboardLiveScalarViewTests: XCTestCase {
         }
         try host.settle()
         let firstPixels = try host.pixels()
-        let firstCounts = try metricCounts(context.presentation)
+        let firstCounts = try leafCounts(context.presentation)
         context.parentTick += 1
         try host.settle()
         XCTAssertEqual(
-            try metricCounts(context.presentation), firstCounts,
+            try leafCounts(context.presentation), firstCounts,
             "Equal immutable child inputs should skip a forced parent update")
         context.store = second
         try host.settle()
         XCTAssertNotEqual(
             try host.pixels(), firstPixels,
             "An equal child must consume the replacement environment store")
-        let replacedCounts = try metricCounts(context.presentation)
+        let replacedCounts = try leafCounts(context.presentation)
         XCTAssertGreaterThan(
-            try XCTUnwrap(replacedCounts["rate"]), try XCTUnwrap(firstCounts["rate"]))
-        XCTAssertGreaterThan(
-            try XCTUnwrap(replacedCounts["gpu"]), try XCTUnwrap(firstCounts["gpu"]))
+            try XCTUnwrap(replacedCounts["metrics"]), try XCTUnwrap(firstCounts["metrics"]))
         let replacementPixels = try host.pixels()
         first.applyGPUSample(
             GPUActivitySample(
@@ -271,15 +169,13 @@ final class DashboardLiveScalarViewTests: XCTestCase {
                 activityPercent: 91, source: "scalar-test GPU", scope: .system),
             epoch: first.monitoringEpoch)
         try host.settle()
-        let retiredCounts = try metricCounts(context.presentation)
+        let retiredCounts = try leafCounts(context.presentation)
         // A previously registered Observation dependency can consume one final
         // callback after replacement. It must retire, never render old values,
         // and never keep invalidating this leaf on subsequent old-store events.
-        for metric in ["rate", "gpu"] {
-            XCTAssertLessThanOrEqual(
-                try XCTUnwrap(retiredCounts[metric]),
-                try XCTUnwrap(replacedCounts[metric]) + 1)
-        }
+        XCTAssertLessThanOrEqual(
+            try XCTUnwrap(retiredCounts["metrics"]),
+            try XCTUnwrap(replacedCounts["metrics"]) + 1)
         XCTAssertEqual(try host.pixels(), replacementPixels)
         for (offset, value) in [(0.72, 61.0), (0.74, 42.0)] {
             first.applyGPUSample(
@@ -289,7 +185,7 @@ final class DashboardLiveScalarViewTests: XCTestCase {
                 epoch: first.monitoringEpoch)
             try host.settle()
             XCTAssertEqual(
-                try metricCounts(context.presentation), retiredCounts,
+                try leafCounts(context.presentation), retiredCounts,
                 "A retired environment store must stop invalidating the replacement leaf")
             XCTAssertEqual(
                 try host.pixels(), replacementPixels,
@@ -302,20 +198,18 @@ final class DashboardLiveScalarViewTests: XCTestCase {
             epoch: second.monitoringEpoch)
         try host.settle()
         let beforeSchemePixels = try host.pixels()
-        let beforeSchemeCounts = try metricCounts(context.presentation)
+        let beforeSchemeCounts = try leafCounts(context.presentation)
         XCTAssertNotEqual(beforeSchemePixels, replacementPixels)
         XCTAssertGreaterThan(
-            try XCTUnwrap(beforeSchemeCounts["gpu"]),
-            try XCTUnwrap(retiredCounts["gpu"]),
+            try XCTUnwrap(beforeSchemeCounts["metrics"]),
+            try XCTUnwrap(retiredCounts["metrics"]),
             "The replacement environment store must still invalidate its leaf")
         context.scheme = .dark
         try host.settle()
         XCTAssertNotEqual(try host.pixels(), beforeSchemePixels)
-        for metric in ["rate", "gpu"] {
-            XCTAssertGreaterThan(
-                try XCTUnwrap(metricCounts(context.presentation)[metric]),
-                try XCTUnwrap(beforeSchemeCounts[metric]))
-        }
+        XCTAssertGreaterThan(
+            try XCTUnwrap(leafCounts(context.presentation)["metrics"]),
+            try XCTUnwrap(beforeSchemeCounts["metrics"]))
     }
 
     func testMutableActionCallbacksRemainObservedInsideEqualHeader() throws {
@@ -458,32 +352,13 @@ final class DashboardLiveScalarViewTests: XCTestCase {
         return counts.mapValues(\.uint64Value)
     }
 
-    private func metricCounts(_ state: DashboardPresentationState) throws -> [String: UInt64] {
+    private func presentedValues(_ state: DashboardPresentationState) throws -> NSDictionary {
         let scalar = try XCTUnwrap(
             PerformanceGraphicsDiagnostics.shared.snapshot()["scalar_presentation"]
                 as? [String: Any])
         let owners = try XCTUnwrap(scalar["presentation_owners"] as? [String: [String: Any]])
         let owner = try XCTUnwrap(owners[state.scalarPerformanceOwnerID.uuidString])
-        let counts = try XCTUnwrap(owner["metric_body_updates"] as? [String: NSNumber])
-        return counts.mapValues(\.uint64Value)
-    }
-
-    private func metricTotals() throws -> [String: UInt64] {
-        let scalar = try XCTUnwrap(
-            PerformanceGraphicsDiagnostics.shared.snapshot()["scalar_presentation"]
-                as? [String: Any])
-        let counts = try XCTUnwrap(scalar["metric_body_updates"] as? [String: NSNumber])
-        return counts.mapValues(\.uint64Value)
-    }
-
-    private func metricWitness(_ state: DashboardPresentationState) throws -> [String: String] {
-        let scalar = try XCTUnwrap(
-            PerformanceGraphicsDiagnostics.shared.snapshot()["scalar_presentation"]
-                as? [String: Any])
-        let owners = try XCTUnwrap(scalar["presentation_owners"] as? [String: [String: Any]])
-        let owner = try XCTUnwrap(owners[state.scalarPerformanceOwnerID.uuidString])
-        let presented = try XCTUnwrap(owner["presented_values"] as? [String: Any])
-        return try XCTUnwrap(presented["metrics"] as? [String: String])
+        return try XCTUnwrap(owner["presented_values"] as? NSDictionary)
     }
 
     private func drain() {
@@ -549,11 +424,11 @@ private final class LiveScalarLeafHost {
         window.setContentSize(CGSize(width: 700, height: 160))
         hosting = host
     }
-    func settle(forceLayout: Bool = true) throws {
+    func settle() throws {
         let host = try XCTUnwrap(hosting)
         for _ in 0..<5 {
             window.layoutIfNeeded()
-            if forceLayout { host.view.needsLayout = true }
+            host.view.needsLayout = true
             host.view.layoutSubtreeIfNeeded()
             RunLoop.main.run(until: Date().addingTimeInterval(0.01))
         }
@@ -609,12 +484,12 @@ private final class LiveScalarDashboardHost {
         window.setContentSize(size)
         hosting = host
     }
-    func settle(forceLayout: Bool = true) throws {
+    func settle() throws {
         let host = try XCTUnwrap(hosting)
         for _ in 0..<5 {
             window.layoutIfNeeded()
             window.contentView?.layoutSubtreeIfNeeded()
-            if forceLayout { host.view.needsLayout = true }
+            host.view.needsLayout = true
             host.view.layoutSubtreeIfNeeded()
             RunLoop.main.run(until: Date().addingTimeInterval(0.01))
         }
