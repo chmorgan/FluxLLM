@@ -256,6 +256,7 @@ private struct RequestRailDecorations: View {
     @State private var animating = false
     @State private var frameClock = RequestRailFrameClock()
     @State private var primitiveEffectsFailed = false
+    @State private var effectGeometryCache = RequestRailEffectGeometryCache()
 
     private var effectsEnabled: Bool {
         isLive && !reduceMotion && !reduceTransparency && contrast != .increased && windowVisible
@@ -423,7 +424,12 @@ private struct RequestRailDecorations: View {
         .task(id: work) {
             await runDecorations(work: work)
         }
-        .onDisappear { animating = false }
+        .onDisappear {
+            animating = false
+            if PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry {
+                effectGeometryCache.removeAll()
+            }
+        }
     }
 
     private struct InactiveDecorationRevision: Hashable {}
@@ -432,6 +438,7 @@ private struct RequestRailDecorations: View {
     /// resized chart cannot change an existing bolt's forks or burst family.
     @MainActor
     private func runDecorations(work: RequestRailLifecycleEffects.WorkKey) async {
+        guard !Task.isCancelled else { return }
         let timestamp = Date()
         if PerformanceGraphicsDiagnostics.shared.mode.omitsArrivalEffects {
             let count = arrivalSuppression.update(
@@ -446,11 +453,17 @@ private struct RequestRailDecorations: View {
             animating = false
             prepared = []
             twinkles = []
+            if PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry {
+                effectGeometryCache.removeAll()
+            }
             return
         }
         prepared = RequestRailLifecycleEffects.prepare(
             lifecycleEvents, lanes: lanes, assignments: presentation.assignments,
             now: now, timestamp: timestamp, previous: prepared)
+        if PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry {
+            effectGeometryCache.retain(Set(prepared.map(\.key)), duration: work.duration)
+        }
         let liveIDs = work.eligibility.liveIDs
         twinkles.removeAll { $0.endsAt <= timestamp || !liveIDs.contains($0.requestID) }
         var sequence = PerformanceAnimationRandomness.initialTwinkleSequence(
@@ -460,7 +473,12 @@ private struct RequestRailDecorations: View {
         while !Task.isCancelled {
             let timestamp = Date()
             let currentPrepared = prepared.filter { $0.visibleUntil > timestamp }
-            if prepared.count != currentPrepared.count { prepared = currentPrepared }
+            if prepared.count != currentPrepared.count {
+                prepared = currentPrepared
+                if PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry {
+                    effectGeometryCache.retain(Set(prepared.map(\.key)), duration: work.duration)
+                }
+            }
             var currentTwinkles = twinkles.filter { $0.endsAt > timestamp }
             if let due = nextTwinkleAt, due <= timestamp {
                 // A single scheduler keeps the entire chart to at most two
@@ -579,17 +597,23 @@ private struct RequestRailDecorations: View {
                 guard age >= 0, timestamp < effect.expiresAt else { continue }
                 let bar = segment.rect
                 let profile = effect.profile
+                let geometry =
+                    PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry
+                    ? effectGeometryCache.geometry(key: effect.key, profile: profile, rect: bar)
+                    : nil
                 if profile.completion {
                     let tip = CGPoint(x: bar.maxX, y: bar.midY)
                     drawBurst(
                         profile, age: age, duration: 0.24, scale: 0.5,
-                        at: tip, color: color, in: &context)
-                    drawLightning(profile, age: age, rect: bar, color: color, in: &context)
+                        at: tip, color: color, geometry: geometry, in: &context)
+                    drawLightning(
+                        profile, age: age, rect: bar, color: color, geometry: geometry, in: &context
+                    )
                     if profile.explodes {
                         drawBurst(
                             profile, age: age - profile.surgeDelay - profile.surgeDuration,
                             duration: profile.burstDuration, scale: 1.12,
-                            at: tip, color: color, in: &context)
+                            at: tip, color: color, geometry: geometry, in: &context)
                     }
                 } else if segment.lane.startedAt >= now.addingTimeInterval(-duration) {
                     let diagnostics = PerformanceArrivalDiagnostics.shared
@@ -597,7 +621,7 @@ private struct RequestRailDecorations: View {
                     drawBurst(
                         profile, age: age, duration: profile.burstDuration, scale: 1,
                         at: CGPoint(x: bar.minX + segment.cornerRadius, y: bar.midY),
-                        color: color, in: &context)
+                        color: color, geometry: geometry, in: &context)
                     diagnostics.end(measurement)
                 }
             }
@@ -613,7 +637,8 @@ private struct RequestRailDecorations: View {
 
     private func drawBurst(
         _ profile: RequestRailEffectProfile, age: TimeInterval, duration: TimeInterval,
-        scale: Double, at point: CGPoint, color: Color, in context: inout GraphicsContext
+        scale: Double, at point: CGPoint, color: Color,
+        geometry: RequestRailEffectGeometryCache.Geometry? = nil, in context: inout GraphicsContext
     ) {
         let p = age / duration
         guard p > 0, p < 1 else { return }
@@ -643,15 +668,16 @@ private struct RequestRailDecorations: View {
                     style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
             }
         } else {
-            for particle in profile.particles {
+            for (index, particle) in profile.particles.enumerated() {
                 let q = RequestRailEffectProfile.clamp((p - particle.delay) / particle.life)
                 let brightness = RequestRailEffectProfile.envelope(q) * 0.92
                 guard brightness > 0 else { continue }
                 let travel = 1 - pow(1 - q, 2)
                 let distance = (4 + particle.distance * travel) * size
+                let direction = geometry?.particleDirections[index]
                 let position = CGPoint(
-                    x: point.x + cos(particle.angle) * distance,
-                    y: point.y + sin(particle.angle) * distance)
+                    x: point.x + (direction?.cosine ?? cos(particle.angle)) * distance,
+                    y: point.y + (direction?.sine ?? sin(particle.angle)) * distance)
                 if profile.family == .fireflies {
                     drawGlow(
                         at: position, radius: particle.size * 3, strength: brightness * 0.8,
@@ -665,8 +691,8 @@ private struct RequestRailDecorations: View {
                     spark.move(to: position)
                     spark.addLine(
                         to: CGPoint(
-                            x: position.x + cos(particle.angle) * length,
-                            y: position.y + sin(particle.angle) * length))
+                            x: position.x + (direction?.cosine ?? cos(particle.angle)) * length,
+                            y: position.y + (direction?.sine ?? sin(particle.angle)) * length))
                     context.stroke(
                         spark, with: .color(.white.opacity(brightness)),
                         style: StrokeStyle(lineWidth: particle.size * 0.75, lineCap: .round))
@@ -677,15 +703,24 @@ private struct RequestRailDecorations: View {
         let core =
             profile.family == .fireflies
             ? circle(at: point, radius: (2 + 1.3 * strength) * size)
-            : star(at: point, size: (4.5 + 3.5 * strength) * size, angle: profile.angle)
+            : star(
+                at: point, size: (4.5 + 3.5 * strength) * size, angle: profile.angle,
+                rotation: geometry?.starRotation)
         context.fill(core, with: .color(.white.opacity(strength)))
     }
 
     private func drawLightning(
         _ profile: RequestRailEffectProfile, age: TimeInterval, rect: CGRect,
-        color: Color, in context: inout GraphicsContext
+        color: Color, geometry: RequestRailEffectGeometryCache.Geometry? = nil,
+        in context: inout GraphicsContext
     ) {
-        guard let frame = profile.lightningFrame(age: age, rect: rect) else { return }
+        let frame: RequestRailEffectProfile.LightningFrame?
+        if let geometry {
+            frame = geometry.lightningFrame(profile: profile, age: age)
+        } else {
+            frame = profile.lightningFrame(age: age, rect: rect)
+        }
+        guard let frame else { return }
         var clipped = context
         // Keep crackles local to the bar, leaving the neighboring rail body clear.
         clipped.clip(
@@ -745,7 +780,9 @@ private struct RequestRailDecorations: View {
                 x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2))
     }
 
-    private func star(at point: CGPoint, size: CGFloat, angle: Double) -> Path {
+    private func star(
+        at point: CGPoint, size: CGFloat, angle: Double, rotation: CGAffineTransform? = nil
+    ) -> Path {
         let inset = size * 0.24
         var path = Path()
         path.move(to: CGPoint(x: 0, y: -size))
@@ -755,7 +792,7 @@ private struct RequestRailDecorations: View {
         path.addQuadCurve(to: CGPoint(x: 0, y: -size), control: CGPoint(x: -inset, y: -inset))
         path.closeSubpath()
         return path.applying(
-            CGAffineTransform(rotationAngle: angle).concatenating(
+            (rotation ?? CGAffineTransform(rotationAngle: angle)).concatenating(
                 CGAffineTransform(translationX: point.x, y: point.y)))
     }
 
@@ -902,6 +939,13 @@ struct RequestRailRandom {
 
 /// Pure motion model shared by rendering and geometry/motion regressions.
 struct RequestRailEffectProfile: Equatable {
+    /// Generated profiles are immutable. Their original normalized inputs are
+    /// a constant-time cache identity, avoiding an equality scan of crackles.
+    struct GeometryIdentity: Equatable {
+        let seed: UInt64
+        let requestDuration: TimeInterval
+        let completion: Bool
+    }
     enum Family: Equatable { case fireflies, sparks, arcs }
     struct Particle: Equatable {
         let angle, distance, length, size, delay, life, stretch: Double
@@ -925,6 +969,7 @@ struct RequestRailEffectProfile: Equatable {
     }
 
     let completion: Bool
+    let geometryIdentity: GeometryIdentity
     let family: Family
     let angle, size, burstDuration: Double
     let particles: [Particle]
@@ -935,6 +980,19 @@ struct RequestRailEffectProfile: Equatable {
     let crackles: [Crackle]
     let flashAt: [Double]
 
+    // Cache identity is not a visible profile parameter. Preserve the former
+    // equality behavior for inputs that generate identical capped durations.
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.completion == rhs.completion && lhs.family == rhs.family
+            && lhs.angle == rhs.angle && lhs.size == rhs.size
+            && lhs.burstDuration == rhs.burstDuration
+            && lhs.particles == rhs.particles && lhs.surgeDelay == rhs.surgeDelay
+            && lhs.surgeDuration == rhs.surgeDuration && lhs.direction == rhs.direction
+            && lhs.bend == rhs.bend && lhs.trail == rhs.trail && lhs.explodes == rhs.explodes
+            && lhs.channel == rhs.channel && lhs.crackles == rhs.crackles
+            && lhs.flashAt == rhs.flashAt
+    }
+
     init(seed: UInt64, requestDuration: TimeInterval, completion: Bool) {
         var random = RequestRailRandom(seed: seed)
         self.completion = completion
@@ -942,6 +1000,8 @@ struct RequestRailEffectProfile: Equatable {
         family = choice < 0.45 ? .fireflies : choice < 0.82 ? .sparks : .arcs
         angle = random.unit() * .pi * 2
         let duration = requestDuration.isFinite ? max(0, requestDuration) : 0
+        geometryIdentity = GeometryIdentity(
+            seed: seed, requestDuration: duration, completion: completion)
         surgeDuration = min(1.2, 0.64 + duration * 0.016) * (1 + random.unit() * 0.18)
         direction = random.unit() < 0.5 ? -1 : 1
         explodes = random.unit() < 0.65

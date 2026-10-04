@@ -212,6 +212,182 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
         }
     }
 
+    /// Canvas replay with cached invariants must be pixel-identical to the
+    /// independent pre-optimization oracle. This has a separate output gate
+    /// and never relaxes the existing two-byte Metal comparison.
+    func testCachedRailGeometryAgainstIndependentCanvasOptIn() throws {
+        let gate = try railGeometryGate()
+        var results: [[String: Any]] = []
+        do {
+            for scale in [CGFloat(1), 2] {
+                let result = try calibrateCanvas(scale: scale, gate: gate)
+                results.append(result)
+                guard (result["expected_nonzero_alpha_pixels"] as? Int ?? 0) > 0 else {
+                    try gate.summary(
+                        status: "unavailable", cases: results, device: nil,
+                        error: "Independent Canvas calibration produced no pixels")
+                    throw XCTSkip(
+                        "Canvas calibration produced no pixels; cached rail fidelity unavailable")
+                }
+                guard result["fixture_verified"] as? Bool == true,
+                    result["within_gate"] as? Bool == true
+                else {
+                    throw Failure.failed(
+                        "Cached Canvas readback calibration failed; \(gate.directory.path)")
+                }
+            }
+            let arrivals = try seeds(completion: false)
+            let exploding = try seeds(completion: true, explodes: true)
+            let settling = try seeds(completion: true, explodes: false)
+            for scale in [CGFloat(1), 2] {
+                for (family, seed) in arrivals {
+                    let effect = effect(seed: seed, completion: false)
+                    for progress in [0.025, 0.25, 0.7, 0.94] {
+                        results.append(
+                            try compareCachedCanvas(
+                                [.effect(effect)], elapsed: effect.profile.burstDuration * progress,
+                                scale: scale,
+                                label: "arrival-\(family)-seed\(seed)-p\(progress)-s\(Int(scale))",
+                                gate: gate))
+                    }
+                }
+                for (explodes, fixtures) in [(true, exploding), (false, settling)] {
+                    for (family, seed) in fixtures {
+                        let effect = effect(seed: seed, completion: true, color: colors[1])
+                        let profile = effect.profile
+                        var times = [
+                            0.06, profile.surgeDelay + profile.surgeDuration * 0.5,
+                            profile.surgeDelay + profile.surgeDuration + 0.06,
+                        ]
+                        if explodes {
+                            times.append(
+                                profile.surgeDelay + profile.surgeDuration + profile.burstDuration
+                                    * 0.45)
+                        }
+                        for (index, elapsed) in times.enumerated() {
+                            results.append(
+                                try compareCachedCanvas(
+                                    [.effect(effect)], elapsed: elapsed, scale: scale,
+                                    label:
+                                        "completion-\(family)-seed\(seed)-explode\(explodes)-t\(index)-s\(Int(scale))",
+                                    gate: gate))
+                        }
+                    }
+                }
+                let first = effect(
+                    seed: arrivals[0].1, completion: false,
+                    rect: CGRect(x: 89.25, y: 45.375, width: 24.5, height: 7))
+                let second = effect(
+                    seed: exploding[1].1, completion: true, index: 1, startTime: 0.035,
+                    rect: CGRect(x: 68.75, y: 47.125, width: 31.5, height: 7), color: colors[1])
+                for star in [false, true] {
+                    let glint = twinkle(star: star, atLeftEdge: !star)
+                    results.append(
+                        try compareCachedCanvas(
+                            [.twinkle(glint)], elapsed: 0.17, scale: scale,
+                            label: "clipped-glint-star\(star)-s\(Int(scale))", gate: gate))
+                    for (order, elements) in [
+                        [Element.effect(first), .twinkle(glint), .effect(second)],
+                        [.effect(second), .twinkle(glint), .effect(first)],
+                    ].enumerated() {
+                        results.append(
+                            try compareCachedCanvas(
+                                elements, elapsed: 0.17, scale: scale,
+                                label: "ordered-overlap\(order)-star\(star)-s\(Int(scale))",
+                                gate: gate))
+                    }
+                }
+                // Both Canvas replays receive chart coordinates and a fractional
+                // crop origin; each translates the drawing independently.
+                results.append(
+                    try compareCachedCanvas(
+                        [
+                            .effect(first), .twinkle(twinkle(star: true, atLeftEdge: false)),
+                            .effect(second),
+                        ],
+                        elapsed: 0.17, scale: scale,
+                        label: "cropped-fractional-origin-s\(Int(scale))", gate: gate,
+                        pointSize: CGSize(width: 64, height: 24),
+                        drawingOrigin: CGPoint(x: 76.25, y: 41.375)))
+                // Reaches the original 240-knot cap, with clipping at both image
+                // edges, covering cached long-perimeter knots and forks.
+                let wideBase = effect(
+                    seed: exploding[2].1, completion: true, index: 2,
+                    rect: CGRect(x: 0, y: 70.375, width: 1600.5, height: 7))
+                let wideElapsed =
+                    wideBase.profile.surgeDelay + wideBase.profile.surgeDuration * 0.25
+                let wideFrame = try XCTUnwrap(
+                    Self.lightningFrame(wideBase.profile, age: wideElapsed, rect: wideBase.rect))
+                let wide = effect(
+                    seed: exploding[2].1, completion: true, index: 2,
+                    rect: CGRect(x: 96.25 - wideFrame.head.x, y: 70.375, width: 1600.5, height: 7))
+                results.append(
+                    try compareCachedCanvas(
+                        [.effect(wide)], elapsed: wideElapsed,
+                        scale: scale, label: "wide-clipped-channel-s\(Int(scale))", gate: gate))
+
+                for (family, seed) in arrivals {
+                    let effect = effect(seed: seed, completion: false)
+                    for (boundary, elapsed) in [
+                        ("start", 0.0), ("end", effect.profile.burstDuration),
+                    ] {
+                        results.append(
+                            try compareCachedCanvas(
+                                [.effect(effect)], elapsed: elapsed, scale: scale,
+                                label: "blank-arrival-\(family)-\(boundary)-s\(Int(scale))",
+                                gate: gate, content: .blank))
+                    }
+                }
+                for (family, seed) in exploding {
+                    let effect = effect(seed: seed, completion: true)
+                    for (boundary, elapsed) in [
+                        ("start", 0.0), ("end", effect.profile.visibleDuration),
+                    ] {
+                        results.append(
+                            try compareCachedCanvas(
+                                [.effect(effect)], elapsed: elapsed, scale: scale,
+                                label: "blank-completion-\(family)-\(boundary)-s\(Int(scale))",
+                                gate: gate, content: .blank))
+                    }
+                }
+                for star in [false, true] {
+                    let glint = twinkle(star: star, atLeftEdge: !star)
+                    for (boundary, elapsed) in [
+                        ("start", glint.startTime),
+                        ("end", glint.startTime + glint.twinkle.duration),
+                    ] {
+                        results.append(
+                            try compareCachedCanvas(
+                                [.twinkle(glint)], elapsed: elapsed, scale: scale,
+                                label: "blank-glint-star\(star)-\(boundary)-s\(Int(scale))",
+                                gate: gate, content: .blank))
+                    }
+                }
+            }
+            let failed = results.filter { ($0["within_gate"] as? Bool) != true }.count
+            let unavailable = results.contains {
+                ($0["requires_visible_content"] as? Bool) == true
+                    && ($0["expected_nonzero_alpha_pixels"] as? Int ?? 0) == 0
+            }
+            try gate.summary(
+                status: unavailable ? "unavailable" : failed == 0 ? "passed" : "failed",
+                cases: results, device: nil,
+                error: unavailable
+                    ? "A visible original Canvas fixture produced no pixels; no fidelity verdict"
+                    : nil)
+            if unavailable {
+                throw XCTSkip(
+                    "Original Canvas produced no pixels in a visible fixture; evidence saved")
+            }
+            XCTAssertEqual(
+                failed, 0,
+                "Cached normal Canvas exact pixel gate failed; evidence: \(gate.directory.path)")
+        } catch {
+            try gate.failureIfAbsent(error, cases: results, device: nil)
+            throw error
+        }
+    }
+
     private func effect(
         seed: UInt64, completion: Bool, index: Int = 0, startTime: TimeInterval = 0,
         rect: CGRect = CGRect(x: 49.25, y: 43.375, width: 101.5, height: 7),
@@ -332,6 +508,84 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
 
     // MARK: Original Canvas drawing and timing, independent of candidate geometry
 
+    private func compareCachedCanvas(
+        _ elements: [Element], elapsed: TimeInterval, scale: CGFloat,
+        label: String, gate: Gate, pointSize: CGSize? = nil, drawingOrigin: CGPoint = .zero,
+        content: Content = .visible
+    ) throws -> [String: Any] {
+        let pointSize = pointSize ?? size
+        let cache = RequestRailEffectGeometryCache(recordsDiagnostics: false)
+        let effects = elements.compactMap { element -> MetalFullChartEffectsRenderer.Effect? in
+            guard case .effect(let effect) = element else { return nil }
+            return effect
+        }
+        cache.retain(Set(effects.map(\.id)), duration: 60)
+        var geometries: [RequestRailLifecycleEffects.Key: RequestRailEffectGeometryCache.Geometry] =
+            [:]
+        for effect in effects {
+            let first = try XCTUnwrap(
+                cache.geometry(key: effect.id, profile: effect.profile, rect: effect.rect))
+            let reused = try XCTUnwrap(
+                cache.geometry(key: effect.id, profile: effect.profile, rect: effect.rect))
+            XCTAssertTrue(first === reused, "Candidate fixture must exercise cached geometry reuse")
+            geometries[effect.id] = reused
+        }
+        let candidateGeometry = geometries
+        let actual = try canvas(scale: scale, size: pointSize) { context in
+            context.translateBy(x: -drawingOrigin.x, y: -drawingOrigin.y)
+            Self.drawReference(
+                elements, elapsed: elapsed, cachedGeometry: candidateGeometry, in: &context)
+        }
+        let expected = try canvas(scale: scale, size: pointSize) { context in
+            context.translateBy(x: -drawingOrigin.x, y: -drawingOrigin.y)
+            Self.drawReference(elements, elapsed: elapsed, in: &context)
+        }
+        cache.removeAll()
+        XCTAssertEqual(cache.statistics.currentEntries, 0)
+        var result = try comparison(
+            actual, expected: expected, label: label, gate: gate,
+            requiresVisible: content == .visible)
+        result["candidate_renderer"] = "normal Canvas with cached invariant rail geometry"
+        result["reference_renderer"] =
+            "independent original Canvas with original perimeter and timing formulas"
+        result["scale"] = Double(scale)
+        result["elapsed_seconds"] = elapsed
+        result["point_size"] = [Double(pointSize.width), Double(pointSize.height)]
+        result["drawing_origin"] = [Double(drawingOrigin.x), Double(drawingOrigin.y)]
+        result["cache_builds"] = cache.statistics.builds
+        result["cache_hits"] = cache.statistics.hits
+        result["cache_entries_after_clear"] = cache.statistics.currentEntries
+        result["cache_peak_entries"] = cache.statistics.peakEntries
+        result["element_order"] = elements.map { element -> [String: Any] in
+            switch element {
+            case .effect(let effect):
+                [
+                    "kind": effect.profile.completion ? "completion" : "arrival",
+                    "seed": String(effect.id.seed),
+                    "family": familyName(effect.profile.family),
+                    "explodes": effect.profile.explodes,
+                    "start_time": effect.startTime, "burst_duration": effect.profile.burstDuration,
+                    "visible_duration": effect.profile.visibleDuration,
+                    "rect": [
+                        Double(effect.rect.minX), Double(effect.rect.minY),
+                        Double(effect.rect.width), Double(effect.rect.height),
+                    ],
+                    "srgb_rgba": [effect.color.x, effect.color.y, effect.color.z, effect.color.w]
+                        .map(Double.init),
+                ]
+            case .twinkle(let glint):
+                [
+                    "kind": "glint", "star": glint.twinkle.star, "start_time": glint.startTime,
+                    "duration": glint.twinkle.duration,
+                    "srgb_rgba": [glint.color.x, glint.color.y, glint.color.z, glint.color.w].map(
+                        Double.init),
+                ]
+            }
+        }
+        try gate.write(result, name: "\(label)-metrics.json")
+        return result
+    }
+
     private static func color(_ rgba: SIMD4<Float>) -> Color {
         Color(
             .sRGB, red: Double(rgba.x), green: Double(rgba.y), blue: Double(rgba.z),
@@ -339,7 +593,10 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
     }
 
     private static func drawReference(
-        _ elements: [Element], elapsed: TimeInterval, in context: inout GraphicsContext
+        _ elements: [Element], elapsed: TimeInterval,
+        cachedGeometry: [RequestRailLifecycleEffects.Key: RequestRailEffectGeometryCache.Geometry] =
+            [:],
+        in context: inout GraphicsContext
     ) {
         for element in elements {
             switch element {
@@ -349,23 +606,26 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
                 let rect = effect.rect
                 guard age >= 0 else { continue }
                 let tint = color(effect.color)
+                let geometry = cachedGeometry[effect.id]
                 if profile.completion {
                     let tip = CGPoint(x: rect.maxX, y: rect.midY)
                     drawBurst(
                         profile, age: age, duration: 0.24, scale: 0.5, at: tip, color: tint,
-                        in: &context)
-                    drawLightning(profile, age: age, rect: rect, color: tint, in: &context)
+                        geometry: geometry, in: &context)
+                    drawLightning(
+                        profile, age: age, rect: rect, color: tint, geometry: geometry, in: &context
+                    )
                     if profile.explodes {
                         drawBurst(
                             profile, age: age - profile.surgeDelay - profile.surgeDuration,
                             duration: profile.burstDuration, scale: 1.12, at: tip, color: tint,
-                            in: &context)
+                            geometry: geometry, in: &context)
                     }
                 } else {
                     drawBurst(
                         profile, age: age, duration: profile.burstDuration, scale: 1,
                         at: CGPoint(x: rect.minX + effect.cornerRadius, y: rect.midY), color: tint,
-                        in: &context)
+                        geometry: geometry, in: &context)
                 }
             case .twinkle(let glint):
                 drawTwinkle(glint, age: elapsed - glint.startTime, in: &context)
@@ -386,7 +646,8 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
 
     private static func drawBurst(
         _ profile: RequestRailEffectProfile, age: TimeInterval, duration: TimeInterval,
-        scale: Double, at point: CGPoint, color: Color, in context: inout GraphicsContext
+        scale: Double, at point: CGPoint, color: Color,
+        geometry: RequestRailEffectGeometryCache.Geometry? = nil, in context: inout GraphicsContext
     ) {
         let p = age / duration
         guard p > 0, p < 1 else { return }
@@ -415,15 +676,16 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
                     style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
             }
         } else {
-            for particle in profile.particles {
+            for (index, particle) in profile.particles.enumerated() {
                 let q = clamp((p - particle.delay) / particle.life)
                 let brightness = envelope(q) * 0.92
                 guard brightness > 0 else { continue }
                 let travel = 1 - pow(1 - q, 2)
                 let distance = (4 + particle.distance * travel) * size
+                let direction = geometry?.particleDirections[index]
                 let position = CGPoint(
-                    x: point.x + cos(particle.angle) * distance,
-                    y: point.y + sin(particle.angle) * distance)
+                    x: point.x + (direction?.cosine ?? cos(particle.angle)) * distance,
+                    y: point.y + (direction?.sine ?? sin(particle.angle)) * distance)
                 if profile.family == .fireflies {
                     drawGlow(
                         at: position, radius: particle.size * 3, strength: brightness * 0.8,
@@ -437,8 +699,8 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
                     spark.move(to: position)
                     spark.addLine(
                         to: CGPoint(
-                            x: position.x + cos(particle.angle) * length,
-                            y: position.y + sin(particle.angle) * length))
+                            x: position.x + (direction?.cosine ?? cos(particle.angle)) * length,
+                            y: position.y + (direction?.sine ?? sin(particle.angle)) * length))
                     context.stroke(
                         spark, with: .color(.white.opacity(brightness)),
                         style: StrokeStyle(lineWidth: particle.size * 0.75, lineCap: .round))
@@ -449,7 +711,9 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
         let core =
             profile.family == .fireflies
             ? circle(at: point, radius: (2 + 1.3 * strength) * size)
-            : star(at: point, size: (4.5 + 3.5 * strength) * size, angle: profile.angle)
+            : star(
+                at: point, size: (4.5 + 3.5 * strength) * size, angle: profile.angle,
+                rotation: geometry?.starRotation)
         context.fill(core, with: .color(.white.opacity(strength)))
     }
 
@@ -485,9 +749,17 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
 
     private static func drawLightning(
         _ profile: RequestRailEffectProfile, age: TimeInterval,
-        rect: CGRect, color: Color, in context: inout GraphicsContext
+        rect: CGRect, color: Color,
+        geometry: RequestRailEffectGeometryCache.Geometry? = nil,
+        in context: inout GraphicsContext
     ) {
-        guard let frame = lightningFrame(profile, age: age, rect: rect) else { return }
+        let frame: RequestRailEffectProfile.LightningFrame?
+        if let geometry {
+            frame = geometry.lightningFrame(profile: profile, age: age)
+        } else {
+            frame = lightningFrame(profile, age: age, rect: rect)
+        }
+        guard let frame else { return }
         var clipped = context
         clipped.clip(
             to: Path(
@@ -672,7 +944,10 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
             ellipseIn: CGRect(
                 x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2))
     }
-    private static func star(at point: CGPoint, size: CGFloat, angle: Double) -> Path {
+    private static func star(
+        at point: CGPoint, size: CGFloat, angle: Double,
+        rotation: CGAffineTransform? = nil
+    ) -> Path {
         let inset = size * 0.24
         var path = Path()
         path.move(to: CGPoint(x: 0, y: -size))
@@ -682,7 +957,7 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
         path.addQuadCurve(to: CGPoint(x: 0, y: -size), control: CGPoint(x: -inset, y: -inset))
         path.closeSubpath()
         return path.applying(
-            CGAffineTransform(rotationAngle: angle).concatenating(
+            (rotation ?? CGAffineTransform(rotationAngle: angle)).concatenating(
                 CGAffineTransform(translationX: point.x, y: point.y)))
     }
     private static func polyline(_ points: [CGPoint]) -> Path {
@@ -695,6 +970,56 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
     }
 
     // MARK: Independent native row, channel and alpha calibration
+
+    private func calibrateCanvas(scale: CGFloat, gate: Gate) throws -> [String: Any] {
+        func renderFixture() throws -> CGContext {
+            try canvas(scale: scale, size: size) { context in
+                context.fill(
+                    Path(CGRect(x: 7, y: 11, width: 9, height: 13)),
+                    with: .color(Color(.sRGB, red: 1, green: 0, blue: 0)))
+                context.fill(
+                    Path(CGRect(x: 75, y: 61, width: 11, height: 9)),
+                    with: .color(Color(.sRGB, red: 0, green: 0, blue: 1)))
+                context.fill(
+                    Path(CGRect(x: 39, y: 27, width: 15, height: 11)),
+                    with: .color(Color(.sRGB, red: 0.1, green: 0.7, blue: 0.3, opacity: 0.5)))
+            }
+        }
+        let actual = try renderFixture()
+        let expected = try renderFixture()
+        let label = "canvas-calibration-s\(Int(scale))"
+        var result = try comparison(
+            actual, expected: expected, label: label, gate: gate, requiresVisible: true)
+        var verified = true
+        var samples: [[String: Any]] = []
+        for (producer, bitmap) in [("cached-canvas", actual), ("original-canvas", expected)] {
+            for (point, expectedRGBA) in [
+                (CGPoint(x: 11, y: 17), [255, 0, 0, 255]),
+                (CGPoint(x: 80, y: 65), [0, 0, 255, 255]),
+                (CGPoint(x: 45, y: 32), [13, 89, 38, 128]),
+                (CGPoint(x: 11, y: 70), [0, 0, 0, 0]),
+                (CGPoint(x: 80, y: 22), [0, 0, 0, 0]),
+            ] {
+                let bytes = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
+                let offset = Int(point.y * scale) * bitmap.bytesPerRow + Int(point.x * scale) * 4
+                let rgba = (0..<4).map { Int(bytes[offset + $0]) }
+                verified = verified && zip(rgba, expectedRGBA).allSatisfy { abs($0 - $1) <= 1 }
+                samples.append([
+                    "producer": producer, "xy": [Double(point.x), Double(point.y)],
+                    "expected_rgba": expectedRGBA, "actual_rgba": rgba,
+                ])
+            }
+        }
+        let coverage = Int(381 * scale * scale)
+        verified =
+            verified && (result["actual_nonzero_alpha_pixels"] as? Int == coverage)
+            && (result["expected_nonzero_alpha_pixels"] as? Int == coverage)
+        result["fixture_samples"] = samples
+        result["fixture_verified"] = verified
+        result["scale"] = Double(scale)
+        try gate.write(result, name: "\(label)-metrics.json")
+        return result
+    }
 
     private struct CalibrationVertex {
         let point: SIMD2<Float>
@@ -915,7 +1240,7 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
                     sums[channel] += UInt64(delta)
                     squared[channel] += Double(delta * delta)
                     different = different || delta > 0
-                    outsideGate = outsideGate || delta > 2
+                    outsideGate = outsideGate || delta > gate.maximumAllowedChannelDifference
                     difference[di + channel] = UInt8(delta)
                 }
                 difference[di + 3] = 255
@@ -939,13 +1264,14 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
             "actual_nonzero_alpha_pixels": actualVisible,
             "expected_nonzero_alpha_pixels": expectedVisible,
             "requires_visible_content": requiresVisible, "content_verified": contentVerified,
-            "maximum_allowed_channel_difference": 2,
-            "within_gate": contentVerified && maximum.allSatisfy { $0 <= 2 },
+            "maximum_allowed_channel_difference": gate.maximumAllowedChannelDifference,
+            "within_gate": contentVerified
+                && maximum.allSatisfy { $0 <= gate.maximumAllowedChannelDifference },
             "format": "sRGB encoded premultiplied RGBA8",
             "row_order": "upper-left row first, direct calibrated mapping",
         ]
-        try gate.save(actual, name: "\(label)-metal.png")
-        try gate.save(expected, name: "\(label)-canvas.png")
+        try gate.save(actual, name: "\(label)-\(gate.candidateImageLabel).png")
+        try gate.save(expected, name: "\(label)-\(gate.referenceImageLabel).png")
         try gate.save(differenceImage, name: "\(label)-absolute-difference.png")
         return result
     }
@@ -955,6 +1281,23 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
     private enum Failure: Error { case failed(String) }
     private struct Gate {
         let directory: URL
+        let maximumAllowedChannelDifference: Int
+        let candidateImageLabel: String
+        let referenceImageLabel: String
+        let scope: String
+
+        init(
+            directory: URL, maximumAllowedChannelDifference: Int = 2,
+            candidateImageLabel: String = "metal", referenceImageLabel: String = "canvas",
+            scope: String =
+                "Native Metal particle/lightning/glint primitives against independent original Canvas; includes cropped origins, ordered overlap and exact blank endpoints; excludes static chart, text and live CPU/GPU resource acceptance"
+        ) {
+            self.directory = directory
+            self.maximumAllowedChannelDifference = maximumAllowedChannelDifference
+            self.candidateImageLabel = candidateImageLabel
+            self.referenceImageLabel = referenceImageLabel
+            self.scope = scope
+        }
         func write(_ value: [String: Any], name: String) throws {
             try JSONSerialization.data(
                 withJSONObject: value, options: [.prettyPrinted, .sortedKeys]
@@ -967,9 +1310,8 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
                 [
                     "schema_version": 1, "status": status, "cases": cases,
                     "device": device as Any? ?? NSNull(), "error": error as Any? ?? NSNull(),
-                    "maximum_allowed_channel_difference": 2,
-                    "scope":
-                        "Native Metal particle/lightning/glint primitives against independent original Canvas; includes cropped origins, ordered overlap and exact blank endpoints; excludes static chart, text and live CPU/GPU resource acceptance",
+                    "maximum_allowed_channel_difference": maximumAllowedChannelDifference,
+                    "scope": scope,
                 ],
                 name: "result.json")
         }
@@ -1017,5 +1359,40 @@ final class MetalPrimitiveEffectsFidelityTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         print("FLUXLLM_METAL_PRIMITIVE_FIDELITY_OUTPUT=\(directory.path)")
         return Gate(directory: directory)
+    }
+
+    private func railGeometryGate() throws -> Gate {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["FLUXLLM_RUN_RAIL_GEOMETRY_FIDELITY"] == "1" else {
+            throw XCTSkip(
+                "Set FLUXLLM_RUN_RAIL_GEOMETRY_FIDELITY=1 and FLUXLLM_RAIL_GEOMETRY_FIDELITY_OUTPUT for the cached normal Canvas pixel gate"
+            )
+        }
+        guard let path = environment["FLUXLLM_RAIL_GEOMETRY_FIDELITY_OUTPUT"], !path.isEmpty else {
+            throw Failure.failed("Explicit FLUXLLM_RAIL_GEOMETRY_FIDELITY_OUTPUT is required")
+        }
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let ignored = repository.appendingPathComponent(".performance-results", isDirectory: true)
+            .resolvingSymlinksInPath()
+        let requested =
+            (path.hasPrefix("/")
+            ? URL(fileURLWithPath: path, isDirectory: true)
+            : repository.appendingPathComponent(path, isDirectory: true)).standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard requested.path == ignored.path || requested.path.hasPrefix(ignored.path + "/") else {
+            throw Failure.failed(
+                "Cached Canvas pixel results must be under ignored .performance-results")
+        }
+        let directory = requested.appendingPathComponent(
+            "rail-geometry-fidelity-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        print("FLUXLLM_RAIL_GEOMETRY_FIDELITY_OUTPUT=\(directory.path)")
+        return Gate(
+            directory: directory, maximumAllowedChannelDifference: 0,
+            candidateImageLabel: "cached-canvas", referenceImageLabel: "original-canvas",
+            scope:
+                "Normal Canvas with cached invariant rail effect geometry against independent original Canvas; exact pixel equality at 1x and 2x, cropped fractional origins, ordered overlap, wide clipped channel and blank endpoints; excludes static chart, text and live CPU/GPU resource acceptance"
+        )
     }
 }
