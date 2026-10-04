@@ -275,9 +275,7 @@ private struct DashboardScalarFrameProbe: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
-        if diagnostics.isEnabled
-            && (diagnostics.mode == .normal || diagnostics.mode.usesFrozenScalarPresentation)
-        {
+        if diagnostics.isEnabled && diagnostics.mode.usesScalarPresentationInstrumentation {
             let generation = presentation.scalarFrameGeneration
             content.overlayPreferenceValue(DashboardFrameAnchors.self) { anchors in
                 GeometryReader { geometry in

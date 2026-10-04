@@ -357,6 +357,34 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         }
     }
 
+    /// Capture only the full dashboard usage block. Both native presentations
+    /// must already be visible; compact response tokens remain authoritative.
+    public func performanceFreezeUsagePresentation() throws -> [String: Any] {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        guard diagnostics.isEnabled, diagnostics.mode.usesHeldUsagePresentation, isStarted,
+            metricsStore.backendKind == .ollama, !metricsStore.backendActivity.isActive,
+            metricsStore.activeGeneration?.state != .running
+        else {
+            throw DashboardScalarFreezeError.invalid(
+                "Usage holding requires the idle held-usage performance mode")
+        }
+        let visible = performanceVisibility
+        guard visible.dashboard, visible.popover,
+            popoverPresentation.isActive, dashboardPresentation.isActive,
+            !popoverPresentation.scalarPerformanceFrames.isEmpty
+        else {
+            throw DashboardScalarFreezeError.invalid(
+                "Both native presentations must be visible before usage holding")
+        }
+        let snapshot = try dashboardPresentation.prepareHeldUsage(store: metricsStore)
+        try dashboardPresentation.holdUsage(snapshot, store: metricsStore)
+        Self.performanceUICheckpoint?("usage.presentation.freeze")
+        return [
+            "frozen": true, "owner": snapshot.owner.uuidString,
+            "epoch": snapshot.epoch.uuidString, "capture_identity": snapshot.fingerprint,
+        ]
+    }
+
     public var performancePopoverReadiness: PerformancePopoverReadiness {
         let button = statusItem?.button
         let window = button?.window

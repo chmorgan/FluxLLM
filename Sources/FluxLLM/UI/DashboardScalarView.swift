@@ -28,6 +28,7 @@ struct DashboardScalarView: View, Equatable {
         if PerformanceGraphicsDiagnostics.shared.isEnabled, presentation.isActive {
             PerformanceGraphicsDiagnostics.shared.recordScalarLeafBody(
                 leaf, owner: presentation.scalarPerformanceOwnerID)
+            recordPresentedValues()
         }
         return Group {
             switch leaf {
@@ -451,12 +452,55 @@ struct DashboardScalarView: View, Equatable {
 
     private var displayedUsageSummary: UsageSummary {
         if let frozen = frozenScalars { return frozen.usage }
+        if scalarMode.usesHeldUsagePresentation, !isCompact, let held = presentation.heldUsage,
+            held.epoch == store.monitoringEpoch
+        {
+            return held.usage
+        }
         if let live = liveScalars { return live.usage }
         return store.usageSummary(
             in: legacyUsageInterval
                 ?? DateInterval(
                     start: store.chartPresentation.timestamp.addingTimeInterval(-60),
                     end: store.chartPresentation.timestamp))
+    }
+
+    /// These bounded receipts are the actual labels read by the native leaf,
+    /// not sampled raw counters. They do not run in ordinary app sessions.
+    private func recordPresentedValues() {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        guard diagnostics.mode == .normal || diagnostics.mode.usesHeldUsagePresentation else {
+            return
+        }
+        let values: [String: Any]
+        switch leaf {
+        case .header:
+            values = [
+                "status": statusTitle, "model": modelLabel,
+                "activity": activityDetail as Any? ?? NSNull(),
+            ]
+        case .metrics:
+            values = ["rate": rateLabel, "gpu": gpuLabel]
+        case .details where isCompact && scalarBackendKind == .ollama:
+            values = ["response": responseTokensLabel]
+        case .details where !isCompact && scalarBackendKind == .ollama:
+            let scope: UsageScope
+            if scalarMode.usesHeldUsagePresentation, let held = presentation.heldUsage,
+                held.epoch == store.monitoringEpoch
+            {
+                scope = held.scope
+            } else {
+                scope = store.usageScope
+            }
+            values = [
+                "scope": scope.rawValue,
+                "values": DashboardHeldUsage.values(for: displayedUsageSummary),
+            ]
+        default: return
+        }
+        diagnostics.recordScalarPresentedValues(
+            leaf, owner: presentation.scalarPerformanceOwnerID,
+            compact: isCompact, values: values)
     }
 
     private var displayedHistoryPersistenceError: String? {

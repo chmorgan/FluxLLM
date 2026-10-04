@@ -14,6 +14,7 @@ final class DashboardPresentationState {
     @ObservationIgnored private var monitoringEpoch: UUID?
     @ObservationIgnored let scalarPerformanceOwnerID = UUID()
     private(set) var frozenScalars: DashboardFrozenScalars?
+    private(set) var heldUsage: DashboardHeldUsage?
     @ObservationIgnored private(set) var scalarPerformanceFrames: [String: CGRect] = [:]
     @ObservationIgnored private(set) var scalarFrameGeneration: UInt64 = 0
     @ObservationIgnored private weak var scalarNativeWindow: NSWindow?
@@ -139,10 +140,49 @@ final class DashboardPresentationState {
 
     func releaseFrozenScalars() {
         frozenScalars = nil
+        releaseHeldUsage()
         if PerformanceGraphicsDiagnostics.shared.isEnabled {
             PerformanceGraphicsDiagnostics.shared.frozenScalarPresentationReleased(
                 owner: scalarPerformanceOwnerID)
         }
+    }
+
+    func prepareHeldUsage(store: MetricsStore) throws -> DashboardHeldUsage {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        guard diagnostics.isEnabled, diagnostics.mode.usesHeldUsagePresentation,
+            isActive, heldUsage == nil, frozenScalars == nil,
+            scalarRole == "dashboard", monitoringEpoch == store.monitoringEpoch
+        else {
+            throw DashboardScalarFreezeError.invalid(
+                "Usage holding requires an active, unheld full diagnostic dashboard")
+        }
+        return try DashboardHeldUsage.capture(
+            store: store, owner: scalarPerformanceOwnerID, frames: scalarPerformanceFrames,
+            presentationGeneration: scalarFrameGeneration)
+    }
+
+    func holdUsage(_ snapshot: DashboardHeldUsage, store: MetricsStore) throws {
+        guard isActive, heldUsage == nil, frozenScalars == nil,
+            scalarRole == "dashboard", snapshot.owner == scalarPerformanceOwnerID,
+            snapshot.presentationGeneration == scalarFrameGeneration,
+            snapshot.frames == scalarPerformanceFrames,
+            snapshot.epoch == monitoringEpoch, snapshot.epoch == store.monitoringEpoch,
+            snapshot.scope == store.usageScope,
+            snapshot.usage == store.dashboardScalarPresentation.usage,
+            store.backendKind == .ollama, !store.backendActivity.isActive,
+            store.activeGeneration?.state != .running,
+            PerformanceGraphicsDiagnostics.shared.mode.usesHeldUsagePresentation,
+            PerformanceGraphicsDiagnostics.shared.heldUsagePresentationCaptured(snapshot)
+        else {
+            throw DashboardScalarFreezeError.invalid("Held usage diagnostic receipt was rejected")
+        }
+        heldUsage = snapshot
+    }
+
+    func releaseHeldUsage() {
+        heldUsage = nil
+        PerformanceGraphicsDiagnostics.shared.heldUsagePresentationReleased(
+            owner: scalarPerformanceOwnerID)
     }
 
     private static func validFrame(_ frame: CGRect) -> Bool {

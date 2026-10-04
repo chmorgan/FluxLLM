@@ -42,6 +42,7 @@ final class PerformanceControl {
     private var handshaken = false
     private var stopping = false
     private var scalarPresentationFrozen = false
+    private var usagePresentationFrozen = false
     private var stopTask: Task<Void, Never>?
     private(set) var hasStopped = false
     private var shutdownCommandID = "termination"
@@ -238,6 +239,7 @@ final class PerformanceControl {
         var reason: String?
         var popoverReadinessBeforeShow: [String: Any]?
         var uiFailurePhase: String?
+        var usageAcknowledgment: [String: Any]?
         switch command.command {
         case "snapshot":
             break
@@ -296,6 +298,20 @@ final class PerformanceControl {
                 status = "error"
                 reason = "Scalar presentation capture failed: \(error)"
             }
+        case "freeze_usage":
+            guard configuration.graphics_mode == .runtimeHeldUsage, !usagePresentationFrozen else {
+                status = "error"
+                reason = "Usage holding requires its diagnostic mode and is permitted exactly once"
+                break
+            }
+            do {
+                usageAcknowledgment = try session.menuBarController
+                    .performanceFreezeUsagePresentation()
+                usagePresentationFrozen = true
+            } catch {
+                status = "error"
+                reason = "Usage presentation capture failed: \(error)"
+            }
         case "set_logging":
             guard let enabled = command.enabled else {
                 fail("set_logging requires enabled: boolean", commandID: command.command_id)
@@ -343,6 +359,7 @@ final class PerformanceControl {
             event["popover_readiness_before_show"] = popoverReadinessBeforeShow
         }
         if let uiFailurePhase { event["ui_failure_phase"] = uiFailurePhase }
+        if let usageAcknowledgment { event["held_usage_capture"] = usageAcknowledgment }
         event["monotonic_seconds"] = Self.monotonicSeconds()
         if let reason { event["reason"] = reason }
         gpuReporter?.sample()
@@ -490,6 +507,15 @@ final class PerformanceControl {
 
     private func snapshot(of session: PerformanceApplicationSession) -> [String: Any] {
         var value = session.snapshot()
+        // This is the current authoritative epoch, independent of an immutable
+        // held receipt and of SwiftUI's asynchronously processed epoch callback.
+        if var graphics = value["graphics_diagnostics"] as? [String: Any],
+            var usage = graphics["held_usage"] as? [String: Any]
+        {
+            usage["monitoring_epoch"] = session.store.monitoringEpoch.uuidString
+            graphics["held_usage"] = usage
+            value["graphics_diagnostics"] = graphics
+        }
         let logger = session.store.diagnosticLogger
         value["logging_enabled"] = logger.isEnabled
         value["logging_supported"] = true
