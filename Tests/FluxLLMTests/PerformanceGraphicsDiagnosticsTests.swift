@@ -167,7 +167,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
         XCTAssertEqual(Mode.runtimeTelemetryBatch.rawValue, "runtime-telemetry-batch")
         XCTAssertEqual(Mode.runtimeAtomicChartScale.rawValue, "runtime-atomic-chart-scale")
         XCTAssertEqual(Mode.runtimeEfficientEffects.rawValue, "runtime-efficient-effects")
-        XCTAssertEqual(Mode.allCases.count, 45)
+        XCTAssertEqual(Mode.allCases.count, 46)
         for mode in Mode.allCases {
             let encoded = try JSONEncoder().encode(mode)
             XCTAssertEqual(try JSONDecoder().decode(Mode.self, from: encoded), mode)
@@ -822,7 +822,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
             .runtimeMetalCachedChart, .runtimeMetalPrimitiveEffects, .runtimeTelemetryBatch,
             .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart,
             .runtimeCompletedLaneCache, .runtimeCachedRailGeometry, .runtimeReuseCaches,
-            .runtimeFrozenScalars,
+            .runtimeFrozenScalars, .runtimeHeldUsage,
         ]
         let runtime: [Mode] =
             [
@@ -872,7 +872,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeTelemetryBatch,
                     .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart,
                     .runtimeCompletedLaneCache, .runtimeCachedRailGeometry, .runtimeReuseCaches,
-                    .runtimeFrozenScalars,
+                    .runtimeFrozenScalars, .runtimeHeldUsage,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesCanvasFrameClock,
@@ -885,7 +885,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeMetalPrimitiveEffects, .runtimeTelemetryBatch,
                     .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart,
                     .runtimeCompletedLaneCache, .runtimeCachedRailGeometry, .runtimeReuseCaches,
-                    .runtimeFrozenScalars,
+                    .runtimeFrozenScalars, .runtimeHeldUsage,
                 ].contains(mode))
             XCTAssertEqual(
                 mode.usesOrderedChartPublication,
@@ -899,7 +899,7 @@ final class PerformanceGraphicsDiagnosticsTests: XCTestCase {
                     .runtimeTelemetryBatch,
                     .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart,
                     .runtimeCompletedLaneCache, .runtimeCachedRailGeometry, .runtimeReuseCaches,
-                    .runtimeFrozenScalars,
+                    .runtimeFrozenScalars, .runtimeHeldUsage,
                 ].contains(mode))
             XCTAssertEqual(mode.usesDirectToolPlot, mode == .runtimeDirectToolPlot)
             XCTAssertEqual(mode.usesUngroupedNativeCanvas, mode == .runtimeUngroupedCanvas)

@@ -20,7 +20,7 @@ final class PerformanceFrozenScalarDiagnosticsTests: XCTestCase {
     func testFrozenModePreservesNormalRenderingAndChangesOnlyScalarPresentation() throws {
         typealias Mode = Diagnostics.Mode
         XCTAssertEqual(Mode.runtimeFrozenScalars.rawValue, "runtime-frozen-scalars")
-        XCTAssertEqual(Mode.allCases.count, 45)
+        XCTAssertEqual(Mode.allCases.count, 46)
         XCTAssertEqual(
             try JSONDecoder().decode(
                 Mode.self, from: JSONEncoder().encode(Mode.runtimeFrozenScalars)),
@@ -60,7 +60,7 @@ final class PerformanceFrozenScalarDiagnosticsTests: XCTestCase {
             let diagnostics = Diagnostics()
             try diagnostics.enable(mode: mode)
             recordWork(diagnostics)
-            let enabled = mode == .normal || mode == .runtimeFrozenScalars
+            let enabled = [.normal, .runtimeFrozenScalars, .runtimeHeldUsage].contains(mode)
             XCTAssertEqual(diagnostics.layoutCountersForPresentation != nil, enabled)
             let snapshot = diagnostics.snapshot()
             XCTAssertEqual(snapshot["scalar_instrumentation_enabled"] as? Bool, enabled)

@@ -45,6 +45,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeCachedRailGeometry = "runtime-cached-rail-geometry"
         case runtimeReuseCaches = "runtime-reuse-caches"
         case runtimeFrozenScalars = "runtime-frozen-scalars"
+        case runtimeHeldUsage = "runtime-held-usage"
         case runtimeHeldStaticChart = "runtime-held-static-chart"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
@@ -97,6 +98,7 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeMetalCachedChart, .runtimeMetalPrimitiveEffects, .runtimeTelemetryBatch,
                 .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeCompletedLaneCache,
                 .runtimeCachedRailGeometry, .runtimeReuseCaches, .runtimeFrozenScalars,
+                .runtimeHeldUsage,
                 .runtimeHeldStaticChart:
                 true
             default:
@@ -128,6 +130,11 @@ public final class PerformanceGraphicsDiagnostics {
         }
         /// Diagnostic ablation only; authoritative metrics and chart data stay live.
         var usesFrozenScalarPresentation: Bool { self == .runtimeFrozenScalars }
+        /// Causal diagnostic only: full-dashboard usage values stay held.
+        var usesHeldUsagePresentation: Bool { self == .runtimeHeldUsage }
+        var usesScalarPresentationInstrumentation: Bool {
+            self == .normal || usesFrozenScalarPresentation || usesHeldUsagePresentation
+        }
         /// Causal diagnostic only: the displayed static chart intentionally stops updating.
         var usesHeldStaticChart: Bool { self == .runtimeHeldStaticChart }
 
@@ -150,6 +157,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalFullChart
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
                 || usesCompletedLaneCache || usesCachedRailGeometry || usesFrozenScalarPresentation
+                || usesHeldUsagePresentation
                 || usesHeldStaticChart
         }
 
@@ -181,6 +189,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalFullChart
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
                 || usesCompletedLaneCache || usesCachedRailGeometry || usesFrozenScalarPresentation
+                || usesHeldUsagePresentation
                 || usesHeldStaticChart
         }
 
@@ -195,6 +204,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalArrivalBursts
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
                 || usesCompletedLaneCache || usesCachedRailGeometry || usesFrozenScalarPresentation
+                || usesHeldUsagePresentation
                 || usesHeldStaticChart
         }
 
@@ -325,6 +335,7 @@ public final class PerformanceGraphicsDiagnostics {
         var role: String? = nil
         var frames: [String: CGRect] = [:]
         var leafBodyUpdates: [ScalarLeaf: UInt64] = [:]
+        var presentedValues: [String: [String: Any]] = [:]
     }
 
     private struct FrozenScalarOwner {
@@ -336,13 +347,17 @@ public final class PerformanceGraphicsDiagnostics {
     private var scalarLeafBodyUpdates: [ScalarLeaf: UInt64] = [:]
     private var scalarPresentationOwners: [UUID: ScalarPresentationOwner] = [:]
     private var frozenScalarOwners: [UUID: FrozenScalarOwner] = [:]
+    private var heldUsageOwners: [UUID: DashboardHeldUsage] = [:]
+    private var usageCaptures: UInt64 = 0
+    private var usageReleases: UInt64 = 0
+    private var usagePeakOwners: UInt64 = 0
     private var dashboardLayoutCounters: LayoutCounters?
     private var scalarFreezesCaptured: UInt64 = 0
     private var scalarFreezesReleased: UInt64 = 0
     private var scalarPeakFrozenOwners: UInt64 = 0
 
     private var scalarInstrumentationEnabled: Bool {
-        isEnabled && (mode == .normal || mode.usesFrozenScalarPresentation)
+        isEnabled && mode.usesScalarPresentationInstrumentation
     }
 
     /// Read only while constructing the view on the main actor. The retained
@@ -584,7 +599,8 @@ public final class PerformanceGraphicsDiagnostics {
         guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty,
             metalPrimitiveEffectsHosts.isEmpty
         else { throw ConfigurationError.liveCanvases }
-        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty else {
+        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty, heldUsageOwners.isEmpty
+        else {
             throw ConfigurationError.liveScalarPresentations
         }
         reset()
@@ -601,7 +617,8 @@ public final class PerformanceGraphicsDiagnostics {
         guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty,
             metalPrimitiveEffectsHosts.isEmpty
         else { throw ConfigurationError.liveCanvases }
-        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty else {
+        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty, heldUsageOwners.isEmpty
+        else {
             throw ConfigurationError.liveScalarPresentations
         }
         reset()
@@ -641,6 +658,10 @@ public final class PerformanceGraphicsDiagnostics {
         scalarLeafBodyUpdates.removeAll(keepingCapacity: false)
         scalarPresentationOwners.removeAll(keepingCapacity: false)
         frozenScalarOwners.removeAll(keepingCapacity: false)
+        heldUsageOwners.removeAll(keepingCapacity: false)
+        usageCaptures = 0
+        usageReleases = 0
+        usagePeakOwners = 0
         dashboardLayoutCounters?.reset(enabled: false)
         dashboardLayoutCounters = nil
         scalarFreezesCaptured = 0
@@ -1365,6 +1386,71 @@ public final class PerformanceGraphicsDiagnostics {
         scalarLeafBodyUpdates[leaf] = total.partialValue
     }
 
+    /// Authenticated native leaf callbacks report displayed values, never raw
+    /// counters sampled behind an independently held or coalesced presentation.
+    func recordScalarPresentedValues(
+        _ leaf: ScalarLeaf, owner: UUID, compact: Bool, values: [String: Any]
+    ) {
+        guard scalarInstrumentationEnabled, mode == .normal || mode.usesHeldUsagePresentation else {
+            return
+        }
+        guard var receipt = scalarPresentationOwners[owner] else {
+            invalidEvents += 1
+            return
+        }
+        let key: String
+        let expected: Set<String>
+        switch leaf {
+        case .header:
+            key = "header"
+            expected = ["status", "model", "activity"]
+        case .metrics:
+            key = "metrics"
+            expected = ["rate", "gpu"]
+        case .details where compact:
+            key = "compact_details"
+            expected = ["response"]
+        case .details:
+            key = "dashboard_usage"
+            expected = ["scope", "values"]
+        default:
+            invalidEvents += 1
+            return
+        }
+        let valid: Bool
+        if key == "dashboard_usage" {
+            let countKeys: Set<String> = [
+                "unknown_input_requests", "output_tokens", "tool_calls", "requests",
+                "active_requests",
+            ]
+            if let scope = values["scope"] as? String, UsageScope(rawValue: scope) != nil,
+                let usage = values["values"] as? [String: Any],
+                Set(usage.keys)
+                    == countKeys.union(["input_tokens", "output_is_estimated", "is_partial"])
+            {
+                valid =
+                    countKeys.allSatisfy { (usage[$0] as? Int).map { $0 >= 0 } ?? false }
+                    && (usage["input_tokens"] is NSNull
+                        || (usage["input_tokens"] as? Int).map { $0 >= 0 } == true)
+                    && usage["output_is_estimated"] is Bool && usage["is_partial"] is Bool
+            } else {
+                valid = false
+            }
+        } else {
+            valid = values.values.allSatisfy({ value in
+                if let text = value as? String { return text.utf8.count <= 4096 }
+                return key == "header" && value is NSNull
+            })
+        }
+        guard Set(values.keys) == expected, valid
+        else {
+            invalidEvents += 1
+            return
+        }
+        receipt.presentedValues[key] = values
+        scalarPresentationOwners[owner] = receipt
+    }
+
     func recordDashboardLayoutSize() {
         dashboardLayoutCounters?.recordSize()
     }
@@ -1434,6 +1520,7 @@ public final class PerformanceGraphicsDiagnostics {
     /// work survives cleanup while all per-owner state is released.
     func frozenScalarPresentationReleased(owner: UUID) {
         guard scalarInstrumentationEnabled else { return }
+        heldUsagePresentationReleased(owner: owner)
         if frozenScalarOwners[owner] != nil {
             let released = scalarFreezesReleased.addingReportingOverflow(1)
             guard !released.overflow else {
@@ -1444,6 +1531,44 @@ public final class PerformanceGraphicsDiagnostics {
             frozenScalarOwners.removeValue(forKey: owner)
         }
         scalarPresentationOwners.removeValue(forKey: owner)
+    }
+
+    @discardableResult
+    func heldUsagePresentationCaptured(_ snapshot: DashboardHeldUsage) -> Bool {
+        guard scalarInstrumentationEnabled, mode.usesHeldUsagePresentation else { return false }
+        guard heldUsageOwners.isEmpty, validScalarFingerprint(snapshot.fingerprint),
+            DashboardHeldUsage.requiredFrames.isSubset(of: Set(snapshot.frames.keys)),
+            validScalarFrames(snapshot.frames),
+            let current = scalarPresentationOwners[snapshot.owner],
+            current.role == "dashboard", current.frames == snapshot.frames,
+            scalarPresentationOwners.count == 2,
+            scalarPresentationOwners.values.contains(where: {
+                $0.role == "popover" && validScalarFrames($0.frames)
+            })
+        else {
+            invalidEvents += 1
+            return false
+        }
+        let captured = usageCaptures.addingReportingOverflow(1)
+        guard !captured.overflow else {
+            invalidEvents += 1
+            return false
+        }
+        heldUsageOwners[snapshot.owner] = snapshot
+        usageCaptures = captured.partialValue
+        usagePeakOwners = max(usagePeakOwners, UInt64(heldUsageOwners.count))
+        return true
+    }
+
+    func heldUsagePresentationReleased(owner: UUID) {
+        guard scalarInstrumentationEnabled, heldUsageOwners[owner] != nil else { return }
+        let released = usageReleases.addingReportingOverflow(1)
+        guard !released.overflow else {
+            invalidEvents += 1
+            return
+        }
+        heldUsageOwners.removeValue(forKey: owner)
+        usageReleases = released.partialValue
     }
 
     private func validScalarRole(_ role: String) -> Bool {
@@ -1501,6 +1626,7 @@ public final class PerformanceGraphicsDiagnostics {
                         "role": receipt.role as Any? ?? NSNull(),
                         "current_frames": scalarFramesSnapshot(receipt.frames),
                         "leaf_body_updates": scalarLeavesSnapshot(receipt.leafBodyUpdates),
+                        "presented_values": receipt.presentedValues,
                     ] as [String: Any]
                 )
             })
@@ -1523,6 +1649,17 @@ public final class PerformanceGraphicsDiagnostics {
             "frozen_scalar_presentation_enabled": isEnabled && mode.usesFrozenScalarPresentation,
             "scalar_instrumentation_enabled": scalarInstrumentationEnabled,
             "scalar_presentation": scalarPresentationSnapshot(layout: layout),
+            "held_usage_enabled": isEnabled && mode.usesHeldUsagePresentation,
+            "held_usage": [
+                "enabled": isEnabled && mode.usesHeldUsagePresentation,
+                "monitoring_epoch": NSNull(),
+                "captures": usageCaptures, "releases": usageReleases,
+                "current_owners": UInt64(heldUsageOwners.count), "peak_owners": usagePeakOwners,
+                "owners": Dictionary(
+                    uniqueKeysWithValues: heldUsageOwners.map {
+                        ($0.key.uuidString, $0.value.diagnostics)
+                    }),
+            ] as [String: Any],
             "native_canvas_frames": scalarInstrumentationEnabled
                 ? Dictionary(
                     uniqueKeysWithValues: canvases.filter { $0.value.role == .staticChart }.map {
