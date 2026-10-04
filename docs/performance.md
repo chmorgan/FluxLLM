@@ -1452,6 +1452,21 @@ resource acceptance, or production promotion**, even when its measured values
 fall below the unchanged 5% CPU and 1% GPU limits. Kernel metrics remain useful
 for attributing the cost of live scalar presentation.
 
+For a live scalar implementation, use the existing frozen-version CPU comparison
+with `--baseline-mode normal --candidate-mode normal` and the three explicit
+reference product/provenance arguments. The runner executes old normal/new
+normal/old normal, retaining each case's scalar and layout counters. Normal
+versions remain eligible for the unchanged 5% runtime CPU target. Their local
+chart bounds, native chart dimensions/scale, and window sizes must also match
+across the three cases. A paired `gpu-compare` with both modes `normal` retains
+the same scalar counters and matches that geometry before qualifying the
+comparison; the calibrated 1% GPU target stays unchanged. Global window origins
+remain report-only. Older comparisons where every normal product lacks scalar
+metadata remain supported; a mixture of present and absent metadata or an
+incomplete proof invalidates the comparison. Source and original provenance
+remain immutable; any updated external validation uses a preserved, reviewed
+comparison binding.
+
 ## Baselines and comparison artifacts
 
 Record the same workload before changing production behavior:

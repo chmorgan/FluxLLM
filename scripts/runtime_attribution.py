@@ -375,21 +375,57 @@ def validate_scalar_presentation_checkpoints(report, mode, *, closed_labels=("07
     return result
 
 
-def validate_scalar_geometry_comparison(cases):
-    if not any(case.get("mode") == memory.FROZEN_SCALARS_MODE for case in cases):
+def scalar_comparison_geometry(work, mode):
+    require(isinstance(work, dict) and type(work.get("enabled")) is bool
+            and work["enabled"] is (mode == memory.FROZEN_SCALARS_MODE),
+            "Scalar comparison lacks complete presentation diagnostics")
+    frames = work.get("critical_frames_by_role")
+    require(isinstance(frames, dict) and set(frames) == set(SCALAR_CRITICAL_FRAMES),
+            "Scalar comparison lacks both chart-owner frame diagnostics")
+    for role, names in SCALAR_CRITICAL_FRAMES.items():
+        require(isinstance(frames[role], dict) and set(frames[role]) == set(names),
+                "Scalar comparison critical chart/native-window frames are incomplete")
+        for name, rect in frames[role].items():
+            fields = ("width", "height") if name == "native-window" else ("x", "y", "width", "height")
+            require(isinstance(rect, dict) and set(rect) == set(fields)
+                    and all(memory.finite_numeric(rect[field]) for field in fields)
+                    and rect["width"] > 0 and rect["height"] > 0
+                    and (name == "native-window" or math.isfinite(float(rect["x"]) + float(rect["width"]))
+                         and math.isfinite(float(rect["y"]) + float(rect["height"]))),
+                    "Scalar comparison critical geometry is malformed")
+    native = work.get("native_chart_geometry")
+    require(isinstance(native, list) and len(native) == 2 and all(isinstance(frame, dict)
+            and set(frame) == {"role", "width", "height", "scale"} and frame["role"] == "static_chart"
+            and all(memory.finite_numeric(frame[field]) and frame[field] > 0 for field in ("width", "height", "scale"))
+            for frame in native), "Scalar comparison native chart geometry is incomplete")
+    return {"critical_frames_by_role": frames,
+            "native_chart_geometry": sorted(native, key=lambda frame: (frame["width"], frame["height"], frame["scale"]))}
+
+
+def validate_scalar_geometry_rows(rows):
+    """Old all-absent normal products remain optional; partial proof fails closed."""
+    work = [row.get("scalar_presentation_work") for row in rows]
+    if not any(value is not None for value in work):
         return None
-    require(len(cases) == 3 and cases[0].get("mode") == cases[-1].get("mode") == "normal"
-            and cases[1].get("mode") == memory.FROZEN_SCALARS_MODE,
-            "Scalar ablation requires a normal/frozen/normal comparison")
-    first = cases[0].get("scalar_presentation_work")
-    require(isinstance(first, dict), "Scalar comparison lacks normal-control frame diagnostics")
-    for case in cases[1:]:
-        current = case.get("scalar_presentation_work")
-        require(isinstance(current, dict) and current.get("critical_frames_by_role") == first.get("critical_frames_by_role")
-                and current.get("native_chart_geometry") == first.get("native_chart_geometry"),
-                "Scalar comparison cases changed chart/native-window geometry")
-    return {"available": True, "matching_critical_frames": True, "acceptance_eligible": False,
-            "scope": "Same-binary normal/frozen/normal with identical chart and native-window geometry"}
+    geometries = [scalar_comparison_geometry(value, row["mode"]) for value, row in zip(work, rows)]
+    require(all(value == geometries[0] for value in geometries[1:]),
+            "Scalar comparison cases changed chart/native-window geometry")
+    return {"available": True, "matching_critical_frames": True,
+            "acceptance_eligible": all(row["mode"] == "normal" for row in rows),
+            "scope": "Matching local chart bounds, native backing geometry and window sizes; global window origins are reported separately"}
+
+
+def validate_scalar_geometry_comparison(cases):
+    frozen = any(case.get("mode") == memory.FROZEN_SCALARS_MODE for case in cases)
+    if frozen:
+        require(len(cases) == 3 and cases[0].get("mode") == cases[-1].get("mode") == "normal"
+                and cases[1].get("mode") == memory.FROZEN_SCALARS_MODE,
+                "Scalar ablation requires a normal/frozen/normal comparison")
+        require(all(isinstance(case.get("scalar_presentation_work"), dict) for case in cases),
+                "Scalar ablation comparison lacks mandatory frame diagnostics")
+    elif len(cases) != 3 or any(case.get("mode") != "normal" for case in cases):
+        return None
+    return validate_scalar_geometry_rows(cases)
 
 
 def validate_scalar_comparison_products(products):

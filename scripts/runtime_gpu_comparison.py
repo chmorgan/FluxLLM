@@ -421,6 +421,11 @@ def qualify_result(result):
     selected = result.get("capture_case", "both")
     require(selected in ("both", "reference", "candidate"), "Unknown GPU capture selection")
     expected_labels = ["reference", "candidate"] if selected == "both" else [selected]
+    if (selected == "both" and len(result["rows"]) == 2
+            and all(row.get("mode") == "normal" for row in result["rows"])):
+        scalar_geometry = runtime.validate_scalar_geometry_rows(result["rows"])
+        if scalar_geometry is not None:
+            result["scalar_geometry_comparison"] = scalar_geometry
     gpu = result.get("gpu_trace", {})
     provider_valid = (gpu.get("valid") is True and gpu.get("recording_complete") is True and gpu.get("lost_events") is False
                       and gpu.get("calibration", {}).get("valid") is True and gpu.get("capture_scope", {}).get("validated") is True)
@@ -582,7 +587,8 @@ def run(argv=None):
                 require(case["status"] == "diagnostic_captured", label + " short GPU replay is incomplete; see preserved report")
                 row = {"label": label, "mode": modes[label], "report_path": str(path), "report_sha256": app.path_hash(path),
                        "validated_work": case["workload"]["validated_work"], "visual_work": case["visual_work"],
-                       "runtime_work": case["runtime_work"], **register_report(trace, case, label, ended)}
+                       "runtime_work": case["runtime_work"], "scalar_presentation_work": case.get("scalar_presentation_work"),
+                       **register_report(trace, case, label, ended)}
                 report["rows"].append(row)
                 write_report(output, report)
     except ERRORS + (KeyboardInterrupt,) as error:
