@@ -41,6 +41,9 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeTelemetryBatch = "runtime-telemetry-batch"
         case runtimeAtomicChartScale = "runtime-atomic-chart-scale"
         case runtimeEfficientEffects = "runtime-efficient-effects"
+        case runtimeCompletedLaneCache = "runtime-completed-lane-cache"
+        case runtimeCachedRailGeometry = "runtime-cached-rail-geometry"
+        case runtimeReuseCaches = "runtime-reuse-caches"
         case runtimeHeldStaticChart = "runtime-held-static-chart"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
@@ -91,7 +94,8 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeNoArrivalEffects, .runtimeCompactToolPaths, .runtimeDeferredToolGeometry,
                 .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts, .runtimeMetalFullChart,
                 .runtimeMetalCachedChart, .runtimeMetalPrimitiveEffects, .runtimeTelemetryBatch,
-                .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeHeldStaticChart:
+                .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeCompletedLaneCache,
+                .runtimeCachedRailGeometry, .runtimeReuseCaches, .runtimeHeldStaticChart:
                 true
             default:
                 false
@@ -114,6 +118,12 @@ public final class PerformanceGraphicsDiagnostics {
         var usesAtomicChartScale: Bool {
             self == .runtimeAtomicChartScale || self == .runtimeEfficientEffects
         }
+        var usesCompletedLaneCache: Bool {
+            self == .runtimeCompletedLaneCache || self == .runtimeReuseCaches
+        }
+        var usesCachedRailGeometry: Bool {
+            self == .runtimeCachedRailGeometry || self == .runtimeReuseCaches
+        }
         /// Causal diagnostic only: the displayed static chart intentionally stops updating.
         var usesHeldStaticChart: Bool { self == .runtimeHeldStaticChart }
 
@@ -135,6 +145,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalArrivalBursts
                 || usesMetalFullChart
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
+                || usesCompletedLaneCache || usesCachedRailGeometry
                 || usesHeldStaticChart
         }
 
@@ -165,6 +176,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalArrivalBursts
                 || usesMetalFullChart
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
+                || usesCompletedLaneCache || usesCachedRailGeometry
                 || usesHeldStaticChart
         }
 
@@ -178,6 +190,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
+                || usesCompletedLaneCache || usesCachedRailGeometry
                 || usesHeldStaticChart
         }
 
@@ -299,6 +312,17 @@ public final class PerformanceGraphicsDiagnostics {
     private var atomicChartScaleResolutions: UInt64 = 0
     private var atomicChartScaleChanges: UInt64 = 0
     private var atomicChartScaleCacheHits: UInt64 = 0
+    private var completedLaneCacheBuilds: UInt64 = 0
+    private var completedLaneCacheHits: UInt64 = 0
+    private var completedLaneCacheVisitedRecords: UInt64 = 0
+    private var completedLaneCacheEntries: UInt64 = 0
+    private var completedLaneCachePeakEntries: UInt64 = 0
+    private var railGeometryCacheBuilds: UInt64 = 0
+    private var railGeometryCacheHits: UInt64 = 0
+    private var railGeometryCacheEntries: UInt64 = 0
+    private var railGeometryCachePeakEntries: UInt64 = 0
+    private var railGeometryCacheOwners: [UUID: UInt64] = [:]
+    private var railGeometryCachePeakOwners: UInt64 = 0
 
     private struct MetalPrimitiveEffectsCounters {
         var hostsCreated: UInt64 = 0
@@ -475,6 +499,17 @@ public final class PerformanceGraphicsDiagnostics {
         atomicChartScaleResolutions = 0
         atomicChartScaleChanges = 0
         atomicChartScaleCacheHits = 0
+        completedLaneCacheBuilds = 0
+        completedLaneCacheHits = 0
+        completedLaneCacheVisitedRecords = 0
+        completedLaneCacheEntries = 0
+        completedLaneCachePeakEntries = 0
+        railGeometryCacheBuilds = 0
+        railGeometryCacheHits = 0
+        railGeometryCacheEntries = 0
+        railGeometryCachePeakEntries = 0
+        railGeometryCacheOwners.removeAll(keepingCapacity: false)
+        railGeometryCachePeakOwners = 0
     }
 
     public func canvasCreated(role: Role) -> UInt64? {
@@ -1087,6 +1122,81 @@ public final class PerformanceGraphicsDiagnostics {
         atomicChartScaleCacheHits += 1
     }
 
+    /// Absolute history counters are sampled at existing publication/cleanup
+    /// boundaries. Reading diagnostics never queries or rebuilds history.
+    func completedLaneCachePrepared(
+        builds: UInt64, hits: UInt64, visitedRecords: UInt64, entries: Int
+    ) {
+        guard isEnabled, mode.usesCompletedLaneCache else { return }
+        guard let entries = UInt64(exactly: entries), entries <= 20_000,
+            builds >= completedLaneCacheBuilds, hits >= completedLaneCacheHits,
+            visitedRecords >= completedLaneCacheVisitedRecords
+        else {
+            invalidEvents += 1
+            return
+        }
+        completedLaneCacheBuilds = builds
+        completedLaneCacheHits = hits
+        completedLaneCacheVisitedRecords = visitedRecords
+        completedLaneCacheEntries = entries
+        completedLaneCachePeakEntries = max(completedLaneCachePeakEntries, entries)
+    }
+
+    func recordRailGeometryCacheBuild(owner: UUID, entries: Int) {
+        guard isEnabled, mode.usesCachedRailGeometry else { return }
+        guard updateRailGeometryCacheEntries(owner: owner, count: entries), entries > 0 else {
+            return
+        }
+        let next = railGeometryCacheBuilds.addingReportingOverflow(1)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return
+        }
+        railGeometryCacheBuilds = next.partialValue
+    }
+
+    func recordRailGeometryCacheHit(owner: UUID) {
+        guard isEnabled, mode.usesCachedRailGeometry else { return }
+        guard railGeometryCacheOwners[owner] != nil else {
+            invalidEvents += 1
+            return
+        }
+        let next = railGeometryCacheHits.addingReportingOverflow(1)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return
+        }
+        railGeometryCacheHits = next.partialValue
+    }
+
+    func recordRailGeometryCacheEntries(owner: UUID, _ count: Int) {
+        guard isEnabled, mode.usesCachedRailGeometry else { return }
+        _ = updateRailGeometryCacheEntries(owner: owner, count: count)
+    }
+
+    private func updateRailGeometryCacheEntries(owner: UUID, count: Int) -> Bool {
+        guard let entries = UInt64(exactly: count), entries <= 24 else {
+            invalidEvents += 1
+            return false
+        }
+        let retained = railGeometryCacheEntries - (railGeometryCacheOwners[owner] ?? 0)
+        let next = retained.addingReportingOverflow(entries)
+        guard !next.overflow else {
+            invalidEvents += 1
+            return false
+        }
+        if entries == 0 {
+            railGeometryCacheOwners.removeValue(forKey: owner)
+        } else {
+            railGeometryCacheOwners[owner] = entries
+        }
+        railGeometryCacheEntries = next.partialValue
+        railGeometryCachePeakEntries = max(railGeometryCachePeakEntries, railGeometryCacheEntries)
+        railGeometryCachePeakOwners = max(
+            railGeometryCachePeakOwners, UInt64(railGeometryCacheOwners.count))
+        return true
+    }
+
     public func snapshot() -> [String: Any] {
         var result: [String: Any] = [
             "enabled": isEnabled, "mode": mode.rawValue,
@@ -1104,6 +1214,24 @@ public final class PerformanceGraphicsDiagnostics {
                 "scale_changes": atomicChartScaleChanges,
                 "cache_hits": atomicChartScaleCacheHits,
             ],
+            "completed_lane_cache_enabled": isEnabled && mode.usesCompletedLaneCache,
+            "completed_lane_cache": [
+                "builds": completedLaneCacheBuilds,
+                "hits": completedLaneCacheHits,
+                "visited_records": completedLaneCacheVisitedRecords,
+                "current_entries": completedLaneCacheEntries,
+                "peak_entries": completedLaneCachePeakEntries,
+            ],
+            "rail_geometry_cache_enabled": isEnabled && mode.usesCachedRailGeometry,
+            "rail_geometry_cache": [
+                "builds": railGeometryCacheBuilds, "hits": railGeometryCacheHits,
+                "current_entries": railGeometryCacheEntries,
+                "peak_entries": railGeometryCachePeakEntries,
+                "current_caches": UInt64(railGeometryCacheOwners.count),
+                "peak_caches": railGeometryCachePeakOwners,
+                "max_entries_per_cache": UInt64(24),
+            ],
+            "rail_geometry_cache_used": railGeometryCacheBuilds > 0,
             "invalid_events": invalidEvents,
             "cpu_glow_fallbacks": cpuGlowFallbacks,
             "gradient_substitutions": gradientSubstitutions,
