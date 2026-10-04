@@ -298,6 +298,7 @@ public final class MetricsStore {
             // retained independently and will rebuild immediately on reopening.
             chartPresentation = ChartPresentationSnapshot(timestamp: sampleDate)
             usageHistory.releaseQueryCaches()
+            publishCompletedLaneCacheDiagnostics()
         }
     }
 
@@ -1073,6 +1074,15 @@ public final class MetricsStore {
         lastRatePublicationAt = date
     }
 
+    private func publishCompletedLaneCacheDiagnostics() {
+        guard PerformanceGraphicsDiagnostics.shared.mode.usesCompletedLaneCache else { return }
+        PerformanceGraphicsDiagnostics.shared.completedLaneCachePrepared(
+            builds: usageHistory.completedLaneCacheBuildCount,
+            hits: usageHistory.completedLaneCacheHitCount,
+            visitedRecords: usageHistory.completedLaneCacheVisitedRecords,
+            entries: usageHistory.completedLaneCacheEntryCount)
+    }
+
     private func publishChartPresentationIfDue(at date: Date) {
         guard !presentationDemandIsManaged || !presentationConsumers.isEmpty else { return }
         let interval = PerformanceGraphicsDiagnostics.shared.mode.chartPublicationIntervalSeconds
@@ -1119,19 +1129,22 @@ public final class MetricsStore {
             .usesSharedChartPreparation
         let orderedPublication = PerformanceGraphicsDiagnostics.shared.mode
             .usesOrderedChartPublication
+        let completedLaneCache = PerformanceGraphicsDiagnostics.shared.mode.usesCompletedLaneCache
         let historicalLanes: [RequestLane]
         if orderedPublication, historyIntervals.count == 1 {
             // The query already returns unique, ordered lanes. Preserve that
             // order for the common single merged viewport instead of sorting twice.
             PerformancePresentationCounters.shared.record(.orderedChartPublicationQueries)
             historicalLanes = usageHistory.requestLanes(
-                source: historySource, interval: historyIntervals[0], inclusiveEnd: selection != nil
-            )
+                source: historySource, interval: historyIntervals[0],
+                inclusiveEnd: selection != nil,
+                useCompletedLaneCache: completedLaneCache)
         } else {
             var savedLanes: [UUID: RequestLane] = [:]
             for interval in historyIntervals {
                 for lane in usageHistory.requestLanes(
-                    source: historySource, interval: interval, inclusiveEnd: selection != nil
+                    source: historySource, interval: interval, inclusiveEnd: selection != nil,
+                    useCompletedLaneCache: completedLaneCache
                 ) { savedLanes[lane.id] = lane }
             }
             PerformancePresentationCounters.shared.record(.chartPublicationFullSorts)
@@ -1140,6 +1153,7 @@ public final class MetricsStore {
                     ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
             }
         }
+        publishCompletedLaneCacheDiagnostics()
         let historicalTools: [ToolActivityEvent]
         if orderedPublication, toolIntervals.count == 1 {
             PerformancePresentationCounters.shared.record(.orderedChartPublicationQueries)
