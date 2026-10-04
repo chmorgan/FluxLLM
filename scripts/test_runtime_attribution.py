@@ -101,6 +101,9 @@ def workload_snapshots(mode):
 
 
 def clock_work_report(mode="runtime-canvas-clock"):
+    if mode == memory.RETAINED_USAGE_MODE:
+        from test_runtime_retained_usage import retained_report
+        return retained_report(mode)
     if mode == memory.HELD_USAGE_MODE:
         from test_runtime_held_usage import held_report
         return held_report(mode)
@@ -218,7 +221,7 @@ class RuntimeWorkTests(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["deltas"]["chart_preparations"], 2)
                 self.assertEqual(result["deltas"]["static_chart_draws"], 0 if mode in (memory.HELD_STATIC_CHART_MODE, *memory.METAL_CHART_MODES) else 2)
-                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "metal_full_chart_enabled", "metal_static_cache_enabled", "holds_static_chart_drawing", "frozen_scalar_presentation_enabled", "held_usage_enabled", *memory.NEW_RUNTIME_FLAGS, *memory.REUSE_RUNTIME_FLAGS) if field in after["graphics_diagnostics"]})
+                self.assertEqual(result["features"], {field: after["graphics_diagnostics"][field] for field in memory.RUNTIME_FLAGS + memory.NEXT_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "metal_full_chart_enabled", "metal_static_cache_enabled", "holds_static_chart_drawing", "frozen_scalar_presentation_enabled", "held_usage_enabled", "retained_usage_fields", *memory.NEW_RUNTIME_FLAGS, *memory.REUSE_RUNTIME_FLAGS) if field in after["graphics_diagnostics"]})
 
     def test_chart_preparation_requires_complete_optimized_coverage(self):
         for delta in (0, 1, 3):
@@ -916,7 +919,7 @@ class NextRuntimeWorkTests(unittest.TestCase):
             self.assertEqual(work["features"]["unpromised_stream_body_writes"], mode != "runtime-canvas-clock")
             args = runtime.parser().parse_args(["compare", "--app-binary", "/app", "--test-bundle", "/tests",
                 "--collector-binary", "/collector", "--provenance", "/provenance", "--controls", mode])
-            if mode in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE):
+            if mode in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE, memory.RETAINED_USAGE_MODE):
                 args.baseline_mode = "normal"
             self.assertEqual(runtime.selected_cases(args)[1], (mode, mode))
 

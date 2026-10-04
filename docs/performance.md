@@ -637,6 +637,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-reuse-caches` | Combine completed-lane and normal-Canvas effect geometry caching. |
 | `runtime-frozen-scalars` | Hold complete scalar leaf snapshots for the two visible windows while chart data, normal effects, menu-bar status, streaming and accounting remain live. Diagnostic ablation only. |
 | `runtime-held-usage` | Hold only the full dashboard's `UsageSummary`; compact latest response, headers, rates, GPU labels, charts and effects remain live. Diagnostic ablation only. |
+| `runtime-retained-usage` | Keep full dashboard usage live through retained value hosts; compact fields, headers, rates, charts and effects retain their normal behavior. Opt-in candidate. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -1530,6 +1531,73 @@ tree, XCTest explicitly reports that check as skipped; an empty tree never count
 as parity. If the sentinel works, missing dashboard labels or changed accessibility
 values fail the test. Keep this availability limitation with the captured results;
 the held-usage mode remains diagnostic-only.
+
+### Retained live usage candidate
+
+`runtime-retained-usage` keeps dashboard usage live while avoiding repeated
+reconstruction of the complete SwiftUI usage block. Four fixed native selectable
+`NSTextField` hosts use CoreText to draw input, output, tool-call and request
+values, retaining the original SwiftUI captions, layout and help. A retained
+SwiftUI badge displays partial/active status. One coordinator listens to the
+existing coalesced usage publication and applies only changed value payloads;
+it adds no timer or observer for individual stream chunks. The ordinary `normal`
+mode remains unchanged, and the candidate stays opt-in. It sends neither
+`freeze_usage` nor `freeze_scalars`.
+
+Run the bounded same-product CPU bracket:
+
+```sh
+python3 scripts/run_performance_checks.py runtime compare \
+  --baseline-mode normal --controls runtime-retained-usage \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json \
+  --output-dir .performance-results/retained-usage-cpu-comparison
+```
+
+The runner executes normal/candidate/normal with the existing fixed two-stream,
+25-second load, owned process lifetimes and closed cleanup. It normally finishes
+in about 130 seconds inside the unchanged 300-second deadline. Both windows stay
+visible; charts retain 1 Hz publication, 30 Hz Canvas lifecycle effects, ordinary
+retained glints, exact forwarding and token/tool accounting. The candidate's
+`retained_usage_fields` flag must be true, with experimental Metal, batching,
+atomic-scale and cache controls disabled.
+
+Candidate receipts come from actual native value-host apply callbacks. The
+harness checks their owner and live monitoring epoch, all five applied labels,
+complete usage values, monotonic host/apply counters, and live full-dashboard and
+compact response accounting. Existing rendered headers and rates remain live,
+each chart separately preserves drawing cadence, and all three cases match local
+chart bounds, native backing dimensions/scale and window sizes. Closing releases
+all five measured hosts and the owner, followed by the quiet closed interval.
+Older normal products may omit retained metadata; partial metadata is invalid.
+
+Native validation must prove zero outer layout invalidation from value updates,
+pixel and geometry parity, live values and exact accounting, host/owner lifecycle
+cleanup, and real selectable-field copy behavior using a private pasteboard.
+These checks must exercise actual native drawing and copy actions; formatting
+helpers or populated clipboard fixtures alone cannot establish parity. Pixel
+comparisons allow at most one 8-bit RGB quantization step at identical coordinates;
+dimensions, geometry and the bitmap's actual alpha component remain exact, with
+no image shifts or special allowance for large values. The
+accessibility test uses an independent presented SwiftUI `Text` sentinel: when
+that host exposes no accessibility tree, the check is explicitly unavailable or
+skipped, never counted as a pass. When the sentinel works, missing or changed
+candidate accessibility values fail. Font fitting and baseline alignment remain
+subject to native validation; this documentation does not claim test passes or
+measured CPU/GPU gains.
+
+The candidate can be evaluated against the unchanged 5% runtime CPU target.
+A separate bounded `gpu-compare` with identical products,
+`--reference-mode normal --candidate-mode runtime-retained-usage --capture-case both`,
+repeats the live-value and paired geometry proof with the shorter fixed fixture.
+GPU qualification still requires complete process ownership, clock, loss and
+calibration evidence before evaluating the 1% target. Traced CPU cannot qualify
+the CPU gate. Missing GPU measurements remain unavailable. Measured CPU/GPU
+results do not automatically promote the candidate or establish a full resource
+pass. Preserve earlier held/normal captures and source capsules; updated
+validators use a separate reviewed measurement binding.
 
 ## Baselines and comparison artifacts
 

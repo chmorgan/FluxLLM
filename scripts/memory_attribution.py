@@ -37,6 +37,10 @@ NO_ARRIVAL_MODE = "runtime-no-arrival-effects"
 HELD_STATIC_CHART_MODE = "runtime-held-static-chart"
 FROZEN_SCALARS_MODE = "runtime-frozen-scalars"
 HELD_USAGE_MODE = "runtime-held-usage"
+RETAINED_USAGE_MODE = "runtime-retained-usage"
+RETAINED_USAGE_COUNTERS = ("hosts_created", "hosts_destroyed", "value_apply_attempts", "value_applies", "value_apply_skips")
+RETAINED_USAGE_GAUGES = ("current_owners", "peak_owners")
+RETAINED_USAGE_FIELDS = ("input", "output", "tools", "requests", "badge")
 HELD_USAGE_COUNTERS = ("captures", "releases")
 HELD_USAGE_GAUGES = ("current_owners", "peak_owners")
 HELD_USAGE_VALUE_COUNTS = ("input_tokens", "unknown_input_requests", "output_tokens", "tool_calls", "requests", "active_requests")
@@ -98,7 +102,7 @@ DEFERRED_TOOL_GEOMETRY_MODE = "runtime-deferred-tool-geometry"
 DEFERRED_TOOL_GEOMETRY_2HZ_MODE = "runtime-deferred-tool-geometry-2hz"
 DEFERRED_TOOL_GEOMETRY_MODES = (DEFERRED_TOOL_GEOMETRY_MODE, DEFERRED_TOOL_GEOMETRY_2HZ_MODE)
 TOOL_PATH_POINT_COUNTERS = ("tool_path_input_points", "tool_path_output_points")
-ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, HELD_USAGE_MODE) + DEFERRED_TOOL_GEOMETRY_MODES + NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES
+ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, HELD_USAGE_MODE, RETAINED_USAGE_MODE) + DEFERRED_TOOL_GEOMETRY_MODES + NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES
 CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + tuple(mode for mode in ORDERED_PUBLICATION_MODES if mode not in METAL_CHART_MODES)
 NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized", *METAL_CHART_MODES) + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
@@ -455,12 +459,12 @@ def runtime_feature_contract(value, mode):
         return None
     extras = {}
     for field, enabled_modes in zip(NEW_RUNTIME_FLAGS, (PRIMITIVE_EFFECTS_MODES, BATCHED_TELEMETRY_MODES, ATOMIC_CHART_SCALE_MODES)):
-        if mode in NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE, HELD_USAGE_MODE) or field in value:
+        if mode in NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE, HELD_USAGE_MODE, RETAINED_USAGE_MODE) or field in value:
             require(type(value.get(field)) is bool and value[field] is (mode in enabled_modes),
                     f"Graphics {field} does not match the requested runtime control")
             extras[field] = value[field]
     for field, enabled_modes in zip(REUSE_RUNTIME_FLAGS, (COMPLETED_LANE_CACHE_MODES, CACHED_RAIL_GEOMETRY_MODES)):
-        if mode in REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE, HELD_USAGE_MODE) or field in value:
+        if mode in REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE, HELD_USAGE_MODE, RETAINED_USAGE_MODE) or field in value:
             require(type(value.get(field)) is bool and value[field] is (mode in enabled_modes),
                     f"Graphics {field} does not match the requested runtime control")
             extras[field] = value[field]
@@ -473,6 +477,10 @@ def runtime_feature_contract(value, mode):
         require(type(value.get("held_usage_enabled")) is bool and value["held_usage_enabled"] is (mode == HELD_USAGE_MODE),
                 "Graphics held_usage_enabled does not match the requested runtime control")
         extras["held_usage_enabled"] = value["held_usage_enabled"]
+    if mode == RETAINED_USAGE_MODE or "retained_usage_fields" in value:
+        require(type(value.get("retained_usage_fields")) is bool and value["retained_usage_fields"] is (mode == RETAINED_USAGE_MODE),
+                "Graphics retained_usage_fields does not match the requested runtime control")
+        extras["retained_usage_fields"] = value["retained_usage_fields"]
     if mode in METAL_CHART_MODES or "metal_full_chart_enabled" in value:
         require(type(value.get("metal_full_chart_enabled")) is bool
                 and value["metal_full_chart_enabled"] is (mode in METAL_CHART_MODES),
@@ -569,7 +577,7 @@ def tool_path_point_counts(snapshot):
 
 def chart_publication_interval(value, mode):
     field = "chart_publication_interval_seconds"
-    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, HELD_USAGE_MODE, *NEW_RUNTIME_MODES, *REUSE_RUNTIME_MODES):
+    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, HELD_USAGE_MODE, RETAINED_USAGE_MODE, *NEW_RUNTIME_MODES, *REUSE_RUNTIME_MODES):
         return None
     interval = value.get(field)
     expected = .5 if mode == DEFERRED_TOOL_GEOMETRY_2HZ_MODE else 1.0
@@ -884,9 +892,9 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
     """Authenticate the scalar ablation without treating held UI as a gate pass."""
     value = snapshot.get("graphics_diagnostics", {})
     fields = ("frozen_scalar_presentation_enabled", "scalar_instrumentation_enabled", "scalar_presentation")
-    if mode not in (FROZEN_SCALARS_MODE, HELD_USAGE_MODE) and not any(field in value for field in fields):
+    if mode not in (FROZEN_SCALARS_MODE, HELD_USAGE_MODE, RETAINED_USAGE_MODE) and not any(field in value for field in fields):
         return None
-    enabled, instrumented = mode == FROZEN_SCALARS_MODE, mode in ("normal", FROZEN_SCALARS_MODE, HELD_USAGE_MODE)
+    enabled, instrumented = mode == FROZEN_SCALARS_MODE, mode in ("normal", FROZEN_SCALARS_MODE, HELD_USAGE_MODE, RETAINED_USAGE_MODE)
     for field, expected in zip(fields[:2], (enabled, instrumented)):
         require(type(value.get(field)) is bool and value[field] is expected,
                 f"Graphics {field} does not match the requested scalar diagnostic")
@@ -938,7 +946,7 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
             else:
                 frames(entry.get("current_frames"), "Scalar current")
                 leaf_counts(entry.get("leaf_body_updates"), "Scalar owner leaf_body_updates")
-                if "presented_values" in entry or mode == HELD_USAGE_MODE:
+                if "presented_values" in entry or mode in (HELD_USAGE_MODE, RETAINED_USAGE_MODE):
                     presented_scalar_values(entry.get("presented_values"))
         require(len(roles) == len(set(roles)), f"Scalar {name} owner roles are duplicated")
     require(counts["freezes_captured"] >= counts["freezes_released"]
@@ -1098,6 +1106,66 @@ def held_usage_contract(snapshot, mode, *, require_held=False, expected_closed=F
             "acceptance_eligible": not enabled}
 
 
+def retained_usage_contract(snapshot, mode, *, require_live=False, expected_closed=False):
+    value = snapshot.get("graphics_diagnostics", {})
+    if mode != RETAINED_USAGE_MODE and not any(field in value for field in ("retained_usage_fields", "retained_usage")):
+        return None
+    enabled = mode == RETAINED_USAGE_MODE
+    require(type(value.get("retained_usage_fields")) is bool and value["retained_usage_fields"] is enabled,
+            "Graphics retained_usage_fields does not match the requested runtime control")
+    raw = value.get("retained_usage")
+    require(isinstance(raw, dict) and set(raw) == set(("enabled", "owners") + RETAINED_USAGE_COUNTERS + RETAINED_USAGE_GAUGES)
+            and type(raw["enabled"]) is bool and raw["enabled"] is enabled, "Retained usage namespace is incomplete")
+    counts = {field: raw.get(field) for field in RETAINED_USAGE_COUNTERS + RETAINED_USAGE_GAUGES}
+    require(all(type(count) is int and 0 <= count <= 2**64 - 1 for count in counts.values()),
+            "Retained usage requires complete UInt64 counters")
+    owners = raw["owners"]
+    require(isinstance(owners, dict) and len(owners) <= 1, "Retained usage owner inventory exceeds its dashboard bound")
+    require(counts["hosts_created"] >= counts["hosts_destroyed"]
+            and (counts["hosts_created"] == counts["hosts_destroyed"] if not owners else
+                 1 <= counts["hosts_created"] - counts["hosts_destroyed"] <= len(RETAINED_USAGE_FIELDS))
+            and counts["current_owners"] == len(owners) <= counts["peak_owners"] <= 1
+            and counts["value_apply_attempts"] == counts["value_applies"] + counts["value_apply_skips"],
+            "Retained usage host lifetime or apply counters do not reconcile")
+    current_epoch = None
+    if owners:
+        held = held_usage_contract(snapshot, mode)
+        require(held is not None and held["monitoring_epoch"] is not None,
+                "Retained usage lacks the actual live monitoring epoch witness")
+        current_epoch = held["monitoring_epoch"]
+    for owner, entry in owners.items():
+        require(isinstance(owner, str) and re.fullmatch(r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}", owner)
+                and isinstance(entry, dict) and set(entry) == {"role", "epoch", "scope", "values", "fields"}
+                and entry["role"] == "dashboard", "Retained usage owner identity or role is invalid")
+        pending = entry["epoch"] is None and entry["scope"] is None and entry["values"] == {} and entry["fields"] == {}
+        if pending:
+            require(not require_live and not expected_closed, "Measured retained usage owner has not applied all fields")
+            continue
+        require(entry["epoch"] == current_epoch
+                and counts["hosts_created"] - counts["hosts_destroyed"] == len(RETAINED_USAGE_FIELDS),
+                "Retained usage owner monitoring epoch or complete host inventory is invalid")
+        require(entry["scope"] in ("sinceLaunch", "selectedPeriod", "today"), "Retained usage scope is invalid")
+        usage_presentation_values(entry["values"], "Retained applied dashboard")
+        fields = entry["fields"]
+        require(isinstance(fields, dict) and set(fields) == set(RETAINED_USAGE_FIELDS),
+                "Retained usage lacks all five actually applied value hosts")
+        for field in fields.values():
+            require(isinstance(field, dict) and set(field) == {"value", "help"}
+                    and all(isinstance(text, str) and len(text.encode()) <= 4096 for text in field.values()),
+                    "Retained applied host labels/help are incomplete or exceed their bound")
+    if not enabled:
+        require(not owners and all(count == 0 for count in counts.values()), "Inactive mode executed retained usage work")
+    if require_live:
+        require(enabled and len(owners) == counts["current_owners"] == counts["peak_owners"] == 1
+                and counts["value_applies"] >= len(RETAINED_USAGE_FIELDS),
+                "Retained usage did not create and apply all five live dashboard fields")
+    if expected_closed:
+        require(not owners and counts["current_owners"] == 0, "Retained usage hosts remain live after closing")
+    return {"enabled": enabled, "counters": counts, "owners": owners,
+            "monitoring_epoch": current_epoch, "acceptance_eligible": True,
+            "promotion_eligible": False if enabled else None}
+
+
 def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False,
                       require_native_normal=False):
     value = snapshot.get("graphics_diagnostics")
@@ -1132,6 +1200,9 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
         expected_closed=expected_closed)
     held_usage = held_usage_contract(snapshot, mode,
         require_held=completed_visible_workload and mode == HELD_USAGE_MODE and not expected_closed,
+        expected_closed=expected_closed)
+    retained_usage = retained_usage_contract(snapshot, mode,
+        require_live=completed_visible_workload and mode == RETAINED_USAGE_MODE and not expected_closed,
         expected_closed=expected_closed)
     if completed_visible_workload and mode == FROZEN_SCALARS_MODE:
         require(scalar_presentation["counters"]["freezes_captured"] == 2,
@@ -1364,6 +1435,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             **({"reuse_caches": reuse_caches} if reuse_caches is not None else {}),
             **({"scalar_presentation": scalar_presentation} if scalar_presentation is not None else {}),
             **({"held_usage": held_usage} if held_usage is not None else {}),
+            **({"retained_usage": retained_usage} if retained_usage is not None else {}),
             **({"arrival_backend": metal_arrival["arrival_backend"]} if metal_arrival and metal_arrival["arrival_backend"] is not None else {}),
             **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {}),
             **({"runtime_feature_contract": runtime_features} if runtime_features is not None else {}),

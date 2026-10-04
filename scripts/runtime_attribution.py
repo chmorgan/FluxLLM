@@ -232,7 +232,7 @@ def validate_scalar_presentation_checkpoints(report, mode, *, closed_labels=("07
         require(not commands, "Normal control unexpectedly issued a scalar-freeze command")
     if first is None:
         return None
-    if mode not in ("normal", memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE):
+    if mode not in ("normal", memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE, memory.RETAINED_USAGE_MODE):
         return scalar_presentation_work(points[0]["snapshot"], points[-1]["snapshot"], mode)
     if boundary is None:
         clocks = report["runtime"]
@@ -370,7 +370,7 @@ def validate_scalar_presentation_checkpoints(report, mode, *, closed_labels=("07
         arrival_deltas=arrival_work, completion_deltas=completion_work,
         steady_retained_twinkle_animation_starts=glints[-1] - glints[0],
         held_scalar_identities={entry["role"]: entry["capture_identity"] for entry in first["frozen_owners"].values()},
-        closed_current_frozen_owners=0, promotion_eligible=mode not in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE),
+        closed_current_frozen_owners=0, promotion_eligible=mode not in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE, memory.RETAINED_USAGE_MODE),
         scope="Fixed local chart bounds, native backing geometry and window sizes; global window origins are reported. Live chart/streaming work remains exact; frozen scalar leaves are a diagnostic ablation")
     return result
 
@@ -424,7 +424,7 @@ def validate_held_usage_checkpoints(report, mode, *, closed_labels=("07-both-clo
                 "Normal control unexpectedly issued a usage-freeze command")
     if first is None:
         return None
-    if mode not in ("normal", memory.HELD_USAGE_MODE):
+    if mode not in ("normal", memory.HELD_USAGE_MODE, memory.RETAINED_USAGE_MODE):
         return None
     scalar_work = validate_scalar_presentation_checkpoints(report, mode, closed_labels=closed_labels,
         minimum_closed_seconds=minimum_closed_seconds, boundary=boundary)
@@ -529,7 +529,7 @@ def validate_held_usage_checkpoints(report, mode, *, closed_labels=("07-both-clo
         previous = current
     require(closed[-1][1] - closed[0][1] >= minimum_closed_seconds and closed[0][0] == closed[-1][0],
             "Held usage continued work after closing or lacks a quiet closed observation")
-    return {"enabled": held, "acceptance_eligible": not held, "promotion_eligible": not held,
+    return {"enabled": held, "acceptance_eligible": not held, "promotion_eligible": not held and mode != memory.RETAINED_USAGE_MODE,
             "capture_identity": receipt["capture_identity"] if held else None,
             "owner": held_owner, "monitoring_epoch": first["monitoring_epoch"],
             "counter_deltas": {field: previous["counters"][field] - first["counters"][field] for field in memory.HELD_USAGE_COUNTERS},
@@ -548,7 +548,7 @@ def validate_scalar_geometry_rows(rows):
     require(all(value == geometries[0] for value in geometries[1:]),
             "Scalar comparison cases changed chart/native-window geometry")
     return {"available": True, "matching_critical_frames": True,
-            "acceptance_eligible": all(row["mode"] == "normal" for row in rows),
+            "acceptance_eligible": all(row["mode"] in ("normal", memory.RETAINED_USAGE_MODE) for row in rows),
             "scope": "Matching local chart bounds, native backing geometry and window sizes; global window origins are reported separately"}
 
 
@@ -563,6 +563,13 @@ def validate_scalar_geometry_comparison(cases):
                 "Scalar ablation comparison lacks mandatory frame diagnostics")
         if diagnostic == memory.HELD_USAGE_MODE:
             validate_held_usage_rows(cases)
+    elif any(case.get("mode") == memory.RETAINED_USAGE_MODE for case in cases):
+        require(len(cases) == 3 and [case.get("mode") for case in cases]
+                == ["normal", memory.RETAINED_USAGE_MODE, "normal"],
+                "Retained usage requires the same-binary normal/retained/normal comparison")
+        require(all(isinstance(case.get("scalar_presentation_work"), dict) for case in cases),
+                "Retained usage comparison lacks mandatory frame diagnostics")
+        validate_retained_usage_rows(cases)
     elif len(cases) != 3 or any(case.get("mode") != "normal" for case in cases):
         return None
     return validate_scalar_geometry_rows(cases)
@@ -589,6 +596,145 @@ def validate_held_usage_rows(rows):
                  and all(character in "0123456789abcdef" for character in work["capture_identity"]))
                 if held else work.get("capture_identity") is None,
                 "Held usage comparison capture identity is missing or retained by a normal control")
+
+
+def validate_retained_applied_fields(entry):
+    values, fields = entry["values"], entry["fields"]
+    input_label = fields["input"]["value"]
+    if values["input_tokens"] is None:
+        require(input_label == "—", "Retained input field does not display unavailable usage")
+    else:
+        require(input_label.endswith("+") is (values["unknown_input_requests"] > 0)
+                and not input_label.startswith("~")
+                and rendered_response_tokens(input_label.removesuffix("+")) == values["input_tokens"],
+                "Retained input label differs from the actually applied usage")
+    output_label = fields["output"]["value"]
+    require(output_label.startswith("~") is values["output_is_estimated"]
+            and rendered_response_tokens(output_label) == values["output_tokens"],
+            "Retained output label differs from the actually applied usage")
+    for field, count in (("tools", "tool_calls"), ("requests", "requests")):
+        label = fields[field]["value"]
+        require(not label.startswith("~") and rendered_response_tokens(label) == values[count],
+                "Retained count label differs from the actually applied usage")
+    badge = "Partial history" if values["is_partial"] else f"{values['active_requests']} active" if values["active_requests"] else ""
+    require(fields["badge"]["value"] == badge, "Retained badge differs from partial/active usage")
+    input_help = (f"Input usage is unavailable for {values['unknown_input_requests']} requests. A + marks the known subtotal."
+                  if values["unknown_input_requests"] > 0 else "Input tokens reported by the backend.")
+    require(fields["input"]["help"] == input_help
+            and fields["tools"]["help"] == "Observed calls, excluding submitted results; this does not measure execution success."
+            and all(fields[field]["help"] == "" for field in ("output", "requests", "badge")),
+            "Retained value-host help differs from existing usage semantics")
+
+
+def validate_retained_usage_checkpoints(report, mode, *, closed_labels=("07-both-closed-after-probe", "08-closed-after-five-more-seconds"),
+                                        minimum_closed_seconds=5, boundary=None):
+    points = report["runtime"]["checkpoints"]
+    candidate = mode == memory.RETAINED_USAGE_MODE
+    first = memory.retained_usage_contract(points[0]["snapshot"], mode, require_live=candidate)
+    if first is None:
+        return None
+    if mode not in ("normal", memory.RETAINED_USAGE_MODE):
+        return None
+    live = validate_held_usage_checkpoints(report, mode, closed_labels=closed_labels,
+        minimum_closed_seconds=minimum_closed_seconds, boundary=boundary)
+    require(live is not None and live["enabled"] is False, "Retained usage lacks its full live dashboard/compact accounting proof")
+    previous, applied = first, []
+    for point in points:
+        current = memory.retained_usage_contract(point["snapshot"], mode, require_live=candidate)
+        require(current is not None and all(current["counters"][field] >= previous["counters"][field]
+                for field in memory.RETAINED_USAGE_COUNTERS + ("peak_owners",)), "Retained usage intermediate counters regressed or disappeared")
+        if candidate:
+            require(set(current["owners"]) == set(first["owners"])
+                    and current["monitoring_epoch"] == first["monitoring_epoch"]
+                    and all(current["counters"][field] == first["counters"][field] for field in ("hosts_created", "hosts_destroyed")),
+                    "Retained usage recreated hosts or changed live owner/epoch during the workload")
+            owner, entry = next(iter(current["owners"].items()))
+            scalar = memory.scalar_presentation_contract(point["snapshot"], mode)
+            require(owner in scalar["presentation_owners"] and scalar["presentation_owners"][owner]["role"] == "dashboard"
+                    and scalar["presentation_owners"][owner]["presented_values"]["dashboard_usage"]
+                        == {"scope": entry["scope"], "values": entry["values"]},
+                    "Retained applied receipt differs from the native dashboard display witness")
+            validate_retained_applied_fields(entry)
+            if entry["scope"] == "sinceLaunch" and applied:
+                require(all(entry["values"][field] >= applied[-1]["values"][field]
+                            for field in ("output_tokens", "tool_calls", "requests"))
+                        and (entry["values"]["input_tokens"] is None or applied[-1]["values"]["input_tokens"] is None
+                             or entry["values"]["input_tokens"] >= applied[-1]["values"]["input_tokens"]),
+                        "Retained applied since-launch usage regressed during the fixed fixture")
+            stamp = boundary(point) if boundary is not None else (point["resource_sample"]["mach_absolute_seconds"]
+                - sum(report["runtime"][name]["absolute_minus_monotonic_seconds"] for name in ("mach_clock_start", "mach_clock_end")) / 2)
+            steady = report["phase_windows"]["steady"]
+            if steady["start_monotonic_seconds"] < stamp < steady["end_monotonic_seconds"]:
+                require(entry["values"]["active_requests"] == 2, "Retained active usage did not display both steady requests")
+            applied.append(entry)
+        previous = current
+    if candidate:
+        require(previous["counters"]["value_applies"] > first["counters"]["value_applies"],
+                "Retained usage did not actually apply live field updates")
+        require(all(entry["scope"] == applied[0]["scope"] for entry in applied), "Retained usage scope changed during the fixture")
+        work = report["workload"]["validated_work"]
+        before, after = applied[0]["values"], applied[-1]["values"]
+        require(before["active_requests"] == after["active_requests"] == 0, "Retained usage active count did not return to idle")
+        if applied[0]["scope"] == "sinceLaunch":
+            require(all(after[field] - before[field] == work[expected] for field, expected in
+                        (("output_tokens", "output_tokens"), ("tool_calls", "tool_calls"), ("requests", "requests")))
+                    and (before["input_tokens"] is None or after["input_tokens"] is not None
+                         and after["input_tokens"] - before["input_tokens"] == work["prompt_tokens"])
+                    and after["unknown_input_requests"] == before["unknown_input_requests"]
+                    and after["output_is_estimated"] is before["output_is_estimated"],
+                    "Retained applied usage does not match exact final prompt/output/tool/request accounting")
+    closed = []
+    for label in closed_labels:
+        matches = [point for point in report["checkpoints"] if point["label"] == label]
+        require(len(matches) == 1, "Retained usage closed checkpoints are missing or duplicated")
+        current = memory.retained_usage_contract(matches[0]["snapshot"], mode, expected_closed=True)
+        require(current is not None and all(current["counters"][field] >= previous["counters"][field]
+                for field in memory.RETAINED_USAGE_COUNTERS + ("peak_owners",)), "Retained usage cleanup counters regressed")
+        if candidate:
+            require(current["counters"]["hosts_created"] == first["counters"]["hosts_created"]
+                    and current["counters"]["hosts_destroyed"] - first["counters"]["hosts_destroyed"] == len(memory.RETAINED_USAGE_FIELDS),
+                    "Retained usage did not release exactly its five measured hosts")
+        closed.append(current)
+        previous = current
+    require(closed[0] == closed[-1], "Retained usage continued applying fields or retaining resources after closing")
+    return {"enabled": candidate, "acceptance_eligible": True, "promotion_eligible": False if candidate else None,
+            "actually_applied_usage_verified": candidate, "live_unrelated_fields_verified": True,
+            "live_compact_response_final_count": live["live_compact_response_final_count"],
+            "owner": next(iter(first["owners"])) if candidate else None, "monitoring_epoch": first["monitoring_epoch"],
+            "initial_scope": applied[0]["scope"] if candidate else None,
+            "counter_deltas": {field: previous["counters"][field] - first["counters"][field] for field in memory.RETAINED_USAGE_COUNTERS},
+            "closed_current_owners": 0, "closed_live_hosts": 0,
+            "scope": "Live retained dashboard values authenticated by native apply callbacks; separate CPU/GPU targets, no automatic promotion"}
+
+
+def validate_retained_usage_rows(rows):
+    for row in rows:
+        candidate = row.get("mode") == memory.RETAINED_USAGE_MODE
+        work = row.get("retained_usage_work")
+        require(isinstance(work, dict) and work.get("enabled") is candidate and work.get("acceptance_eligible") is True
+                and work.get("actually_applied_usage_verified") is candidate and work.get("live_unrelated_fields_verified") is True
+                and type(work.get("live_compact_response_final_count")) is int
+                and 0 < work["live_compact_response_final_count"] <= 2**64 - 1
+                and type(work.get("closed_current_owners")) is int and work["closed_current_owners"] == 0
+                and type(work.get("closed_live_hosts")) is int and work["closed_live_hosts"] == 0,
+                "Retained usage comparison lacks complete applied-value/lifetime proof")
+        counters = work.get("counter_deltas")
+        require(isinstance(counters, dict) and set(counters) == set(memory.RETAINED_USAGE_COUNTERS)
+                and all(type(count) is int and 0 <= count <= 2**64 - 1 for count in counters.values())
+                and counters["value_apply_attempts"] == counters["value_applies"] + counters["value_apply_skips"],
+                "Retained usage comparison lacks complete reconciled native counters")
+        if candidate:
+            require(work.get("promotion_eligible") is False and isinstance(work.get("owner"), str)
+                    and memory.re.fullmatch(r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}", work["owner"])
+                    and isinstance(work.get("monitoring_epoch"), str)
+                    and memory.re.fullmatch(r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}", work["monitoring_epoch"])
+                    and work.get("initial_scope") in ("sinceLaunch", "selectedPeriod", "today")
+                    and counters["value_applies"] > 0 and counters["hosts_created"] == 0
+                    and counters["hosts_destroyed"] == len(memory.RETAINED_USAGE_FIELDS),
+                    "Retained usage comparison did not apply live fields and release its measured hosts")
+        else:
+            require(all(count == 0 for count in counters.values()) and work.get("owner") is None,
+                    "Normal comparison control executed retained usage work")
 
 
 def validate_scalar_comparison_products(products):
@@ -1818,6 +1964,9 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
         usage_work = validate_held_usage_checkpoints(report, mode)
         if usage_work is not None:
             report["held_usage_work"] = usage_work
+        retained_work = validate_retained_usage_checkpoints(report, mode)
+        if retained_work is not None:
+            report["retained_usage_work"] = retained_work
         held_work = validate_held_static_chart_checkpoints(report, mode)
         if held_work is not None:
             report["held_static_chart_work"] = held_work
@@ -1896,6 +2045,13 @@ def selected_cases(args):
                     "Scalar ablation comparison requires exactly one diagnostic control")
     if memory.HELD_USAGE_MODE in requested or getattr(args, "graphics_mode", None) == memory.HELD_USAGE_MODE:
         require(args.operation == "compare", "Held usage requires the automated normal/held/normal comparison")
+    if args.operation == "compare" and memory.RETAINED_USAGE_MODE in requested:
+        require(args.baseline_mode == "normal", "Retained usage comparison requires the normal baseline")
+        if any(value is not None for value in references):
+            require(getattr(args, "candidate_mode", None) == memory.RETAINED_USAGE_MODE and args.controls is None,
+                    "Retained usage comparison requires one retained candidate and normal reference")
+        else:
+            require(args.controls == [memory.RETAINED_USAGE_MODE], "Retained usage comparison requires exactly one retained control")
     if any(value is not None for value in references):
         require(all(value is not None for value in references),
                 "Frozen reference comparison requires all three reference product/provenance arguments")
@@ -2041,7 +2197,7 @@ def _run(args, deadline):
                                                     "candidate": args.candidate_mode or args.baseline_mode}
             for product in products.values():
                 product["files"] = runtime_product_identity(product["paths"], product["provenance"])
-            if args.operation == "compare" and any(mode in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE) for _label, mode in cases):
+            if args.operation == "compare" and any(mode in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE, memory.RETAINED_USAGE_MODE) for _label, mode in cases):
                 validate_scalar_comparison_products(products)
             report["products"] = {role: {"files": product["files"], "production_provenance": product["provenance"],
                                         "measurement_identity": product["identity"]} for role, product in products.items()}
@@ -2071,6 +2227,7 @@ def _run(args, deadline):
                    "steady_twinkle_delivery": case.get("steady_twinkle_delivery"),
                    "scalar_presentation_work": case.get("scalar_presentation_work"),
                    "held_usage_work": case.get("held_usage_work"),
+                   "retained_usage_work": case.get("retained_usage_work"),
                    "thread_cpu_analysis": case.get("thread_cpu_analysis"),
                    "nio_cpu_analysis": case.get("nio_cpu_analysis"),
                    "visual_work": case.get("visual_work"),
