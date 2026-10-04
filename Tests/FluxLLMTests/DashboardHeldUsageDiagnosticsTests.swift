@@ -39,6 +39,7 @@ final class DashboardHeldUsageDiagnosticsTests: XCTestCase {
             ("atomic chart scales", \.usesAtomicChartScale),
             ("completed lane cache", \.usesCompletedLaneCache),
             ("rail geometry cache", \.usesCachedRailGeometry),
+            ("retained usage fields", \.usesRetainedUsageFields),
             ("held static drawing", \.usesHeldStaticChart),
             ("shared preparation", \.usesSharedChartPreparation),
             ("stable decoration hosts", \.usesStableDecorationHosts),
@@ -62,7 +63,8 @@ final class DashboardHeldUsageDiagnosticsTests: XCTestCase {
             XCTAssertEqual(value.usesFrozenScalarPresentation, value == .runtimeFrozenScalars)
             XCTAssertEqual(
                 value.usesScalarPresentationInstrumentation,
-                [.normal, .runtimeFrozenScalars, .runtimeHeldUsage].contains(value))
+                [.normal, .runtimeFrozenScalars, .runtimeHeldUsage, .runtimeRetainedUsage].contains(
+                    value))
         }
     }
 

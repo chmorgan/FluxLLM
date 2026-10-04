@@ -46,6 +46,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeReuseCaches = "runtime-reuse-caches"
         case runtimeFrozenScalars = "runtime-frozen-scalars"
         case runtimeHeldUsage = "runtime-held-usage"
+        case runtimeRetainedUsage = "runtime-retained-usage"
         case runtimeHeldStaticChart = "runtime-held-static-chart"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
@@ -99,6 +100,7 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeCompletedLaneCache,
                 .runtimeCachedRailGeometry, .runtimeReuseCaches, .runtimeFrozenScalars,
                 .runtimeHeldUsage,
+                .runtimeRetainedUsage,
                 .runtimeHeldStaticChart:
                 true
             default:
@@ -132,8 +134,10 @@ public final class PerformanceGraphicsDiagnostics {
         var usesFrozenScalarPresentation: Bool { self == .runtimeFrozenScalars }
         /// Causal diagnostic only: full-dashboard usage values stay held.
         var usesHeldUsagePresentation: Bool { self == .runtimeHeldUsage }
+        var usesRetainedUsageFields: Bool { self == .runtimeRetainedUsage }
         var usesScalarPresentationInstrumentation: Bool {
             self == .normal || usesFrozenScalarPresentation || usesHeldUsagePresentation
+                || usesRetainedUsageFields
         }
         /// Causal diagnostic only: the displayed static chart intentionally stops updating.
         var usesHeldStaticChart: Bool { self == .runtimeHeldStaticChart }
@@ -158,6 +162,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
                 || usesCompletedLaneCache || usesCachedRailGeometry || usesFrozenScalarPresentation
                 || usesHeldUsagePresentation
+                || usesRetainedUsageFields
                 || usesHeldStaticChart
         }
 
@@ -190,6 +195,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
                 || usesCompletedLaneCache || usesCachedRailGeometry || usesFrozenScalarPresentation
                 || usesHeldUsagePresentation
+                || usesRetainedUsageFields
                 || usesHeldStaticChart
         }
 
@@ -205,6 +211,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
                 || usesCompletedLaneCache || usesCachedRailGeometry || usesFrozenScalarPresentation
                 || usesHeldUsagePresentation
+                || usesRetainedUsageFields
                 || usesHeldStaticChart
         }
 
@@ -314,6 +321,9 @@ public final class PerformanceGraphicsDiagnostics {
 
     static let maximumScalarPresentationOwners = 2
     static let maximumScalarFrameAnchors = 16
+    static let retainedUsageFieldNames: Set<String> = [
+        "input", "output", "tools", "requests", "badge",
+    ]
 
     public static let shared = PerformanceGraphicsDiagnostics()
     public private(set) var mode: Mode = .normal
@@ -344,6 +354,30 @@ public final class PerformanceGraphicsDiagnostics {
         let frames: [String: CGRect]
     }
 
+    private struct RetainedUsageOwner {
+        var liveFields: Set<String> = []
+        var appliedFields: Set<String> = []
+        var epoch: UUID?
+        var scope: UsageScope?
+        var usage: UsageSummary?
+        var fields: [String: [String: String]] = [:]
+
+        mutating func clearPresentation() {
+            epoch = nil
+            scope = nil
+            usage = nil
+            fields.removeAll(keepingCapacity: false)
+        }
+
+        var snapshot: [String: Any] {
+            [
+                "role": "dashboard", "epoch": epoch?.uuidString as Any? ?? NSNull(),
+                "scope": scope?.rawValue as Any? ?? NSNull(),
+                "values": usage.map(DashboardHeldUsage.values(for:)) ?? [:], "fields": fields,
+            ]
+        }
+    }
+
     private var scalarLeafBodyUpdates: [ScalarLeaf: UInt64] = [:]
     private var scalarPresentationOwners: [UUID: ScalarPresentationOwner] = [:]
     private var frozenScalarOwners: [UUID: FrozenScalarOwner] = [:]
@@ -351,6 +385,13 @@ public final class PerformanceGraphicsDiagnostics {
     private var usageCaptures: UInt64 = 0
     private var usageReleases: UInt64 = 0
     private var usagePeakOwners: UInt64 = 0
+    private var retainedUsageOwners: [UUID: RetainedUsageOwner] = [:]
+    private var retainedUsageHostsCreated: UInt64 = 0
+    private var retainedUsageHostsDestroyed: UInt64 = 0
+    private var retainedUsagePeakOwners: UInt64 = 0
+    private var retainedUsageValueApplyAttempts: UInt64 = 0
+    private var retainedUsageValueApplies: UInt64 = 0
+    private var retainedUsageValueApplySkips: UInt64 = 0
     private var dashboardLayoutCounters: LayoutCounters?
     private var scalarFreezesCaptured: UInt64 = 0
     private var scalarFreezesReleased: UInt64 = 0
@@ -599,7 +640,8 @@ public final class PerformanceGraphicsDiagnostics {
         guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty,
             metalPrimitiveEffectsHosts.isEmpty
         else { throw ConfigurationError.liveCanvases }
-        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty, heldUsageOwners.isEmpty
+        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty, heldUsageOwners.isEmpty,
+            retainedUsageOwners.isEmpty
         else {
             throw ConfigurationError.liveScalarPresentations
         }
@@ -617,7 +659,8 @@ public final class PerformanceGraphicsDiagnostics {
         guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty,
             metalPrimitiveEffectsHosts.isEmpty
         else { throw ConfigurationError.liveCanvases }
-        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty, heldUsageOwners.isEmpty
+        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty, heldUsageOwners.isEmpty,
+            retainedUsageOwners.isEmpty
         else {
             throw ConfigurationError.liveScalarPresentations
         }
@@ -662,6 +705,13 @@ public final class PerformanceGraphicsDiagnostics {
         usageCaptures = 0
         usageReleases = 0
         usagePeakOwners = 0
+        retainedUsageOwners.removeAll(keepingCapacity: false)
+        retainedUsageHostsCreated = 0
+        retainedUsageHostsDestroyed = 0
+        retainedUsagePeakOwners = 0
+        retainedUsageValueApplyAttempts = 0
+        retainedUsageValueApplies = 0
+        retainedUsageValueApplySkips = 0
         dashboardLayoutCounters?.reset(enabled: false)
         dashboardLayoutCounters = nil
         scalarFreezesCaptured = 0
@@ -1391,9 +1441,9 @@ public final class PerformanceGraphicsDiagnostics {
     func recordScalarPresentedValues(
         _ leaf: ScalarLeaf, owner: UUID, compact: Bool, values: [String: Any]
     ) {
-        guard scalarInstrumentationEnabled, mode == .normal || mode.usesHeldUsagePresentation else {
-            return
-        }
+        guard scalarInstrumentationEnabled,
+            mode == .normal || mode.usesHeldUsagePresentation || mode.usesRetainedUsageFields
+        else { return }
         guard var receipt = scalarPresentationOwners[owner] else {
             invalidEvents += 1
             return
@@ -1521,6 +1571,7 @@ public final class PerformanceGraphicsDiagnostics {
     func frozenScalarPresentationReleased(owner: UUID) {
         guard scalarInstrumentationEnabled else { return }
         heldUsagePresentationReleased(owner: owner)
+        releaseRetainedUsagePresentation(owner: owner)
         if frozenScalarOwners[owner] != nil {
             let released = scalarFreezesReleased.addingReportingOverflow(1)
             guard !released.overflow else {
@@ -1569,6 +1620,142 @@ public final class PerformanceGraphicsDiagnostics {
         }
         heldUsageOwners.removeValue(forKey: owner)
         usageReleases = released.partialValue
+    }
+
+    /// Each native value field registers once. Creation precedes the anchor
+    /// callback, so a complete dashboard witness is required at presentation.
+    @discardableResult
+    func retainedUsageHostCreated(owner: UUID, field: String) -> Bool {
+        guard isEnabled, mode.usesRetainedUsageFields else { return false }
+        guard Self.retainedUsageFieldNames.contains(field),
+            retainedUsageOwners.isEmpty || retainedUsageOwners[owner] != nil,
+            scalarPresentationOwners[owner]?.role != "popover",
+            !(retainedUsageOwners[owner]?.liveFields.contains(field) ?? false)
+        else {
+            invalidEvents += 1
+            return false
+        }
+        let created = retainedUsageHostsCreated.addingReportingOverflow(1)
+        guard !created.overflow else {
+            invalidEvents += 1
+            return false
+        }
+        var receipt = retainedUsageOwners[owner] ?? RetainedUsageOwner()
+        receipt.liveFields.insert(field)
+        retainedUsageOwners[owner] = receipt
+        retainedUsageHostsCreated = created.partialValue
+        retainedUsagePeakOwners = max(retainedUsagePeakOwners, UInt64(retainedUsageOwners.count))
+        return true
+    }
+
+    func retainedUsageHostDestroyed(owner: UUID, field: String) {
+        guard isEnabled, mode.usesRetainedUsageFields else { return }
+        guard Self.retainedUsageFieldNames.contains(field) else {
+            invalidEvents += 1
+            return
+        }
+        guard var receipt = retainedUsageOwners[owner], receipt.liveFields.contains(field) else {
+            return
+        }
+        let destroyed = retainedUsageHostsDestroyed.addingReportingOverflow(1)
+        guard !destroyed.overflow else {
+            invalidEvents += 1
+            return
+        }
+        receipt.liveFields.remove(field)
+        receipt.appliedFields.remove(field)
+        receipt.clearPresentation()
+        retainedUsageHostsDestroyed = destroyed.partialValue
+        if receipt.liveFields.isEmpty {
+            retainedUsageOwners.removeValue(forKey: owner)
+        } else {
+            retainedUsageOwners[owner] = receipt
+        }
+        clearRetainedUsagePresentedValues(owner: owner)
+    }
+
+    /// A callback records whether the native value/help properties needed an
+    /// actual write. Skipped writes remain distinct from missing native work.
+    @discardableResult
+    func retainedUsageValueApplied(owner: UUID, field: String, changed: Bool) -> Bool {
+        guard isEnabled, mode.usesRetainedUsageFields else { return false }
+        guard Self.retainedUsageFieldNames.contains(field),
+            retainedUsageOwners[owner]?.liveFields.contains(field) == true
+        else {
+            invalidEvents += 1
+            return false
+        }
+        let attempts = retainedUsageValueApplyAttempts.addingReportingOverflow(1)
+        let applies = retainedUsageValueApplies.addingReportingOverflow(changed ? 1 : 0)
+        let skips = retainedUsageValueApplySkips.addingReportingOverflow(changed ? 0 : 1)
+        guard !attempts.overflow, !applies.overflow, !skips.overflow else {
+            invalidEvents += 1
+            return false
+        }
+        retainedUsageValueApplyAttempts = attempts.partialValue
+        retainedUsageValueApplies = applies.partialValue
+        retainedUsageValueApplySkips = skips.partialValue
+        retainedUsageOwners[owner]?.appliedFields.insert(field)
+        return true
+    }
+
+    /// The native coordinator supplies actual displayed strings and help, once
+    /// all five fields and the matching dashboard frame witness are present.
+    @discardableResult
+    func retainedUsagePresentationApplied(
+        owner: UUID, epoch: UUID, scope: UsageScope, usage: UsageSummary,
+        fields: [String: [String: String]]
+    ) -> Bool {
+        guard isEnabled, mode.usesRetainedUsageFields else { return false }
+        guard var receipt = retainedUsageOwners[owner],
+            receipt.liveFields == Self.retainedUsageFieldNames,
+            receipt.appliedFields == Self.retainedUsageFieldNames,
+            let current = scalarPresentationOwners[owner], current.role == "dashboard",
+            DashboardHeldUsage.requiredFrames.isSubset(of: Set(current.frames.keys)),
+            validScalarFrames(current.frames), validRetainedUsage(usage),
+            Set(fields.keys) == Self.retainedUsageFieldNames,
+            fields.values.allSatisfy({ field in
+                Set(field.keys) == ["value", "help"]
+                    && field.values.allSatisfy { $0.utf8.count <= 4096 }
+            })
+        else {
+            invalidEvents += 1
+            return false
+        }
+        receipt.epoch = epoch
+        receipt.scope = scope
+        receipt.usage = usage
+        receipt.fields = fields
+        retainedUsageOwners[owner] = receipt
+        recordScalarPresentedValues(
+            .details, owner: owner, compact: false,
+            values: ["scope": scope.rawValue, "values": DashboardHeldUsage.values(for: usage)])
+        return true
+    }
+
+    private func validRetainedUsage(_ usage: UsageSummary) -> Bool {
+        (usage.inputTokens.map { $0 >= 0 } ?? true) && usage.unknownInputRequests >= 0
+            && usage.outputTokens >= 0 && usage.toolCalls >= 0
+            && usage.requests >= 0 && usage.activeRequests >= 0
+    }
+
+    private func clearRetainedUsagePresentedValues(owner: UUID) {
+        guard var current = scalarPresentationOwners[owner] else { return }
+        current.presentedValues.removeValue(forKey: "dashboard_usage")
+        scalarPresentationOwners[owner] = current
+    }
+
+    private func releaseRetainedUsagePresentation(owner: UUID) {
+        guard let receipt = retainedUsageOwners[owner] else { return }
+        let destroyed = retainedUsageHostsDestroyed.addingReportingOverflow(
+            UInt64(receipt.liveFields.count))
+        guard !destroyed.overflow else {
+            invalidEvents += 1
+            return
+        }
+        retainedUsageOwners.removeValue(forKey: owner)
+        retainedUsageHostsDestroyed = destroyed.partialValue
+        clearRetainedUsagePresentedValues(owner: owner)
     }
 
     private func validScalarRole(_ role: String) -> Bool {
@@ -1658,6 +1845,21 @@ public final class PerformanceGraphicsDiagnostics {
                 "owners": Dictionary(
                     uniqueKeysWithValues: heldUsageOwners.map {
                         ($0.key.uuidString, $0.value.diagnostics)
+                    }),
+            ] as [String: Any],
+            "retained_usage_fields": isEnabled && mode.usesRetainedUsageFields,
+            "retained_usage": [
+                "enabled": isEnabled && mode.usesRetainedUsageFields,
+                "hosts_created": retainedUsageHostsCreated,
+                "hosts_destroyed": retainedUsageHostsDestroyed,
+                "current_owners": UInt64(retainedUsageOwners.count),
+                "peak_owners": retainedUsagePeakOwners,
+                "value_apply_attempts": retainedUsageValueApplyAttempts,
+                "value_applies": retainedUsageValueApplies,
+                "value_apply_skips": retainedUsageValueApplySkips,
+                "owners": Dictionary(
+                    uniqueKeysWithValues: retainedUsageOwners.map {
+                        ($0.key.uuidString, $0.value.snapshot)
                     }),
             ] as [String: Any],
             "native_canvas_frames": scalarInstrumentationEnabled
