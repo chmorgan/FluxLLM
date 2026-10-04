@@ -30,7 +30,7 @@ REQUEST_INDICES = (CYCLE * 32, CYCLE * 32 + 1)
 STAGE = {"activity": "high-rate", "seconds": 8}
 WORK = {"chunks": 3200, "output_tokens": 6434, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
-MODES = ("normal", memory.METAL_ARRIVAL_MODE, *memory.METAL_CHART_MODES, *memory.NEW_RUNTIME_MODES, *memory.REUSE_RUNTIME_MODES)
+MODES = ("normal", memory.METAL_ARRIVAL_MODE, *memory.METAL_CHART_MODES, *memory.NEW_RUNTIME_MODES, *memory.REUSE_RUNTIME_MODES, memory.FROZEN_SCALARS_MODE)
 ERRORS = (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError)
 
 
@@ -328,6 +328,11 @@ def validate_report(report, mode):
     report["visual_work"] = validate_visual_identity(report)
     report["runtime_work"] = runtime.validate_runtime_work(points[0]["snapshot"], points[-1]["snapshot"], mode)
     report["canvas_clock_work"] = validate_short_clock_work(report, mode)
+    scalar_work = runtime.validate_scalar_presentation_checkpoints(report, mode,
+        closed_labels=("closed-start", "closed-end"), minimum_closed_seconds=2,
+        boundary=lambda point: snapshot_time(report, point))
+    if scalar_work is not None:
+        report["scalar_presentation_work"] = scalar_work
     # Reuse strict Mach/sample validation; these traced CPU values are diagnostics only.
     report["phase_cpu"] = runtime.phase_cpu(report, report["phase_windows"])
     for point in report["checkpoints"]:
@@ -438,6 +443,14 @@ def qualify_result(result):
         if row.get("mode") in (*memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES):
             row.update(promotion_eligible=False,
                        promotion_reason="Experimental renderer requires independent visual and frame-delivery qualification")
+        if row.get("mode") == memory.FROZEN_SCALARS_MODE:
+            row.update(promotion_eligible=False, gpu_acceptance_eligible=False,
+                       promotion_reason="Frozen scalar presentation is a diagnostic ablation, not live production presentation")
+            for name, window, available_window in (("runtime", workload, available), ("lifetime", lifetime, life_available)):
+                observed = row["gpu_target"][name]["within_limit"]
+                row["gpu_target"][name].update(evaluated=False, acceptance_eligible=False, within_limit=None,
+                    observed_within_limit=observed if available_window else None,
+                    reason="Frozen scalar presentation is a diagnostic ablation")
         if not available or not life_available:
             result["errors"].append(row["label"] + ": GPU window or owned exit/command-completion proof incomplete")
     if not provider_valid:

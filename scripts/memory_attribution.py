@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 import os
+import math
 from pathlib import Path
 import re
 import secrets
@@ -32,6 +33,11 @@ UNGROUPED_CANVAS_MODE = "runtime-ungrouped-canvas"
 NATIVE_CANVAS_GROUP_COUNTERS = ("ungrouped_native_canvas_draws", "grouped_native_canvas_draws")
 NO_ARRIVAL_MODE = "runtime-no-arrival-effects"
 HELD_STATIC_CHART_MODE = "runtime-held-static-chart"
+FROZEN_SCALARS_MODE = "runtime-frozen-scalars"
+SCALAR_LEAVES = ("header", "metrics", "details", "card_footer", "app_footer")
+SCALAR_PRESENTATION_COUNTERS = ("layout_size_calls", "layout_place_calls", "layout_child_measurements",
+                                "freezes_captured", "freezes_released")
+SCALAR_PRESENTATION_GAUGES = ("current_frozen_owners", "peak_frozen_owners")
 HELD_STATIC_CHART_COUNTERS = ("drawing_update_attempts", "drawing_updates_applied", "drawing_updates_held", "drawing_hold_resets")
 METAL_ARRIVAL_MODE = "runtime-metal-arrival-bursts"
 METAL_ARRIVAL_COUNTERS = ("metal_arrival_frames", "metal_arrival_submissions", "metal_arrival_failures")
@@ -85,7 +91,7 @@ DEFERRED_TOOL_GEOMETRY_MODE = "runtime-deferred-tool-geometry"
 DEFERRED_TOOL_GEOMETRY_2HZ_MODE = "runtime-deferred-tool-geometry-2hz"
 DEFERRED_TOOL_GEOMETRY_MODES = (DEFERRED_TOOL_GEOMETRY_MODE, DEFERRED_TOOL_GEOMETRY_2HZ_MODE)
 TOOL_PATH_POINT_COUNTERS = ("tool_path_input_points", "tool_path_output_points")
-ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE) + DEFERRED_TOOL_GEOMETRY_MODES + NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES
+ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE) + DEFERRED_TOOL_GEOMETRY_MODES + NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES
 CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + tuple(mode for mode in ORDERED_PUBLICATION_MODES if mode not in METAL_CHART_MODES)
 NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized", *METAL_CHART_MODES) + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
@@ -113,6 +119,11 @@ NATIVE_ERROR = re.compile(r"(?im)^\s*(?:error\b|warning\b|(?:footprint|vmmap|hea
 
 def unsigned(value, name):
     return number(value, name, integer=True)
+
+
+def finite_numeric(value):
+    return (type(value) in (int, float) and -sys.float_info.max <= value <= sys.float_info.max
+            and math.isfinite(value))
 
 
 def footprint_group(name):
@@ -433,19 +444,24 @@ def twinkle_delivery_contract(snapshot, mode):
 
 
 def runtime_feature_contract(value, mode):
-    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + NEW_RUNTIME_FLAGS + REUSE_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing")):
+    if mode not in RUNTIME_MODES and not any(field in value for field in RUNTIME_FLAGS + NEXT_RUNTIME_FLAGS + NEW_RUNTIME_FLAGS + REUSE_RUNTIME_FLAGS + ("canvas_frame_clock", "ordered_chart_publication", "direct_tool_plot", "ungrouped_native_canvas", "arrival_effects_enabled", "compact_tool_paths_enabled", "deferred_tool_geometry_enabled", "metal_arrival_bursts_enabled", "holds_static_chart_drawing", "frozen_scalar_presentation_enabled")):
         return None
     extras = {}
     for field, enabled_modes in zip(NEW_RUNTIME_FLAGS, (PRIMITIVE_EFFECTS_MODES, BATCHED_TELEMETRY_MODES, ATOMIC_CHART_SCALE_MODES)):
-        if mode in NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES or field in value:
+        if mode in NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE,) or field in value:
             require(type(value.get(field)) is bool and value[field] is (mode in enabled_modes),
                     f"Graphics {field} does not match the requested runtime control")
             extras[field] = value[field]
     for field, enabled_modes in zip(REUSE_RUNTIME_FLAGS, (COMPLETED_LANE_CACHE_MODES, CACHED_RAIL_GEOMETRY_MODES)):
-        if mode in REUSE_RUNTIME_MODES or field in value:
+        if mode in REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE,) or field in value:
             require(type(value.get(field)) is bool and value[field] is (mode in enabled_modes),
                     f"Graphics {field} does not match the requested runtime control")
             extras[field] = value[field]
+    if mode == FROZEN_SCALARS_MODE or "frozen_scalar_presentation_enabled" in value:
+        require(type(value.get("frozen_scalar_presentation_enabled")) is bool
+                and value["frozen_scalar_presentation_enabled"] is (mode == FROZEN_SCALARS_MODE),
+                "Graphics frozen_scalar_presentation_enabled does not match the requested runtime control")
+        extras["frozen_scalar_presentation_enabled"] = value["frozen_scalar_presentation_enabled"]
     if mode in METAL_CHART_MODES or "metal_full_chart_enabled" in value:
         require(type(value.get("metal_full_chart_enabled")) is bool
                 and value["metal_full_chart_enabled"] is (mode in METAL_CHART_MODES),
@@ -542,7 +558,7 @@ def tool_path_point_counts(snapshot):
 
 def chart_publication_interval(value, mode):
     field = "chart_publication_interval_seconds"
-    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, *NEW_RUNTIME_MODES, *REUSE_RUNTIME_MODES):
+    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, *NEW_RUNTIME_MODES, *REUSE_RUNTIME_MODES):
         return None
     interval = value.get(field)
     expected = .5 if mode == DEFERRED_TOOL_GEOMETRY_2HZ_MODE else 1.0
@@ -853,6 +869,107 @@ def reuse_cache_contract(snapshot, mode, *, completed_visible_workload=False, ex
     return result
 
 
+def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expected_closed=False):
+    """Authenticate the scalar ablation without treating held UI as a gate pass."""
+    value = snapshot.get("graphics_diagnostics", {})
+    fields = ("frozen_scalar_presentation_enabled", "scalar_instrumentation_enabled", "scalar_presentation")
+    if mode != FROZEN_SCALARS_MODE and not any(field in value for field in fields):
+        return None
+    enabled, instrumented = mode == FROZEN_SCALARS_MODE, mode in ("normal", FROZEN_SCALARS_MODE)
+    for field, expected in zip(fields[:2], (enabled, instrumented)):
+        require(type(value.get(field)) is bool and value[field] is expected,
+                f"Graphics {field} does not match the requested scalar diagnostic")
+    raw = value.get("scalar_presentation")
+    require(isinstance(raw, dict), "Scalar presentation diagnostic counters are missing")
+    counts = {}
+    for field in SCALAR_PRESENTATION_COUNTERS + SCALAR_PRESENTATION_GAUGES:
+        count = raw.get(field)
+        require(type(count) is int and 0 <= count <= 2**64 - 1,
+                f"scalar_presentation.{field} must be a complete UInt64 counter")
+        counts[field] = count
+
+    def leaf_counts(values, label):
+        require(isinstance(values, dict) and set(values) == set(SCALAR_LEAVES), f"{label} requires all five scalar leaf counters")
+        require(all(type(count) is int and 0 <= count <= 2**64 - 1 for count in values.values()),
+                f"{label} must contain complete UInt64 counters")
+        return values
+
+    leaves = leaf_counts(raw.get("leaf_body_updates"), "scalar_presentation.leaf_body_updates")
+
+    def frames(values, label):
+        require(isinstance(values, dict) and len(values) <= 16, f"{label} frame inventory is invalid")
+        for name, rect in values.items():
+            require(isinstance(name, str) and 0 < len(name.encode()) <= 64 and isinstance(rect, dict)
+                    and set(rect) == {"x", "y", "width", "height"}, f"{label} frame is missing or malformed")
+            require(all(finite_numeric(rect[field]) for field in rect)
+                    and rect["width"] > 0 and rect["height"] > 0
+                    and math.isfinite(float(rect["x"]) + float(rect["width"]))
+                    and math.isfinite(float(rect["y"]) + float(rect["height"])), f"{label} frame must be finite and positive")
+        return values
+
+    frozen, owners = raw.get("frozen_owners"), raw.get("presentation_owners")
+    for name, entries in (("frozen_owners", frozen), ("presentation_owners", owners)):
+        require(isinstance(entries, dict) and len(entries) <= 2, f"Scalar {name} owner inventory is invalid")
+        roles = []
+        for owner, entry in entries.items():
+            require(isinstance(owner, str) and re.fullmatch(r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}", owner)
+                    and isinstance(entry, dict), f"Scalar {name} owner identity is invalid")
+            role = entry.get("role")
+            require(role in ("dashboard", "popover") or name == "presentation_owners" and role is None,
+                    f"Scalar {name} owner role is invalid")
+            if role is not None:
+                roles.append(role)
+            if name == "frozen_owners":
+                require(isinstance(entry.get("capture_identity"), str)
+                        and re.fullmatch(r"[0-9a-f]{64}", entry["capture_identity"]),
+                        "Frozen scalar capture identity is incomplete")
+                require(bool(frames(entry.get("frames"), "Frozen scalar captured")), "Frozen scalar capture lacks native frames")
+            else:
+                frames(entry.get("current_frames"), "Scalar current")
+                leaf_counts(entry.get("leaf_body_updates"), "Scalar owner leaf_body_updates")
+        require(len(roles) == len(set(roles)), f"Scalar {name} owner roles are duplicated")
+    require(counts["freezes_captured"] >= counts["freezes_released"]
+            and counts["freezes_captured"] - counts["freezes_released"] == counts["current_frozen_owners"] == len(frozen)
+            and counts["current_frozen_owners"] <= counts["peak_frozen_owners"] <= counts["freezes_captured"] <= 2,
+            "Frozen scalar owner capture/release counters do not reconcile")
+    require(set(frozen) <= set(owners), "Frozen scalar owners lack live presentation ownership")
+    for owner, entry in frozen.items():
+        require(entry["role"] == owners[owner]["role"], "Frozen scalar owner role differs from live presentation")
+    require(all(sum(entry["leaf_body_updates"][leaf] for entry in owners.values()) <= leaves[leaf] for leaf in SCALAR_LEAVES),
+            "Scalar owner body updates exceed aggregate counters")
+    if not enabled:
+        require(not frozen and all(counts[field] == 0 for field in
+                    ("freezes_captured", "freezes_released") + SCALAR_PRESENTATION_GAUGES),
+                "Non-frozen mode held scalar presentation")
+    if not instrumented:
+        require(not owners and all(count == 0 for count in counts.values()) and all(count == 0 for count in leaves.values()),
+                "Inactive scalar instrumentation executed work")
+    native = value.get("native_canvas_frames")
+    native_draws = value.get("native_canvas_draws")
+    require(isinstance(native, dict) and len(native) <= 2, "Scalar diagnostic native chart frame inventory is incomplete")
+    require(isinstance(native_draws, dict) and set(native_draws) == set(native)
+            and all(type(count) is int and 0 <= count <= 2**64 - 1 for count in native_draws.values()),
+            "Scalar diagnostic per-chart drawing counters are incomplete or invalid")
+    for identity, frame in native.items():
+        require(isinstance(identity, str) and re.fullmatch(r"[1-9][0-9]{0,19}", identity)
+                and int(identity) <= 2**64 - 1 and isinstance(frame, dict) and frame.get("role") == "static_chart"
+                and set(frame) == {"role", "width", "height", "scale"}, "Scalar diagnostic native chart identity is invalid")
+        require(all(finite_numeric(frame[field]) and frame[field] >= 0
+                    for field in ("width", "height", "scale")), "Scalar diagnostic native chart geometry is invalid")
+    if require_frozen:
+        require(enabled and counts["freezes_captured"] == counts["current_frozen_owners"] == 2
+                and counts["freezes_released"] == 0 and len(owners) == 2
+                and {entry["role"] for entry in frozen.values()} == {"dashboard", "popover"},
+                "Runtime scalar ablation requires exactly two captured visible owners")
+    if expected_closed:
+        require(not owners and not frozen and not native and counts["current_frozen_owners"] == 0,
+                "Scalar diagnostic owners or native charts remain live after closing")
+    return {"enabled": enabled, "instrumented": instrumented, "counters": counts,
+            "leaf_body_updates": leaves, "frozen_owners": frozen, "presentation_owners": owners,
+            "native_canvas_frames": native, "native_canvas_draws": native_draws,
+            "acceptance_eligible": False if enabled else True}
+
+
 def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False,
                       require_native_normal=False):
     value = snapshot.get("graphics_diagnostics")
@@ -882,6 +999,12 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
     atomic_chart_scale = atomic_chart_scale_contract(snapshot, mode, completed_visible_workload=completed_visible_workload)
     reuse_caches = reuse_cache_contract(snapshot, mode, completed_visible_workload=completed_visible_workload,
                                        expected_closed=expected_closed)
+    scalar_presentation = scalar_presentation_contract(snapshot, mode,
+        require_frozen=completed_visible_workload and mode == FROZEN_SCALARS_MODE and not expected_closed,
+        expected_closed=expected_closed)
+    if completed_visible_workload and mode == FROZEN_SCALARS_MODE:
+        require(scalar_presentation["counters"]["freezes_captured"] == 2,
+                "Completed scalar diagnostic never captured both visible owners")
     if (mode in (COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE) + DEFERRED_TOOL_GEOMETRY_MODES or "compact_tool_paths_enabled" in value
             or any(field in snapshot for field in TOOL_PATH_POINT_COUNTERS)):
         require("compact_tool_paths_enabled" in value or contract not in NATIVE_GPU_MODES,
@@ -1108,6 +1231,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             **({"batched_telemetry": batched_telemetry} if batched_telemetry is not None else {}),
             **({"atomic_chart_scale": atomic_chart_scale} if atomic_chart_scale is not None else {}),
             **({"reuse_caches": reuse_caches} if reuse_caches is not None else {}),
+            **({"scalar_presentation": scalar_presentation} if scalar_presentation is not None else {}),
             **({"arrival_backend": metal_arrival["arrival_backend"]} if metal_arrival and metal_arrival["arrival_backend"] is not None else {}),
             **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {}),
             **({"runtime_feature_contract": runtime_features} if runtime_features is not None else {}),

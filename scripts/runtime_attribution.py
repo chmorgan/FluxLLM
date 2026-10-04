@@ -41,7 +41,7 @@ BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal", memory.ORDER
 
 
 def cpu_acceptance_eligible(mode, *, profile=False):
-    return not profile and mode not in (memory.HELD_STATIC_CHART_MODE, *memory.PRIMITIVE_EFFECTS_MODES,
+    return not profile and mode not in (memory.HELD_STATIC_CHART_MODE, memory.FROZEN_SCALARS_MODE, *memory.PRIMITIVE_EFFECTS_MODES,
                                        *memory.METAL_CHART_MODES)
 
 
@@ -188,6 +188,221 @@ def validate_reuse_cache_phase_work(report, mode, *, closed_labels=("07-both-clo
             "closed_current_entries": dict.fromkeys((spec[0] for spec in memory.REUSE_CACHE_SPECS), 0),
             "semantic_parity_required": True,
             "scope": "Executed bounded caches with unchanged visible Canvas effects and retained glints; counters do not measure CPU or GPU"}
+
+
+SCALAR_CRITICAL_FRAMES = {
+    "dashboard": ("activity-chart", "main-activity-plot", "request-rail-band", "native-window"),
+    "popover": ("activity-chart", "main-activity-plot", "native-window"),
+}
+
+
+def scalar_presentation_work(before, after, mode):
+    first = memory.scalar_presentation_contract(before, mode, require_frozen=mode == memory.FROZEN_SCALARS_MODE)
+    last = memory.scalar_presentation_contract(after, mode, require_frozen=mode == memory.FROZEN_SCALARS_MODE)
+    require((first is None) == (last is None), "Scalar diagnostic instrumentation changed during runtime")
+    if first is None:
+        return None
+    require(first["enabled"] == last["enabled"] and first["instrumented"] == last["instrumented"],
+            "Scalar diagnostic enabled metadata changed during runtime")
+    fields = memory.SCALAR_PRESENTATION_COUNTERS + ("peak_frozen_owners",)
+    require(all(last["counters"][field] >= first["counters"][field] for field in fields)
+            and all(last["leaf_body_updates"][leaf] >= first["leaf_body_updates"][leaf] for leaf in memory.SCALAR_LEAVES),
+            "Scalar presentation counters moved backwards")
+    if mode == memory.FROZEN_SCALARS_MODE:
+        require(first["frozen_owners"] == last["frozen_owners"], "Held scalar snapshot identity or captured frames changed")
+    require(set(first["native_canvas_draws"]) == set(last["native_canvas_draws"])
+            and all(last["native_canvas_draws"][identity] >= count for identity, count in first["native_canvas_draws"].items()),
+            "Scalar diagnostic per-chart drawing counters changed or moved backwards")
+    return {"enabled": first["enabled"], "counter_deltas": {field: last["counters"][field] - first["counters"][field]
+            for field in memory.SCALAR_PRESENTATION_COUNTERS},
+            "leaf_body_update_deltas": {leaf: last["leaf_body_updates"][leaf] - first["leaf_body_updates"][leaf]
+                                         for leaf in memory.SCALAR_LEAVES},
+            "native_canvas_draw_deltas": {identity: last["native_canvas_draws"][identity] - count
+                                           for identity, count in first["native_canvas_draws"].items()},
+            "acceptance_eligible": False if first["enabled"] else True}
+
+
+def validate_scalar_presentation_checkpoints(report, mode, *, closed_labels=("07-both-closed-after-probe", "08-closed-after-five-more-seconds"),
+                                             minimum_closed_seconds=5, boundary=None):
+    """Held presentation changes the UI workload and can never qualify a gate."""
+    points = report["runtime"]["checkpoints"]
+    first = memory.scalar_presentation_contract(points[0]["snapshot"], mode, require_frozen=mode == memory.FROZEN_SCALARS_MODE)
+    commands = [entry for entry in report.get("commands", []) if entry.get("command") == "freeze_scalars"]
+    if mode != memory.FROZEN_SCALARS_MODE:
+        require(not commands, "Normal control unexpectedly issued a scalar-freeze command")
+    if first is None:
+        return None
+    if mode not in ("normal", memory.FROZEN_SCALARS_MODE):
+        return scalar_presentation_work(points[0]["snapshot"], points[-1]["snapshot"], mode)
+    if boundary is None:
+        clocks = report["runtime"]
+        offset = sum(clocks[name]["absolute_minus_monotonic_seconds"] for name in ("mach_clock_start", "mach_clock_end")) / 2
+
+        def boundary(point):
+            snapshot, sample = point["snapshot"], point["resource_sample"]
+            matches = [row for row in report["samples"]
+                       if row["monotonic_seconds"] == snapshot.get("runner_collector_sample_monotonic_seconds")]
+            require(len(matches) == 1 and matches[0] == sample
+                    and all(sample.get(field) == report["owned_identity"][field] for field in ("process_id", "birth_time_us")),
+                    "Scalar checkpoint lacks its authenticated kernel boundary")
+            return sample["mach_absolute_seconds"] - offset
+    stamps = [boundary(point) for point in points]
+    if mode == memory.FROZEN_SCALARS_MODE:
+        acknowledgment = report["runtime"].get("scalar_freeze_acknowledgment")
+        require(len(commands) == 1 and isinstance(acknowledgment, dict) and commands[0].get("response") == acknowledgment
+                and acknowledgment.get("type") == "ack" and acknowledgment.get("command") == "freeze_scalars"
+                and isinstance(acknowledgment.get("command_id"), str) and acknowledgment["command_id"].startswith("runner-")
+                and acknowledgment.get("status") == "ok", "Scalar freeze lacks one authenticated pre-runtime acknowledgment")
+        edges = [acknowledgment.get("collector_control_before_seconds"), acknowledgment.get("collector_control_after_seconds")]
+        require(all(memory.finite_numeric(edge) and edge >= 0 for edge in edges)
+                and edges[0] <= edges[1] <= points[0]["snapshot"]["runner_collector_sample_monotonic_seconds"],
+                "Scalar freeze did not complete before the measured before-traffic boundary")
+        captured = acknowledgment.get("snapshot")
+        require(isinstance(captured, dict) and captured.get("dashboard_visible") is True and captured.get("popover_visible") is True
+                and captured.get("active_requests") == 0, "Scalar freeze acknowledgment did not capture two visible idle windows")
+        ack = memory.scalar_presentation_contract(captured, mode, require_frozen=True)
+        require(ack["frozen_owners"] == first["frozen_owners"], "Scalar freeze identity changed before traffic")
+
+    def geometry(contract):
+        owners = contract["presentation_owners"]
+        require(len(owners) == 2 and {entry["role"] for entry in owners.values()} == {"dashboard", "popover"},
+                "Scalar runtime requires exactly two visible presentation owners")
+        result = {}
+        for owner, entry in owners.items():
+            role = entry["role"]
+            frames = entry["current_frames"]
+            require(set(SCALAR_CRITICAL_FRAMES[role]) <= set(frames), "Scalar runtime critical chart/native-window frames are incomplete")
+            result[role] = {name: ({field: frames[name][field] for field in ("width", "height")}
+                                   if name == "native-window" else frames[name]) for name in SCALAR_CRITICAL_FRAMES[role]}
+            if mode == memory.FROZEN_SCALARS_MODE:
+                captured = contract["frozen_owners"][owner]["frames"]
+                require(set(SCALAR_CRITICAL_FRAMES[role]) <= set(captured)
+                        and all(all(captured[name][field] == frames[name][field] for field in
+                                    (("width", "height") if name == "native-window" else ("x", "y", "width", "height")))
+                                for name in SCALAR_CRITICAL_FRAMES[role]),
+                        "Frozen scalar live chart or native-window frames differ from capture")
+        native = contract["native_canvas_frames"]
+        require(len(native) == 2 and all(all(frame[field] > 0 for field in ("width", "height", "scale")) for frame in native.values()),
+                "Scalar runtime lacks positive live native chart geometry")
+        return result
+
+    frames = geometry(first)
+    window_origins = []
+    previous = first
+    for point in points:
+        snapshot = point["snapshot"]
+        require(snapshot.get("dashboard_visible") is True and snapshot.get("popover_visible") is True,
+                "Scalar runtime lost either visible window")
+        current = memory.scalar_presentation_contract(snapshot, mode, require_frozen=mode == memory.FROZEN_SCALARS_MODE)
+        require(geometry(current) == frames and current["native_canvas_frames"] == first["native_canvas_frames"],
+                "Scalar runtime chart or native-window geometry changed")
+        require(all(current["native_canvas_draws"][identity] >= count for identity, count in previous["native_canvas_draws"].items()),
+                "Scalar diagnostic intermediate per-chart drawing counters moved backwards")
+        window_origins.append({"checkpoint": point["label"], "by_role": {entry["role"]:
+            {field: entry["current_frames"]["native-window"][field] for field in ("x", "y")}
+            for entry in current["presentation_owners"].values()}})
+        require(set(current["presentation_owners"]) == set(first["presentation_owners"]), "Scalar presentation owner identity changed during runtime")
+        require(all(current["counters"][field] >= previous["counters"][field]
+                    for field in memory.SCALAR_PRESENTATION_COUNTERS + ("peak_frozen_owners",))
+                and all(current["leaf_body_updates"][leaf] >= previous["leaf_body_updates"][leaf] for leaf in memory.SCALAR_LEAVES),
+                "Scalar presentation intermediate counters moved backwards")
+        for owner, entry in current["presentation_owners"].items():
+            require(all(entry["leaf_body_updates"][leaf] >= previous["presentation_owners"][owner]["leaf_body_updates"][leaf]
+                        for leaf in memory.SCALAR_LEAVES), "Scalar owner intermediate leaf counters moved backwards")
+        if mode == memory.FROZEN_SCALARS_MODE:
+            require(current["frozen_owners"] == first["frozen_owners"], "Held scalar snapshot changed at an interior checkpoint")
+        previous = current
+    closed = []
+    for label in closed_labels:
+        matches = [point for point in report["checkpoints"] if point["label"] == label]
+        require(len(matches) == 1, "Scalar closed checkpoints are missing or duplicated")
+        point = matches[0]
+        require(point["snapshot"].get("dashboard_visible") is False and point["snapshot"].get("popover_visible") is False
+                and point["snapshot"].get("active_requests") == 0, "Scalar closed checkpoint is not hidden and idle")
+        contract = memory.scalar_presentation_contract(point["snapshot"], mode, expected_closed=True)
+        require(all(contract["counters"][field] >= previous["counters"][field]
+                    for field in memory.SCALAR_PRESENTATION_COUNTERS + ("peak_frozen_owners",))
+                and all(contract["leaf_body_updates"][leaf] >= previous["leaf_body_updates"][leaf] for leaf in memory.SCALAR_LEAVES),
+                "Scalar cleanup counters moved backwards")
+        closed.append((point, contract, boundary(point)))
+        previous = contract
+    require(closed[-1][2] - closed[0][2] >= minimum_closed_seconds, "Scalar closed observation is shorter than its required interval")
+    require(closed[0][1] == closed[-1][1], "Scalar presentation work continued after closing")
+
+    def effect_work(left, right):
+        first_snapshot, last_snapshot = left["snapshot"], right["snapshot"]
+        ticks = last_snapshot["rail_frame_clock_ticks"] - first_snapshot["rail_frame_clock_ticks"]
+        draws = last_snapshot["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"] - first_snapshot["graphics_diagnostics"]["roles"]["rail_decorations"]["draws"]
+        require(ticks > 0 and draws > 0, "Scalar ablation suppressed normal lifecycle drawing")
+        return {"rail_frame_clock_ticks": ticks, "rail_decorations_draws": draws}
+
+    arrival, steady, completion = (report["phase_windows"][name] for name in ("arrival", "steady", "completion"))
+    ends = [point for point, stamp in zip(points, stamps) if arrival["end_monotonic_seconds"] <= stamp < steady["start_monotonic_seconds"]]
+    require(stamps[0] <= arrival["start_monotonic_seconds"] and ends, "Scalar diagnostic arrival coverage is incomplete")
+    arrival_work = effect_work(points[0], ends[0])
+    interior = [point for point, stamp in zip(points, stamps) if steady["start_monotonic_seconds"] < stamp < steady["end_monotonic_seconds"]]
+    require(len(interior) >= 2 and all(point["snapshot"].get("active_requests") == 2 for point in interior),
+            "Scalar diagnostic steady phase lacks both live requests")
+    glints = [point["snapshot"]["graphics_diagnostics"]["retained_twinkles"]["animation_starts"] for point in interior]
+    require(glints[-1] > glints[0], "Scalar ablation suppressed ordinary retained glints")
+    began = [(point, stamp) for point, stamp in zip(points, stamps) if point["label"] == "completion-begin"]
+    require(len(began) == 1 and completion["start_monotonic_seconds"] <= began[0][1] < completion["end_monotonic_seconds"],
+            "Scalar diagnostic completion-begin is incomplete")
+    finished = [point for point, stamp in zip(points, stamps) if began[0][1] <= stamp <= completion["end_monotonic_seconds"]]
+    require(len(finished) >= 2 and all(point["snapshot"].get("active_requests") == 0 for point in finished),
+            "Scalar diagnostic completion coverage is incomplete")
+    completion_work = effect_work(finished[0], finished[-1])
+    result = scalar_presentation_work(points[0]["snapshot"], points[-1]["snapshot"], mode)
+    minimum_draws = max(1, math.floor(stamps[-1] - stamps[0]) - 2)
+    require(all(count >= minimum_draws for count in result["native_canvas_draw_deltas"].values()),
+            "Scalar diagnostic failed to preserve 1 Hz drawing for each chart")
+    first_steady = memory.scalar_presentation_contract(interior[0]["snapshot"], mode)
+    last_steady = memory.scalar_presentation_contract(interior[-1]["snapshot"], mode)
+    steady_draws = {identity: last_steady["native_canvas_draws"][identity] - count
+                    for identity, count in first_steady["native_canvas_draws"].items()}
+    steady_minimum = max(1, math.floor(boundary(interior[-1]) - boundary(interior[0])) - 2)
+    require(all(count >= steady_minimum for count in steady_draws.values()),
+            "Scalar diagnostic failed to preserve 1 Hz steady drawing for each chart")
+    result.update(critical_frames_by_role=frames,
+        native_canvas_steady_draw_deltas=steady_draws, native_canvas_minimum_runtime_draws=minimum_draws,
+        native_window_origins=window_origins,
+        native_chart_geometry=sorted(first["native_canvas_frames"].values(), key=lambda frame: (frame["width"], frame["height"], frame["scale"])),
+        arrival_deltas=arrival_work, completion_deltas=completion_work,
+        steady_retained_twinkle_animation_starts=glints[-1] - glints[0],
+        held_scalar_identities={entry["role"]: entry["capture_identity"] for entry in first["frozen_owners"].values()},
+        closed_current_frozen_owners=0, promotion_eligible=False if mode == memory.FROZEN_SCALARS_MODE else True,
+        scope="Fixed local chart bounds, native backing geometry and window sizes; global window origins are reported. Live chart/streaming work remains exact; frozen scalar leaves are a diagnostic ablation")
+    return result
+
+
+def validate_scalar_geometry_comparison(cases):
+    if not any(case.get("mode") == memory.FROZEN_SCALARS_MODE for case in cases):
+        return None
+    require(len(cases) == 3 and cases[0].get("mode") == cases[-1].get("mode") == "normal"
+            and cases[1].get("mode") == memory.FROZEN_SCALARS_MODE,
+            "Scalar ablation requires a normal/frozen/normal comparison")
+    first = cases[0].get("scalar_presentation_work")
+    require(isinstance(first, dict), "Scalar comparison lacks normal-control frame diagnostics")
+    for case in cases[1:]:
+        current = case.get("scalar_presentation_work")
+        require(isinstance(current, dict) and current.get("critical_frames_by_role") == first.get("critical_frames_by_role")
+                and current.get("native_chart_geometry") == first.get("native_chart_geometry"),
+                "Scalar comparison cases changed chart/native-window geometry")
+    return {"available": True, "matching_critical_frames": True, "acceptance_eligible": False,
+            "scope": "Same-binary normal/frozen/normal with identical chart and native-window geometry"}
+
+
+def validate_scalar_comparison_products(products):
+    if "reference" not in products:
+        return
+    reference, candidate = products["reference"], products["candidate"]
+    for name in ("app", "tests", "collector"):
+        hashes = [product.get("files", {}).get(name, {}).get("sha256") for product in (reference, candidate)]
+        require(all(isinstance(value, str) and len(value) == 64 for value in hashes) and hashes[0] == hashes[1],
+                "Scalar ablation reference and candidate must use identical frozen binaries")
+    hashes = [product.get("provenance", {}).get("provenance_file_sha256") for product in (reference, candidate)]
+    require(all(isinstance(value, str) and len(value) == 64 for value in hashes) and hashes[0] == hashes[1],
+            "Scalar ablation reference and candidate must use identical frozen provenance")
 
 
 def held_static_chart_work(before, after, mode):
@@ -613,9 +828,11 @@ def validate_runtime_work(before, after, mode, *, required=True):
                 "Primitive Metal effects fell back to Canvas decorations or CPU frame clocks")
     mechanism_work = transaction_mechanism_work(before, after, mode)
     reuse_work = reuse_cache_mechanism_work(before, after, mode)
+    scalar_work = scalar_presentation_work(before, after, mode)
     return {"available": True, "features": flags, "deltas": delta,
             **({"transaction_mechanisms": mechanism_work} if mechanism_work else {}),
             **({"reuse_caches": reuse_work} if reuse_work is not None else {}),
+            **({"scalar_presentation": scalar_work} if scalar_work is not None else {}),
             **({"metal_primitive_effects_deltas": primitive_delta, "promotion_eligible": False,
                 **primitive_overlap_coverage(primitive_delta["twinkle_frames"]),
                 "promotion_reason": "Experimental renderer requires independent visual fidelity qualification"}
@@ -1189,6 +1406,10 @@ class RuntimeDiagnostic(memory.MemoryDiagnostic):
             self.runtime_checkpoint("completion" if self.completing else "during-traffic")
 
     def begin_runtime(self):
+        if self.graphics_mode == memory.FROZEN_SCALARS_MODE:
+            response = self.command("freeze_scalars")
+            memory.scalar_presentation_contract(response.get("snapshot", {}), self.graphics_mode, require_frozen=True)
+            self.runtime["scalar_freeze_acknowledgment"] = response
         self.runtime["mach_clock_start"] = _mach_clock()
         if self.profile_enabled:
             self.begin_profile()
@@ -1388,6 +1609,9 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
             "end_checkpoint": points[-1]["label"], **report["phase_windows"]["whole_contiguous_runtime"]}
         report["canvas_clock_work"] = validate_canvas_clock_work(report, mode)
         report["steady_twinkle_delivery"] = validate_steady_twinkle_delivery(report, mode)
+        scalar_work = validate_scalar_presentation_checkpoints(report, mode)
+        if scalar_work is not None:
+            report["scalar_presentation_work"] = scalar_work
         held_work = validate_held_static_chart_checkpoints(report, mode)
         if held_work is not None:
             report["held_static_chart_work"] = held_work
@@ -1399,10 +1623,11 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
         report["runtime_cpu_target"] = {"evaluated": eligible, "acceptance_eligible": eligible, "limit_percent": 5.0,
             "within_limit": report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5 if eligible else None,
             "scope": "Contiguous visible traffic and completion only; separate from full resource gate"}
-        if mode in (memory.HELD_STATIC_CHART_MODE, *memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES):
+        if mode in (memory.HELD_STATIC_CHART_MODE, memory.FROZEN_SCALARS_MODE, *memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES):
             report["runtime_cpu_target"]["reason"] = ("Experimental Metal chart needs independent visual and frame-delivery qualification"
                 if mode in (*memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES)
-                else "Held static chart drawing is a diagnostic ablation, not production rendering")
+                else "Frozen scalar presentation is a diagnostic ablation, not live production presentation"
+                if mode == memory.FROZEN_SCALARS_MODE else "Held static chart drawing is a diagnostic ablation, not production rendering")
             report["runtime_cpu_target"]["observed_within_limit"] = report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5
             report["cpu_gate_evaluated"] = False
             report.setdefault("workload_cpu", {}).update(acceptance_eligible=False, gate_evaluated=False, within_limit=None)
@@ -1447,6 +1672,19 @@ def runtime_work_counter_diagnostic(report, *, profile=False):
 
 def selected_cases(args):
     references = reference_arguments(args)
+    if args.operation == "compare" and not any(value is not None for value in references) and args.controls is not None:
+        require(1 <= len(args.controls) <= 3 and len(set(args.controls)) == len(args.controls),
+                "Select one to three distinct runtime controls")
+    scalar_compare = (args.operation == "compare" and memory.FROZEN_SCALARS_MODE in
+        [args.baseline_mode, getattr(args, "candidate_mode", None), *(args.controls or [])])
+    if scalar_compare:
+        require(args.baseline_mode == "normal", "Scalar ablation comparison requires the normal baseline")
+        if any(value is not None for value in references):
+            require(getattr(args, "candidate_mode", None) == memory.FROZEN_SCALARS_MODE and args.controls is None,
+                    "Scalar ablation version comparison requires one frozen-scalar candidate and normal reference")
+        else:
+            require(args.controls == [memory.FROZEN_SCALARS_MODE],
+                    "Scalar ablation comparison requires exactly one frozen-scalar control")
     if any(value is not None for value in references):
         require(all(value is not None for value in references),
                 "Frozen reference comparison requires all three reference product/provenance arguments")
@@ -1592,6 +1830,8 @@ def _run(args, deadline):
                                                     "candidate": args.candidate_mode or args.baseline_mode}
             for product in products.values():
                 product["files"] = runtime_product_identity(product["paths"], product["provenance"])
+            if args.operation == "compare" and any(mode == memory.FROZEN_SCALARS_MODE for _label, mode in cases):
+                validate_scalar_comparison_products(products)
             report["products"] = {role: {"files": product["files"], "production_provenance": product["provenance"],
                                         "measurement_identity": product["identity"]} for role, product in products.items()}
         for label, mode in cases:
@@ -1618,6 +1858,7 @@ def _run(args, deadline):
                    "phase_cpu": case.get("phase_cpu"), "runtime_work": case.get("runtime_work"),
                    "runtime_cpu_work_counters": case.get("runtime_cpu_work_counters"),
                    "steady_twinkle_delivery": case.get("steady_twinkle_delivery"),
+                   "scalar_presentation_work": case.get("scalar_presentation_work"),
                    "thread_cpu_analysis": case.get("thread_cpu_analysis"),
                    "nio_cpu_analysis": case.get("nio_cpu_analysis"),
                    "visual_work": case.get("visual_work"),
@@ -1669,6 +1910,9 @@ def _run(args, deadline):
                     report["analysis_pending_reasons"] = reasons or ["Time Profiler quantitative attribution quality is unavailable."]
         if args.operation in ("compare", "threads", "nio"):
             report["baseline_drift"] = baseline_drift(report["cases"])
+            scalar_comparison = validate_scalar_geometry_comparison(report["cases"]) if args.operation == "compare" else None
+            if scalar_comparison is not None:
+                report["scalar_geometry_comparison"] = scalar_comparison
         if args.operation in ("threads", "nio"):
             before, measured, after = [case["phase_cpu"]["whole_contiguous_runtime"] for case in report["cases"]]
             report["observer_comparison"] = {

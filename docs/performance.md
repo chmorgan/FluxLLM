@@ -635,6 +635,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-completed-lane-cache` | Cache the selected completed request lanes, rebuild live lanes, and merge their ordered results. |
 | `runtime-cached-rail-geometry` | Cache invariant normal-Canvas particle directions and lightning geometry by receipt profile and exact rectangle. |
 | `runtime-reuse-caches` | Combine completed-lane and normal-Canvas effect geometry caching. |
+| `runtime-frozen-scalars` | Hold complete scalar leaf snapshots for the two visible windows while chart data, normal effects, menu-bar status, streaming and accounting remain live. Diagnostic ablation only. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -1398,6 +1399,58 @@ maximum rolling app GPU execution. Memory remains report-only. These controls
 preserve the normal rendering path and remain eligible for CPU acceptance after
 their semantic parity tests pass. Promotion still requires measured benefit and
 no GPU regression; successful cache counters alone do not establish either.
+
+### Frozen scalar presentation diagnostic
+
+`runtime-frozen-scalars` isolates scalar-driven SwiftUI and layout work. The
+runner sends the authenticated `freeze_scalars` command exactly once, after both
+windows become visible and before its measured `before-traffic` boundary. It
+captures one complete immutable scalar snapshot per window, including the
+selected usage interval, provider/model fields, statistics, and footer values.
+The scope picker's displayed selection and label are held with that snapshot;
+its setter remains authoritative. The fixed fixture performs no picker input.
+Normal controls never receive this command. The command rejects the wrong mode,
+repeated capture, hidden windows, or incomplete frame receipts.
+
+Both ordinary controls and the ablation use the same newly frozen products and
+their scalar instrumentation. Run the automated normal/frozen/normal bracket:
+
+```sh
+python3 scripts/run_performance_checks.py runtime compare \
+  --baseline-mode normal --controls runtime-frozen-scalars \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json \
+  --output-dir .performance-results/frozen-scalars-cpu-comparison
+```
+
+The fixed 25-second two-stream workload, 1 Hz chart publication, 30 Hz lifecycle
+effects, retained glints, exact byte forwarding, and token/tool accounting stay
+unchanged. Capture normally finishes in about 130 seconds under the existing
+300-second ceiling. The mode also works in the independent short GPU diagnostic,
+which preserves its existing calibrated attribution and deadline.
+
+Every interior checkpoint must preserve both captured scalar identities, both
+visible owners, local chart bounds, native chart backing dimensions/scale, and
+native window sizes. Each chart separately proves monotonic full-rate drawing;
+aggregate drawing cannot hide a stopped chart. Native global window origins are
+recorded separately: live menu-bar width changes can move its anchored popover
+without changing chart backing or draw work. Local chart movement or window
+resizing invalidates the comparison. Controls must match the candidate's chart
+geometry and window sizes. Statistics text's intrinsic bounds may change in
+normal controls.
+
+Reports include fixed-inventory scalar leaf body updates, stack layout calls,
+child measurements, scalar snapshot capture/release counts, per-chart drawing,
+and native window origins. All counters remain unsigned and monotonic, and all
+owners are released with quiet counters during the existing closed interval.
+Missing metadata remains optional for older normal binaries; complete diagnostic
+metadata is mandatory when present and for the ablation. This mode deliberately
+holds displayed scalar values and is **always ineligible for CPU, GPU, full
+resource acceptance, or production promotion**, even when its measured values
+fall below the unchanged 5% CPU and 1% GPU limits. Kernel metrics remain useful
+for attributing the cost of live scalar presentation.
 
 ## Baselines and comparison artifacts
 
