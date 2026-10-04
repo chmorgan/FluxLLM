@@ -1447,6 +1447,15 @@ Reports include fixed-inventory scalar leaf body updates, stack layout calls,
 child measurements, scalar snapshot capture/release counts, per-chart drawing,
 and native window origins. All counters remain unsigned and monotonic, and all
 owners are released with quiet counters during the existing closed interval.
+The generated-rate and GPU columns observe their displayed values and help
+independently. New products also report aggregate and per-owner
+`metric_body_updates` for `rate` and `gpu`; the shared row's counter alone does
+not describe their work. Display witnesses merge actual callbacks from both
+children of the same owner. Older products without this inventory report
+unavailable child counts, never zero. Partial inventories, backward counts, or
+child work after closure invalidate the capture. Native isolation tests warm
+the first chart reconciliation, then require three successive chart-only
+publications to leave both the parent leaves and metric children unchanged.
 Missing metadata remains optional for older normal binaries; complete diagnostic
 metadata is mandatory when present and for the ablation. This mode deliberately
 holds displayed scalar values and is **always ineligible for CPU, GPU, full

@@ -196,6 +196,21 @@ SCALAR_CRITICAL_FRAMES = {
 }
 
 
+def validate_metric_child_progress(first, last):
+    left, right = first["metric_body_updates"], last["metric_body_updates"]
+    require((left is None) == (right is None), "Metric child instrumentation changed during runtime")
+    if left is None:
+        return None
+    require(all(right[metric] >= left[metric] for metric in memory.SCALAR_METRICS),
+            "Metric child counters moved backwards")
+    for owner in set(first["presentation_owners"]) & set(last["presentation_owners"]):
+        before = first["presentation_owners"][owner]["metric_body_updates"]
+        after = last["presentation_owners"][owner]["metric_body_updates"]
+        require(all(after[metric] >= before[metric] for metric in memory.SCALAR_METRICS),
+                "Scalar owner metric child counters moved backwards")
+    return {metric: right[metric] - left[metric] for metric in memory.SCALAR_METRICS}
+
+
 def scalar_presentation_work(before, after, mode):
     first = memory.scalar_presentation_contract(before, mode, require_frozen=mode == memory.FROZEN_SCALARS_MODE)
     last = memory.scalar_presentation_contract(after, mode, require_frozen=mode == memory.FROZEN_SCALARS_MODE)
@@ -204,6 +219,7 @@ def scalar_presentation_work(before, after, mode):
         return None
     require(first["enabled"] == last["enabled"] and first["instrumented"] == last["instrumented"],
             "Scalar diagnostic enabled metadata changed during runtime")
+    metric_deltas = validate_metric_child_progress(first, last)
     fields = memory.SCALAR_PRESENTATION_COUNTERS + ("peak_frozen_owners",)
     require(all(last["counters"][field] >= first["counters"][field] for field in fields)
             and all(last["leaf_body_updates"][leaf] >= first["leaf_body_updates"][leaf] for leaf in memory.SCALAR_LEAVES),
@@ -217,6 +233,7 @@ def scalar_presentation_work(before, after, mode):
             for field in memory.SCALAR_PRESENTATION_COUNTERS},
             "leaf_body_update_deltas": {leaf: last["leaf_body_updates"][leaf] - first["leaf_body_updates"][leaf]
                                          for leaf in memory.SCALAR_LEAVES},
+            "metric_body_update_deltas": metric_deltas,
             "native_canvas_draw_deltas": {identity: last["native_canvas_draws"][identity] - count
                                            for identity, count in first["native_canvas_draws"].items()},
             "acceptance_eligible": first["acceptance_eligible"]}
@@ -302,6 +319,7 @@ def validate_scalar_presentation_checkpoints(report, mode, *, closed_labels=("07
             {field: entry["current_frames"]["native-window"][field] for field in ("x", "y")}
             for entry in current["presentation_owners"].values()}})
         require(set(current["presentation_owners"]) == set(first["presentation_owners"]), "Scalar presentation owner identity changed during runtime")
+        validate_metric_child_progress(previous, current)
         require(all(current["counters"][field] >= previous["counters"][field]
                     for field in memory.SCALAR_PRESENTATION_COUNTERS + ("peak_frozen_owners",))
                 and all(current["leaf_body_updates"][leaf] >= previous["leaf_body_updates"][leaf] for leaf in memory.SCALAR_LEAVES),
@@ -320,6 +338,7 @@ def validate_scalar_presentation_checkpoints(report, mode, *, closed_labels=("07
         require(point["snapshot"].get("dashboard_visible") is False and point["snapshot"].get("popover_visible") is False
                 and point["snapshot"].get("active_requests") == 0, "Scalar closed checkpoint is not hidden and idle")
         contract = memory.scalar_presentation_contract(point["snapshot"], mode, expected_closed=True)
+        validate_metric_child_progress(previous, contract)
         require(all(contract["counters"][field] >= previous["counters"][field]
                     for field in memory.SCALAR_PRESENTATION_COUNTERS + ("peak_frozen_owners",))
                 and all(contract["leaf_body_updates"][leaf] >= previous["leaf_body_updates"][leaf] for leaf in memory.SCALAR_LEAVES),
