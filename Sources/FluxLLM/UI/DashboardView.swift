@@ -272,6 +272,12 @@ private struct DashboardScalarFrameProbe: ViewModifier {
     let presentation: DashboardPresentationState
     let epoch: UUID
 
+    private struct Receipt: Equatable {
+        let frames: [String: CGRect]
+        let generation: UInt64
+        let epoch: UUID
+    }
+
     @ViewBuilder
     func body(content: Content) -> some View {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
@@ -280,10 +286,12 @@ private struct DashboardScalarFrameProbe: ViewModifier {
             content.overlayPreferenceValue(DashboardFrameAnchors.self) { anchors in
                 GeometryReader { geometry in
                     let frames = anchors.mapValues { geometry[$0] }
+                    let receipt = Receipt(frames: frames, generation: generation, epoch: epoch)
                     Color.clear
-                        .onChange(of: frames, initial: true) { _, current in
+                        .onChange(of: receipt, initial: true) { _, current in
                             presentation.recordScalarPerformanceFrames(
-                                current, generation: generation, epoch: epoch)
+                                current.frames, generation: current.generation, epoch: current.epoch
+                            )
                         }
                 }
                 .allowsHitTesting(false)

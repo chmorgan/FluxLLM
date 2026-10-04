@@ -231,44 +231,50 @@ struct DashboardScalarView: View, Equatable {
     private func dashboardDetails(narrow: Bool, density: DashboardHeightPolicy) -> some View {
         VStack(alignment: .leading, spacing: density.value(8, 5)) {
             if scalarBackendKind == .ollama {
-                let totals = displayedUsageSummary
-                HStack(spacing: 8) {
-                    Text("Usage").font(.system(size: 11, weight: .semibold))
-                    Picker("Usage scope", selection: usageScope) {
-                        ForEach(UsageScope.allCases) { scope in Text(scope.title).tag(scope) }
+                if scalarMode.usesRetainedUsageFields {
+                    retainedUsageDetails(narrow: narrow, density: density)
+                } else {
+                    let totals = displayedUsageSummary
+                    HStack(spacing: 8) {
+                        Text("Usage").font(.system(size: 11, weight: .semibold))
+                        Picker("Usage scope", selection: usageScope) {
+                            ForEach(UsageScope.allCases) { scope in Text(scope.title).tag(scope) }
+                        }
+                        .labelsHidden().pickerStyle(.menu).fixedSize().controlSize(.small)
+                        .help(usageScopeHelp)
+                        Spacer(minLength: 0)
+                        if totals.isPartial {
+                            Text("Partial history").font(.system(size: 10)).foregroundStyle(
+                                .secondary)
+                        } else if totals.activeRequests > 0 {
+                            Text("\(totals.activeRequests) active")
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                        }
                     }
-                    .labelsHidden().pickerStyle(.menu).fixedSize().controlSize(.small)
+                    LazyVGrid(
+                        columns: Array(
+                            repeating: GridItem(.flexible(), alignment: .leading),
+                            count: narrow ? 2 : 4
+                        ),
+                        alignment: .leading, spacing: 8
+                    ) {
+                        summaryValue("Input tokens", inputUsageLabel(totals), density: density)
+                            .help(
+                                totals.unknownInputRequests > 0
+                                    ? "Input usage is unavailable for \(totals.unknownInputRequests) requests. A + marks the known subtotal."
+                                    : "Input tokens reported by the backend.")
+                        summaryValue(
+                            "Output tokens",
+                            (totals.outputIsEstimated ? "~" : "") + totals.outputTokens.formatted(),
+                            density: density)
+                        summaryValue("Tool calls", totals.toolCalls.formatted(), density: density)
+                            .help(
+                                "Observed calls, excluding submitted results; this does not measure execution success."
+                            )
+                        summaryValue("Requests", totals.requests.formatted(), density: density)
+                    }
                     .help(usageScopeHelp)
-                    Spacer(minLength: 0)
-                    if totals.isPartial {
-                        Text("Partial history").font(.system(size: 10)).foregroundStyle(.secondary)
-                    } else if totals.activeRequests > 0 {
-                        Text("\(totals.activeRequests) active")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
-                    }
                 }
-                LazyVGrid(
-                    columns: Array(
-                        repeating: GridItem(.flexible(), alignment: .leading), count: narrow ? 2 : 4
-                    ),
-                    alignment: .leading, spacing: 8
-                ) {
-                    summaryValue("Input tokens", inputUsageLabel(totals), density: density)
-                        .help(
-                            totals.unknownInputRequests > 0
-                                ? "Input usage is unavailable for \(totals.unknownInputRequests) requests. A + marks the known subtotal."
-                                : "Input tokens reported by the backend.")
-                    summaryValue(
-                        "Output tokens",
-                        (totals.outputIsEstimated ? "~" : "") + totals.outputTokens.formatted(),
-                        density: density)
-                    summaryValue("Tool calls", totals.toolCalls.formatted(), density: density)
-                        .help(
-                            "Observed calls, excluding submitted results; this does not measure execution success."
-                        )
-                    summaryValue("Requests", totals.requests.formatted(), density: density)
-                }
-                .help(usageScopeHelp)
             } else {
                 let layout =
                     narrow
@@ -291,6 +297,73 @@ struct DashboardScalarView: View, Equatable {
         }
         .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
             ["statistics-row": $0]
+        }
+    }
+
+    private func retainedUsageDetails(narrow: Bool, density: DashboardHeightPolicy) -> some View {
+        let coordinator = presentation.retainedUsageCoordinator(store: store)
+        return VStack(alignment: .leading, spacing: density.value(8, 5)) {
+            HStack(spacing: 8) {
+                Text("Usage").font(.system(size: 11, weight: .semibold))
+                Picker("Usage scope", selection: usageScope) {
+                    ForEach(UsageScope.allCases) { scope in Text(scope.title).tag(scope) }
+                }
+                .labelsHidden().pickerStyle(.menu).fixedSize().controlSize(.small)
+                .help(usageScopeHelp)
+                Spacer(minLength: 0)
+                DashboardRetainedUsageField(
+                    coordinator: coordinator, field: .badge,
+                    density: density, colorScheme: colorScheme)
+            }
+            LazyVGrid(
+                columns: Array(
+                    repeating: GridItem(.flexible(), alignment: .leading), count: narrow ? 2 : 4),
+                alignment: .leading, spacing: 8
+            ) {
+                ForEach(
+                    [DashboardRetainedUsageCoordinator.Field.input, .output, .tools, .requests],
+                    id: \.self
+                ) {
+                    retainedUsageCell($0, coordinator: coordinator, density: density)
+                }
+            }
+            .help(usageScopeHelp)
+        }
+    }
+
+    @ViewBuilder private func retainedUsageCell(
+        _ field: DashboardRetainedUsageCoordinator.Field,
+        coordinator: DashboardRetainedUsageCoordinator, density: DashboardHeightPolicy
+    ) -> some View {
+        let content = VStack(alignment: .leading, spacing: density.value(5, 2)) {
+            Text(retainedUsageLabel(field)).font(.system(size: 11)).foregroundStyle(.secondary)
+                .lineLimit(1).minimumScaleFactor(0.8).frame(height: 14)
+            GeometryReader { geometry in
+                DashboardRetainedUsageField(
+                    coordinator: coordinator, field: field,
+                    density: density, colorScheme: colorScheme,
+                    logicalFrame: geometry.frame(in: .global))
+            }
+            .frame(height: density.value(21, 18))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        switch field {
+        case .input: content.help(coordinator.inputHelp.text)
+        case .tools:
+            content.help(
+                "Observed calls, excluding submitted results; this does not measure execution success."
+            )
+        default: content
+        }
+    }
+
+    private func retainedUsageLabel(_ field: DashboardRetainedUsageCoordinator.Field) -> String {
+        switch field {
+        case .input: "Input tokens"
+        case .output: "Output tokens"
+        case .tools: "Tool calls"
+        case .requests: "Requests"
+        case .badge: ""
         }
     }
 
@@ -469,9 +542,10 @@ struct DashboardScalarView: View, Equatable {
     /// not sampled raw counters. They do not run in ordinary app sessions.
     private func recordPresentedValues() {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
-        guard diagnostics.mode == .normal || diagnostics.mode.usesHeldUsagePresentation else {
-            return
-        }
+        guard
+            diagnostics.mode == .normal || diagnostics.mode.usesHeldUsagePresentation
+                || diagnostics.mode.usesRetainedUsageFields
+        else { return }
         let values: [String: Any]
         switch leaf {
         case .header:
@@ -484,6 +558,10 @@ struct DashboardScalarView: View, Equatable {
         case .details where isCompact && scalarBackendKind == .ollama:
             values = ["response": responseTokensLabel]
         case .details where !isCompact && scalarBackendKind == .ollama:
+            // Native host apply callbacks supply this witness after applying
+            // the actual retained fields. Reading usage here would enroll the
+            // parent details body and report values it did not render.
+            if scalarMode.usesRetainedUsageFields { return }
             let scope: UsageScope
             if scalarMode.usesHeldUsagePresentation, let held = presentation.heldUsage,
                 held.epoch == store.monitoringEpoch

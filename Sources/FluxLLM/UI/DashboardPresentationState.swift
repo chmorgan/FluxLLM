@@ -16,9 +16,22 @@ final class DashboardPresentationState {
     private(set) var frozenScalars: DashboardFrozenScalars?
     private(set) var heldUsage: DashboardHeldUsage?
     @ObservationIgnored private(set) var scalarPerformanceFrames: [String: CGRect] = [:]
-    @ObservationIgnored private(set) var scalarFrameGeneration: UInt64 = 0
+    private(set) var scalarFrameGeneration: UInt64 = 0
     @ObservationIgnored private weak var scalarNativeWindow: NSWindow?
     @ObservationIgnored private var scalarRole: String?
+    @ObservationIgnored private var retainedUsage: DashboardRetainedUsageCoordinator?
+    private var retainedUsageGeneration: UInt64 = 0
+
+    func retainedUsageCoordinator(store: MetricsStore) -> DashboardRetainedUsageCoordinator {
+        // Only the retained details leaf observes this lifetime boundary. Its
+        // values stay outside SwiftUI observation, but a visible epoch change
+        // must reconnect native hosts even when backend and layout stay equal.
+        _ = retainedUsageGeneration
+        if let retainedUsage, !retainedUsage.isStopped { return retainedUsage }
+        let coordinator = DashboardRetainedUsageCoordinator(store: store, presentation: self)
+        retainedUsage = coordinator
+        return coordinator
+    }
 
     func synchronize(with store: MetricsStore) {
         guard monitoringEpoch != store.monitoringEpoch else { return }
@@ -77,6 +90,7 @@ final class DashboardPresentationState {
         scalarPerformanceFrames = complete
         diagnostics.performanceScalarFramesUpdated(
             owner: scalarPerformanceOwnerID, role: role, frames: complete)
+        if diagnostics.mode.usesRetainedUsageFields { retainedUsage?.publishAppliedPresentation() }
     }
 
     func refreshScalarPerformanceNativeFrame() {
@@ -139,6 +153,9 @@ final class DashboardPresentationState {
     }
 
     func releaseFrozenScalars() {
+        if retainedUsage != nil { retainedUsageGeneration &+= 1 }
+        retainedUsage?.stop()
+        retainedUsage = nil
         frozenScalars = nil
         releaseHeldUsage()
         if PerformanceGraphicsDiagnostics.shared.isEnabled {
