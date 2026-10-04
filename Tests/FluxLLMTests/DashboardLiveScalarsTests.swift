@@ -250,30 +250,29 @@ final class DashboardLiveScalarsTests: XCTestCase {
         }
     }
 
-    func testBatchFirstOutputAndTerminalBoundariesKeepLedgerAndProjectionEquivalent() throws {
+    func testOrderedFirstOutputAndTerminalBoundariesKeepLedgerAndProjectionEquivalent() throws {
         try withNormal {
             let store = MetricsStore(clock: { self.origin })
-            let request = GenerationRequest(model: "Batch model", startedAt: origin)
-            store.applyBatch([.began(request)])
+            let request = GenerationRequest(model: "Ordered model", startedAt: origin)
+            store.apply(.began(request))
             let firstOutput = observe { _ = store.liveScalars.activityDetail }
-            store.applyBatch(
-                (1...40).map { count in
+            for count in 1...40 {
+                store.apply(
                     .updated(
                         requestID: request.id,
                         snapshot: GenerationSnapshot(
-                            outputTokens: count, liveTPS: 20, elapsed: 0.2, timestamp: date(0.2)))
-                })
+                            outputTokens: count, liveTPS: 20, elapsed: 0.2, timestamp: date(0.2))))
+            }
             XCTAssertEqual(firstOutput.value, 1)
             XCTAssertEqual(store.liveScalars.activityDetail, "Generating · 0s")
             XCTAssertEqual(store.outputTokens, 40)
             XCTAssertEqual(store.liveScalars.responseTokensLabel, "~0")
-            store.applyBatch([
+            store.apply(
                 .updated(
                     requestID: request.id,
                     snapshot: GenerationSnapshot(
                         outputTokens: 37, promptTokens: 4, isEstimated: false,
-                        finished: true, timestamp: date(0.3)))
-            ])
+                        finished: true, timestamp: date(0.3))))
             XCTAssertEqual(store.liveScalars.responseTokensLabel, "37")
             XCTAssertEqual(store.liveScalars.usage.outputTokens, 37)
             XCTAssertEqual(store.liveScalars.usage.inputTokens, 4)
@@ -328,9 +327,9 @@ final class DashboardLiveScalarsTests: XCTestCase {
     private func assertLegacyValues(
         _ store: MetricsStore, file: StaticString = #filePath, line: UInt = #line
     ) throws {
-        // The immutable diagnostic uses the original raw helpers and existing
-        // coalesced snapshot. It is an independent display-value oracle.
-        let old = try DashboardFrozenScalars.capture(store: store, interval: allHistory)
+        // Test-only raw helpers and coalesced accounting are an independent
+        // oracle; no production selector or frozen rendering path is required.
+        let old = LegacyDashboardScalarValues.capture(store: store)
         let live = store.liveScalars
         XCTAssertEqual(live.backendKind, old.backendKind, file: file, line: line)
         XCTAssertEqual(live.providerTitle, old.providerTitle, file: file, line: line)

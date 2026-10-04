@@ -158,57 +158,40 @@ final class SharedToolTraceTests: XCTestCase {
         XCTAssertEqual(tracks[resultID]?.resultPoints.count, 1)
     }
 
-    func testSharedTracksMatchIndependentConstructionForEveryDrawingStrategy() throws {
+    func testSharedTracksMatchIndependentConstructionAndCountEachDrawnPath() throws {
         let observation = observation()
         let firstID = UUID()
         let secondID = UUID()
         let first = history([call(1), call(4), call(4.5), result(2)], observation: observation)
         let second = history([call(2), call(3.5), call(5), result(9)], observation: observation)
-        for direct in [false, true] {
-            for compact in [false, true] {
-                for deferred in [false, true] {
-                    let expectedFirst = try XCTUnwrap(
-                        frame(
-                            [firstID: first], direct: direct, compact: compact
-                        ).requestTools[firstID])
-                    let expectedSecond = try XCTUnwrap(
-                        frame(
-                            [secondID: second], direct: direct, compact: compact
-                        ).requestTools[secondID])
-                    PerformancePresentationCounters.shared.enable()
-                    let combined = frame(
-                        [firstID: first, secondID: second], direct: direct, compact: compact,
-                        deferred: deferred)
-                    assertBuilds(unique: deferred ? 0 : 1, reused: deferred ? 0 : 1)
-                    let tracks = combined.requestTools
-                    assertBuilds(unique: 1, reused: 1)
-                    assertEqual(try XCTUnwrap(tracks[firstID]), expectedFirst)
-                    assertEqual(try XCTUnwrap(tracks[secondID]), expectedSecond)
-                    // Overlay work counters continue to describe all drawn paths,
-                    // even though their immutable geometry was constructed once.
-                    let counters = PerformancePresentationCounters.shared.snapshot()
-                    XCTAssertEqual(
-                        counters[direct ? "direct_tool_plot_builds" : "legacy_tool_plot_builds"], 2)
-                    XCTAssertEqual(
-                        counters["tool_path_input_points"],
-                        UInt64(
-                            tracks.values.reduce(0) {
-                                $0 + $1.segments.reduce(0) { $0 + $1.points.count }
-                            }))
-                    XCTAssertEqual(
-                        counters["tool_path_output_points"],
-                        UInt64(
-                            tracks.values.reduce(0) {
-                                $0 + $1.segments.reduce(0) { $0 + $1.tracePointCount }
-                            }))
-                    for _ in 0..<3 { _ = combined.requestTools }
-                    XCTAssertEqual(PerformancePresentationCounters.shared.snapshot(), counters)
-                }
-            }
-        }
+        let expectedFirst = try XCTUnwrap(frame([firstID: first]).requestTools[firstID])
+        let expectedSecond = try XCTUnwrap(frame([secondID: second]).requestTools[secondID])
+        PerformancePresentationCounters.shared.enable()
+        let combined = frame([firstID: first, secondID: second])
+        assertBuilds(unique: 1, reused: 1)
+        let tracks = combined.requestTools
+        assertEqual(try XCTUnwrap(tracks[firstID]), expectedFirst)
+        assertEqual(try XCTUnwrap(tracks[secondID]), expectedSecond)
+        // Overlay work still describes all drawn paths, even when their
+        // immutable geometry was constructed only once.
+        let counters = PerformancePresentationCounters.shared.snapshot()
+        XCTAssertEqual(
+            counters["tool_path_input_points"],
+            UInt64(
+                tracks.values.reduce(0) {
+                    $0 + $1.segments.reduce(0) { $0 + $1.points.count }
+                }))
+        XCTAssertEqual(
+            counters["tool_path_output_points"],
+            UInt64(
+                tracks.values.reduce(0) {
+                    $0 + $1.segments.reduce(0) { $0 + $1.tracePointCount }
+                }))
+        for _ in 0..<3 { _ = combined.requestTools }
+        XCTAssertEqual(PerformancePresentationCounters.shared.snapshot(), counters)
     }
 
-    func testDeferredFrameBuildsOnlyWhenReadAndNewProjectionOwnsNewSharedGeometry() throws {
+    func testNewProjectionOwnsNewSharedGeometry() throws {
         let observation = observation()
         let firstID = UUID()
         let secondID = UUID()
@@ -219,25 +202,21 @@ final class SharedToolTraceTests: XCTestCase {
         let cache = Cache()
         let chart = chartHistory()
         let projection = key()
-        func deferred(_ key: Cache.Key) -> Cache.Frame {
-            cache.frame(
-                for: key, throughput: chart, gpu: chart, requestTools: tools,
-                deferredToolGeometry: true)
+        func build(_ key: Cache.Key) -> Cache.Frame {
+            cache.frame(for: key, throughput: chart, gpu: chart, requestTools: tools)
         }
         PerformancePresentationCounters.shared.enable()
-        let initial = deferred(projection)
-        XCTAssertTrue(deferred(projection) === initial)
-        assertBuilds(unique: 0, reused: 0)
-        let initialTrack = try XCTUnwrap(initial.requestTools[firstID])
+        let initial = build(projection)
+        XCTAssertTrue(build(projection) === initial)
         assertBuilds(unique: 1, reused: 1)
+        let initialTrack = try XCTUnwrap(initial.requestTools[firstID])
         for changed in [
             key(size: CGSize(width: 801, height: 420)), key(toolUpperBound: 120),
             key(now: 14), key(duration: 75.25),
         ] {
             PerformancePresentationCounters.shared.enable()
-            let replacement = deferred(changed)
+            let replacement = build(changed)
             XCTAssertFalse(replacement === initial)
-            assertBuilds(unique: 0, reused: 0)
             let track = try XCTUnwrap(replacement.requestTools[firstID])
             assertBuilds(unique: 1, reused: 1)
             XCTAssertNotEqual(track.segments.map(\.points), initialTrack.segments.map(\.points))
@@ -275,13 +254,11 @@ final class SharedToolTraceTests: XCTestCase {
     }
 
     private func frame(
-        _ tools: [UUID: ToolActivityHistory], key: Cache.Key? = nil,
-        direct: Bool = false, compact: Bool = false, deferred: Bool = false
+        _ tools: [UUID: ToolActivityHistory], key: Cache.Key? = nil
     ) -> Cache.Frame {
         let history = chartHistory()
         return Cache().frame(
-            for: key ?? self.key(), throughput: history, gpu: history, requestTools: tools,
-            directToolPlot: direct, compactToolPaths: compact, deferredToolGeometry: deferred)
+            for: key ?? self.key(), throughput: history, gpu: history, requestTools: tools)
     }
 
     private func key(

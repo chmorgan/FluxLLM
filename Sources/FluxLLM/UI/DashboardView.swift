@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Native layout landmarks shared by the retained-host transition checks.
+/// Native layout landmarks used by geometry and scalar rendering checks.
 enum DashboardFrameAnchors: PreferenceKey {
     static var defaultValue: [String: Anchor<CGRect>] { [:] }
 
@@ -68,12 +68,9 @@ struct DashboardView: View {
         _ leaf: PerformanceGraphicsDiagnostics.ScalarLeaf, narrow: Bool = false,
         density: DashboardHeightPolicy = .roomy, omittedRequestCount: Int = 0
     ) -> some View {
-        let mode = PerformanceGraphicsDiagnostics.shared.mode
         return DashboardScalarView(
             actions: actions, presentation: presentation, leaf: leaf, isCompact: isCompact,
-            narrow: narrow, density: density, omittedRequestCount: omittedRequestCount,
-            scalarMode: mode,
-            legacyUsageInterval: mode.usesCoalescedScalarPresentation ? nil : chartInterval
+            narrow: narrow, density: density, omittedRequestCount: omittedRequestCount
         )
         .equatable()
     }
@@ -244,31 +241,16 @@ struct DashboardView: View {
         presentation.chartPreparation.histories(
             snapshot: store.chartPresentation, duration: chartDuration,
             epoch: store.monitoringEpoch,
-            windowEnd: chartInterval.end, isLive: isCompact || currentNavigation.isLive,
-            optimized: PerformanceGraphicsDiagnostics.shared.mode.usesOptimizedChartPreparation,
-            sharedNormalization: PerformanceGraphicsDiagnostics.shared.mode
-                .usesSharedChartPreparation
+            windowEnd: chartInterval.end, isLive: isCompact || currentNavigation.isLive
         )
     }
 
-    private var frozenScalars: DashboardFrozenScalars? {
-        guard PerformanceGraphicsDiagnostics.shared.mode.usesFrozenScalarPresentation else {
-            return nil
-        }
-        return presentation.frozenScalars
-    }
-    private var scalarBackendKind: BackendKind? {
-        if let frozen = frozenScalars { return frozen.backendKind }
-        if PerformanceGraphicsDiagnostics.shared.mode.usesCoalescedScalarPresentation {
-            return store.liveScalars.backendKind
-        }
-        return store.backendKind
-    }
+    private var scalarBackendKind: BackendKind? { store.liveScalars.backendKind }
 }
 
 /// Resolve existing native layout landmarks only in authenticated captures.
 /// The receipt is nonobservable and creates no polling or animation work.
-private struct DashboardScalarFrameProbe: ViewModifier {
+struct DashboardScalarFrameProbe: ViewModifier {
     let presentation: DashboardPresentationState
     let epoch: UUID
 
@@ -281,7 +263,7 @@ private struct DashboardScalarFrameProbe: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
-        if diagnostics.isEnabled && diagnostics.mode.usesScalarPresentationInstrumentation {
+        if diagnostics.isEnabled {
             let generation = presentation.scalarFrameGeneration
             content.overlayPreferenceValue(DashboardFrameAnchors.self) { anchors in
                 GeometryReader { geometry in

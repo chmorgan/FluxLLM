@@ -361,7 +361,6 @@ public final class MetricsStore {
             // retained independently and will rebuild immediately on reopening.
             chartPresentation = ChartPresentationSnapshot(timestamp: sampleDate)
             usageHistory.releaseQueryCaches()
-            publishCompletedLaneCacheDiagnostics()
         }
     }
 
@@ -411,25 +410,6 @@ public final class MetricsStore {
         applyAuthoritativeEvent(event)
         refreshObservedProxyActivity()
         if requiresBoundaryPublication(event) { publishDashboardScalarPresentation() }
-    }
-
-    /// A drained inbox batch is one actor transaction. Exact accounting, request
-    /// ownership, tool history, and logs still consume every event in order;
-    /// derived activity and boundary presentation are refreshed only afterward.
-    func applyBatch(_ events: [GenerationEvent], epoch: UUID? = nil) {
-        guard !events.isEmpty, epoch == nil || epoch == monitoringEpoch,
-            backendKind == nil || backendKind == .ollama
-        else { return }
-        var needsBoundaryPublication = false
-        for event in events {
-            applyAuthoritativeEvent(event)
-            needsBoundaryPublication =
-                needsBoundaryPublication || requiresBoundaryPublication(event)
-        }
-        refreshObservedProxyActivity()
-        if needsBoundaryPublication { publishDashboardScalarPresentation() }
-        PerformanceGraphicsDiagnostics.shared.batchedTelemetryBatchApplied(eventCount: events.count)
-        PerformanceGraphicsDiagnostics.shared.batchedTelemetryProjectionRefreshed()
     }
 
     private func requiresBoundaryPublication(_ event: GenerationEvent) -> Bool {
@@ -730,7 +710,7 @@ public final class MetricsStore {
             // Never keep another source's trace visible until the next tick.
             // Preserve the TPS trace, time axis, and publication deadline.
             if !chartPresentation.systemGPU.isEmpty {
-                var replacement = ChartPresentationSnapshot(
+                let replacement = ChartPresentationSnapshot(
                     timestamp: chartPresentation.timestamp,
                     throughput: chartPresentation.throughput,
                     toolActivity: chartPresentation.toolActivity,
@@ -741,7 +721,6 @@ public final class MetricsStore {
                     historicalRequestLanes: chartPresentation.historicalRequestLanes,
                     historicalToolActivity: chartPresentation.historicalToolActivity,
                     toolActivityRequestIDs: chartPresentation.toolActivityRequestIDs)
-                replacement.sharedPreparationMetadata = chartPresentation.sharedPreparationMetadata
                 chartPresentation = replacement
             }
         }
@@ -989,9 +968,6 @@ public final class MetricsStore {
     /// display summaries or rebuilt query caches; explicit presentation, scope,
     /// and lifecycle changes publish immediately without scheduling a timer.
     private func publishDashboardScalarPresentation() {
-        guard PerformanceGraphicsDiagnostics.shared.mode.usesCoalescedScalarPresentation else {
-            return
-        }
         guard !presentationDemandIsManaged || !presentationConsumers.isEmpty else {
             if dashboardScalarPresentation != .empty {
                 dashboardScalarPresentation = .empty
@@ -1162,19 +1138,9 @@ public final class MetricsStore {
         lastRatePublicationAt = date
     }
 
-    private func publishCompletedLaneCacheDiagnostics() {
-        guard PerformanceGraphicsDiagnostics.shared.mode.usesCompletedLaneCache else { return }
-        PerformanceGraphicsDiagnostics.shared.completedLaneCachePrepared(
-            builds: usageHistory.completedLaneCacheBuildCount,
-            hits: usageHistory.completedLaneCacheHitCount,
-            visitedRecords: usageHistory.completedLaneCacheVisitedRecords,
-            entries: usageHistory.completedLaneCacheEntryCount)
-    }
-
     private func publishChartPresentationIfDue(at date: Date) {
         guard !presentationDemandIsManaged || !presentationConsumers.isEmpty else { return }
-        let interval = PerformanceGraphicsDiagnostics.shared.mode.chartPublicationIntervalSeconds
-        guard lastChartPublicationAt.map({ date.timeIntervalSince($0) >= interval }) ?? true else {
+        guard lastChartPublicationAt.map({ date.timeIntervalSince($0) >= 1 }) ?? true else {
             return
         }
         let firstRaw =
@@ -1213,26 +1179,19 @@ public final class MetricsStore {
         let toolIntervals = (sampleIntervals ?? historyIntervals).map {
             DateInterval(start: max(historyStart, $0.start), end: $0.end)
         }
-        let sharedPreparation = PerformanceGraphicsDiagnostics.shared.mode
-            .usesSharedChartPreparation
-        let orderedPublication = PerformanceGraphicsDiagnostics.shared.mode
-            .usesOrderedChartPublication
-        let completedLaneCache = PerformanceGraphicsDiagnostics.shared.mode.usesCompletedLaneCache
         let historicalLanes: [RequestLane]
-        if orderedPublication, historyIntervals.count == 1 {
+        if historyIntervals.count == 1 {
             // The query already returns unique, ordered lanes. Preserve that
             // order for the common single merged viewport instead of sorting twice.
             PerformancePresentationCounters.shared.record(.orderedChartPublicationQueries)
             historicalLanes = usageHistory.requestLanes(
-                source: historySource, interval: historyIntervals[0],
-                inclusiveEnd: selection != nil,
-                useCompletedLaneCache: completedLaneCache)
+                source: historySource, interval: historyIntervals[0], inclusiveEnd: selection != nil
+            )
         } else {
             var savedLanes: [UUID: RequestLane] = [:]
             for interval in historyIntervals {
                 for lane in usageHistory.requestLanes(
-                    source: historySource, interval: interval, inclusiveEnd: selection != nil,
-                    useCompletedLaneCache: completedLaneCache
+                    source: historySource, interval: interval, inclusiveEnd: selection != nil
                 ) { savedLanes[lane.id] = lane }
             }
             PerformancePresentationCounters.shared.record(.chartPublicationFullSorts)
@@ -1241,9 +1200,8 @@ public final class MetricsStore {
                     ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
             }
         }
-        publishCompletedLaneCacheDiagnostics()
         let historicalTools: [ToolActivityEvent]
-        if orderedPublication, toolIntervals.count == 1 {
+        if toolIntervals.count == 1 {
             PerformancePresentationCounters.shared.record(.orderedChartPublicationQueries)
             historicalTools = Self.canonicalToolEvents(
                 usageHistory.toolEvents(
@@ -1271,7 +1229,7 @@ public final class MetricsStore {
             )
             .union(retainedToolRequestCounts.keys)
         }
-        var snapshot = ChartPresentationSnapshot(
+        let snapshot = ChartPresentationSnapshot(
             timestamp: date,
             throughput: sampleIntervals.map { throughputSamples.elements(in: $0) } ?? tpsHistory,
             systemGPU: gpuHistoryScope == .system
@@ -1283,9 +1241,6 @@ public final class MetricsStore {
             historicalRequestLanes: historicalLanes,
             historicalToolActivity: historicalTools,
             toolActivityRequestIDs: knownToolRequests)
-        if sharedPreparation {
-            snapshot.sharedPreparationMetadata = SharedChartPresentationMetadata(snapshot: snapshot)
-        }
         chartPresentation = snapshot
         lastChartPublicationAt = date
     }
@@ -1513,9 +1468,6 @@ public struct ChartPresentationSnapshot: Sendable, Equatable {
     public let historicalToolActivity: [ToolActivityEvent]
     /// Known overlays survive a frozen window even if its first tool event is later.
     public let toolActivityRequestIDs: Set<UUID>?
-    /// Derived immutable data shared by visible hosts, bounded by this publication.
-    /// It is excluded from value equality because it does not change the inputs.
-    var sharedPreparationMetadata: SharedChartPresentationMetadata?
 
     public init(
         timestamp: Date, throughput: [TimeSeriesPoint] = [], systemGPU: [TimeSeriesPoint] = [],

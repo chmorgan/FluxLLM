@@ -66,37 +66,17 @@ final class StreamTapperTests: XCTestCase {
         try await verifyLiveForwarding(chat: true)
     }
 
-    func testBatchedTelemetryForwardsGenerateAndChatBytesBeforeCompletion() async throws {
-        try await withBatchedTelemetry {
-            try await verifyLiveForwarding(chat: false)
-            try await verifyLiveForwarding(chat: true)
-        }
-    }
-
-    func testBatchedTelemetryPreservesMalformedBytesToolsAndAuthoritativeCorrection() async throws {
-        try await withBatchedTelemetry {
-            try await verifySharedRecordPreservesTextToolsMalformedBytesAndFinalCorrection()
-        }
-    }
-
-    func testBatchedTelemetryPreservesClientCancellationAndShutdownUsage() async throws {
-        try await withBatchedTelemetry {
-            try await verifyClientCancellation()
-            try await verifyStoppingProxyDuringRequest()
-        }
-    }
-
-    func testBatchedTelemetryPreservesAbortedUpstreamFailureAndAcceptedUsage() async throws {
-        try await withBatchedTelemetry {
-            try await verifyUpstreamAbort()
-        }
-    }
-
     func testUnpromisedBodiesKeepLiveDeliveryAndAuthoritativeCompletion() async throws {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
-        let previousMode = diagnostics.mode
-        try diagnostics.enable(mode: .runtimeStreamWrites)
-        defer { try? diagnostics.enable(mode: previousMode) }
+        let wasEnabled = diagnostics.isEnabled
+        try diagnostics.enable(mode: .normal)
+        defer {
+            if wasEnabled {
+                try? diagnostics.enable(mode: .normal)
+            } else {
+                try? diagnostics.disable()
+            }
+        }
         PerformancePresentationCounters.shared.enable()
         try await verifyLiveForwarding(chat: true)
         XCTAssertGreaterThan(
@@ -383,9 +363,15 @@ final class StreamTapperTests: XCTestCase {
 
     func testUnpromisedBodiesCancelWhenClientDisconnects() async throws {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
-        let previousMode = diagnostics.mode
-        try diagnostics.enable(mode: .runtimeStreamWrites)
-        defer { try? diagnostics.enable(mode: previousMode) }
+        let wasEnabled = diagnostics.isEnabled
+        try diagnostics.enable(mode: .normal)
+        defer {
+            if wasEnabled {
+                try? diagnostics.enable(mode: .normal)
+            } else {
+                try? diagnostics.disable()
+            }
+        }
         try await verifyClientCancellation()
     }
 
@@ -445,27 +431,4 @@ final class StreamTapperTests: XCTestCase {
         }
     }
 
-    private func withBatchedTelemetry(_ operation: () async throws -> Void) async throws {
-        let diagnostics = PerformanceGraphicsDiagnostics.shared
-        let previousMode = diagnostics.mode
-        let wasEnabled = diagnostics.isEnabled
-        try diagnostics.enable(mode: .runtimeTelemetryBatch)
-        defer {
-            if wasEnabled {
-                try? diagnostics.enable(mode: previousMode)
-            } else {
-                try? diagnostics.disable()
-            }
-        }
-        try await operation()
-        let counters = try XCTUnwrap(
-            diagnostics.snapshot()["batched_telemetry"] as? [String: UInt64])
-        XCTAssertGreaterThan(counters["compact_states_enqueued", default: 0], 0)
-        XCTAssertGreaterThan(counters["snapshots_materialized", default: 0], 0)
-        XCTAssertGreaterThan(counters["batches_applied", default: 0], 0)
-        XCTAssertEqual(counters["projection_refreshes"], counters["batches_applied"])
-        XCTAssertLessThanOrEqual(
-            counters["snapshots_materialized", default: 0],
-            counters["compact_states_enqueued", default: 0])
-    }
 }

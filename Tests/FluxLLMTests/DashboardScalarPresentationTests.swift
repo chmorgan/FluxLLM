@@ -16,61 +16,38 @@ final class DashboardScalarPresentationTests: XCTestCase {
     private let origin = Date(timeIntervalSince1970: 1_800_000_000)
 
     func testLiveUpdatesKeepExactLedgerWhileOnlySamplingPublishesScalars() throws {
-        for mode in [
-            PerformanceGraphicsDiagnostics.Mode.normal, .nativeGPUCoalescedScalars,
-            .nativeGPUOptimized,
-        ] {
-            try withMode(mode) {
-                let store = MetricsStore(clock: { self.origin })
-                store.setChartPresentationDemand(true, consumer: .dashboard)
-                let older = GenerationRequest(startedAt: date(0))
-                let latest = GenerationRequest(startedAt: date(0.001))
-                store.apply(.began(older))
-                store.apply(.began(latest))
-                let changes = observe(store)
-                let beforeLiveUpdates = scalarPublications
-                for count in 1...40 {
-                    update(store, request: older.id, tokens: count, at: Double(count) / 200)
-                    update(store, request: latest.id, tokens: count * 2, at: Double(count) / 200)
-                }
-                XCTAssertEqual(changes.value, 0, "Live accounting must not invalidate scalar views")
-                XCTAssertEqual(scalarPublications, beforeLiveUpdates)
-                XCTAssertEqual(store.outputTokens, 80)
-                XCTAssertEqual(store.usageSummary(in: allHistory).outputTokens, 120)
-                XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.outputTokens, 0)
-                XCTAssertEqual(store.dashboardScalarPresentation.usage.outputTokens, 0)
-
-                store.sample(at: date(0.5))
-                XCTAssertEqual(changes.value, 1)
-                XCTAssertEqual(scalarPublications, beforeLiveUpdates + 1)
-                XCTAssertEqual(
-                    store.dashboardScalarPresentation.latestResponse?.requestID, latest.id)
-                XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.outputTokens, 80)
-                XCTAssertEqual(store.dashboardScalarPresentation.usage.outputTokens, 120)
-                let unchanged = observe(store)
-                let publications = scalarPublications
-                store.sample(at: date(0.5))
-                XCTAssertEqual(
-                    unchanged.value, 0, "Equal values must not publish an arbitrary clock tick")
-                XCTAssertEqual(scalarPublications, publications)
+        try withNormal {
+            let store = MetricsStore(clock: { self.origin })
+            store.setChartPresentationDemand(true, consumer: .dashboard)
+            let older = GenerationRequest(startedAt: date(0))
+            let latest = GenerationRequest(startedAt: date(0.001))
+            store.apply(.began(older))
+            store.apply(.began(latest))
+            let changes = observe(store)
+            let beforeLiveUpdates = scalarPublications
+            for count in 1...40 {
+                update(store, request: older.id, tokens: count, at: Double(count) / 200)
+                update(store, request: latest.id, tokens: count * 2, at: Double(count) / 200)
             }
-        }
-    }
+            XCTAssertEqual(changes.value, 0, "Live accounting must not invalidate scalar views")
+            XCTAssertEqual(scalarPublications, beforeLiveUpdates)
+            XCTAssertEqual(store.outputTokens, 80)
+            XCTAssertEqual(store.usageSummary(in: allHistory).outputTokens, 120)
+            XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.outputTokens, 0)
+            XCTAssertEqual(store.dashboardScalarPresentation.usage.outputTokens, 0)
 
-    func testComparisonModesLeaveScalarCandidateDisabled() throws {
-        for mode in [
-            PerformanceGraphicsDiagnostics.Mode.nativeGPUCanvas, .nativeGPURetainedTwinkles,
-        ] {
-            try withMode(mode) {
-                let store = MetricsStore(clock: { self.origin })
-                let request = GenerationRequest(startedAt: origin)
-                store.apply(.began(request))
-                update(store, request: request.id, tokens: 17, at: 0.1)
-                store.sample(at: date(0.5))
-                XCTAssertEqual(store.outputTokens, 17)
-                XCTAssertEqual(store.usageSummary(in: allHistory).outputTokens, 17)
-                XCTAssertEqual(store.dashboardScalarPresentation, .empty)
-            }
+            store.sample(at: date(0.5))
+            XCTAssertEqual(changes.value, 1)
+            XCTAssertEqual(scalarPublications, beforeLiveUpdates + 1)
+            XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.requestID, latest.id)
+            XCTAssertEqual(store.dashboardScalarPresentation.latestResponse?.outputTokens, 80)
+            XCTAssertEqual(store.dashboardScalarPresentation.usage.outputTokens, 120)
+            let unchanged = observe(store)
+            let publications = scalarPublications
+            store.sample(at: date(0.5))
+            XCTAssertEqual(
+                unchanged.value, 0, "Equal values must not publish an arbitrary clock tick")
+            XCTAssertEqual(scalarPublications, publications)
         }
     }
 
@@ -153,7 +130,7 @@ final class DashboardScalarPresentationTests: XCTestCase {
     }
 
     func testToolBurstKeepsDiscreteEventsExactWithoutPublishingEveryCounterChange() throws {
-        try withMode {
+        try withNormal {
             let store = MetricsStore(clock: { self.origin })
             let request = GenerationRequest(startedAt: origin)
             store.apply(.began(request))
@@ -185,7 +162,7 @@ final class DashboardScalarPresentationTests: XCTestCase {
     }
 
     func testEveryNonOwningTerminalImmediatelyPublishesAggregateUsage() throws {
-        try withMode {
+        try withNormal {
             for terminal in ["completed", "snapshot-error", "failed", "cancelled"] {
                 let store = MetricsStore(clock: { self.origin })
                 let older = GenerationRequest(startedAt: date(0))
@@ -224,7 +201,7 @@ final class DashboardScalarPresentationTests: XCTestCase {
     }
 
     func testLatestResponseCompletionAndNextBeginPublishWithoutSampling() throws {
-        try withMode {
+        try withNormal {
             let store = MetricsStore(clock: { self.origin })
             let request = GenerationRequest(startedAt: origin)
             store.apply(.began(request))
@@ -251,7 +228,7 @@ final class DashboardScalarPresentationTests: XCTestCase {
     }
 
     func testSelectedUsageUsesHeldChartEndpointRatherThanFasterScalarClock() throws {
-        try withMode {
+        try withNormal {
             let store = MetricsStore(clock: { self.origin })
             store.historyRange = .minute
             store.usageScope = .selectedPeriod
@@ -275,7 +252,7 @@ final class DashboardScalarPresentationTests: XCTestCase {
     }
 
     func testHiddenCollectionReleasesCachesAndReopenUsesPinnedDashboardInterval() throws {
-        try withMode {
+        try withNormal {
             let history = UsageHistory(now: origin)
             let store = MetricsStore(clock: { self.origin }, usageHistory: history)
             store.setChartPresentationDemand(true, consumer: .dashboard)
@@ -314,7 +291,7 @@ final class DashboardScalarPresentationTests: XCTestCase {
     }
 
     func testScopeAndPresetChangesPublishExactTotalsWithoutWaitingForSample() throws {
-        try withMode {
+        try withNormal {
             let store = MetricsStore(clock: { self.origin })
             let older = GenerationRequest(startedAt: date(1))
             let recent = GenerationRequest(startedAt: date(90))
@@ -340,7 +317,7 @@ final class DashboardScalarPresentationTests: XCTestCase {
     }
 
     func testTodayCrossesMidnightWhileSelectedChartTimeRemainsHeld() throws {
-        try withMode {
+        try withNormal {
             var calendar = Calendar(identifier: .gregorian)
             calendar.timeZone = TimeZone(secondsFromGMT: 0)!
             let midnight = calendar.startOfDay(for: origin).addingTimeInterval(86_400)
@@ -365,7 +342,7 @@ final class DashboardScalarPresentationTests: XCTestCase {
     }
 
     func testSourceResetPublishesClearedIdentityAndRejectsStaleEpoch() throws {
-        try withMode {
+        try withNormal {
             let store = MetricsStore(clock: { self.origin })
             let firstEpoch = UUID()
             store.beginBackendSession(kind: .ollama, epoch: firstEpoch, sourceID: "first")
@@ -421,11 +398,8 @@ final class DashboardScalarPresentationTests: XCTestCase {
             as? UInt64 ?? 0
     }
 
-    private func withMode(
-        _ mode: PerformanceGraphicsDiagnostics.Mode = .nativeGPUCoalescedScalars,
-        _ body: () throws -> Void
-    ) throws {
-        try PerformanceGraphicsDiagnostics.shared.enable(mode: mode)
+    private func withNormal(_ body: () throws -> Void) throws {
+        try PerformanceGraphicsDiagnostics.shared.enable(mode: .normal)
         defer { try? PerformanceGraphicsDiagnostics.shared.disable() }
         try body()
     }

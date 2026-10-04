@@ -13,7 +13,6 @@ final class NativeGPUChartCanvasTests: XCTestCase {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
         XCTAssertFalse(diagnostics.isEnabled)
         XCTAssertEqual(diagnostics.mode, .normal)
-        XCTAssertTrue(diagnostics.mode.usesNativeGPUCanvas)
         let initial = diagnostics.snapshot() as NSDictionary
         let size = CGSize(width: 120, height: 80)
         for scale in [CGFloat(1), 2] {
@@ -59,7 +58,7 @@ final class NativeGPUChartCanvasTests: XCTestCase {
         }
     }
 
-    func testUngroupedCanvasMatchesGroupedCurvesGradientsBlurAndTextPerPixel() throws {
+    func testNativeCanvasMatchesCurvesGradientsBlurAndTextPerPixelAcrossAppearances() throws {
         let size = CGSize(width: 120, height: 80)
         for scale in [CGFloat(1), 2] {
             for scheme in [ColorScheme.light, .dark] {
@@ -67,25 +66,19 @@ final class NativeGPUChartCanvasTests: XCTestCase {
                 environment.displayScale = scale
                 environment.colorScheme = scheme
                 let grouped = try render(
-                    NativeGPUChartCanvas(ungrouped: false, renderer: artwork).environment(
-                        \.self, environment),
-                    size: size, scale: scale)
-                let ungrouped = try render(
-                    NativeGPUChartCanvas(ungrouped: true, renderer: artwork).environment(
-                        \.self, environment),
+                    NativeGPUChartCanvas(renderer: artwork).environment(\.self, environment),
                     size: size, scale: scale)
                 let reference = try render(
                     Canvas(renderer: artwork).environment(\.self, environment),
                     size: size, scale: scale)
                 assertTightPixels(grouped, match: reference)
-                assertTightPixels(ungrouped, match: grouped)
             }
         }
     }
 
-    func testGroupingPreservesTransparentSourceOverColorsAndAlpha() throws {
+    func testNativeCanvasPreservesTransparentSourceOverColorsAndAlpha() throws {
         let size = CGSize(width: 60, height: 20)
-        let drawing: ChartCanvas.Drawing = { context, _ in
+        let drawing: ChartDrawingSurface.Drawing = { context, _ in
             context.fill(
                 Path(CGRect(x: 5, y: 0, width: 25, height: 20)),
                 with: .color(Color(.sRGB, red: 1, green: 0, blue: 0, opacity: 0.5)))
@@ -97,15 +90,9 @@ final class NativeGPUChartCanvasTests: XCTestCase {
             var environment = EnvironmentValues()
             environment.displayScale = scale
             let grouped = try render(
-                NativeGPUChartCanvas(ungrouped: false, renderer: drawing).environment(
-                    \.self, environment),
+                NativeGPUChartCanvas(renderer: drawing).environment(\.self, environment),
                 size: size, scale: scale)
-            let ungrouped = try render(
-                NativeGPUChartCanvas(ungrouped: true, renderer: drawing).environment(
-                    \.self, environment),
-                size: size, scale: scale)
-            assertTightPixels(ungrouped, match: grouped)
-            for bitmap in [grouped, ungrouped] {
+            for bitmap in [grouped] {
                 let data = bytes(bitmap)
                 for (x, expected) in [
                     (2, [0, 0, 0, 0]), (10, [128, 0, 0, 128]),
@@ -123,9 +110,9 @@ final class NativeGPUChartCanvasTests: XCTestCase {
         }
     }
 
-    func testUngroupedCroppedTranslatedCanvasPreservesClipAndGradientPixels() throws {
+    func testCroppedTranslatedNativeCanvasPreservesClipAndGradientPixels() throws {
         let crop = CGRect(x: 20, y: 15, width: 50, height: 35)
-        let drawing: ChartCanvas.Drawing = { context, _ in
+        let drawing: ChartDrawingSurface.Drawing = { context, _ in
             context.clip(
                 to: Path(roundedRect: CGRect(x: 25, y: 19, width: 37, height: 25), cornerRadius: 5))
             context.fill(
@@ -144,10 +131,7 @@ final class NativeGPUChartCanvasTests: XCTestCase {
             var environment = EnvironmentValues()
             environment.displayScale = scale
             let grouped = try render(
-                NativeGPUChartCanvas(drawingBounds: crop, ungrouped: false, renderer: drawing)
-                    .environment(\.self, environment), size: crop.size, scale: scale)
-            let ungrouped = try render(
-                NativeGPUChartCanvas(drawingBounds: crop, ungrouped: true, renderer: drawing)
+                NativeGPUChartCanvas(drawingBounds: crop, renderer: drawing)
                     .environment(\.self, environment), size: crop.size, scale: scale)
             let reference = try render(
                 Canvas { context, size in
@@ -155,49 +139,44 @@ final class NativeGPUChartCanvasTests: XCTestCase {
                     drawing(&context, size)
                 }.environment(\.self, environment), size: crop.size, scale: scale)
             assertTightPixels(grouped, match: reference)
-            assertTightPixels(ungrouped, match: grouped)
-            let pixels = bytes(ungrouped)
+            let pixels = bytes(grouped)
             let alpha = stride(from: 3, to: pixels.count, by: 4).map { pixels[$0] }
             XCTAssertTrue(alpha.contains(0))
             XCTAssertTrue(alpha.contains { $0 > 0 && $0 < 255 })
         }
     }
 
-    func testGroupingChangeInvalidatesStableRevisionAndCountersMatchAcceptedDraws() throws {
+    func testNativeCanvasCountersMatchAcceptedDraws() throws {
         let counters = PerformancePresentationCounters.shared
         counters.enable()
         let size = CGSize(width: 20, height: 12)
-        var groupedCalls: UInt64 = 0
-        var ungroupedCalls: UInt64 = 0
-        func surface(ungrouped: Bool, color: Color) -> NativeGPUChartCanvas {
-            NativeGPUChartCanvas(revision: AnyHashable(1), ungrouped: ungrouped) { context, size in
-                if ungrouped { ungroupedCalls += 1 } else { groupedCalls += 1 }
+        var drawingCalls: UInt64 = 0
+        func surface(revision: Int, color: Color) -> NativeGPUChartCanvas {
+            NativeGPUChartCanvas(revision: AnyHashable(revision)) { context, size in
+                drawingCalls += 1
                 context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(color))
             }
         }
-        let renderer = ImageRenderer(content: surface(ungrouped: false, color: .red))
+        let renderer = ImageRenderer(content: surface(revision: 1, color: .red))
         renderer.isObservationEnabled = true
         renderer.proposedSize = ProposedViewSize(size)
         XCTAssertEqual(counters.snapshot()["grouped_native_canvas_draws"], 0)
-        XCTAssertEqual(counters.snapshot()["ungrouped_native_canvas_draws"], 0)
         let first = try render(renderer, size: size, scale: 1)
-        renderer.content = surface(ungrouped: false, color: .blue)
+        renderer.content = surface(revision: 1, color: .blue)
         assertTightPixels(try render(renderer, size: size, scale: 1), match: first)
-        renderer.content = surface(ungrouped: true, color: .blue)
+        renderer.content = surface(revision: 2, color: .blue)
         let changed = try render(renderer, size: size, scale: 1)
         assertTightPixels(
             changed, match: try render(Canvas(renderer: solid(.blue)), size: size, scale: 1))
         XCTAssertNotEqual(bytes(first), bytes(changed))
-        XCTAssertGreaterThan(groupedCalls, 0)
-        XCTAssertGreaterThan(ungroupedCalls, 0)
-        XCTAssertEqual(counters.snapshot()["grouped_native_canvas_draws"], groupedCalls)
-        XCTAssertEqual(counters.snapshot()["ungrouped_native_canvas_draws"], ungroupedCalls)
+        XCTAssertGreaterThan(drawingCalls, 0)
+        XCTAssertEqual(counters.snapshot()["grouped_native_canvas_draws"], drawingCalls)
     }
 
     func testCroppedNativeSurfaceRecomposesWithTheSameChartOrigin() throws {
         let size = CGSize(width: 90, height: 60)
         let crop = CGRect(x: 20, y: 15, width: 50, height: 35)
-        let drawing: ChartCanvas.Drawing = { context, _ in
+        let drawing: ChartDrawingSurface.Drawing = { context, _ in
             context.fill(Path(CGRect(x: 25, y: 20, width: 8, height: 6)), with: .color(.red))
             context.fill(
                 Path(ellipseIn: CGRect(x: 43, y: 31, width: 14, height: 14)),
@@ -244,7 +223,7 @@ final class NativeGPUChartCanvasTests: XCTestCase {
 
     func testUnversionedDrawingAndCropChangesInvalidateContent() throws {
         let size = CGSize(width: 30, height: 20)
-        let drawing: ChartCanvas.Drawing = { context, _ in
+        let drawing: ChartDrawingSurface.Drawing = { context, _ in
             context.fill(Path(CGRect(x: 12, y: 10, width: 6, height: 4)), with: .color(.white))
         }
         let renderer = ImageRenderer(
@@ -271,7 +250,7 @@ final class NativeGPUChartCanvasTests: XCTestCase {
         environment.displayScale = 1
         environment.colorScheme = .light
         var observed: EnvironmentValues?
-        let drawing: ChartCanvas.Drawing = { context, size in
+        let drawing: ChartDrawingSurface.Drawing = { context, size in
             observed = context.environment
             context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.primary))
         }
@@ -312,62 +291,57 @@ final class NativeGPUChartCanvasTests: XCTestCase {
     }
 
     func testFrameClockChangesOnlyDrawingAndClearsWithoutReplayingStoppedTicks() throws {
-        for ungrouped in [false, true] {
-            let clock = RequestRailFrameClock()
-            let origin = Date(timeIntervalSince1970: 1_800_000_000)
-            let generation = clock.start(at: origin, monotonicTime: 0)
-            defer { clock.stop() }
-            let size = CGSize(width: 20, height: 12)
-            var contentUpdates = 0
-            var drawingCalls = 0
-            func surface(isDrawing: Bool) -> NativeGPUFrameClockTestSurface {
-                NativeGPUFrameClockTestSurface(
-                    clock: clock, origin: origin, isDrawing: isDrawing,
-                    ungrouped: ungrouped,
-                    contentUpdated: { contentUpdates += 1 },
-                    didDraw: { drawingCalls += 1 })
-            }
-            let renderer = ImageRenderer(content: surface(isDrawing: true))
-            renderer.isObservationEnabled = true
-            renderer.proposedSize = ProposedViewSize(size)
-            renderer.scale = 1
-            let first = try render(renderer, size: size, scale: 1)
-            let initialContentUpdates = contentUpdates
-            XCTAssertGreaterThan(initialContentUpdates, 0)
-            XCTAssertGreaterThan(drawingCalls, 0)
-
-            XCTAssertTrue(
-                clock.tick(
-                    generation: generation, at: origin.addingTimeInterval(0.5), monotonicTime: 0.5))
-            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
-            let next = try render(renderer, size: size, scale: 1)
-            XCTAssertNotEqual(bytes(first), bytes(next))
-            let expected = try render(Canvas(renderer: solid(.blue)), size: size, scale: 1)
-            assertPixels(next, match: expected)
-            XCTAssertEqual(
-                contentUpdates, initialContentUpdates,
-                "Reading the clock only inside Canvas must not rebuild its enclosing content")
-
-            renderer.content = surface(isDrawing: false)
-            clock.stop()
-            let cleared = try render(renderer, size: size, scale: 1)
-            XCTAssertTrue(bytes(cleared).allSatisfy { $0 == 0 })
-            let callsAfterClear = drawingCalls
-            let updatesAfterClear = contentUpdates
-            XCTAssertFalse(
-                clock.tick(
-                    generation: generation, at: origin.addingTimeInterval(1), monotonicTime: 1))
-            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
-            XCTAssertEqual(drawingCalls, callsAfterClear)
-            XCTAssertEqual(contentUpdates, updatesAfterClear)
+        let clock = RequestRailFrameClock()
+        let origin = Date(timeIntervalSince1970: 1_800_000_000)
+        let generation = clock.start(at: origin, monotonicTime: 0)
+        defer { clock.stop() }
+        let size = CGSize(width: 20, height: 12)
+        var contentUpdates = 0
+        var drawingCalls = 0
+        func surface(isDrawing: Bool) -> NativeGPUFrameClockTestSurface {
+            NativeGPUFrameClockTestSurface(
+                clock: clock, origin: origin, isDrawing: isDrawing,
+                contentUpdated: { contentUpdates += 1 },
+                didDraw: { drawingCalls += 1 })
         }
+        let renderer = ImageRenderer(content: surface(isDrawing: true))
+        renderer.isObservationEnabled = true
+        renderer.proposedSize = ProposedViewSize(size)
+        renderer.scale = 1
+        let first = try render(renderer, size: size, scale: 1)
+        let initialContentUpdates = contentUpdates
+        XCTAssertGreaterThan(initialContentUpdates, 0)
+        XCTAssertGreaterThan(drawingCalls, 0)
+
+        XCTAssertTrue(
+            clock.tick(
+                generation: generation, at: origin.addingTimeInterval(0.5), monotonicTime: 0.5))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        let next = try render(renderer, size: size, scale: 1)
+        XCTAssertNotEqual(bytes(first), bytes(next))
+        let expected = try render(Canvas(renderer: solid(.blue)), size: size, scale: 1)
+        assertPixels(next, match: expected)
+        XCTAssertEqual(
+            contentUpdates, initialContentUpdates,
+            "Reading the clock only inside Canvas must not rebuild its enclosing content")
+
+        renderer.content = surface(isDrawing: false)
+        clock.stop()
+        let cleared = try render(renderer, size: size, scale: 1)
+        XCTAssertTrue(bytes(cleared).allSatisfy { $0 == 0 })
+        let callsAfterClear = drawingCalls
+        let updatesAfterClear = contentUpdates
+        XCTAssertFalse(
+            clock.tick(generation: generation, at: origin.addingTimeInterval(1), monotonicTime: 1))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        XCTAssertEqual(drawingCalls, callsAfterClear)
+        XCTAssertEqual(contentUpdates, updatesAfterClear)
     }
 
     func testOwnerDrawsAndReappearsWithoutDiagnosticRegistration() {
         let diagnostics = PerformanceGraphicsDiagnostics()
         XCTAssertFalse(diagnostics.isEnabled)
         XCTAssertEqual(diagnostics.mode, .normal)
-        XCTAssertTrue(diagnostics.mode.usesNativeGPUCanvas)
         let initial = diagnostics.snapshot() as NSDictionary
         let owner = NativeGPUChartCanvasOwner(diagnostics: diagnostics)
         let size = CGSize(width: 20, height: 12)
@@ -402,7 +376,7 @@ final class NativeGPUChartCanvasTests: XCTestCase {
 
     func testOwnerAccountsEarlyDrawVisibilityReappearanceRoleChangesAndFinalRelease() throws {
         let diagnostics = PerformanceGraphicsDiagnostics()
-        try diagnostics.enable(mode: .nativeGPUCanvas)
+        try diagnostics.enable(mode: .normal)
         let owner = NativeGPUChartCanvasOwner(diagnostics: diagnostics)
         let size = CGSize(width: 20, height: 12)
         owner.contentUpdated(role: .staticChart)
@@ -453,7 +427,7 @@ final class NativeGPUChartCanvasTests: XCTestCase {
 
     func testOwnerRejectsEmptyOrInvalidGeometryAndDeinitReleasesItsToken() throws {
         let diagnostics = PerformanceGraphicsDiagnostics()
-        try diagnostics.enable(mode: .nativeGPUCanvas)
+        try diagnostics.enable(mode: .normal)
         var owner: NativeGPUChartCanvasOwner? = NativeGPUChartCanvasOwner(diagnostics: diagnostics)
         for size in [
             CGSize.zero, CGSize(width: -1, height: 10),
@@ -481,7 +455,7 @@ final class NativeGPUChartCanvasTests: XCTestCase {
         diagnostics.snapshot()[key] as? UInt64 ?? 0
     }
 
-    private func solid(_ color: Color) -> ChartCanvas.Drawing {
+    private func solid(_ color: Color) -> ChartDrawingSurface.Drawing {
         { context, size in
             context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(color))
         }
@@ -559,7 +533,7 @@ final class NativeGPUChartCanvasTests: XCTestCase {
         XCTAssertLessThanOrEqual(maximumError, 2, file: file, line: line)
     }
 
-    private let artwork: ChartCanvas.Drawing = { context, size in
+    private let artwork: ChartDrawingSurface.Drawing = { context, size in
         context.fill(Path(CGRect(x: 3, y: 5, width: 13, height: 9)), with: .color(.red))
         context.fill(
             Path(CGRect(x: size.width - 18, y: size.height - 16, width: 11, height: 7)),
@@ -597,14 +571,12 @@ private struct NativeGPUFrameClockTestSurface: View {
     let clock: RequestRailFrameClock
     let origin: Date
     let isDrawing: Bool
-    let ungrouped: Bool
     let contentUpdated: () -> Void
     let didDraw: () -> Void
 
     var body: some View {
         let _ = contentUpdated()
-        return NativeGPUChartCanvas(revision: AnyHashable(isDrawing), ungrouped: ungrouped) {
-            context, size in
+        return NativeGPUChartCanvas(revision: AnyHashable(isDrawing)) { context, size in
             didDraw()
             if isDrawing {
                 let color: Color = clock.date.timeIntervalSince(origin) < 0.5 ? .red : .blue

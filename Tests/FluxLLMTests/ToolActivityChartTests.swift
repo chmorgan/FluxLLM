@@ -85,9 +85,7 @@ final class ToolActivityChartTests: XCTestCase {
             ).isEmpty)
     }
 
-    func testGeneratedAndToolUnitsStayDistinct() {
-        XCTAssertEqual(ChartMetric.throughput.unit, "tokens/s")
-        XCTAssertEqual(ChartMetric.throughput.spokenUnit, "tokens per second")
+    func testToolUnitsDescribeCalls() {
         XCTAssertEqual(ToolActivityChartPresentation.unit, "calls/min")
         XCTAssertEqual(ToolActivityChartPresentation.spokenUnit, "tool calls per minute")
     }

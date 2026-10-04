@@ -13,22 +13,12 @@ struct RequestRailLayer: View {
     let isLive: Bool
 
     var body: some View {
-        if PerformanceGraphicsDiagnostics.shared.mode.omitsRailDecorations {
-            // Controlled attribution only: preserve layout and the static bars
-            // while omitting the complete animation subtree, including its
-            // scheduler, visibility observer, and drawing surface.
-            Color.clear
-                .frame(width: plotSize.width, height: plotSize.height)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-        } else {
-            RequestRailDecorations(
-                lanes: lanes, segments: segments, presentation: presentation, now: now,
-                duration: duration, rect: rect, plotSize: plotSize, isLive: isLive
-            )
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-        }
+        RequestRailDecorations(
+            lanes: lanes, segments: segments, presentation: presentation, now: now,
+            duration: duration, rect: rect, plotSize: plotSize, isLive: isLive
+        )
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -65,10 +55,6 @@ struct RequestRailBarDrawing {
             let color = color(for: segment.lane)
             if contrast == .increased || reduceTransparency {
                 context.fill(shape, with: .color(color))
-            } else if PerformanceGraphicsDiagnostics.shared.mode.omitsGradients {
-                // Diagnostic-only: retain the bar path, using the middle stop.
-                PerformanceGraphicsDiagnostics.shared.recordGradientSubstitution()
-                context.fill(shape, with: .color(color.opacity(segment.isLive ? 1 : 0.83)))
             } else {
                 context.fill(
                     shape,
@@ -155,21 +141,6 @@ enum RequestRailLifecycleEffects {
         let enabled: Bool
     }
 
-    static func selecting(
-        _ events: [RequestRailEvent], omitsArrivals: Bool
-    ) -> [RequestRailEvent] {
-        omitsArrivals ? events.filter { $0.kind != .arrival } : events
-    }
-
-    static func usesMetalArrival(
-        enabled: Bool, drawsLifecycle: Bool, prepared: [Prepared],
-        eligibleIDs: [RequestRailEvent.ID]
-    ) -> Bool {
-        guard enabled, drawsLifecycle else { return false }
-        let visible = prepared.filter { eligibleIDs.contains($0.key.eventID) }
-        return !visible.isEmpty && !visible.contains { $0.profile.completion }
-    }
-
     static func prepare(
         _ events: [RequestRailEvent], lanes: [RequestLane],
         assignments: [UUID: RequestRailAssignment], now: Date, timestamp: Date,
@@ -204,36 +175,6 @@ enum RequestRailLifecycleEffects {
     }
 }
 
-/// Diagnostic receipt accounting retains only identities still present in the
-/// unexpired publication. It creates no profiles, deadlines, or cleanup timer.
-struct RequestRailArrivalSuppression {
-    private var counted: Set<RequestRailLifecycleEffects.Key> = []
-
-    var retainedReceiptCount: Int { counted.count }
-
-    mutating func update(
-        events: [RequestRailEvent], eligibleIDs: [RequestRailEvent.ID],
-        lanes: [RequestLane], assignments: [UUID: RequestRailAssignment],
-        timestamp: Date, enabled: Bool
-    ) -> Int {
-        let arrivals = events.filter { $0.kind == .arrival && $0.expiresAt > timestamp }
-        counted.formIntersection(Set(arrivals.map(RequestRailLifecycleEffects.Key.init)))
-        guard enabled else { return 0 }
-        var newlySuppressed = 0
-        for event in arrivals {
-            guard eligibleIDs.contains(event.id),
-                lanes.contains(where: { $0.id == event.requestID }),
-                let assignment = assignments[event.requestID],
-                (0..<RequestRailState.individualTrackCount).contains(assignment.track)
-            else { continue }
-            if counted.insert(RequestRailLifecycleEffects.Key(event)).inserted {
-                newlySuppressed += 1
-            }
-        }
-        return newlySuppressed
-    }
-}
-
 private struct RequestRailDecorations: View {
     let lanes: [RequestLane]
     let segments: [RequestRailGeometry.Segment]
@@ -248,175 +189,64 @@ private struct RequestRailDecorations: View {
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.self) private var environment
     @State private var windowVisible = false
     @State private var prepared: [RequestRailLifecycleEffects.Prepared] = []
-    @State private var arrivalSuppression = RequestRailArrivalSuppression()
     @State private var twinkles: [RequestRailTwinkle] = []
     @State private var animating = false
     @State private var frameClock = RequestRailFrameClock()
-    @State private var primitiveEffectsFailed = false
-    @State private var effectGeometryCache = RequestRailEffectGeometryCache()
 
     private var effectsEnabled: Bool {
         isLive && !reduceMotion && !reduceTransparency && contrast != .increased && windowVisible
     }
 
-    private var sourceLifecycleEvents: [RequestRailEvent] {
-        // Attribution control: retain live-request eligibility and the normal
-        // twinkle scheduler while omitting arrival/completion preparation.
-        PerformanceGraphicsDiagnostics.shared.mode.omitsLifecycleEffects ? [] : presentation.events
-    }
-
-    private var lifecycleEvents: [RequestRailEvent] {
-        RequestRailLifecycleEffects.selecting(
-            sourceLifecycleEvents,
-            omitsArrivals: PerformanceGraphicsDiagnostics.shared.mode.omitsArrivalEffects)
-    }
-
     var body: some View {
-        let mode = PerformanceGraphicsDiagnostics.shared.mode
         let eligibility = RequestRailAnimationEligibility(
-            segments: segments, events: lifecycleEvents, now: now, duration: duration)
-        let sourceEligibility =
-            mode.omitsArrivalEffects
-            ? RequestRailAnimationEligibility(
-                segments: segments, events: sourceLifecycleEvents, now: now, duration: duration)
-            : eligibility
+            segments: segments, events: presentation.events, now: now, duration: duration)
         let work = RequestRailLifecycleEffects.WorkKey(
-            // Preserve the reference scheduler's publication identity. Arrival
-            // omission changes effect work, not live-twinkle restart timing or
-            // the retry when a previously empty layout becomes visible.
-            events: sourceLifecycleEvents.map(RequestRailLifecycleEffects.Key.init),
-            eligibility: sourceEligibility,
-            duration: duration, enabled: effectsEnabled)
+            events: presentation.events.map(RequestRailLifecycleEffects.Key.init),
+            eligibility: eligibility, duration: duration, enabled: effectsEnabled)
         let decoratedSegments = segments.filter { segment in
             segment.isLive || prepared.contains { $0.key.requestID == segment.lane.id }
         }
-
-        let retainedTwinkles = mode.usesRetainedTwinkles
-        let stableHosts = mode.usesStableDecorationHosts
         let lifecycleVisible = prepared.contains {
             eligibility.effectIDs.contains($0.key.eventID)
         }
         let bounds = ChartSurfaceBounds.decorations(rail: rect, plotSize: plotSize)
-        let activeEpisode =
-            effectsEnabled
-            && (!eligibility.liveIDs.isEmpty
-                || !prepared.isEmpty || !twinkles.isEmpty || animating)
-        // Keep one native surface throughout an active request/effect episode,
-        // including gaps between glints, and release it when genuinely idle.
-        let needsSurface =
-            stableHosts
-            ? activeEpisode
-            : effectsEnabled
-                && (retainedTwinkles
-                    ? lifecycleVisible
-                    : (!eligibility.liveIDs.isEmpty || !eligibility.effectIDs.isEmpty
-                        || !prepared.isEmpty || animating))
+        let needsSurface = effectsEnabled && lifecycleVisible
         let needsRetainedHost =
-            retainedTwinkles
-            && (stableHosts
-                ? activeEpisode
-                : effectsEnabled && !lifecycleVisible
-                    && (!eligibility.liveIDs.isEmpty || !twinkles.isEmpty))
-        let drawsLifecycle = effectsEnabled && animating && (!stableHosts || lifecycleVisible)
-        // A mixed completion episode stays on the original Canvas, preserving
-        // per-request burst/lightning/glint ordering. Arrival-only episodes can
-        // execute the same ordered burst/glint list in one native Metal surface.
-        let metalArrival = RequestRailLifecycleEffects.usesMetalArrival(
-            enabled: mode.usesMetalArrivalBursts, drawsLifecycle: drawsLifecycle,
-            prepared: prepared, eligibleIDs: eligibility.effectIDs)
-        let primitiveEffects = mode.usesMetalPrimitiveEffects && !primitiveEffectsFailed
-        let primitiveElements: [MetalLifecycleEffectsSurface.Element]? =
-            primitiveEffects && drawsLifecycle && lifecycleVisible
-            ? MetalLifecycleEffectsInput.elements(
-                segments: decoratedSegments, prepared: prepared,
-                eligibleIDs: eligibility.effectIDs, twinkles: twinkles,
-                now: now, duration: duration, rail: rect, color: metalColor(for:))
-            : []
+            effectsEnabled && !lifecycleVisible
+            && (!eligibility.liveIDs.isEmpty || !twinkles.isEmpty)
+        let drawsLifecycle = effectsEnabled && animating
         ZStack(alignment: .topLeading) {
             Color.clear
-            if primitiveEffects && !bounds.isEmpty {
-                // Static chart pixels remain on the established chart surface.
-                // Native lifecycle frames affect only this cropped rail band.
-                MetalLifecycleEffectsSurface(
-                    elements: primitiveElements ?? [], drawingBounds: bounds,
-                    isValid: primitiveElements != nil,
-                    onFailure: { primitiveEffectsFailed = true }
-                )
-                .frame(width: bounds.width, height: bounds.height)
-                .offset(x: bounds.minX, y: bounds.minY)
-            }
-            if mode.usesMetalArrivalBursts && !bounds.isEmpty {
-                // Keep the paused host attached while visible so pipeline
-                // initialization occurs before the first measured request.
-                MetalArrivalBurstSurface(
-                    elements: metalArrival ? metalArrivalElements(decoratedSegments) : [],
-                    drawingBounds: bounds
-                )
-                .frame(width: bounds.width, height: bounds.height)
-                .offset(x: bounds.minX, y: bounds.minY)
-            }
-            // During a lifecycle effect, preserve the original per-request
-            // ordering of bursts and glints in the existing Canvas. Between
-            // effects, the same twinkle instances continue in retained layers.
+            // During a lifecycle effect, preserve the per-request ordering of
+            // bursts and glints. Between effects, retain the same glint layers.
             if needsRetainedHost {
                 RetainedRequestRailTwinkles(
                     twinkles: twinkles, segments: segments, now: now, duration: duration,
-                    rail: rect, color: color(for:), isPresented: !lifecycleVisible
+                    rail: rect, color: color(for:)
                 )
                 .frame(width: plotSize.width, height: plotSize.height)
             }
-            if needsSurface && !metalArrival && !primitiveEffects && !bounds.isEmpty {
-                // The stable-host control clears once between effects, then
-                // ignores ordinary glint publications until animation resumes.
-                let revision: AnyHashable? =
-                    stableHosts && !drawsLifecycle
-                    ? AnyHashable(InactiveDecorationRevision()) : nil
-                if mode.usesCanvasFrameClock {
-                    ChartDrawingSurface(
-                        role: .railDecorations, revision: revision,
-                        drawingBounds: bounds
-                    ) { context, _ in
-                        PerformancePresentationCounters.shared.record(.canvasDraws)
-                        if drawsLifecycle {
-                            // This is the only observed date read. Clock ticks
-                            // invalidate drawing without rebuilding the view.
-                            drawDecorations(decoratedSegments, at: frameClock.date, in: &context)
-                        }
-                    }
-                    .frame(width: bounds.width, height: bounds.height)
-                    .offset(x: bounds.minX, y: bounds.minY)
-                    .task(id: drawsLifecycle) {
-                        guard !Task.isCancelled else { return }
-                        if drawsLifecycle {
-                            await frameClock.run()
-                        } else {
-                            frameClock.stop()
-                        }
-                    }
-                    .onDisappear { frameClock.stop() }
-                } else {
-                    TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !drawsLifecycle)) {
-                        clock in
-                        let _ = PerformancePresentationCounters.shared.record(
-                            .railTimelineContentUpdates)
-                        ChartDrawingSurface(
-                            role: .railDecorations, revision: revision,
-                            drawingBounds: bounds
-                        ) { context, _ in
-                            PerformancePresentationCounters.shared.record(.canvasDraws)
-                            // A paused timeline can retain its previous date. Draw
-                            // an empty frame after the visible interval has ended.
-                            if drawsLifecycle {
-                                drawDecorations(decoratedSegments, at: clock.date, in: &context)
-                            }
-                        }
-                        .frame(width: bounds.width, height: bounds.height)
-                        .offset(x: bounds.minX, y: bounds.minY)
+            if needsSurface && !bounds.isEmpty {
+                ChartDrawingSurface(role: .railDecorations, drawingBounds: bounds) { context, _ in
+                    PerformancePresentationCounters.shared.record(.canvasDraws)
+                    if drawsLifecycle {
+                        // Clock ticks invalidate only drawing, never the enclosing view.
+                        drawDecorations(decoratedSegments, at: frameClock.date, in: &context)
                     }
                 }
+                .frame(width: bounds.width, height: bounds.height)
+                .offset(x: bounds.minX, y: bounds.minY)
+                .task(id: drawsLifecycle) {
+                    guard !Task.isCancelled else { return }
+                    if drawsLifecycle {
+                        await frameClock.run()
+                    } else {
+                        frameClock.stop()
+                    }
+                }
+                .onDisappear { frameClock.stop() }
             }
         }
         .frame(width: plotSize.width, height: plotSize.height, alignment: .topLeading)
@@ -424,15 +254,8 @@ private struct RequestRailDecorations: View {
         .task(id: work) {
             await runDecorations(work: work)
         }
-        .onDisappear {
-            animating = false
-            if PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry {
-                effectGeometryCache.removeAll()
-            }
-        }
+        .onDisappear { animating = false }
     }
-
-    private struct InactiveDecorationRevision: Hashable {}
 
     /// Profiles are cached by receipt identity, so a new telemetry snapshot or a
     /// resized chart cannot change an existing bolt's forks or burst family.
@@ -440,30 +263,15 @@ private struct RequestRailDecorations: View {
     private func runDecorations(work: RequestRailLifecycleEffects.WorkKey) async {
         guard !Task.isCancelled else { return }
         let timestamp = Date()
-        if PerformanceGraphicsDiagnostics.shared.mode.omitsArrivalEffects {
-            let count = arrivalSuppression.update(
-                events: sourceLifecycleEvents, eligibleIDs: work.eligibility.effectIDs,
-                lanes: lanes, assignments: presentation.assignments,
-                timestamp: timestamp, enabled: work.enabled)
-            for _ in 0..<count {
-                PerformancePresentationCounters.shared.record(.suppressedArrivalEffects)
-            }
-        }
         guard work.enabled else {
             animating = false
             prepared = []
             twinkles = []
-            if PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry {
-                effectGeometryCache.removeAll()
-            }
             return
         }
         prepared = RequestRailLifecycleEffects.prepare(
-            lifecycleEvents, lanes: lanes, assignments: presentation.assignments,
+            presentation.events, lanes: lanes, assignments: presentation.assignments,
             now: now, timestamp: timestamp, previous: prepared)
-        if PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry {
-            effectGeometryCache.retain(Set(prepared.map(\.key)), duration: work.duration)
-        }
         let liveIDs = work.eligibility.liveIDs
         twinkles.removeAll { $0.endsAt <= timestamp || !liveIDs.contains($0.requestID) }
         var sequence = PerformanceAnimationRandomness.initialTwinkleSequence(
@@ -475,9 +283,6 @@ private struct RequestRailDecorations: View {
             let currentPrepared = prepared.filter { $0.visibleUntil > timestamp }
             if prepared.count != currentPrepared.count {
                 prepared = currentPrepared
-                if PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry {
-                    effectGeometryCache.retain(Set(prepared.map(\.key)), duration: work.duration)
-                }
             }
             var currentTwinkles = twinkles.filter { $0.endsAt > timestamp }
             if let due = nextTwinkleAt, due <= timestamp {
@@ -513,9 +318,7 @@ private struct RequestRailDecorations: View {
                 at: timestamp,
                 visibleUntil: visibleEffects.map(\.visibleUntil) + currentTwinkles.map(\.endsAt),
                 nextTwinkleAt: nextTwinkleAt, retainedUntil: prepared.map(\.visibleUntil))
-            let needsTimeline =
-                PerformanceGraphicsDiagnostics.shared.mode.usesRetainedTwinkles
-                ? !visibleEffects.isEmpty : schedule.isAnimating
+            let needsTimeline = !visibleEffects.isEmpty
             if animating != needsTimeline { animating = needsTimeline }
             guard let nextUpdate = schedule.nextUpdate else { return }
             do {
@@ -535,57 +338,6 @@ private struct RequestRailDecorations: View {
             at: presentation.assignments[lane.id]?.colorIndex ?? 0, scheme: colorScheme)
     }
 
-    /// Called only by a publication or lifecycle change, never by a Metal frame.
-    /// Preserve the Canvas's segment → effects → glints composition order.
-    private func metalArrivalElements(
-        _ segments: [RequestRailGeometry.Segment]
-    ) -> [MetalArrivalBurstSurface.Element] {
-        let diagnostics = PerformanceArrivalDiagnostics.shared
-        let measurement = diagnostics.begin(.metalElements)
-        defer { diagnostics.end(measurement) }
-        var elements: [MetalArrivalBurstSurface.Element] = []
-        for segment in segments {
-            guard let color = metalColor(for: segment.lane) else {
-                PerformancePresentationCounters.shared.record(.metalArrivalFailures)
-                continue
-            }
-            for effect in prepared where effect.key.requestID == segment.lane.id {
-                guard !effect.profile.completion,
-                    segment.lane.startedAt >= now.addingTimeInterval(-duration)
-                else { continue }
-                elements.append(
-                    .burst(
-                        .init(
-                            id: effect.key, startDate: effect.startedAt, profile: effect.profile,
-                            origin: CGPoint(
-                                x: segment.rect.minX + segment.cornerRadius, y: segment.rect.midY),
-                            color: color)))
-            }
-            if segment.isLive {
-                for twinkle in twinkles where twinkle.requestID == segment.lane.id {
-                    if let placement = twinkle.placement(
-                        segment: segment, now: now, duration: duration, rail: rect)
-                    {
-                        elements.append(
-                            .twinkle(
-                                .init(
-                                    twinkle: twinkle, placement: placement, color: color)))
-                    }
-                }
-            }
-        }
-        return elements
-    }
-
-    private func metalColor(for lane: RequestLane) -> SIMD4<Float>? {
-        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
-            let converted = color(for: lane).resolve(in: environment).cgColor.converted(
-                to: space, intent: .relativeColorimetric, options: nil),
-            let values = converted.components, values.count == 4
-        else { return nil }
-        return SIMD4(Float(values[0]), Float(values[1]), Float(values[2]), Float(values[3]))
-    }
-
     private func drawDecorations(
         _ segments: [RequestRailGeometry.Segment], at timestamp: Date,
         in context: inout GraphicsContext
@@ -597,23 +349,17 @@ private struct RequestRailDecorations: View {
                 guard age >= 0, timestamp < effect.expiresAt else { continue }
                 let bar = segment.rect
                 let profile = effect.profile
-                let geometry =
-                    PerformanceGraphicsDiagnostics.shared.mode.usesCachedRailGeometry
-                    ? effectGeometryCache.geometry(key: effect.key, profile: profile, rect: bar)
-                    : nil
                 if profile.completion {
                     let tip = CGPoint(x: bar.maxX, y: bar.midY)
                     drawBurst(
                         profile, age: age, duration: 0.24, scale: 0.5,
-                        at: tip, color: color, geometry: geometry, in: &context)
-                    drawLightning(
-                        profile, age: age, rect: bar, color: color, geometry: geometry, in: &context
-                    )
+                        at: tip, color: color, in: &context)
+                    drawLightning(profile, age: age, rect: bar, color: color, in: &context)
                     if profile.explodes {
                         drawBurst(
                             profile, age: age - profile.surgeDelay - profile.surgeDuration,
                             duration: profile.burstDuration, scale: 1.12,
-                            at: tip, color: color, geometry: geometry, in: &context)
+                            at: tip, color: color, in: &context)
                     }
                 } else if segment.lane.startedAt >= now.addingTimeInterval(-duration) {
                     let diagnostics = PerformanceArrivalDiagnostics.shared
@@ -621,7 +367,7 @@ private struct RequestRailDecorations: View {
                     drawBurst(
                         profile, age: age, duration: profile.burstDuration, scale: 1,
                         at: CGPoint(x: bar.minX + segment.cornerRadius, y: bar.midY),
-                        color: color, geometry: geometry, in: &context)
+                        color: color, in: &context)
                     diagnostics.end(measurement)
                 }
             }
@@ -637,8 +383,7 @@ private struct RequestRailDecorations: View {
 
     private func drawBurst(
         _ profile: RequestRailEffectProfile, age: TimeInterval, duration: TimeInterval,
-        scale: Double, at point: CGPoint, color: Color,
-        geometry: RequestRailEffectGeometryCache.Geometry? = nil, in context: inout GraphicsContext
+        scale: Double, at point: CGPoint, color: Color, in context: inout GraphicsContext
     ) {
         let p = age / duration
         guard p > 0, p < 1 else { return }
@@ -668,16 +413,15 @@ private struct RequestRailDecorations: View {
                     style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
             }
         } else {
-            for (index, particle) in profile.particles.enumerated() {
+            for particle in profile.particles {
                 let q = RequestRailEffectProfile.clamp((p - particle.delay) / particle.life)
                 let brightness = RequestRailEffectProfile.envelope(q) * 0.92
                 guard brightness > 0 else { continue }
                 let travel = 1 - pow(1 - q, 2)
                 let distance = (4 + particle.distance * travel) * size
-                let direction = geometry?.particleDirections[index]
                 let position = CGPoint(
-                    x: point.x + (direction?.cosine ?? cos(particle.angle)) * distance,
-                    y: point.y + (direction?.sine ?? sin(particle.angle)) * distance)
+                    x: point.x + cos(particle.angle) * distance,
+                    y: point.y + sin(particle.angle) * distance)
                 if profile.family == .fireflies {
                     drawGlow(
                         at: position, radius: particle.size * 3, strength: brightness * 0.8,
@@ -691,8 +435,8 @@ private struct RequestRailDecorations: View {
                     spark.move(to: position)
                     spark.addLine(
                         to: CGPoint(
-                            x: position.x + (direction?.cosine ?? cos(particle.angle)) * length,
-                            y: position.y + (direction?.sine ?? sin(particle.angle)) * length))
+                            x: position.x + cos(particle.angle) * length,
+                            y: position.y + sin(particle.angle) * length))
                     context.stroke(
                         spark, with: .color(.white.opacity(brightness)),
                         style: StrokeStyle(lineWidth: particle.size * 0.75, lineCap: .round))
@@ -703,23 +447,15 @@ private struct RequestRailDecorations: View {
         let core =
             profile.family == .fireflies
             ? circle(at: point, radius: (2 + 1.3 * strength) * size)
-            : star(
-                at: point, size: (4.5 + 3.5 * strength) * size, angle: profile.angle,
-                rotation: geometry?.starRotation)
+            : star(at: point, size: (4.5 + 3.5 * strength) * size, angle: profile.angle)
         context.fill(core, with: .color(.white.opacity(strength)))
     }
 
     private func drawLightning(
         _ profile: RequestRailEffectProfile, age: TimeInterval, rect: CGRect,
-        color: Color, geometry: RequestRailEffectGeometryCache.Geometry? = nil,
-        in context: inout GraphicsContext
+        color: Color, in context: inout GraphicsContext
     ) {
-        let frame: RequestRailEffectProfile.LightningFrame?
-        if let geometry {
-            frame = geometry.lightningFrame(profile: profile, age: age)
-        } else {
-            frame = profile.lightningFrame(age: age, rect: rect)
-        }
+        let frame = profile.lightningFrame(age: age, rect: rect)
         guard let frame else { return }
         var clipped = context
         // Keep crackles local to the bar, leaving the neighboring rail body clear.
@@ -754,15 +490,6 @@ private struct RequestRailDecorations: View {
         at point: CGPoint, radius: CGFloat, strength: Double, color: Color,
         in context: inout GraphicsContext
     ) {
-        if PerformanceGraphicsDiagnostics.shared.mode.omitsGradients {
-            // Diagnostic-only: retain the animated halo's size and timing,
-            // replacing radial shading with the existing colored stop.
-            PerformanceGraphicsDiagnostics.shared.recordGradientSubstitution()
-            context.fill(
-                circle(at: point, radius: radius),
-                with: .color(color.opacity(strength * 0.95)))
-            return
-        }
         context.fill(
             circle(at: point, radius: radius),
             with: .radialGradient(
@@ -781,7 +508,7 @@ private struct RequestRailDecorations: View {
     }
 
     private func star(
-        at point: CGPoint, size: CGFloat, angle: Double, rotation: CGAffineTransform? = nil
+        at point: CGPoint, size: CGFloat, angle: Double
     ) -> Path {
         let inset = size * 0.24
         var path = Path()
@@ -792,7 +519,7 @@ private struct RequestRailDecorations: View {
         path.addQuadCurve(to: CGPoint(x: 0, y: -size), control: CGPoint(x: -inset, y: -inset))
         path.closeSubpath()
         return path.applying(
-            (rotation ?? CGAffineTransform(rotationAngle: angle)).concatenating(
+            CGAffineTransform(rotationAngle: angle).concatenating(
                 CGAffineTransform(translationX: point.x, y: point.y)))
     }
 

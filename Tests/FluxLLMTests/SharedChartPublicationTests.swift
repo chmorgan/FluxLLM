@@ -5,9 +5,7 @@ import XCTest
 
 @MainActor
 final class SharedChartPublicationTests: XCTestCase {
-    func testOrderedAndSharedPublicationsPreserveSingleAndDisjointQueriesAndMetadataLifetime()
-        throws
-    {
+    func testOrderedPublicationsPreserveSingleAndDisjointQueriesAndWinnerOwnership() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let store = MetricsStore(clock: { now })
         let epoch = UUID()
@@ -34,6 +32,7 @@ final class SharedChartPublicationTests: XCTestCase {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
         let counters = PerformancePresentationCounters.shared
         counters.enable()
+        try diagnostics.enable(mode: .normal)
         defer { try? diagnostics.disable() }
         for pinned in [false, true] {
             store.setChartPresentationDemand(false, consumer: .dashboard)
@@ -42,51 +41,21 @@ final class SharedChartPublicationTests: XCTestCase {
                 pinned
                     ? .fixed(DateInterval(start: now.addingTimeInterval(-420), duration: 60))
                     : .live(duration: 600), consumer: .dashboard)
-            try diagnostics.enable(mode: .runtimeStreamCanvasClock)
             store.setChartPresentationDemand(true, consumer: .dashboard)
-            let referenceBefore = counters.snapshot()
+            let before = counters.snapshot()
             store.setChartPresentationDemand(true, consumer: .popover)
-            let reference = store.chartPresentation
-            XCTAssertNil(reference.sharedPreparationMetadata)
-            assertQueryWork(since: referenceBefore, fastQueries: 0, fullSorts: 2)
-            for mode in [
-                PerformanceGraphicsDiagnostics.Mode.runtimeOrderedPublication,
-                .runtimeSharedPreparation,
-            ] {
-                store.setChartPresentationDemand(false, consumer: .dashboard)
-                store.setChartPresentationDemand(false, consumer: .popover)
-                try diagnostics.enable(mode: mode)
-                store.setChartPresentationDemand(true, consumer: .dashboard)
-                let before = counters.snapshot()
-                store.setChartPresentationDemand(true, consumer: .popover)
-                assertQueryWork(
-                    since: before, fastQueries: pinned ? 0 : 2, fullSorts: pinned ? 2 : 0)
-                XCTAssertEqual(store.chartPresentation, reference)
-                XCTAssertEqual(
-                    store.chartPresentation.historicalToolActivity.map(\.requestID),
-                    reference.historicalToolActivity.map(\.requestID))
-                XCTAssertEqual(
-                    Set(store.chartPresentation.historicalToolActivity.map(\.id)).count,
-                    store.chartPresentation.historicalToolActivity.count)
-                let reusedWinner = store.chartPresentation.historicalToolActivity.first {
-                    $0.id == reusedEventID
-                }
-                XCTAssertEqual(reusedWinner?.timestamp, now.addingTimeInterval(pinned ? -400 : -80))
-                weak var metadata = store.chartPresentation.sharedPreparationMetadata
-                if mode == .runtimeSharedPreparation {
-                    XCTAssertNotNil(metadata)
-                } else {
-                    XCTAssertNil(
-                        metadata, "Ordered publication alone must not construct shared metadata")
-                    XCTAssertEqual(
-                        counters.snapshot()["shared_chart_normalization_builds", default: 0],
-                        before["shared_chart_normalization_builds", default: 0])
-                }
-                store.setChartPresentationDemand(false, consumer: .dashboard)
-                store.setChartPresentationDemand(false, consumer: .popover)
-                XCTAssertNil(store.chartPresentation.sharedPreparationMetadata)
-                XCTAssertNil(metadata)
-            }
+            assertQueryWork(since: before, fastQueries: pinned ? 0 : 2, fullSorts: pinned ? 2 : 0)
+            let published = store.chartPresentation
+            XCTAssertEqual(
+                Set(published.historicalToolActivity.map(\.id)).count,
+                published.historicalToolActivity.count)
+            let winner = try XCTUnwrap(
+                published.historicalToolActivity.first { $0.id == reusedEventID })
+            XCTAssertEqual(winner.timestamp, now.addingTimeInterval(pinned ? -400 : -80))
+            XCTAssertEqual(winner.name, "reused-id")
+            XCTAssertNotNil(winner.requestID)
+            store.setChartPresentationDemand(false, consumer: .dashboard)
+            store.setChartPresentationDemand(false, consumer: .popover)
         }
     }
 
@@ -123,28 +92,48 @@ final class SharedChartPublicationTests: XCTestCase {
         XCTAssertEqual(canonical.last?.kind, .resultSubmission)
     }
 
-    func testGPUSourceChangePreservesSharedRequestMetadata() throws {
+    func testGPUSourceChangeClearsGPUHistoryWithoutChangingRequestPublication() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let diagnostics = PerformanceGraphicsDiagnostics.shared
-        try diagnostics.enable(mode: .runtimeSharedPreparation)
+        try diagnostics.enable(mode: .normal)
         defer { try? diagnostics.disable() }
         let store = MetricsStore(clock: { now })
         let epoch = UUID()
         store.beginBackendSession(kind: .ollama, epoch: epoch)
         store.setChartPresentationDemand(true, consumer: .dashboard)
+        let request = GenerationRequest(
+            model: "GPU reset request", startedAt: now.addingTimeInterval(-1))
+        store.apply(.began(request), epoch: epoch)
+        store.apply(
+            .toolActivity(
+                requestID: request.id,
+                events: [
+                    ToolActivityEvent(
+                        kind: .call, name: "preserved", timestamp: now.addingTimeInterval(-0.5))
+                ]), epoch: epoch)
+        store.apply(.cancelled(requestID: request.id), epoch: epoch)
         store.applyGPUSample(
             GPUActivitySample(
                 timestamp: now, activityPercent: 20,
                 source: "first", scope: .system), epoch: epoch)
         store.sample(at: now.addingTimeInterval(1))
         XCTAssertFalse(store.chartPresentation.systemGPU.isEmpty)
-        let metadata = try XCTUnwrap(store.chartPresentation.sharedPreparationMetadata)
+        let before = store.chartPresentation
+        XCTAssertFalse(before.requestLanes.isEmpty)
+        XCTAssertFalse(before.toolActivity.isEmpty)
         store.applyGPUSample(
             GPUActivitySample(
                 timestamp: now.addingTimeInterval(1), activityPercent: 30,
                 source: "second", scope: .system), epoch: epoch)
         XCTAssertTrue(store.chartPresentation.systemGPU.isEmpty)
-        XCTAssertTrue(store.chartPresentation.sharedPreparationMetadata === metadata)
+        XCTAssertEqual(store.chartPresentation.requestLanes, before.requestLanes)
+        XCTAssertEqual(
+            store.chartPresentation.historicalRequestLanes, before.historicalRequestLanes)
+        XCTAssertEqual(store.chartPresentation.toolActivity, before.toolActivity)
+        XCTAssertEqual(
+            store.chartPresentation.historicalToolActivity, before.historicalToolActivity)
+        XCTAssertEqual(
+            store.chartPresentation.toolActivityRequestIDs, before.toolActivityRequestIDs)
     }
 
     private func assertQueryWork(

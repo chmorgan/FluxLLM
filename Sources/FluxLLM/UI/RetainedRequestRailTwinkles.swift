@@ -2,7 +2,7 @@ import AppKit
 import QuartzCore
 import SwiftUI
 
-/// Receives the same bounded twinkle instances as the Canvas control. Only
+/// Receives the same bounded twinkle instances as the lifecycle Canvas. Only
 /// spawn/expiry and chart publication updates cross SwiftUI; Core Animation
 /// interpolates the two small shapes between those updates.
 struct RetainedRequestRailTwinkles: NSViewRepresentable {
@@ -12,7 +12,6 @@ struct RetainedRequestRailTwinkles: NSViewRepresentable {
     let duration: TimeInterval
     let rail: CGRect
     let color: (RequestLane) -> Color
-    var isPresented = true
     @Environment(\.displayScale) private var displayScale
 
     func makeNSView(context: Context) -> RetainedRequestRailTwinkleView {
@@ -33,7 +32,7 @@ struct RetainedRequestRailTwinkles: NSViewRepresentable {
                 twinkle: twinkle, placement: placement,
                 color: NSColor(color(segment.lane)).cgColor)
         }
-        view.update(descriptors: descriptors, scale: displayScale, isPresented: isPresented)
+        view.update(descriptors: descriptors, scale: displayScale)
     }
 
     static func dismantleNSView(_ view: RetainedRequestRailTwinkleView, coordinator: ()) {
@@ -173,7 +172,6 @@ final class RetainedTwinkleLayerGroup {
 final class RetainedRequestRailTwinkleView: NSView {
     private var descriptors: [RetainedTwinkleDescriptor] = []
     private var requestedScale: CGFloat = 1
-    private var isPresented = true
     private var groups: [RequestRailTwinkle.ID: RetainedTwinkleLayerGroup] = [:]
     private var diagnosticID: UInt64?
     private var closing = false
@@ -193,12 +191,10 @@ final class RetainedRequestRailTwinkleView: NSView {
     override var isOpaque: Bool { false }
     override func updateLayer() {}
 
-    func update(descriptors: [RetainedTwinkleDescriptor], scale: CGFloat, isPresented: Bool = true)
-    {
+    func update(descriptors: [RetainedTwinkleDescriptor], scale: CGFloat) {
         guard !stopped else { return }
         self.descriptors = Array(descriptors.suffix(2))
         requestedScale = scale.isFinite && scale > 0 ? scale : 1
-        self.isPresented = isPresented
         reconcile()
     }
 
@@ -267,16 +263,6 @@ final class RetainedRequestRailTwinkleView: NSView {
             releaseHost()
             return
         }
-        // Suppression is a binary handoff to the original lifecycle Canvas,
-        // not NSView hiding: keep existing shapes and their original clocks.
-        // Actual window hiding still takes the releaseHost path above.
-        let opacity: Float = isPresented ? 1 : 0
-        if layer.opacity != opacity {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer.opacity = opacity
-            CATransaction.commit()
-        }
         let diagnostics = PerformanceGraphicsDiagnostics.shared
         if diagnosticID == nil { diagnosticID = diagnostics.retainedTwinkleHostCreated() }
         let now = Date()
@@ -292,9 +278,7 @@ final class RetainedRequestRailTwinkleView: NSView {
             groups.removeValue(forKey: id)?.stop()
         }
         var started: UInt64 = 0
-        // The Canvas already draws new glints while this host is suppressed.
-        // Delay their layers until presentation resumes, at the original age.
-        for descriptor in eligible where isPresented {
+        for descriptor in eligible {
             let id = descriptor.twinkle.id
             if let group = groups[id] {
                 group.update(descriptor: descriptor, surfaceHeight: bounds.height, scale: scale)

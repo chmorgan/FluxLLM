@@ -13,29 +13,14 @@ final class DashboardPresentationState {
     @ObservationIgnored let chartPreparation = DashboardChartPreparation()
     @ObservationIgnored private var monitoringEpoch: UUID?
     @ObservationIgnored let scalarPerformanceOwnerID = UUID()
-    private(set) var frozenScalars: DashboardFrozenScalars?
-    private(set) var heldUsage: DashboardHeldUsage?
     @ObservationIgnored private(set) var scalarPerformanceFrames: [String: CGRect] = [:]
     private(set) var scalarFrameGeneration: UInt64 = 0
     @ObservationIgnored private weak var scalarNativeWindow: NSWindow?
     @ObservationIgnored private var scalarRole: String?
-    @ObservationIgnored private var retainedUsage: DashboardRetainedUsageCoordinator?
-    private var retainedUsageGeneration: UInt64 = 0
-
-    func retainedUsageCoordinator(store: MetricsStore) -> DashboardRetainedUsageCoordinator {
-        // Only the retained details leaf observes this lifetime boundary. Its
-        // values stay outside SwiftUI observation, but a visible epoch change
-        // must reconnect native hosts even when backend and layout stay equal.
-        _ = retainedUsageGeneration
-        if let retainedUsage, !retainedUsage.isStopped { return retainedUsage }
-        let coordinator = DashboardRetainedUsageCoordinator(store: store, presentation: self)
-        retainedUsage = coordinator
-        return coordinator
-    }
 
     func synchronize(with store: MetricsStore) {
         guard monitoringEpoch != store.monitoringEpoch else { return }
-        releaseFrozenScalars()
+        releaseScalarPerformancePresentation()
         scalarPerformanceFrames.removeAll(keepingCapacity: false)
         scalarFrameGeneration &+= 1
         monitoringEpoch = store.monitoringEpoch
@@ -48,7 +33,7 @@ final class DashboardPresentationState {
         isActive = active
         if !active {
             chartPreparation.releasePreparedCharts()
-            releaseFrozenScalars()
+            releaseScalarPerformancePresentation()
             scalarPerformanceFrames.removeAll(keepingCapacity: false)
         }
     }
@@ -90,7 +75,6 @@ final class DashboardPresentationState {
         scalarPerformanceFrames = complete
         diagnostics.performanceScalarFramesUpdated(
             owner: scalarPerformanceOwnerID, role: role, frames: complete)
-        if diagnostics.mode.usesRetainedUsageFields { retainedUsage?.publishAppliedPresentation() }
     }
 
     func refreshScalarPerformanceNativeFrame() {
@@ -101,105 +85,11 @@ final class DashboardPresentationState {
             scalarPerformanceFrames, generation: scalarFrameGeneration, epoch: epoch)
     }
 
-    func prepareFrozenScalars(store: MetricsStore, compact: Bool) throws -> DashboardFrozenScalars {
-        guard PerformanceGraphicsDiagnostics.shared.isEnabled,
-            PerformanceGraphicsDiagnostics.shared.mode.usesFrozenScalarPresentation,
-            isActive, frozenScalars == nil, monitoringEpoch == store.monitoringEpoch
-        else {
-            throw DashboardScalarFreezeError.invalid(
-                "Scalar freezing requires an active, unfrozen diagnostic presentation")
-        }
-        let required: Set<String> =
-            compact
-            ? ["activity-chart", "main-activity-plot", "native-window"]
-            : ["activity-chart", "main-activity-plot", "request-rail-band", "native-window"]
-        guard required.isSubset(of: Set(scalarPerformanceFrames.keys)),
-            scalarPerformanceFrames.values.allSatisfy(Self.validFrame)
-        else {
-            throw DashboardScalarFreezeError.invalid(
-                "Scalar capture requires complete native chart geometry")
-        }
-        var selection = navigation
-        if selection.preset != store.historyRange {
-            selection.selectPreset(
-                store.historyRange, now: store.chartPresentation.timestamp,
-                historyAge: store.chartHistoryAge)
-        }
-        let now = store.chartPresentation.timestamp
-        let interval =
-            compact
-            ? DateInterval(start: now.addingTimeInterval(-60), end: now)
-            : selection.interval(now: now, historyAge: store.chartHistoryAge)
-        let mode = PerformanceGraphicsDiagnostics.shared.mode
-        let prepared = chartPreparation.histories(
-            snapshot: store.chartPresentation, duration: interval.duration,
-            epoch: store.monitoringEpoch,
-            windowEnd: interval.end, isLive: compact || selection.isLive,
-            optimized: mode.usesOptimizedChartPreparation,
-            sharedNormalization: mode.usesSharedChartPreparation)
-        return try DashboardFrozenScalars.capture(
-            store: store, interval: interval, omittedRequestCount: prepared.omittedRequestCount)
-    }
-
-    func freezeScalars(_ snapshot: DashboardFrozenScalars) throws {
-        guard isActive, frozenScalars == nil, snapshot.epoch == monitoringEpoch,
-            let role = scalarRole,
-            PerformanceGraphicsDiagnostics.shared.mode.usesFrozenScalarPresentation,
-            PerformanceGraphicsDiagnostics.shared.frozenScalarPresentationCaptured(
-                owner: scalarPerformanceOwnerID, role: role, fingerprint: snapshot.fingerprint,
-                frames: scalarPerformanceFrames)
-        else { throw DashboardScalarFreezeError.invalid("Scalar diagnostic receipt was rejected") }
-        frozenScalars = snapshot
-    }
-
-    func releaseFrozenScalars() {
-        if retainedUsage != nil { retainedUsageGeneration &+= 1 }
-        retainedUsage?.stop()
-        retainedUsage = nil
-        frozenScalars = nil
-        releaseHeldUsage()
+    private func releaseScalarPerformancePresentation() {
         if PerformanceGraphicsDiagnostics.shared.isEnabled {
-            PerformanceGraphicsDiagnostics.shared.frozenScalarPresentationReleased(
+            PerformanceGraphicsDiagnostics.shared.performanceScalarPresentationReleased(
                 owner: scalarPerformanceOwnerID)
         }
-    }
-
-    func prepareHeldUsage(store: MetricsStore) throws -> DashboardHeldUsage {
-        let diagnostics = PerformanceGraphicsDiagnostics.shared
-        guard diagnostics.isEnabled, diagnostics.mode.usesHeldUsagePresentation,
-            isActive, heldUsage == nil, frozenScalars == nil,
-            scalarRole == "dashboard", monitoringEpoch == store.monitoringEpoch
-        else {
-            throw DashboardScalarFreezeError.invalid(
-                "Usage holding requires an active, unheld full diagnostic dashboard")
-        }
-        return try DashboardHeldUsage.capture(
-            store: store, owner: scalarPerformanceOwnerID, frames: scalarPerformanceFrames,
-            presentationGeneration: scalarFrameGeneration)
-    }
-
-    func holdUsage(_ snapshot: DashboardHeldUsage, store: MetricsStore) throws {
-        guard isActive, heldUsage == nil, frozenScalars == nil,
-            scalarRole == "dashboard", snapshot.owner == scalarPerformanceOwnerID,
-            snapshot.presentationGeneration == scalarFrameGeneration,
-            snapshot.frames == scalarPerformanceFrames,
-            snapshot.epoch == monitoringEpoch, snapshot.epoch == store.monitoringEpoch,
-            snapshot.scope == store.usageScope,
-            snapshot.usage == store.dashboardScalarPresentation.usage,
-            store.backendKind == .ollama, !store.backendActivity.isActive,
-            store.activeGeneration?.state != .running,
-            PerformanceGraphicsDiagnostics.shared.mode.usesHeldUsagePresentation,
-            PerformanceGraphicsDiagnostics.shared.heldUsagePresentationCaptured(snapshot)
-        else {
-            throw DashboardScalarFreezeError.invalid("Held usage diagnostic receipt was rejected")
-        }
-        heldUsage = snapshot
-    }
-
-    func releaseHeldUsage() {
-        heldUsage = nil
-        PerformanceGraphicsDiagnostics.shared.heldUsagePresentationReleased(
-            owner: scalarPerformanceOwnerID)
     }
 
     private static func validFrame(_ frame: CGRect) -> Bool {

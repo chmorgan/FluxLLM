@@ -6,8 +6,6 @@ final class PreparedDashboardCharts {
     let duration: TimeInterval
     let windowEnd: Date
     let isLive: Bool
-    let optimized: Bool
-    let sharedNormalization: Bool
     let throughput: ChartDisplayHistory
     let gpu: ChartDisplayHistory
     let toolActivity: ToolActivityHistory?
@@ -25,48 +23,24 @@ final class PreparedDashboardCharts {
     init(
         snapshot: ChartPresentationSnapshot, duration: TimeInterval,
         requestRails: RequestRailPresentation? = nil, windowEnd: Date? = nil, isLive: Bool = true,
-        optimized: Bool = false, laneSelection: LaneSelection? = nil,
-        sharedNormalization: Bool = false, sharedMetadata: SharedChartPresentationMetadata? = nil
+        laneSelection: LaneSelection? = nil
     ) {
         PerformancePresentationCounters.shared.record(.chartPreparations)
-        if optimized { PerformancePresentationCounters.shared.record(.optimizedChartPreparations) }
+        PerformancePresentationCounters.shared.record(.optimizedChartPreparations)
         publicationID = snapshot.publicationID
         self.duration = duration
         let end = min(windowEnd ?? snapshot.timestamp, snapshot.timestamp)
         self.windowEnd = end
         self.isLive = isLive
-        self.optimized = optimized
-        self.sharedNormalization = sharedNormalization
-        let metadata =
-            sharedNormalization
-            ? (sharedMetadata ?? snapshot.sharedPreparationMetadata
-                ?? SharedChartPresentationMetadata(snapshot: snapshot)) : nil
         throughput = ChartDisplayHistory(
             samples: snapshot.throughput, now: end, duration: duration,
             archivedSegments: snapshot.archive.throughput)
         gpu = ChartDisplayHistory(
             samples: GPUActivityPresentation.chartSamples(snapshot.systemGPU),
             now: end, duration: duration, archivedSegments: snapshot.archive.systemGPU)
-        let events: [ToolActivityEvent]
-        let knownToolRequests: Set<UUID>
-        if let metadata {
-            PerformancePresentationCounters.shared.record(.sharedChartPreparations)
-            events = metadata.toolEvents(through: end)
-            knownToolRequests = metadata.knownToolRequestIDs
-        } else if optimized {
-            let tools = PreparedDashboardToolEvents(snapshot: snapshot, through: end)
-            events = tools.events
-            knownToolRequests = tools.knownRequestIDs
-        } else {
-            var eventsByID: [UUID: ToolActivityEvent] = [:]
-            for event in snapshot.historicalToolActivity + snapshot.toolActivity {
-                eventsByID[event.id] = event
-            }
-            events = ToolActivityHistory.normalizedEvents(Array(eventsByID.values), through: end)
-            knownToolRequests =
-                snapshot.toolActivityRequestIDs
-                ?? Set(eventsByID.values.compactMap(\.requestID))
-        }
+        let tools = PreparedDashboardToolEvents(snapshot: snapshot, through: end)
+        let events = tools.events
+        let knownToolRequests = tools.knownRequestIDs
         let toolObservation = ToolActivityObservation(
             observations: snapshot.toolObservation, now: end, duration: duration,
             archivedSegments: snapshot.archive.toolObservation)
@@ -77,19 +51,11 @@ final class PreparedDashboardCharts {
 
         // A retained allocator keeps request identity separate from the reused
         // track. Range changes and history expiry never renumber existing hues.
-        let rendered: [RequestLane]
-        if optimized || sharedNormalization {
-            let selection =
-                laneSelection
-                ?? Self.optimizedLaneSelection(
-                    snapshot: snapshot, end: end, duration: duration, sharedMetadata: metadata)
-            rendered = selection.rendered
-            omittedRequestCount = selection.omittedCount
-        } else {
-            let visible = Self.visibleLanes(snapshot: snapshot, end: end, duration: duration)
-            rendered = Self.renderedLanes(visible)
-            omittedRequestCount = visible.count - rendered.count
-        }
+        let selection =
+            laneSelection
+            ?? Self.optimizedLaneSelection(snapshot: snapshot, end: end, duration: duration)
+        let rendered = selection.rendered
+        omittedRequestCount = selection.omittedCount
         lanes = rendered
         let rails =
             requestRails
@@ -118,27 +84,19 @@ final class PreparedDashboardCharts {
     /// Select once for both rendering and retained rail lifecycles. The visible
     /// order already contains the start-time/identity ordering that drawing needs.
     static func optimizedLaneSelection(
-        snapshot: ChartPresentationSnapshot, end: Date, duration: TimeInterval,
-        sharedMetadata: SharedChartPresentationMetadata? = nil
+        snapshot: ChartPresentationSnapshot, end: Date, duration: TimeInterval
     ) -> LaneSelection {
         let start = end.addingTimeInterval(-duration)
-        let visible: [RequestLane]
-        if let sharedMetadata, !sharedMetadata.requiresLegacyLaneSelection {
-            visible = sharedMetadata.requestLanes.filter {
-                $0.startedAt <= end && ($0.endedAt ?? snapshot.timestamp) >= start
-            }
-        } else {
-            var byID: [UUID: RequestLane] = [:]
-            byID.reserveCapacity(
-                max(snapshot.historicalRequestLanes.count, snapshot.requestLanes.count))
-            for lane in snapshot.historicalRequestLanes { byID[lane.id] = lane }
-            for lane in snapshot.requestLanes { byID[lane.id] = lane }
-            visible = byID.values.filter {
-                $0.startedAt <= end && ($0.endedAt ?? snapshot.timestamp) >= start
-            }.sorted {
-                $0.startedAt == $1.startedAt
-                    ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
-            }
+        var byID: [UUID: RequestLane] = [:]
+        byID.reserveCapacity(
+            max(snapshot.historicalRequestLanes.count, snapshot.requestLanes.count))
+        for lane in snapshot.historicalRequestLanes { byID[lane.id] = lane }
+        for lane in snapshot.requestLanes { byID[lane.id] = lane }
+        let visible = byID.values.filter {
+            $0.startedAt <= end && ($0.endedAt ?? snapshot.timestamp) >= start
+        }.sorted {
+            $0.startedAt == $1.startedAt
+                ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
         }
         let openCount = visible.reduce(0) {
             $0 + (!$1.terminal && $1.endedAt == nil ? 1 : 0)
@@ -154,30 +112,6 @@ final class PreparedDashboardCharts {
             return true
         }
         return LaneSelection(rendered: rendered, omittedCount: omittedCount)
-    }
-
-    static func renderedLanes(_ visible: [RequestLane]) -> [RequestLane] {
-        let open = visible.filter { !$0.terminal && $0.endedAt == nil }
-        let ended = visible.filter { $0.terminal || $0.endedAt != nil }
-        // Never hide an active request behind a busy period of completed work.
-        return (open + ended.suffix(max(0, 256 - open.count))).sorted {
-            $0.startedAt == $1.startedAt
-                ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
-        }
-    }
-
-    static func visibleLanes(
-        snapshot: ChartPresentationSnapshot, end: Date, duration: TimeInterval
-    ) -> [RequestLane] {
-        var byID: [UUID: RequestLane] = [:]
-        for lane in snapshot.historicalRequestLanes + snapshot.requestLanes { byID[lane.id] = lane }
-        let start = end.addingTimeInterval(-duration)
-        return byID.values.filter {
-            $0.startedAt <= end && ($0.endedAt ?? snapshot.timestamp) >= start
-        }.sorted {
-            $0.startedAt == $1.startedAt
-                ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
-        }
     }
 }
 
@@ -274,9 +208,6 @@ private struct PreparedDashboardToolEvents {
 /// Keeps history preparation publication-bound while request identities survive range changes.
 final class DashboardChartPreparation {
     private var prepared: PreparedDashboardCharts?
-    /// At most one publication; separate hosts can retain the same immutable payload.
-    private(set) var sharedMetadata: SharedChartPresentationMetadata?
-    private var metadataPublicationID: UUID?
     private var railState = RequestRailState()
     private var railPublicationID: UUID?
     private var railWindow: DateInterval?
@@ -292,14 +223,11 @@ final class DashboardChartPreparation {
     /// assignments and the request lifecycle state needed when it opens again.
     func releasePreparedCharts() {
         prepared = nil
-        sharedMetadata = nil
-        metadataPublicationID = nil
     }
 
     func histories(
         snapshot: ChartPresentationSnapshot, duration: TimeInterval, epoch: UUID? = nil,
-        windowEnd: Date? = nil, isLive: Bool? = nil, optimized: Bool = false,
-        sharedNormalization: Bool = false
+        windowEnd: Date? = nil, isLive: Bool? = nil
     ) -> PreparedDashboardCharts {
         let end = min(windowEnd ?? snapshot.timestamp, snapshot.timestamp)
         let followingLive = isLive ?? (windowEnd == nil)
@@ -314,33 +242,14 @@ final class DashboardChartPreparation {
         }
         if let prepared, prepared.publicationID == snapshot.publicationID,
             prepared.duration == duration, prepared.windowEnd == end,
-            prepared.isLive == followingLive, prepared.optimized == optimized,
-            prepared.sharedNormalization == sharedNormalization
+            prepared.isLive == followingLive
         {
             return prepared
         }
-        if sharedNormalization {
-            if metadataPublicationID != snapshot.publicationID {
-                sharedMetadata =
-                    snapshot.sharedPreparationMetadata
-                    ?? SharedChartPresentationMetadata(snapshot: snapshot)
-                metadataPublicationID = snapshot.publicationID
-            }
-        } else {
-            sharedMetadata = nil
-            metadataPublicationID = nil
-        }
-        let selection =
-            optimized || sharedNormalization
-            ? PreparedDashboardCharts.optimizedLaneSelection(
-                snapshot: snapshot, end: end, duration: duration,
-                sharedMetadata: sharedMetadata) : nil
+        let selection = PreparedDashboardCharts.optimizedLaneSelection(
+            snapshot: snapshot, end: end, duration: duration)
         if railPublicationID != snapshot.publicationID || railWindow != window {
-            let rendered =
-                selection?.rendered
-                ?? PreparedDashboardCharts.renderedLanes(
-                    PreparedDashboardCharts.visibleLanes(
-                        snapshot: snapshot, end: end, duration: duration))
+            let rendered = selection.rendered
             var tracked = Dictionary(
                 uniqueKeysWithValues: rendered.map { ($0.id, $0) })
             // Keep receiving current lifecycles while the viewport is pinned in
@@ -358,8 +267,7 @@ final class DashboardChartPreparation {
             : requestRails
         let prepared = PreparedDashboardCharts(
             snapshot: snapshot, duration: duration, requestRails: rails, windowEnd: end,
-            isLive: followingLive, optimized: optimized, laneSelection: selection,
-            sharedNormalization: sharedNormalization, sharedMetadata: sharedMetadata)
+            isLive: followingLive, laneSelection: selection)
         self.prepared = prepared
         return prepared
     }

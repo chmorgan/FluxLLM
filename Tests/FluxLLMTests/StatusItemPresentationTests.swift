@@ -570,35 +570,4 @@ final class StatusItemPresentationTests: XCTestCase {
             try data.write(to: directory.appendingPathComponent("\(name)\(suffix).png"))
         }
     }
-
-    func testSparklineUsesElapsedTimeRatherThanSampleIndex() {
-        let now = Date(timeIntervalSince1970: 1_000)
-        let points = SparklineGeometry.normalizedPoints(
-            samples: [
-                TimeSeriesPoint(timestamp: now, value: 20),
-                TimeSeriesPoint(timestamp: now.addingTimeInterval(-60), value: 0),
-                TimeSeriesPoint(timestamp: now.addingTimeInterval(-15), value: 10),
-            ], now: now)
-        XCTAssertEqual(points.count, 3)
-        guard points.count == 3 else { return }
-        XCTAssertEqual(points[0].x, 0, accuracy: 0.0001)
-        XCTAssertEqual(points[1].x, 0.75, accuracy: 0.0001)
-        XCTAssertEqual(points[2].x, 1, accuracy: 0.0001)
-        XCTAssertEqual(points[1].y, 0.5, accuracy: 0.0001)
-        XCTAssertEqual(points[2].y, 1, accuracy: 0.0001)
-    }
-
-    func testSparklineDropsExpiredFutureAndNonfiniteSamples() {
-        let now = Date(timeIntervalSince1970: 1_000)
-        let points = SparklineGeometry.normalizedPoints(
-            samples: [
-                TimeSeriesPoint(timestamp: now.addingTimeInterval(-61), value: 10),
-                TimeSeriesPoint(timestamp: now.addingTimeInterval(1), value: 10),
-                TimeSeriesPoint(timestamp: now, value: .nan),
-                TimeSeriesPoint(timestamp: now, value: .infinity),
-                TimeSeriesPoint(timestamp: now.addingTimeInterval(-1), value: -3),
-            ], now: now)
-        XCTAssertEqual(points.count, 1)
-        XCTAssertEqual(points.first?.y, 0)
-    }
 }

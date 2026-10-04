@@ -316,75 +316,6 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         if visible != popover.isShown { togglePopover() }
     }
 
-    /// An authenticated diagnostic command, issued once after both hosts have
-    /// settled and immediately before traffic. It never freezes authoritative
-    /// telemetry, navigation, chart publication, or the animation clock.
-    public func performanceFreezeScalarPresentation() throws {
-        let diagnostics = PerformanceGraphicsDiagnostics.shared
-        guard diagnostics.isEnabled, diagnostics.mode.usesFrozenScalarPresentation, isStarted,
-            !metricsStore.backendActivity.isActive,
-            metricsStore.activeGeneration?.state != .running
-        else {
-            throw DashboardScalarFreezeError.invalid(
-                "Scalar freezing requires the idle frozen-scalar performance mode")
-        }
-        let visible = performanceVisibility
-        guard visible.dashboard, visible.popover else {
-            throw DashboardScalarFreezeError.invalid(
-                "Both native presentations must be visible before scalar freezing")
-        }
-        // Prevalidate and materialize both receipts before changing either host.
-        let dashboard = try dashboardPresentation.prepareFrozenScalars(
-            store: metricsStore, compact: false)
-        let compact = try popoverPresentation.prepareFrozenScalars(
-            store: metricsStore, compact: true)
-        try Self.installFrozenScalarPresentations(
-            dashboard: (dashboardPresentation, dashboard), popover: (popoverPresentation, compact))
-        Self.performanceUICheckpoint?("scalar.presentation.freeze")
-    }
-
-    static func installFrozenScalarPresentations(
-        dashboard: (DashboardPresentationState, DashboardFrozenScalars),
-        popover: (DashboardPresentationState, DashboardFrozenScalars)
-    ) throws {
-        do {
-            try dashboard.0.freezeScalars(dashboard.1)
-            try popover.0.freezeScalars(popover.1)
-        } catch {
-            dashboard.0.releaseFrozenScalars()
-            popover.0.releaseFrozenScalars()
-            throw error
-        }
-    }
-
-    /// Capture only the full dashboard usage block. Both native presentations
-    /// must already be visible; compact response tokens remain authoritative.
-    public func performanceFreezeUsagePresentation() throws -> [String: Any] {
-        let diagnostics = PerformanceGraphicsDiagnostics.shared
-        guard diagnostics.isEnabled, diagnostics.mode.usesHeldUsagePresentation, isStarted,
-            metricsStore.backendKind == .ollama, !metricsStore.backendActivity.isActive,
-            metricsStore.activeGeneration?.state != .running
-        else {
-            throw DashboardScalarFreezeError.invalid(
-                "Usage holding requires the idle held-usage performance mode")
-        }
-        let visible = performanceVisibility
-        guard visible.dashboard, visible.popover,
-            popoverPresentation.isActive, dashboardPresentation.isActive,
-            !popoverPresentation.scalarPerformanceFrames.isEmpty
-        else {
-            throw DashboardScalarFreezeError.invalid(
-                "Both native presentations must be visible before usage holding")
-        }
-        let snapshot = try dashboardPresentation.prepareHeldUsage(store: metricsStore)
-        try dashboardPresentation.holdUsage(snapshot, store: metricsStore)
-        Self.performanceUICheckpoint?("usage.presentation.freeze")
-        return [
-            "frozen": true, "owner": snapshot.owner.uuidString,
-            "epoch": snapshot.epoch.uuidString, "capture_identity": snapshot.fingerprint,
-        ]
-    }
-
     public var performancePopoverReadiness: PerformancePopoverReadiness {
         let button = statusItem?.button
         let window = button?.window
@@ -474,25 +405,12 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         window.isReleasedWhenClosed = false
         window.delegate = window
         presentation.bindScalarPerformanceWindow(window, role: "dashboard")
-        let directHost = PerformanceGraphicsDiagnostics.shared.mode == .directHost
         window.configurePresentation(
-            installPlaceholder: !directHost,
+            installPlaceholder: true,
             makeContent: {
                 Self.performanceUICheckpoint?("dashboard.swiftui_create.begin")
                 let dashboard = DashboardView(actions: actions, presentation: presentation)
                     .environment(store)
-                // Diagnostic comparison holds the viewport constant to isolate
-                // first attachment and initial SwiftUI sizing. Normal windows
-                // remain fully resizable; this mode is performance-control only.
-                if directHost {
-                    let hosting = NSHostingController(
-                        rootView: dashboard.frame(
-                            width: DashboardView.preferredWindowSize.width,
-                            height: DashboardView.preferredWindowSize.height))
-                    hosting.sizingOptions = []
-                    Self.performanceUICheckpoint?("dashboard.swiftui_create.end")
-                    return hosting
-                }
                 let hosting = NSHostingController(rootView: dashboard)
                 hosting.sizingOptions = []
                 Self.performanceUICheckpoint?("dashboard.swiftui_create.end")

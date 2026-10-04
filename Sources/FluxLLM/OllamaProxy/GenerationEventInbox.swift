@@ -11,27 +11,13 @@ final class GenerationEventInbox: @unchecked Sendable {
 
     let notifications: AsyncStream<Void>
 
-    struct Batch {
-        let events: [GenerationEvent]
-        let cumulativeStatesEnqueued: Int
-        let snapshotsMaterialized: Int
-
-        static let empty = Batch(events: [], cumulativeStatesEnqueued: 0, snapshotsMaterialized: 0)
-    }
-
-    private enum Payload {
-        case event(GenerationEvent)
-        case cumulative(requestID: UUID, state: TokenState, timestamp: Date)
-    }
-
     private struct PendingEvent {
         let sequence: UInt64
-        let payload: Payload
+        let event: GenerationEvent
     }
 
     private let continuation: AsyncStream<Void>.Continuation
     private let schedule: Scheduler
-    private let makeSnapshot: GenerationRelay.SnapshotFactory
     private let lock = NSLock()
     private var lifecycleEvents: [PendingEvent] = []
     private var liveSnapshots: [UUID: PendingEvent] = [:]
@@ -41,7 +27,6 @@ final class GenerationEventInbox: @unchecked Sendable {
     private var deliveryReady = false
     private var scheduledDelivery: Cancellation?
     private var scheduleRevision: UInt64 = 0
-    private var cumulativeStatesEnqueued = 0
 
     init(
         schedule: @escaping Scheduler = { delay, action in
@@ -51,9 +36,6 @@ final class GenerationEventInbox: @unchecked Sendable {
                 action()
             }
             return { task.cancel() }
-        },
-        makeSnapshot: @escaping GenerationRelay.SnapshotFactory = { state, timestamp in
-            state.snapshot(at: timestamp)
         }
     ) {
         let (notifications, continuation) = AsyncStream<Void>.makeStream(
@@ -61,7 +43,6 @@ final class GenerationEventInbox: @unchecked Sendable {
         self.notifications = notifications
         self.continuation = continuation
         self.schedule = schedule
-        self.makeSnapshot = makeSnapshot
     }
 
     func submit(_ event: GenerationEvent) {
@@ -72,38 +53,11 @@ final class GenerationEventInbox: @unchecked Sendable {
         enqueue(event)
     }
 
-    /// Stores a compact immutable copy of cumulative accounting. Replaced live
-    /// states never construct a snapshot or schedule per-request work. A record's
-    /// tools precede its terminal state, atomically under the inbox lock.
-    func submit(
-        requestID: UUID, state: TokenState, at timestamp: Date,
-        toolEvents: [ToolActivityEvent] = []
-    ) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !isFinished else { return }
-        cumulativeStatesEnqueued += 1
-        if !toolEvents.isEmpty {
-            enqueue(.toolActivity(requestID: requestID, events: toolEvents), signal: false)
-        }
-        sequence += 1
-        let pending = PendingEvent(
-            sequence: sequence,
-            payload: .cumulative(requestID: requestID, state: state, timestamp: timestamp))
-        if state.isTerminal {
-            liveSnapshots.removeValue(forKey: requestID)
-            lifecycleEvents.append(pending)
-        } else {
-            liveSnapshots[requestID] = pending
-        }
-        requestDelivery(urgent: state.isTerminal || !toolEvents.isEmpty)
-    }
-
     /// Called with the inbox lock held. Lifecycle payloads retain every event;
     /// only ordinary cumulative snapshots can replace a preceding live value.
-    private func enqueue(_ event: GenerationEvent, signal: Bool = true) {
+    private func enqueue(_ event: GenerationEvent) {
         sequence += 1
-        let pending = PendingEvent(sequence: sequence, payload: .event(event))
+        let pending = PendingEvent(sequence: sequence, event: event)
         var urgent = true
         switch event {
         case .began, .toolActivity:
@@ -127,7 +81,7 @@ final class GenerationEventInbox: @unchecked Sendable {
             lifecycleEvents.append(pending)
         }
 
-        if signal { requestDelivery(urgent: urgent) }
+        requestDelivery(urgent: urgent)
     }
 
     private func requestDelivery(urgent: Bool) {
@@ -146,14 +100,10 @@ final class GenerationEventInbox: @unchecked Sendable {
     /// Consumer entry point. A forced drain can leave a buffered signal behind;
     /// that stale signal must not deliver the next live batch before its deadline.
     func drainReadyEvents() -> [GenerationEvent] {
-        drainReadyBatch().events
-    }
-
-    func drainReadyBatch() -> Batch {
         lock.lock()
         defer { lock.unlock() }
         notificationPending = false
-        guard deliveryReady else { return .empty }
+        guard deliveryReady else { return [] }
         return takePendingEvents()
     }
 
@@ -161,37 +111,19 @@ final class GenerationEventInbox: @unchecked Sendable {
     /// overlapping requests on the correct side of newer request beginnings.
     /// Shutdown uses this to apply final usage/cancellations before returning.
     func drain() -> [GenerationEvent] {
-        drainBatch().events
-    }
-
-    func drainBatch() -> Batch {
         lock.lock()
         defer { lock.unlock() }
         notificationPending = false
         return takePendingEvents()
     }
 
-    private func takePendingEvents() -> Batch {
+    private func takePendingEvents() -> [GenerationEvent] {
         cancelScheduledDelivery()
         deliveryReady = false
         let pending = lifecycleEvents + liveSnapshots.values
         lifecycleEvents.removeAll(keepingCapacity: true)
         liveSnapshots.removeAll(keepingCapacity: true)
-        let stateCount = cumulativeStatesEnqueued
-        cumulativeStatesEnqueued = 0
-        var materialized = 0
-        let events = pending.sorted { $0.sequence < $1.sequence }.map {
-            pending -> GenerationEvent in
-            switch pending.payload {
-            case .event(let event): return event
-            case .cumulative(let requestID, let state, let timestamp):
-                materialized += 1
-                return .updated(requestID: requestID, snapshot: makeSnapshot(state, timestamp))
-            }
-        }
-        return Batch(
-            events: events, cumulativeStatesEnqueued: stateCount,
-            snapshotsMaterialized: materialized)
+        return pending.sorted { $0.sequence < $1.sequence }.map(\.event)
     }
 
     /// Normal completion flushes the final pending batch before ending the
@@ -207,7 +139,6 @@ final class GenerationEventInbox: @unchecked Sendable {
         } else {
             lifecycleEvents.removeAll()
             liveSnapshots.removeAll()
-            cumulativeStatesEnqueued = 0
             deliveryReady = false
         }
         continuation.finish()

@@ -12,16 +12,12 @@ struct DashboardScalarView: View, Equatable {
     let narrow: Bool
     let density: DashboardHeightPolicy
     let omittedRequestCount: Int
-    let scalarMode: PerformanceGraphicsDiagnostics.Mode
-    let legacyUsageInterval: DateInterval?
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.actions === rhs.actions && lhs.presentation === rhs.presentation
             && lhs.leaf == rhs.leaf && lhs.isCompact == rhs.isCompact
             && lhs.narrow == rhs.narrow && lhs.density == rhs.density
             && lhs.omittedRequestCount == rhs.omittedRequestCount
-            && lhs.scalarMode == rhs.scalarMode
-            && lhs.legacyUsageInterval == rhs.legacyUsageInterval
     }
 
     var body: some View {
@@ -231,50 +227,44 @@ struct DashboardScalarView: View, Equatable {
     private func dashboardDetails(narrow: Bool, density: DashboardHeightPolicy) -> some View {
         VStack(alignment: .leading, spacing: density.value(8, 5)) {
             if scalarBackendKind == .ollama {
-                if scalarMode.usesRetainedUsageFields {
-                    retainedUsageDetails(narrow: narrow, density: density)
-                } else {
-                    let totals = displayedUsageSummary
-                    HStack(spacing: 8) {
-                        Text("Usage").font(.system(size: 11, weight: .semibold))
-                        Picker("Usage scope", selection: usageScope) {
-                            ForEach(UsageScope.allCases) { scope in Text(scope.title).tag(scope) }
-                        }
-                        .labelsHidden().pickerStyle(.menu).fixedSize().controlSize(.small)
-                        .help(usageScopeHelp)
-                        Spacer(minLength: 0)
-                        if totals.isPartial {
-                            Text("Partial history").font(.system(size: 10)).foregroundStyle(
-                                .secondary)
-                        } else if totals.activeRequests > 0 {
-                            Text("\(totals.activeRequests) active")
-                                .font(.system(size: 10)).foregroundStyle(.secondary)
-                        }
+                let totals = displayedUsageSummary
+                HStack(spacing: 8) {
+                    Text("Usage").font(.system(size: 11, weight: .semibold))
+                    Picker("Usage scope", selection: usageScope) {
+                        ForEach(UsageScope.allCases) { scope in Text(scope.title).tag(scope) }
                     }
-                    LazyVGrid(
-                        columns: Array(
-                            repeating: GridItem(.flexible(), alignment: .leading),
-                            count: narrow ? 2 : 4
-                        ),
-                        alignment: .leading, spacing: 8
-                    ) {
-                        summaryValue("Input tokens", inputUsageLabel(totals), density: density)
-                            .help(
-                                totals.unknownInputRequests > 0
-                                    ? "Input usage is unavailable for \(totals.unknownInputRequests) requests. A + marks the known subtotal."
-                                    : "Input tokens reported by the backend.")
-                        summaryValue(
-                            "Output tokens",
-                            (totals.outputIsEstimated ? "~" : "") + totals.outputTokens.formatted(),
-                            density: density)
-                        summaryValue("Tool calls", totals.toolCalls.formatted(), density: density)
-                            .help(
-                                "Observed calls, excluding submitted results; this does not measure execution success."
-                            )
-                        summaryValue("Requests", totals.requests.formatted(), density: density)
-                    }
+                    .labelsHidden().pickerStyle(.menu).fixedSize().controlSize(.small)
                     .help(usageScopeHelp)
+                    Spacer(minLength: 0)
+                    if totals.isPartial {
+                        Text("Partial history").font(.system(size: 10)).foregroundStyle(.secondary)
+                    } else if totals.activeRequests > 0 {
+                        Text("\(totals.activeRequests) active")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
                 }
+                LazyVGrid(
+                    columns: Array(
+                        repeating: GridItem(.flexible(), alignment: .leading), count: narrow ? 2 : 4
+                    ),
+                    alignment: .leading, spacing: 8
+                ) {
+                    summaryValue("Input tokens", inputUsageLabel(totals), density: density)
+                        .help(
+                            totals.unknownInputRequests > 0
+                                ? "Input usage is unavailable for \(totals.unknownInputRequests) requests. A + marks the known subtotal."
+                                : "Input tokens reported by the backend.")
+                    summaryValue(
+                        "Output tokens",
+                        (totals.outputIsEstimated ? "~" : "") + totals.outputTokens.formatted(),
+                        density: density)
+                    summaryValue("Tool calls", totals.toolCalls.formatted(), density: density)
+                        .help(
+                            "Observed calls, excluding submitted results; this does not measure execution success."
+                        )
+                    summaryValue("Requests", totals.requests.formatted(), density: density)
+                }
+                .help(usageScopeHelp)
             } else {
                 let layout =
                     narrow
@@ -297,73 +287,6 @@ struct DashboardScalarView: View, Equatable {
         }
         .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
             ["statistics-row": $0]
-        }
-    }
-
-    private func retainedUsageDetails(narrow: Bool, density: DashboardHeightPolicy) -> some View {
-        let coordinator = presentation.retainedUsageCoordinator(store: store)
-        return VStack(alignment: .leading, spacing: density.value(8, 5)) {
-            HStack(spacing: 8) {
-                Text("Usage").font(.system(size: 11, weight: .semibold))
-                Picker("Usage scope", selection: usageScope) {
-                    ForEach(UsageScope.allCases) { scope in Text(scope.title).tag(scope) }
-                }
-                .labelsHidden().pickerStyle(.menu).fixedSize().controlSize(.small)
-                .help(usageScopeHelp)
-                Spacer(minLength: 0)
-                DashboardRetainedUsageField(
-                    coordinator: coordinator, field: .badge,
-                    density: density, colorScheme: colorScheme)
-            }
-            LazyVGrid(
-                columns: Array(
-                    repeating: GridItem(.flexible(), alignment: .leading), count: narrow ? 2 : 4),
-                alignment: .leading, spacing: 8
-            ) {
-                ForEach(
-                    [DashboardRetainedUsageCoordinator.Field.input, .output, .tools, .requests],
-                    id: \.self
-                ) {
-                    retainedUsageCell($0, coordinator: coordinator, density: density)
-                }
-            }
-            .help(usageScopeHelp)
-        }
-    }
-
-    @ViewBuilder private func retainedUsageCell(
-        _ field: DashboardRetainedUsageCoordinator.Field,
-        coordinator: DashboardRetainedUsageCoordinator, density: DashboardHeightPolicy
-    ) -> some View {
-        let content = VStack(alignment: .leading, spacing: density.value(5, 2)) {
-            Text(retainedUsageLabel(field)).font(.system(size: 11)).foregroundStyle(.secondary)
-                .lineLimit(1).minimumScaleFactor(0.8).frame(height: 14)
-            GeometryReader { geometry in
-                DashboardRetainedUsageField(
-                    coordinator: coordinator, field: field,
-                    density: density, colorScheme: colorScheme,
-                    logicalFrame: geometry.frame(in: .global))
-            }
-            .frame(height: density.value(21, 18))
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        switch field {
-        case .input: content.help(coordinator.inputHelp.text)
-        case .tools:
-            content.help(
-                "Observed calls, excluding submitted results; this does not measure execution success."
-            )
-        default: content
-        }
-    }
-
-    private func retainedUsageLabel(_ field: DashboardRetainedUsageCoordinator.Field) -> String {
-        switch field {
-        case .input: "Input tokens"
-        case .output: "Output tokens"
-        case .tools: "Tool calls"
-        case .requests: "Requests"
-        case .badge: ""
         }
     }
 
@@ -425,127 +348,33 @@ struct DashboardScalarView: View, Equatable {
     }
 
     private var statusColor: Color {
-        if let frozen = frozenScalars {
-            return switch frozen.statusTone {
-            case .throughput: throughputColor
-            case .secondary: .secondary
-            case .blue: .blue
-            case .orange: .orange
-            }
-        }
-        if let live = liveScalars {
-            return switch live.statusTone {
-            case .throughput: throughputColor
-            case .secondary: .secondary
-            case .blue: .blue
-            case .orange: .orange
-            }
-        }
-        if store.isBackendActive { return throughputColor }
-        return switch store.connectionState {
-        case .ready: store.isBackendActive ? throughputColor : .secondary
-        case .connecting, .detecting: .blue
-        case .needsConfiguration, .unavailable: .orange
+        switch store.liveScalars.statusTone {
+        case .throughput: throughputColor
+        case .secondary: .secondary
+        case .blue: .blue
+        case .orange: .orange
         }
     }
 
     private var usageScope: Binding<UsageScope> {
-        Binding(
-            get: { frozenScalars?.usageScope ?? store.usageScope }, set: { store.usageScope = $0 })
+        Binding(get: { store.usageScope }, set: { store.usageScope = $0 })
     }
-
-    private var usageScopeHelp: String {
-        if let frozen = frozenScalars { return frozen.usageScopeHelp }
-        if let live = liveScalars { return live.usageScopeHelp }
-        return switch store.usageScope {
-        case .sinceLaunch:
-            "All requests observed for this endpoint since FluxLLM launched, including active estimates."
-        case .selectedPeriod:
-            "Full usage of requests completed in the selected chart interval. Tool calls are counted by their event time."
-        case .today:
-            "Requests completed today and active requests started today, including saved history for this endpoint."
-        }
-    }
-
+    private var usageScopeHelp: String { store.liveScalars.usageScopeHelp }
     private func inputUsageLabel(_ summary: UsageSummary) -> String {
         guard let input = summary.inputTokens else { return "—" }
         return input.formatted() + (summary.unknownInputRequests > 0 ? "+" : "")
     }
-
-    private var observationScope: String {
-        if let frozen = frozenScalars { return frozen.observationScope }
-        if let live = liveScalars { return live.observationScope }
-        return switch store.backendKind {
-        case .ollama: "Via FluxLLM"
-        case .none: "Waiting for backend"
-        default: "Server metrics"
-        }
-    }
-
-    private var gpuIsAvailable: Bool {
-        store.systemGPUUtilizationPercent != nil
-    }
-
-    private var gpuHelp: String {
-        if let frozen = frozenScalars { return frozen.gpuHelp }
-        if let live = liveScalars { return live.gpuHelp }
-        return gpuIsAvailable ? GPUActivityPresentation.explanation : store.gpuAvailabilityMessage
-    }
-
-    private var throughputHelp: String {
-        if let frozen = frozenScalars { return frozen.throughputHelp }
-        if let live = liveScalars { return live.throughputHelp }
-        return switch store.throughputBasis {
-        case .estimated:
-            if store.backendKind == .ollama {
-                "Generated and tool-call rates follow the latest request via FluxLLM. Active includes all open monitored requests. Live token rate is approximate until the backend reports final token counts."
-            } else {
-                "Live token rate is approximate until the backend reports final token counts."
-            }
-        case .serverAggregate:
-            "Total token throughput across requests reported by this backend."
-        case .serverReportedAverage:
-            "Average token rate reported by this backend."
-        }
-    }
-
-    private var modelLabel: String {
-        if let frozen = frozenScalars { return frozen.modelLabel }
-        if let live = liveScalars { return live.modelLabel }
-        guard let model = store.currentModel, !model.isEmpty else { return "—" }
-        return model
-    }
-
-    private var responseTokensLabel: String {
-        if let frozen = frozenScalars { return frozen.responseTokensLabel }
-        if let live = liveScalars { return live.responseTokensLabel }
-        return store.activeGeneration == nil
-            ? "—" : (store.outputIsEstimated ? "~" : "") + store.outputTokens.formatted()
-    }
-
-    private var displayedUsageSummary: UsageSummary {
-        if let frozen = frozenScalars { return frozen.usage }
-        if scalarMode.usesHeldUsagePresentation, !isCompact, let held = presentation.heldUsage,
-            held.epoch == store.monitoringEpoch
-        {
-            return held.usage
-        }
-        if let live = liveScalars { return live.usage }
-        return store.usageSummary(
-            in: legacyUsageInterval
-                ?? DateInterval(
-                    start: store.chartPresentation.timestamp.addingTimeInterval(-60),
-                    end: store.chartPresentation.timestamp))
-    }
+    private var observationScope: String { store.liveScalars.observationScope }
+    private var gpuHelp: String { store.liveScalars.gpuHelp }
+    private var throughputHelp: String { store.liveScalars.throughputHelp }
+    private var modelLabel: String { store.liveScalars.modelLabel }
+    private var responseTokensLabel: String { store.liveScalars.responseTokensLabel }
+    private var displayedUsageSummary: UsageSummary { store.liveScalars.usage }
 
     /// These bounded receipts are the actual labels read by the native leaf,
     /// not sampled raw counters. They do not run in ordinary app sessions.
     private func recordPresentedValues() {
         let diagnostics = PerformanceGraphicsDiagnostics.shared
-        guard
-            diagnostics.mode == .normal || diagnostics.mode.usesHeldUsagePresentation
-                || diagnostics.mode.usesRetainedUsageFields
-        else { return }
         let values: [String: Any]
         switch leaf {
         case .header:
@@ -558,21 +387,17 @@ struct DashboardScalarView: View, Equatable {
         case .details where isCompact && scalarBackendKind == .ollama:
             values = ["response": responseTokensLabel]
         case .details where !isCompact && scalarBackendKind == .ollama:
-            // Native host apply callbacks supply this witness after applying
-            // the actual retained fields. Reading usage here would enroll the
-            // parent details body and report values it did not render.
-            if scalarMode.usesRetainedUsageFields { return }
-            let scope: UsageScope
-            if scalarMode.usesHeldUsagePresentation, let held = presentation.heldUsage,
-                held.epoch == store.monitoringEpoch
-            {
-                scope = held.scope
-            } else {
-                scope = store.usageScope
-            }
+            let usage = displayedUsageSummary
             values = [
-                "scope": scope.rawValue,
-                "values": DashboardHeldUsage.values(for: displayedUsageSummary),
+                "scope": store.usageScope.rawValue,
+                "values": [
+                    "input_tokens": usage.inputTokens as Any? ?? NSNull(),
+                    "unknown_input_requests": usage.unknownInputRequests,
+                    "output_tokens": usage.outputTokens,
+                    "output_is_estimated": usage.outputIsEstimated,
+                    "tool_calls": usage.toolCalls, "requests": usage.requests,
+                    "active_requests": usage.activeRequests, "is_partial": usage.isPartial,
+                ],
             ]
         default: return
         }
@@ -582,84 +407,22 @@ struct DashboardScalarView: View, Equatable {
     }
 
     private var displayedHistoryPersistenceError: String? {
-        if let frozen = frozenScalars { return frozen.historyPersistenceError }
-        if let live = liveScalars { return live.historyPersistenceError }
-        return store.historyPersistenceError
+        store.liveScalars.historyPersistenceError
     }
-
-    private var requestCountLabel: String {
-        if let frozen = frozenScalars { return frozen.requestCountLabel }
-        if let live = liveScalars { return live.requestCountLabel }
-        guard let running = store.runningRequests else { return "—" }
-        let queued = store.queuedRequests ?? 0
-        return queued > 0 ? "\(running) active · \(queued) queued" : running.formatted()
-    }
-
-    private var providerTitle: String {
-        if let frozen = frozenScalars { return frozen.providerTitle }
-        if let live = liveScalars { return live.providerTitle }
-        return store.backendKind?.title ?? "LLM monitor"
-    }
-
-    private var activityDetail: String? {
-        if let frozen = frozenScalars { return frozen.activityDetail }
-        if let live = liveScalars { return live.activityDetail }
-        return BackendPresentation.activityDetail(store: store)
-    }
-
-    private var configurationPrompt: String? {
-        if let frozen = frozenScalars { return frozen.configurationPrompt }
-        if let live = liveScalars { return live.configurationPrompt }
-        return BackendPresentation.configurationPrompt(store: store)
-    }
-
-    private var statusTitle: String {
-        if let frozen = frozenScalars { return frozen.statusTitle }
-        if let live = liveScalars { return live.statusTitle }
-        return BackendPresentation.statusTitle(store: store)
-    }
-
-    private var rateLabel: String {
-        if let frozen = frozenScalars { return frozen.rateLabel }
-        if let live = liveScalars { return live.rateLabel }
-        return BackendPresentation.rateLabel(store: store)
-    }
-
-    private var gpuLabel: String {
-        if let frozen = frozenScalars { return frozen.gpuLabel }
-        if let live = liveScalars { return live.gpuLabel }
-        return GPUActivityPresentation.valueLabel(store.systemGPUUtilizationPercent)
-    }
-
-    private var backendOutputTokensLabel: String {
-        if let frozen = frozenScalars { return frozen.backendOutputTokensLabel }
-        if let live = liveScalars { return live.backendOutputTokensLabel }
-        return store.backendOutputTokens?.formatted() ?? "—"
-    }
-
-    private var backendPromptTokensLabel: String {
-        if let frozen = frozenScalars { return frozen.backendPromptTokensLabel }
-        if let live = liveScalars { return live.backendPromptTokensLabel }
-        return store.backendPromptTokens?.formatted() ?? "—"
-    }
-
+    private var requestCountLabel: String { store.liveScalars.requestCountLabel }
+    private var providerTitle: String { store.liveScalars.providerTitle }
+    private var activityDetail: String? { store.liveScalars.activityDetail }
+    private var configurationPrompt: String? { store.liveScalars.configurationPrompt }
+    private var statusTitle: String { store.liveScalars.statusTitle }
+    private var rateLabel: String { store.liveScalars.rateLabel }
+    private var gpuLabel: String { store.liveScalars.gpuLabel }
+    private var backendOutputTokensLabel: String { store.liveScalars.backendOutputTokensLabel }
+    private var backendPromptTokensLabel: String { store.liveScalars.backendPromptTokensLabel }
     private func cardFooterLabel(omittedRequestCount: Int) -> String {
-        if let frozen = frozenScalars { return frozen.cardFooterLabel }
-        return omittedRequestCount > 0
+        omittedRequestCount > 0
             ? "\(observationScope) · \(omittedRequestCount) older rails omitted" : observationScope
     }
-
-    private var frozenScalars: DashboardFrozenScalars? {
-        scalarMode.usesFrozenScalarPresentation ? presentation.frozenScalars : nil
-    }
-    private var liveScalars: DashboardLiveScalars? {
-        scalarMode.usesCoalescedScalarPresentation ? store.liveScalars : nil
-    }
-    private var scalarBackendKind: BackendKind? {
-        if let frozen = frozenScalars { return frozen.backendKind }
-        if let live = liveScalars { return live.backendKind }
-        return store.backendKind
-    }
+    private var scalarBackendKind: BackendKind? { store.liveScalars.backendKind }
     private var throughputColor: Color { TelemetryPalette.throughput(colorScheme) }
     private var gpuColor: Color { TelemetryPalette.gpu(colorScheme) }
 }

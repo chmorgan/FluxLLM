@@ -11,7 +11,8 @@ import XCTest
 final class DashboardLiveScalarViewTests: XCTestCase {
     private let origin = Date(timeIntervalSince1970: 1_800_000_000)
 
-    func testNativePixelsAndGeometryMatchLegacyScalarReceiptAcrossDashboardSizes() throws {
+    func testNativePixelsAndGeometryMatchIndependentRawScalarReferenceAcrossDashboardSizes() throws
+    {
         let cases: [(Bool, CGSize, BackendKind)] = [
             (true, CGSize(width: 360, height: 550), .ollama),
             (false, CGSize(width: 740, height: 700), .ollama),
@@ -22,10 +23,10 @@ final class DashboardLiveScalarViewTests: XCTestCase {
         for (compact, size, backend) in cases {
             let reference = try captureDashboard(
                 compact: compact, size: size, backend: backend,
-                mode: .runtimeFrozenScalars, freeze: true)
+                reference: true)
             let projected = try captureDashboard(
                 compact: compact, size: size, backend: backend,
-                mode: .normal, freeze: false)
+                reference: false)
             XCTAssertEqual(projected.frames, reference.frames, "Layout changed at \(size)")
             XCTAssertEqual(
                 projected.pixels, reference.pixels,
@@ -69,6 +70,51 @@ final class DashboardLiveScalarViewTests: XCTestCase {
                 try presentedValues(state), values,
                 "Actual rendered scalar witnesses must remain unchanged")
         }
+    }
+
+    func testNativeFrameWitnessesRetireOnHideAndRefreshAcrossVisibleEpochChange() throws {
+        try PerformanceGraphicsDiagnostics.shared.enable(mode: .normal)
+        let store = makeStore(.vllm)
+        let state = DashboardPresentationState()
+        let first = LiveScalarDashboardHost(
+            store: store, state: state, compact: false,
+            size: CGSize(width: 740, height: 700))
+        var current = first
+        defer {
+            current.close()
+            drain()
+            try? PerformanceGraphicsDiagnostics.shared.disable()
+        }
+        try first.settle()
+        let previousFrames = state.scalarPerformanceFrames
+        let previousGeneration = state.scalarFrameGeneration
+        let previousEpoch = store.monitoringEpoch
+        first.close()
+        drain()
+        XCTAssertTrue(state.scalarPerformanceFrames.isEmpty)
+        state.recordScalarPerformanceFrames(
+            previousFrames, generation: previousGeneration, epoch: previousEpoch)
+        XCTAssertTrue(
+            state.scalarPerformanceFrames.isEmpty, "A hidden host must reject delayed callbacks")
+        let reopened = LiveScalarDashboardHost(
+            store: store, state: state, compact: false,
+            size: CGSize(width: 740, height: 700))
+        current = reopened
+        try reopened.settle()
+        XCTAssertNotEqual(state.scalarFrameGeneration, previousGeneration)
+        XCTAssertNotNil(state.scalarPerformanceFrames["main-activity-plot"])
+        let oldGeneration = state.scalarFrameGeneration
+        store.beginBackendSession(kind: .vllm, epoch: UUID())
+        try reopened.settle()
+        XCTAssertNotEqual(state.scalarFrameGeneration, oldGeneration)
+        let refreshed = state.scalarPerformanceFrames
+        XCTAssertNotNil(
+            refreshed["main-activity-plot"], "Equal geometry in a fresh epoch needs a new receipt")
+        state.recordScalarPerformanceFrames(
+            previousFrames, generation: oldGeneration, epoch: previousEpoch)
+        XCTAssertEqual(
+            state.scalarPerformanceFrames, refreshed,
+            "Prior-epoch callbacks cannot replace the fresh native receipt")
     }
 
     func testGPUReadingsAndUsageChangesDoNotFanOutToUnrelatedNativeLeaves() throws {
@@ -255,12 +301,6 @@ final class DashboardLiveScalarViewTests: XCTestCase {
         context.omittedRequestCount = 4
         XCTAssertNotEqual(base, context.child)
         context.omittedRequestCount = 0
-        context.mode = .nativeGPUCanvas
-        XCTAssertNotEqual(base, context.child)
-        context.mode = .normal
-        context.legacyUsageInterval = DateInterval(start: origin, duration: 60)
-        XCTAssertNotEqual(base, context.child)
-        context.legacyUsageInterval = nil
         context.actions = MenuActions()
         XCTAssertNotEqual(base, context.child)
         context.actions = base.actions
@@ -275,24 +315,19 @@ final class DashboardLiveScalarViewTests: XCTestCase {
 
     private func captureDashboard(
         compact: Bool, size: CGSize, backend: BackendKind,
-        mode: PerformanceGraphicsDiagnostics.Mode, freeze: Bool
+        reference: Bool
     ) throws -> DashboardCapture {
-        try PerformanceGraphicsDiagnostics.shared.enable(mode: mode)
+        try PerformanceGraphicsDiagnostics.shared.enable(mode: .normal)
         let store = makeStore(backend)
         let state = DashboardPresentationState()
-        let host = LiveScalarDashboardHost(store: store, state: state, compact: compact, size: size)
+        let host = LiveScalarDashboardHost(
+            store: store, state: state, compact: compact, size: size, reference: reference)
         defer {
             host.close()
             drain()
             try? PerformanceGraphicsDiagnostics.shared.disable()
         }
         try host.settle()
-        if freeze {
-            // This receipt still uses the original raw BackendPresentation/GPU
-            // helpers and coalesced accounting; it does not read liveScalars.
-            try state.freezeScalars(state.prepareFrozenScalars(store: store, compact: compact))
-            try host.settle()
-        }
         let keys =
             compact
             ? ["dashboard-header", "throughput-value", "gpu-value", "statistics-row"]
@@ -303,7 +338,7 @@ final class DashboardLiveScalarViewTests: XCTestCase {
         let frames = state.scalarPerformanceFrames.filter { $0.key != "native-window" }
         let pixels = try keys.map { key in
             let context =
-                "\(key), compact=\(compact), size=\(size), backend=\(backend), mode=\(mode)"
+                "\(key), compact=\(compact), size=\(size), backend=\(backend), rawReference=\(reference)"
             return try host.pixels(
                 in: XCTUnwrap(frames[key], "Missing native scalar anchor: \(context)"),
                 context: context)
@@ -377,8 +412,6 @@ private final class ScalarParentContext {
     var narrow = false
     var density = DashboardHeightPolicy.roomy
     var omittedRequestCount = 0
-    var mode = PerformanceGraphicsDiagnostics.Mode.normal
-    var legacyUsageInterval: DateInterval?
     var parentTick = 0
     var scheme = ColorScheme.light
 
@@ -390,8 +423,7 @@ private final class ScalarParentContext {
         DashboardScalarView(
             actions: actions, presentation: presentation, leaf: leaf,
             isCompact: compact, narrow: narrow, density: density,
-            omittedRequestCount: omittedRequestCount, scalarMode: mode,
-            legacyUsageInterval: legacyUsageInterval)
+            omittedRequestCount: omittedRequestCount)
     }
 }
 
@@ -452,7 +484,10 @@ private final class LiveScalarDashboardHost {
     private let state: DashboardPresentationState
     private let store: MetricsStore
     private let size: CGSize
-    init(store: MetricsStore, state: DashboardPresentationState, compact: Bool, size: CGSize) {
+    init(
+        store: MetricsStore, state: DashboardPresentationState, compact: Bool, size: CGSize,
+        reference: Bool = false
+    ) {
         _ = NSApplication.shared
         self.store = store
         self.state = state
@@ -464,10 +499,15 @@ private final class LiveScalarDashboardHost {
         window.appearance = NSAppearance(named: .aqua)
         state.setActive(true, store: store)
         state.bindScalarPerformanceWindow(window, role: compact ? "popover" : "dashboard")
-        let host = NSHostingController(
-            rootView: AnyView(
-                DashboardView(isCompact: compact, presentation: state).environment(store)
-                    .environment(\.colorScheme, .light)))
+        let content: AnyView =
+            reference
+            ? AnyView(
+                LegacyDashboardReferenceView(isCompact: compact, presentation: state)
+                    .environment(store).environment(\.colorScheme, .light))
+            : AnyView(
+                DashboardView(isCompact: compact, presentation: state)
+                    .environment(store).environment(\.colorScheme, .light))
+        let host = NSHostingController(rootView: content)
         host.sizingOptions = []
         let container = NSViewController()
         container.view = NSView(frame: CGRect(origin: .zero, size: size))

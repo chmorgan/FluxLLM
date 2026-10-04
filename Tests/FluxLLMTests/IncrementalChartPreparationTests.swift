@@ -134,75 +134,67 @@ final class IncrementalChartPreparationTests: XCTestCase {
             retainedSeconds: 3_600, laneCount: 33, count: 2)
         for duration in [60.0, 300, 3_600] {
             for endOffset in [0.0, -5.5, -20] {
-                let referenceCache = DashboardChartPreparation(clock: { self.date(4_000) })
                 let candidateCache = DashboardChartPreparation(clock: { self.date(4_000) })
                 for snapshot in snapshots {
                     let end = snapshot.timestamp.addingTimeInterval(endOffset)
-                    let reference = referenceCache.histories(
-                        snapshot: snapshot, duration: duration, windowEnd: end,
-                        isLive: endOffset == 0, optimized: false)
                     let candidate = candidateCache.histories(
                         snapshot: snapshot, duration: duration, windowEnd: end,
-                        isLive: endOffset == 0, optimized: true)
+                        isLive: endOffset == 0)
+                    let reference = prepare(
+                        snapshot, duration: duration, end: end,
+                        optimized: false, requestRails: candidate.requestRails)
                     assertEquivalent(candidate, reference)
-                    XCTAssertEqual(candidate.requestRails.events, reference.requestRails.events)
                 }
             }
         }
     }
 
-    func testSwitchingOptimizationOnSamePublicationInvalidatesCacheWithoutReplayingEffects() throws
-    {
+    func testCacheReusesSamePublicationAndPinnedViewportDoesNotReplayEffects() throws {
         let cache = DashboardChartPreparation(clock: { self.date(10) })
         _ = cache.histories(snapshot: ChartPresentationSnapshot(timestamp: origin), duration: 60)
         let snapshot = ChartPresentationSnapshot(
             timestamp: date(1), requestLanes: [lane(1, start: 1)])
-        let legacy = cache.histories(snapshot: snapshot, duration: 60, optimized: false)
-        let candidate = cache.histories(snapshot: snapshot, duration: 60, optimized: true)
-        XCTAssertFalse(legacy === candidate)
-        assertEquivalent(candidate, legacy)
-        XCTAssertEqual(candidate.requestRails.events, legacy.requestRails.events)
-        XCTAssertEqual(try XCTUnwrap(candidate.requestRails.events.first).kind, .arrival)
+        let live = cache.histories(snapshot: snapshot, duration: 60)
+        XCTAssertEqual(try XCTUnwrap(live.requestRails.events.first).kind, .arrival)
+        XCTAssertTrue(cache.histories(snapshot: snapshot, duration: 60) === live)
+        let pinned = cache.histories(
+            snapshot: snapshot, duration: 60, windowEnd: snapshot.timestamp, isLive: false)
+        XCTAssertFalse(pinned === live)
+        XCTAssertTrue(pinned.requestRails.events.isEmpty)
+        XCTAssertEqual(pinned.requestRails.assignments, live.requestRails.assignments)
         XCTAssertTrue(
-            cache.histories(snapshot: snapshot, duration: 60, optimized: true) === candidate)
-        let switchedBack = cache.histories(snapshot: snapshot, duration: 60, optimized: false)
-        XCTAssertFalse(switchedBack === candidate)
-        XCTAssertEqual(switchedBack.requestRails.events, legacy.requestRails.events)
-        let frozen = cache.histories(
-            snapshot: snapshot, duration: 60, windowEnd: snapshot.timestamp,
-            isLive: false, optimized: true)
-        XCTAssertFalse(frozen === switchedBack)
-        XCTAssertTrue(frozen.requestRails.events.isEmpty)
-        XCTAssertEqual(frozen.requestRails.assignments, legacy.requestRails.assignments)
+            cache.histories(
+                snapshot: snapshot, duration: 60, windowEnd: snapshot.timestamp, isLive: false)
+                === pinned)
     }
 
     func testPinnedViewportStillTracksOutsideCompletionsForStableTrackReuse() throws {
-        for optimized in [false, true] {
+        do {
             var receipt = date(100)
             let cache = DashboardChartPreparation(clock: { receipt })
             let initial = cache.histories(
                 snapshot: ChartPresentationSnapshot(
                     timestamp: date(100), requestLanes: [lane(1, start: 90)]),
-                duration: 20, windowEnd: date(20), optimized: optimized)
+                duration: 20, windowEnd: date(20))
             XCTAssertTrue(initial.lanes.isEmpty)
             let firstAssignment = try XCTUnwrap(initial.requestRails.assignments[id(1)])
             receipt = date(101)
             _ = cache.histories(
                 snapshot: ChartPresentationSnapshot(
                     timestamp: date(101), requestLanes: [lane(1, start: 90, end: 101)]),
-                duration: 20, windowEnd: date(20), optimized: optimized)
+                duration: 20, windowEnd: date(20))
             receipt = date(102)
             let next = ChartPresentationSnapshot(
                 timestamp: date(102), requestLanes: [lane(2, start: 101)])
             let pinned = cache.histories(
-                snapshot: next, duration: 20, windowEnd: date(20), optimized: optimized)
+                snapshot: next, duration: 20, windowEnd: date(20))
             XCTAssertTrue(pinned.lanes.isEmpty)
             XCTAssertTrue(pinned.requestRails.events.isEmpty)
             let nextAssignment = try XCTUnwrap(pinned.requestRails.assignments[id(2)])
             XCTAssertEqual(nextAssignment.track, firstAssignment.track)
             XCTAssertEqual(nextAssignment.colorIndex, firstAssignment.colorIndex + 1)
             receipt = date(110)
-            let live = cache.histories(snapshot: next, duration: 20, optimized: optimized)
+            let live = cache.histories(snapshot: next, duration: 20)
             XCTAssertEqual(live.lanes.map(\.id), [id(2)])
             XCTAssertEqual(live.requestRails.assignments[id(2)], nextAssignment)
             XCTAssertTrue(
@@ -211,17 +203,17 @@ final class IncrementalChartPreparationTests: XCTestCase {
     }
 
     func testReleaseDropsPreparedStorageAndSamePublicationNewEpochReseedsIdentity() throws {
-        for optimized in [false, true] {
+        do {
             let cache = DashboardChartPreparation(clock: { self.date(10) })
             let epoch = id(900)
             _ = cache.histories(
                 snapshot: ChartPresentationSnapshot(
                     timestamp: origin, requestLanes: [lane(1, start: 0)]),
-                duration: 60, epoch: epoch, optimized: optimized)
+                duration: 60, epoch: epoch)
             let snapshot = ChartPresentationSnapshot(
                 timestamp: date(1), requestLanes: [lane(2, start: 1)])
             var prepared: PreparedDashboardCharts? = cache.histories(
-                snapshot: snapshot, duration: 60, epoch: epoch, optimized: optimized)
+                snapshot: snapshot, duration: 60, epoch: epoch)
             let assignments = try XCTUnwrap(prepared).requestRails.assignments
             XCTAssertEqual(assignments[id(2)]?.colorIndex, 1)
             weak var released = prepared
@@ -230,10 +222,10 @@ final class IncrementalChartPreparationTests: XCTestCase {
             cache.releasePreparedCharts()
             XCTAssertNil(released)
             let restored = cache.histories(
-                snapshot: snapshot, duration: 60, epoch: epoch, optimized: optimized)
+                snapshot: snapshot, duration: 60, epoch: epoch)
             XCTAssertEqual(restored.requestRails.assignments, assignments)
             let reset = cache.histories(
-                snapshot: snapshot, duration: 60, epoch: id(901), optimized: optimized)
+                snapshot: snapshot, duration: 60, epoch: id(901))
             XCTAssertFalse(reset === restored)
             XCTAssertEqual(reset.publicationID, restored.publicationID)
             XCTAssertEqual(
@@ -245,10 +237,48 @@ final class IncrementalChartPreparationTests: XCTestCase {
 
     private func prepare(
         _ snapshot: ChartPresentationSnapshot, duration: TimeInterval = 60,
-        end: Date? = nil, optimized: Bool
+        end: Date? = nil, optimized: Bool, requestRails: RequestRailPresentation? = nil
     ) -> PreparedDashboardCharts {
-        PreparedDashboardCharts(
-            snapshot: snapshot, duration: duration, windowEnd: end, optimized: optimized)
+        guard !optimized else {
+            return PreparedDashboardCharts(snapshot: snapshot, duration: duration, windowEnd: end)
+        }
+        // Independent original dictionary winners and stable normalization.
+        let windowEnd = min(end ?? snapshot.timestamp, snapshot.timestamp)
+        var eventsByID: [UUID: ToolActivityEvent] = [:]
+        for event in snapshot.historicalToolActivity + snapshot.toolActivity {
+            eventsByID[event.id] = event
+        }
+        let normalized = ChartPresentationSnapshot(
+            timestamp: snapshot.timestamp, throughput: snapshot.throughput,
+            systemGPU: snapshot.systemGPU,
+            toolActivity: ToolActivityHistory.normalizedEvents(
+                Array(eventsByID.values), through: windowEnd),
+            requestLanes: snapshot.requestLanes, toolObservation: snapshot.toolObservation,
+            supportsToolActivity: snapshot.supportsToolActivity, archive: snapshot.archive,
+            historicalRequestLanes: snapshot.historicalRequestLanes,
+            toolActivityRequestIDs: snapshot.toolActivityRequestIDs
+                ?? Set(eventsByID.values.compactMap(\.requestID)))
+        var lanesByID: [UUID: RequestLane] = [:]
+        for lane in snapshot.historicalRequestLanes + snapshot.requestLanes {
+            lanesByID[lane.id] = lane
+        }
+        let start = windowEnd.addingTimeInterval(-duration)
+        let visible = lanesByID.values.filter {
+            $0.startedAt <= windowEnd && ($0.endedAt ?? snapshot.timestamp) >= start
+        }.sorted {
+            $0.startedAt == $1.startedAt
+                ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
+        }
+        let open = visible.filter { !$0.terminal && $0.endedAt == nil }
+        let ended = visible.filter { $0.terminal || $0.endedAt != nil }
+        let rendered = (open + ended.suffix(max(0, 256 - open.count))).sorted {
+            $0.startedAt == $1.startedAt
+                ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
+        }
+        return PreparedDashboardCharts(
+            snapshot: normalized, duration: duration,
+            requestRails: requestRails, windowEnd: end,
+            laneSelection: .init(rendered: rendered, omittedCount: visible.count - rendered.count))
     }
 
     private func assertEquivalent(

@@ -77,12 +77,12 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
 
     /// Publish the partition together so a snapshot taken during deferred
     /// drawing always sees total tracks equal unique builds plus reuses.
-    func recordToolTraces(unique: UInt64, reused: UInt64, direct: Bool) {
+    func recordToolTraces(unique: UInt64, reused: UInt64) {
         guard enabledFastPath.load(ordering: .acquiring) else { return }
         lock.lock()
         defer { lock.unlock() }
         guard enabled else { return }
-        let totalMetric: Metric = direct ? .directToolPlotBuilds : .legacyToolPlotBuilds
+        let totalMetric: Metric = .legacyToolPlotBuilds
         values[totalMetric.rawValue, default: 0] &+= unique &+ reused
         values[Metric.uniqueToolTraceBuilds.rawValue, default: 0] &+= unique
         values[Metric.reusedToolTraceBuilds.rawValue, default: 0] &+= reused

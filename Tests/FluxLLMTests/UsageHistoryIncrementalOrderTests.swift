@@ -9,7 +9,7 @@ final class UsageHistoryIncrementalOrderTests: XCTestCase {
     private let source = "incremental-order"
 
     func testWarmedPopulatedHistoryAppendsNewWorkWithoutRebuildingEitherOrder() throws {
-        try withMode {
+        try withNormalDiagnostics {
             let history = UsageHistory(now: origin)
             for index in 0..<1_000 {
                 let request = begin(history, at: Double(index))
@@ -64,7 +64,7 @@ final class UsageHistoryIncrementalOrderTests: XCTestCase {
     }
 
     func testBackdatedAndEqualTimeInsertsMatchRebuiltHistoryAndInvalidateOwnerIndices() throws {
-        try withMode {
+        try withNormalDiagnostics {
             let candidate = UsageHistory(now: origin)
             let rebuilt = UsageHistory(now: origin)
             let histories = [candidate, rebuilt]
@@ -111,7 +111,7 @@ final class UsageHistoryIncrementalOrderTests: XCTestCase {
 
     func testChronologicalAppendInsideUnchangedQueryInvalidatesOwnersAndEndRemainsHalfOpen() throws
     {
-        try withMode {
+        try withNormalDiagnostics {
             let history = UsageHistory(now: origin)
             let first = begin(history, at: 0)
             let second = begin(history, at: 0)
@@ -139,7 +139,7 @@ final class UsageHistoryIncrementalOrderTests: XCTestCase {
     }
 
     func testReleasedCachesStayAbsentDuringCollectionAndRebuildOnceOnReopen() throws {
-        try withMode {
+        try withNormalDiagnostics {
             let history = UsageHistory(now: origin)
             let first = begin(history, at: 0)
             tools(history, first, events: [event(at: 1)])
@@ -166,7 +166,7 @@ final class UsageHistoryIncrementalOrderTests: XCTestCase {
     }
 
     func testCapacityAndRetentionPruningRepairPreparedOrdersWithoutFullRebuilds() throws {
-        try withMode {
+        try withNormalDiagnostics {
             let candidate = UsageHistory(now: origin, recordLimit: 3, toolEventLimit: 4)
             let rebuilt = UsageHistory(now: origin, recordLimit: 3, toolEventLimit: 4)
             let histories = [candidate, rebuilt]
@@ -213,7 +213,7 @@ final class UsageHistoryIncrementalOrderTests: XCTestCase {
     }
 
     func testSourcesTerminalPathsAndAllActiveOverflowMatchColdQueries() throws {
-        try withMode {
+        try withNormalDiagnostics {
             let candidate = UsageHistory(now: origin, recordLimit: 2)
             let rebuilt = UsageHistory(now: origin, recordLimit: 2)
             let first = GenerationRequest(startedAt: origin)
@@ -240,26 +240,6 @@ final class UsageHistoryIncrementalOrderTests: XCTestCase {
             XCTAssertEqual(candidate.completedOrderBuildCount, 1)
             XCTAssertEqual(candidate.toolOrderBuildCount, 1)
             XCTAssertTrue(summary(candidate).isPartial)
-        }
-    }
-
-    func testBaselineComparisonStillUsesFullRebuildAfterAnInsertion() throws {
-        try withMode(.nativeGPUOptimized) {
-            let history = UsageHistory(now: origin)
-            let first = begin(history, at: 0)
-            tools(history, first, events: [event(at: 1)])
-            finish(history, first, at: 2)
-            _ = history.requestLanes(source: source, interval: interval(0, 10))
-            _ = history.toolEvents(source: source, interval: interval(0, 10))
-            let second = begin(history, at: 3)
-            tools(history, second, events: [event(at: 4)])
-            finish(history, second, at: 5)
-            _ = history.requestLanes(source: source, interval: interval(0, 10))
-            _ = history.toolEvents(source: source, interval: interval(0, 10))
-            XCTAssertEqual(history.completedOrderBuildCount, 2)
-            XCTAssertEqual(history.toolOrderBuildCount, 2)
-            XCTAssertEqual(history.completedOrderIncrementalInsertCount, 0)
-            XCTAssertEqual(history.toolOrderIncrementalInsertCount, 0)
         }
     }
 
@@ -349,11 +329,10 @@ final class UsageHistoryIncrementalOrderTests: XCTestCase {
         DateInterval(start: date(start), end: date(end))
     }
 
-    private func withMode(
-        _ mode: PerformanceGraphicsDiagnostics.Mode = .runtimeHistoryOrder,
+    private func withNormalDiagnostics(
         _ body: () throws -> Void
     ) throws {
-        try PerformanceGraphicsDiagnostics.shared.enable(mode: mode)
+        try PerformanceGraphicsDiagnostics.shared.enable(mode: .normal)
         defer { try? PerformanceGraphicsDiagnostics.shared.disable() }
         try body()
     }

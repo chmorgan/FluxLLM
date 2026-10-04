@@ -6,21 +6,21 @@ import XCTest
 
 @MainActor
 final class DashboardScalarDiagnosticLayoutTests: XCTestCase {
-    func testInstrumentationPreservesNativeFixedAndFlexibleRowGeometryInBothModes() throws {
+    func testInstrumentationPreservesNativeFixedAndFlexibleRowGeometry() throws {
         let normal = try frames(mode: .normal, size: CGSize(width: 740, height: 600))
-        let held = try frames(mode: .runtimeFrozenScalars, size: CGSize(width: 740, height: 600))
-        XCTAssertEqual(held.frames, normal.frames)
-        for capture in [normal, held] {
+        let repeated = try frames(mode: .normal, size: CGSize(width: 740, height: 600))
+        XCTAssertEqual(repeated.frames, normal.frames)
+        for capture in [normal, repeated] {
             XCTAssertGreaterThan(capture.sizeCalls, 0)
             XCTAssertGreaterThan(capture.placeCalls, 0)
             XCTAssertGreaterThanOrEqual(
                 capture.measurements, 2 * (capture.sizeCalls + capture.placeCalls))
         }
-        let taller = try frames(mode: .runtimeFrozenScalars, size: CGSize(width: 740, height: 900))
-        XCTAssertEqual(taller.frames["fixed"], held.frames["fixed"])
+        let taller = try frames(mode: .normal, size: CGSize(width: 740, height: 900))
+        XCTAssertEqual(taller.frames["fixed"], normal.frames["fixed"])
         XCTAssertEqual(
             try XCTUnwrap(taller.frames["flexible"]).height
-                - XCTUnwrap(held.frames["flexible"]).height, 300, accuracy: 0.5)
+                - XCTUnwrap(normal.frames["flexible"]).height, 300, accuracy: 0.5)
     }
 
     func testUnspecifiedWidthCountsBothIntrinsicAndFinalChildMeasurements() throws {

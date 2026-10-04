@@ -22,20 +22,15 @@ struct LuminousActivityChart: View {
     /// invalidate geometry even when its window and scales happen to match.
     let geometryPublicationID: UUID
 
-    @Environment(\.self) private var environment
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.chartInspectionViewport) private var inspectionViewport
     @State private var tokenScale = ChartScaleState()
     @State private var toolScale = ChartScaleState()
-    @State private var atomicScaleCache = LuminousChartScaleCache()
     @State private var hoverLocation: CGPoint?
     @State private var dragSelection: DragSelection?
     @State private var geometryCache = LuminousChartGeometryCache()
-    @State private var metalSceneCache = MetalFullChartSceneCache()
-    @State private var metalFailed = false
     @GestureState private var isSelecting = false
 
     init(
@@ -118,15 +113,13 @@ struct LuminousActivityChart: View {
     private var hasEffects: Bool { contrast != .increased && !reduceTransparency }
     private var strokeWidth: CGFloat { contrast == .increased ? 2.8 : (compact ? 2.2 : 2.7) }
 
-    private var resolvedScales: LuminousChartScaleCache.Scales {
-        guard PerformanceGraphicsDiagnostics.shared.mode.usesAtomicChartScale else {
-            return .init(
-                tokenUpperBound: tokenScale.upperBound, toolUpperBound: toolScale.upperBound)
-        }
-        return atomicScaleCache.resolve(
-            .init(
-                publicationID: geometryPublicationID, now: now, duration: duration,
-                isLive: isLive, tokenPeak: throughput.peak, toolPeak: tools?.peak))
+    private struct ChartScales {
+        let tokenUpperBound: Double
+        let toolUpperBound: Double
+    }
+
+    private var resolvedScales: ChartScales {
+        ChartScales(tokenUpperBound: tokenScale.upperBound, toolUpperBound: toolScale.upperBound)
     }
 
     var body: some View {
@@ -204,21 +197,14 @@ struct LuminousActivityChart: View {
         .lineLimit(1)
     }
 
-    private func plot(scales: LuminousChartScaleCache.Scales) -> some View {
+    private func plot(scales: ChartScales) -> some View {
         GeometryReader { geometry in
-            let usesMetal =
-                PerformanceGraphicsDiagnostics.shared.mode.usesMetalFullChart && !metalFailed
             let frame = geometryCache.frame(
                 for: .init(
                     publicationID: geometryPublicationID, now: now, duration: duration,
                     size: geometry.size, compact: compact, hasTools: tools != nil,
                     tokenUpperBound: scales.tokenUpperBound, toolUpperBound: scales.toolUpperBound),
-                throughput: throughput, gpu: gpu, requestTools: requestTools,
-                directToolPlot: PerformanceGraphicsDiagnostics.shared.mode.usesDirectToolPlot,
-                compactToolPaths: PerformanceGraphicsDiagnostics.shared.mode.usesCompactToolPaths,
-                deferredToolGeometry: PerformanceGraphicsDiagnostics.shared.mode
-                    .usesDeferredToolGeometry,
-                buildDrawingPaths: !usesMetal)
+                throughput: throughput, gpu: gpu, requestTools: requestTools)
             let layout = frame.layout
             let generated = frame.generated
             let device = frame.device
@@ -244,89 +230,72 @@ struct LuminousActivityChart: View {
                     lanes: lanes, assignments: requestRails.assignments)
             }
             ZStack(alignment: .topLeading) {
-                if usesMetal {
-                    metalSurface(
-                        frame: frame, segments: railSegments, overflow: railOverflow,
-                        cursorX: selected.map {
-                            project($0.timestamp, value: 0, in: layout.main, upperBound: 1).x
-                        })
-                } else {
-                    ChartDrawingSurface(role: .staticChart, revision: staticRevision) {
-                        context, _ in
-                        PerformancePresentationCounters.shared.record(.canvasDraws)
-                        drawGrid(in: &context, layout: layout)
-                        let cpuGlow =
-                            PerformanceGraphicsDiagnostics.shared.mode == .cpuGlow
-                            ? frame.seriesGlowRasterCache : nil
-                        let surfaceBounds = CGRect(origin: .zero, size: frame.key.size)
-                        drawSeries(
-                            device, color: gpuColor, fillOpacity: 0.14, in: &context,
-                            rect: layout.main,
-                            cpuGlow: cpuGlow, series: 0, surfaceBounds: surfaceBounds)
-                        drawSeries(
-                            generated, color: generatedColor, fillOpacity: 0.25, in: &context,
-                            rect: layout.main, cpuGlow: cpuGlow, series: 1,
-                            surfaceBounds: surfaceBounds)
-                        drawEndpoint(frame.generatedEndpoint, color: generatedColor, in: &context)
-                        drawEndpoint(frame.deviceEndpoint, color: gpuColor, in: &context)
-                        // Tool tracks retain their request's current appearance.
-                        let toolTracks = frame.requestTools
-                        for lane in lanes {
-                            if let track = toolTracks[lane.id] {
-                                drawTools(track, in: &context, color: laneColor(lane))
-                            }
-                        }
-                        if !compact {
-                            if layout.lanes.height > 0 {
-                                context.draw(
-                                    Text("Requests")
-                                        .font(.system(size: 9, weight: .medium))
-                                        .foregroundColor(.secondary),
-                                    at: CGPoint(x: layout.lanes.minX, y: layout.lanes.minY - 6),
-                                    anchor: .leading)
-                            }
-                            // Preserve the former bar layer's position in drawing
-                            // order, sharing the static chart's native backing.
-                            RequestRailBarDrawing(
-                                rect: layout.lanes, presentation: requestRails,
-                                colorScheme: colorScheme, contrast: contrast,
-                                reduceTransparency: reduceTransparency
-                            ).draw(railSegments, overflow: railOverflow, in: &context)
+                ChartDrawingSurface(role: .staticChart, revision: staticRevision) { context, _ in
+                    PerformancePresentationCounters.shared.record(.canvasDraws)
+                    drawGrid(in: &context, layout: layout)
+                    drawSeries(
+                        device, color: gpuColor, fillOpacity: 0.14, in: &context, rect: layout.main)
+                    drawSeries(
+                        generated, color: generatedColor, fillOpacity: 0.25, in: &context,
+                        rect: layout.main)
+                    drawEndpoint(frame.generatedEndpoint, color: generatedColor, in: &context)
+                    drawEndpoint(frame.deviceEndpoint, color: gpuColor, in: &context)
+                    // Tool tracks retain their request's current appearance.
+                    let toolTracks = frame.requestTools
+                    for lane in lanes {
+                        if let track = toolTracks[lane.id] {
+                            drawTools(track, in: &context, color: laneColor(lane))
                         }
                     }
+                    if !compact {
+                        if layout.lanes.height > 0 {
+                            context.draw(
+                                Text("Requests")
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundColor(.secondary),
+                                at: CGPoint(x: layout.lanes.minX, y: layout.lanes.minY - 6),
+                                anchor: .leading)
+                        }
+                        // Preserve the former bar layer's position in drawing
+                        // order, sharing the static chart's native backing.
+                        RequestRailBarDrawing(
+                            rect: layout.lanes, presentation: requestRails,
+                            colorScheme: colorScheme, contrast: contrast,
+                            reduceTransparency: reduceTransparency
+                        ).draw(railSegments, overflow: railOverflow, in: &context)
+                    }
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+                if !compact {
+                    RequestRailLayer(
+                        lanes: lanes, segments: railSegments, presentation: requestRails, now: now,
+                        duration: duration, rect: layout.lanes, plotSize: geometry.size,
+                        isLive: isLive
+                    )
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
-                    if !compact {
-                        RequestRailLayer(
-                            lanes: lanes, segments: railSegments, presentation: requestRails,
-                            now: now,
-                            duration: duration, rect: layout.lanes, plotSize: geometry.size,
-                            isLive: isLive
-                        )
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
+                }
+                if let selected {
+                    let cursorX = project(
+                        selected.timestamp, value: 0, in: layout.main, upperBound: 1
+                    ).x
+                    let bounds = ChartSurfaceBounds.cursor(x: cursorX, plotSize: geometry.size)
+                    ChartDrawingSurface(
+                        role: .cursor,
+                        revision: CursorDrawingRevision(
+                            frame: ObjectIdentifier(frame), timestamp: selected.timestamp),
+                        drawingBounds: bounds
+                    ) { context, _ in
+                        PerformancePresentationCounters.shared.record(.canvasDraws)
+                        drawCursor(
+                            selected.timestamp, generated: generated, device: device,
+                            in: &context, layout: layout)
                     }
-                    if let selected {
-                        let cursorX = project(
-                            selected.timestamp, value: 0, in: layout.main, upperBound: 1
-                        ).x
-                        let bounds = ChartSurfaceBounds.cursor(x: cursorX, plotSize: geometry.size)
-                        ChartDrawingSurface(
-                            role: .cursor,
-                            revision: CursorDrawingRevision(
-                                frame: ObjectIdentifier(frame), timestamp: selected.timestamp),
-                            drawingBounds: bounds
-                        ) { context, _ in
-                            PerformancePresentationCounters.shared.record(.canvasDraws)
-                            drawCursor(
-                                selected.timestamp, generated: generated, device: device,
-                                in: &context, layout: layout)
-                        }
-                        .frame(width: bounds.width, height: bounds.height)
-                        .offset(x: bounds.minX, y: bounds.minY)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                    }
+                    .frame(width: bounds.width, height: bounds.height)
+                    .offset(x: bounds.minX, y: bounds.minY)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
                 }
                 axes(layout: layout, scales: scales)
                 selectionOverlay(layout: layout)
@@ -375,77 +344,6 @@ struct LuminousActivityChart: View {
                 dragSelection = nil
             }
         }
-    }
-
-    /// The native surface receives publication data, never an animation clock.
-    /// Cache identities include resolved appearance so changing theme uploads
-    /// fresh colors without changing history or rebuilding on cursor movement.
-    private func metalSurface(
-        frame: LuminousChartGeometryCache.Frame,
-        segments: [RequestRailGeometry.Segment],
-        overflow: [RequestRailGeometry.OverflowSegment], cursorX: CGFloat?
-    ) -> some View {
-        let colors = Dictionary(
-            uniqueKeysWithValues: lanes.map { ($0.id, metalColor(laneColor($0))) })
-        let style = MetalFullChartScene.Style(
-            generatedColor: metalColor(generatedColor), deviceColor: metalColor(gpuColor),
-            backgroundColor: metalColor(Color(nsColor: .windowBackgroundColor)),
-            primaryColor: metalColor(.primary), secondaryColor: metalColor(.secondary),
-            compact: compact, hasEffects: hasEffects,
-            increasedContrast: contrast == .increased, isDark: colorScheme == .dark)
-        let scene = metalSceneCache.scene(
-            frame: frame, lanes: lanes, laneColors: colors, segments: segments,
-            overflow: overflow, style: style)
-        let cursor = metalSceneCache.cursor(frame: frame, x: cursorX, style: style)
-        return ZStack(alignment: .topLeading) {
-            MetalFullChartSurface(
-                scene: scene, revision: ObjectIdentifier(scene), cursor: cursor,
-                cursorRevision: ObjectIdentifier(cursor),
-                decorations: .init(
-                    lanes: lanes, segments: segments, presentation: requestRails,
-                    now: now, duration: duration, rail: frame.layout.lanes, colors: colors,
-                    enabled: isLive && !compact && !reduceMotion && hasEffects),
-                cacheStaticAndRetainTwinkles: PerformanceGraphicsDiagnostics.shared.mode
-                    .cachesMetalStaticChart,
-                onFailure: { metalFailed = true })
-            ForEach(Array(scene.labels.enumerated()), id: \.offset) { _, label in
-                metalLabel(label)
-            }
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-
-    private func metalLabel(_ label: MetalFullChartScene.Label) -> some View {
-        let font: Font =
-            switch label.role {
-            case .requestHeading: .system(size: label.fontSize, weight: .medium)
-            case .emptyRequests: .system(size: label.fontSize)
-            case .overflow: .system(size: label.fontSize, weight: .semibold, design: .rounded)
-            }
-        return Text(label.text)
-            .font(font)
-            .foregroundStyle(
-                Color(
-                    .sRGB, red: Double(label.color.x),
-                    green: Double(label.color.y), blue: Double(label.color.z),
-                    opacity: Double(label.color.w))
-            )
-            .fixedSize()
-            .frame(width: 0, height: 0, alignment: label.leadingAligned ? .leading : .center)
-            .position(label.position)
-    }
-
-    private func metalColor(_ color: Color) -> SIMD4<Float> {
-        let resolved = color.resolve(in: environment)
-        if let space = CGColorSpace(name: CGColorSpace.sRGB),
-            let converted = resolved.cgColor.converted(
-                to: space, intent: .relativeColorimetric, options: nil),
-            let values = converted.components, values.count == 4
-        {
-            return SIMD4(Float(values[0]), Float(values[1]), Float(values[2]), Float(values[3]))
-        }
-        return SIMD4(resolved.red, resolved.green, resolved.blue, resolved.opacity)
     }
 
     /// Frame identity covers immutable publication, viewport and scales. Small
@@ -564,62 +462,27 @@ struct LuminousActivityChart: View {
 
     private func drawSeries(
         _ segments: [PlotSegment], color: Color, fillOpacity: Double,
-        in context: inout GraphicsContext, rect: CGRect,
-        cpuGlow: SeriesGlowRasterCache?, series: Int, surfaceBounds: CGRect
+        in context: inout GraphicsContext, rect: CGRect
     ) {
-        for (index, segment) in segments.enumerated() {
+        for segment in segments {
             guard let first = segment.points.first else { continue }
             let trace = segment.trace
             if hasEffects, let area = segment.area {
-                let graphicsMode = PerformanceGraphicsDiagnostics.shared.mode
-                if graphicsMode.omitsGradients {
-                    // Diagnostic-only: preserve the area path, replacing its
-                    // gradient shading with the first stop's solid color.
-                    PerformanceGraphicsDiagnostics.shared.recordGradientSubstitution()
-                    context.fill(area, with: .color(color.opacity(fillOpacity)))
-                } else {
-                    context.fill(
-                        area,
-                        with: .linearGradient(
-                            Gradient(stops: [
-                                .init(color: color.opacity(fillOpacity), location: 0),
-                                .init(color: color.opacity(0.01), location: 1),
-                            ]), startPoint: CGPoint(x: 0, y: rect.minY),
-                            endPoint: CGPoint(x: 0, y: rect.maxY)))
-                }
-                // Diagnostic-only ablation: preserve the area and primary
-                // stroke, omitting only the filtered series glow pass.
-                if graphicsMode != .noBlur && graphicsMode != .noGradientsOrBlur {
-                    let radius: CGFloat = compact ? 2.5 : 3
-                    let glowColor = color.opacity(colorScheme == .dark ? 0.35 : 0.24)
-                    var drewCPUGlow = false
-                    if let cpuGlow {
-                        do {
-                            let tint = glowColor.resolve(in: context.environment).cgColor
-                            let scale = context.environment.displayScale
-                            try context.withCGContext { cg in
-                                try cpuGlow.forEachMask(
-                                    id: .init(series: series, segment: index), path: trace.cgPath,
-                                    radius: radius, scale: scale, clipBounds: surfaceBounds
-                                ) { mask in
-                                    SeriesGlowRasterCache.composite(mask, color: tint, in: cg)
-                                }
-                            }
-                            drewCPUGlow = true
-                        } catch {
-                            // Preserve the visible effect on diagnostic failure;
-                            // a nonzero counter invalidates the attribution run.
-                            PerformanceGraphicsDiagnostics.shared.recordCPUGlowFallback()
-                        }
-                    }
-                    if !drewCPUGlow {
-                        context.drawLayer { glow in
-                            glow.addFilter(.blur(radius: radius))
-                            glow.stroke(
-                                trace, with: .color(glowColor),
-                                style: StrokeStyle(lineWidth: 7, lineCap: .round, lineJoin: .round))
-                        }
-                    }
+                context.fill(
+                    area,
+                    with: .linearGradient(
+                        Gradient(stops: [
+                            .init(color: color.opacity(fillOpacity), location: 0),
+                            .init(color: color.opacity(0.01), location: 1),
+                        ]), startPoint: CGPoint(x: 0, y: rect.minY),
+                        endPoint: CGPoint(x: 0, y: rect.maxY)))
+                let radius: CGFloat = compact ? 2.5 : 3
+                let glowColor = color.opacity(colorScheme == .dark ? 0.35 : 0.24)
+                context.drawLayer { glow in
+                    glow.addFilter(.blur(radius: radius))
+                    glow.stroke(
+                        trace, with: .color(glowColor),
+                        style: StrokeStyle(lineWidth: 7, lineCap: .round, lineJoin: .round))
                 }
             }
             context.stroke(
@@ -709,7 +572,7 @@ struct LuminousActivityChart: View {
         }
     }
 
-    private func axes(layout: PlotLayout, scales: LuminousChartScaleCache.Scales) -> some View {
+    private func axes(layout: PlotLayout, scales: ChartScales) -> some View {
         ZStack(alignment: .topLeading) {
             ForEach(0..<3, id: \.self) { index in
                 let fraction = Double(index) / 2
@@ -736,9 +599,7 @@ struct LuminousActivityChart: View {
         .accessibilityHidden(true)
     }
 
-    private func toolHeading(layout: PlotLayout, scales: LuminousChartScaleCache.Scales)
-        -> some View
-    {
+    private func toolHeading(layout: PlotLayout, scales: ChartScales) -> some View {
         // The "Tool calls" label sits just above the tools track. Lane
         // colors are self-evident from the bands, so no palette legend is shown.
         HStack(spacing: 4) {
@@ -841,7 +702,6 @@ struct LuminousActivityChart: View {
         }
     }
     private func updateScales() {
-        guard !PerformanceGraphicsDiagnostics.shared.mode.usesAtomicChartScale else { return }
         if !isLive {
             tokenScale = ChartScaleState()
             toolScale = ChartScaleState()

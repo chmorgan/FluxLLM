@@ -64,15 +64,6 @@ public final class UsageHistory {
     private(set) var completedOrderIncrementalInsertCount: UInt64 = 0
     private(set) var toolOrderIncrementalInsertCount: UInt64 = 0
     private var cachedToolOwners: ToolOwnerQueryCache?
-    private var completedLaneRevisions: [Int: UInt64] = [:]
-    private var cachedCompletedLanes: CompletedLaneQueryCache?
-    /// Completed record identities inspected while preparing the one retained
-    /// viewport, including foreign sources; binary-search probes and active lanes
-    /// are excluded.
-    private(set) var completedLaneCacheBuildCount: UInt64 = 0
-    private(set) var completedLaneCacheHitCount: UInt64 = 0
-    private(set) var completedLaneCacheVisitedRecords: UInt64 = 0
-    var completedLaneCacheEntryCount: Int { cachedCompletedLanes?.lanes.count ?? 0 }
     /// Counts visited event records, excluding binary-search probes, so regression
     /// checks can distinguish a rolling query from rescanning the retained day.
     private(set) var toolOwnerQueryVisitedEvents: UInt64 = 0
@@ -103,14 +94,12 @@ public final class UsageHistory {
         toolOrderIsDirty = true
         // The rolling cache's ranges refer to the released tool ordering.
         cachedToolOwners = nil
-        cachedCompletedLanes = nil
     }
 
     /// Scalar storage diagnostic; reading it never prepares or copies a cache.
     var cachedQueryEntryCount: Int {
         completedOrder.count + toolOrder.count
             + (cachedToolOwners?.counts.count ?? 0) + (cachedToolOwners?.owners.count ?? 0)
-            + completedLaneCacheEntryCount
     }
 
     public func apply(_ event: GenerationEvent, source: String, at date: Date) {
@@ -165,7 +154,6 @@ public final class UsageHistory {
                 activeRequests.remove(key)
             }
             records[key] = record
-            if newlyCompleted || old.endedAt != nil { invalidateCompletedLanes(source: source) }
             if newlyCompleted { insertCompletedOrder(key, endedAt: record.endedAt!) }
             updateLaunchTotals(source: source, removing: old, adding: record)
         case .failed(let id, _), .cancelled(let id):
@@ -286,21 +274,9 @@ public final class UsageHistory {
     }
 
     public func requestLanes(
-        source: String, interval: DateInterval, inclusiveEnd: Bool = false,
-        useCompletedLaneCache: Bool = false
+        source: String, interval: DateInterval, inclusiveEnd: Bool = false
     ) -> [RequestLane] {
-        guard let source = sourceIDs[source] else {
-            cachedCompletedLanes = nil
-            return []
-        }
-        if useCompletedLaneCache, interval.start.timeIntervalSinceReferenceDate.isFinite,
-            interval.end.timeIntervalSinceReferenceDate.isFinite
-        {
-            return cachedRequestLanes(
-                source: source, interval: interval, inclusiveEnd: inclusiveEnd)
-        }
-        // An ordinary query never retains the experimental viewport cache.
-        cachedCompletedLanes = nil
+        guard let source = sourceIDs[source] else { return [] }
         prepareCompletedOrder()
         // Completion order skips requests that ended before the viewport while
         // retaining long-running requests that began before its lower boundary.
@@ -321,137 +297,6 @@ public final class UsageHistory {
             $0.startedAt == $1.startedAt
                 ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
         }
-    }
-
-    private func cachedRequestLanes(
-        source: Int, interval: DateInterval, inclusiveEnd: Bool
-    ) -> [RequestLane] {
-        let completed: [RequestLane]
-        if let cache = cachedCompletedLanes,
-            cache.source == source, cache.revision == completedLaneRevisions[source, default: 0],
-            cache.containsSameMembership(interval: interval, inclusiveEnd: inclusiveEnd)
-        {
-            completed = cache.lanes
-            completedLaneCacheHitCount &+= 1
-        } else {
-            prepareCompletedOrder()
-            let first = lowerBound(completedOrder.count) {
-                records[completedOrder[$0]]!.endedAt! < interval.start
-            }
-            // The closest excluded completion defines how far the lower edge
-            // can move backwards without admitting another record from this source.
-            var excludedEnd: Date?
-            for index in (0..<first).reversed() {
-                let key = completedOrder[index]
-                completedLaneCacheVisitedRecords &+= 1
-                guard key.source == source else { continue }
-                excludedEnd = records[key]!.endedAt!
-                break
-            }
-            var lanes: [RequestLane] = []
-            var earliestIncludedEnd: Date?
-            var latestIncludedStart: Date?
-            var earliestExcludedStart: Date?
-            for key in completedOrder[first...] {
-                completedLaneCacheVisitedRecords &+= 1
-                guard key.source == source else { continue }
-                let record = records[key]!
-                if record.startedAt < interval.end
-                    || (inclusiveEnd && record.startedAt == interval.end)
-                {
-                    lanes.append(record.lane(id: key.id, model: metadata[record.modelID]))
-                    earliestIncludedEnd =
-                        earliestIncludedEnd.map { min($0, record.endedAt!) }
-                        ?? record.endedAt!
-                    latestIncludedStart =
-                        latestIncludedStart.map { max($0, record.startedAt) }
-                        ?? record.startedAt
-                } else {
-                    earliestExcludedStart =
-                        earliestExcludedStart.map { min($0, record.startedAt) }
-                        ?? record.startedAt
-                }
-            }
-            lanes.sort(by: Self.lanePrecedes)
-            cachedCompletedLanes = CompletedLaneQueryCache(
-                source: source, revision: completedLaneRevisions[source, default: 0], lanes: lanes,
-                excludedEnd: excludedEnd, earliestIncludedEnd: earliestIncludedEnd,
-                latestIncludedStart: latestIncludedStart,
-                earliestExcludedStart: earliestExcludedStart)
-            completedLaneCacheBuildCount &+= 1
-            completed = lanes
-        }
-        // Live estimates always come from authoritative records. Merge their
-        // small ordered array with the cached completed lanes rather than sorting
-        // the complete viewport again for every publication.
-        var active: [RequestLane] = []
-        for key in activeRequests where key.source == source {
-            guard let record = records[key],
-                record.startedAt < interval.end
-                    || (inclusiveEnd && record.startedAt == interval.end)
-            else { continue }
-            active.append(record.lane(id: key.id, model: metadata[record.modelID]))
-        }
-        active.sort(by: Self.lanePrecedes)
-        if active.isEmpty { return completed }
-        if completed.isEmpty { return active }
-        var result: [RequestLane] = []
-        result.reserveCapacity(completed.count + active.count)
-        var completedIndex = 0
-        var activeIndex = 0
-        while completedIndex < completed.count && activeIndex < active.count {
-            if Self.lanePrecedes(completed[completedIndex], active[activeIndex]) {
-                result.append(completed[completedIndex])
-                completedIndex += 1
-            } else {
-                result.append(active[activeIndex])
-                activeIndex += 1
-            }
-        }
-        result.append(contentsOf: completed[completedIndex...])
-        result.append(contentsOf: active[activeIndex...])
-        return result
-    }
-
-    private static func lanePrecedes(_ left: RequestLane, _ right: RequestLane) -> Bool {
-        left.startedAt == right.startedAt
-            ? left.id.uuidString < right.id.uuidString : left.startedAt < right.startedAt
-    }
-
-    /// A single viewport retains only its selected completed lane values. These
-    /// four bounds describe a conservative rectangle in which neither endpoint
-    /// can add or remove a lane. No previous interval or whole-day copy is kept.
-    private struct CompletedLaneQueryCache {
-        let source: Int
-        let revision: UInt64
-        let lanes: [RequestLane]
-        let excludedEnd: Date?
-        let earliestIncludedEnd: Date?
-        let latestIncludedStart: Date?
-        let earliestExcludedStart: Date?
-
-        func containsSameMembership(interval: DateInterval, inclusiveEnd: Bool) -> Bool {
-            if let excludedEnd, interval.start <= excludedEnd { return false }
-            if let earliestIncludedEnd, interval.start > earliestIncludedEnd { return false }
-            if let latestIncludedStart,
-                inclusiveEnd
-                    ? interval.end < latestIncludedStart : interval.end <= latestIncludedStart
-            {
-                return false
-            }
-            if let earliestExcludedStart,
-                inclusiveEnd
-                    ? interval.end >= earliestExcludedStart : interval.end > earliestExcludedStart
-            {
-                return false
-            }
-            return true
-        }
-    }
-
-    private func invalidateCompletedLanes(source: Int) {
-        completedLaneRevisions[source, default: 0] &+= 1
-        if cachedCompletedLanes?.source == source { cachedCompletedLanes = nil }
     }
 
     public func toolEvents(
@@ -568,12 +413,8 @@ public final class UsageHistory {
 
     private func prepareToolOrder() {
         guard toolOrderIsDirty else { return }
-        if PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering {
-            toolOrder = tools.map { (key: $0.key, timestamp: $0.value.timestamp) }
-                .sorted { $0.timestamp < $1.timestamp }.map(\.key)
-        } else {
-            toolOrder = tools.keys.sorted { tools[$0]!.timestamp < tools[$1]!.timestamp }
-        }
+        toolOrder = tools.map { (key: $0.key, timestamp: $0.value.timestamp) }
+            .sorted { $0.timestamp < $1.timestamp }.map(\.key)
         toolOrderIsDirty = false
         toolOrderBuildCount &+= 1
         PerformancePresentationCounters.shared.record(.historyToolOrderBuilds)
@@ -581,15 +422,9 @@ public final class UsageHistory {
 
     private func prepareCompletedOrder() {
         guard completedOrderIsDirty else { return }
-        if PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering {
-            completedOrder = records.compactMap { element in
-                element.value.endedAt.map { (key: element.key, timestamp: $0) }
-            }.sorted { $0.timestamp < $1.timestamp }.map(\.key)
-        } else {
-            completedOrder = records.keys.filter { records[$0]!.endedAt != nil }.sorted {
-                records[$0]!.endedAt! < records[$1]!.endedAt!
-            }
-        }
+        completedOrder = records.compactMap { element in
+            element.value.endedAt.map { (key: element.key, timestamp: $0) }
+        }.sorted { $0.timestamp < $1.timestamp }.map(\.key)
         completedOrderIsDirty = false
         completedOrderBuildCount &+= 1
         PerformancePresentationCounters.shared.record(.historyCompletedOrderBuilds)
@@ -598,9 +433,7 @@ public final class UsageHistory {
     /// Keep a materialized order current without sorting the retained history
     /// for one new record. Released/never-queried caches remain unmaterialized.
     private func insertCompletedOrder(_ key: RequestKey, endedAt: Date) {
-        guard PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering,
-            !completedOrderIsDirty
-        else {
+        guard !completedOrderIsDirty else {
             completedOrderIsDirty = true
             return
         }
@@ -617,9 +450,7 @@ public final class UsageHistory {
     }
 
     private func insertToolOrder(_ key: ToolKey, timestamp: Date) {
-        guard PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering,
-            !toolOrderIsDirty
-        else {
+        guard !toolOrderIsDirty else {
             toolOrderIsDirty = true
             cachedToolOwners = nil
             return
@@ -693,7 +524,6 @@ public final class UsageHistory {
         record.lastUpdatedAt = record.endedAt ?? date
         records[key] = record
         activeRequests.remove(key)
-        invalidateCompletedLanes(source: key.source)
         insertCompletedOrder(key, endedAt: record.endedAt!)
         updateLaunchTotals(source: key.source, removing: old, adding: record)
     }
@@ -718,7 +548,6 @@ public final class UsageHistory {
         metadata.release(record.modelID)
         activeRequests.remove(key)
         if let end = record.endedAt {
-            invalidateCompletedLanes(source: key.source)
             let bucket = AccountingBucket(source: key.source, date: end)
             completedTotals[bucket]?.include(record, sign: -1)
             if completedTotals[bucket]?.requests == 0 {
@@ -752,9 +581,8 @@ public final class UsageHistory {
         else { return }
         // Removal helpers invalidate indices immediately. Repair each prepared
         // order once after the batch, avoiding a shift per expired record.
-        let incremental = PerformanceGraphicsDiagnostics.shared.mode.usesIncrementalHistoryOrdering
-        let preserveCompletedOrder = incremental && !completedOrderIsDirty
-        let preserveToolOrder = incremental && !toolOrderIsDirty
+        let preserveCompletedOrder = !completedOrderIsDirty
+        let preserveToolOrder = !toolOrderIsDirty
         lastPrunedAt = now
         let cutoff = now.addingTimeInterval(-Self.retentionInterval)
         let expired = records.filter { ($0.value.endedAt.map { $0 < cutoff }) ?? false }

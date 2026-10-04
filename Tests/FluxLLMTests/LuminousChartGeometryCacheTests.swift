@@ -40,23 +40,6 @@ final class LuminousChartGeometryCacheTests: XCTestCase {
         }
     }
 
-    func testToolPlotStrategyChangesInvalidateAndUnchangedStrategyReusesTheFrame() {
-        let cache = Cache()
-        let key = key()
-        let legacy = frame(cache, key: key)
-        XCTAssertFalse(legacy.directToolPlot)
-        XCTAssertTrue(frame(cache, key: key) === legacy)
-        let direct = frame(cache, key: key, directToolPlot: true)
-        XCTAssertTrue(direct.directToolPlot)
-        XCTAssertFalse(direct === legacy)
-        XCTAssertEqual(direct.key, legacy.key)
-        XCTAssertTrue(frame(cache, key: key, directToolPlot: true) === direct)
-        let restored = frame(cache, key: key)
-        XCTAssertFalse(restored.directToolPlot)
-        XCTAssertFalse(restored === direct)
-        XCTAssertTrue(frame(cache, key: key) === restored)
-    }
-
     func testToolPlotCountersCountActualBuildsRatherThanCacheLookups() {
         let counters = PerformancePresentationCounters.shared
         counters.enable()
@@ -64,28 +47,20 @@ final class LuminousChartGeometryCacheTests: XCTestCase {
         let key = key()
         let history = history()
         let tools = [requestID: toolHistory(), UUID(): toolHistory()]
-        func build(_ direct: Bool) -> Cache.Frame {
-            cache.frame(
-                for: key, throughput: history, gpu: history,
-                requestTools: tools, directToolPlot: direct)
+        func build() -> Cache.Frame {
+            cache.frame(for: key, throughput: history, gpu: history, requestTools: tools)
         }
-        let legacy = build(false)
-        XCTAssertEqual(counters.snapshot()["legacy_tool_plot_builds"], 2)
-        XCTAssertEqual(counters.snapshot()["direct_tool_plot_builds"], 0)
-        for _ in 0..<5 { XCTAssertTrue(build(false) === legacy) }
-        XCTAssertEqual(counters.snapshot()["legacy_tool_plot_builds"], 2)
-        let direct = build(true)
-        XCTAssertEqual(counters.snapshot()["legacy_tool_plot_builds"], 2)
-        XCTAssertEqual(counters.snapshot()["direct_tool_plot_builds"], 2)
-        for _ in 0..<5 { XCTAssertTrue(build(true) === direct) }
-        XCTAssertEqual(counters.snapshot()["direct_tool_plot_builds"], 2)
-        _ = Cache().frame(
-            for: key, throughput: history, gpu: history, requestTools: [:], directToolPlot: true)
+        let initial = build()
+        XCTAssertEqual(counters.snapshot()["unique_tool_trace_builds"], 2)
+        XCTAssertEqual(counters.snapshot()["reused_tool_trace_builds"], 0)
+        for _ in 0..<5 { XCTAssertTrue(build() === initial) }
+        XCTAssertEqual(counters.snapshot()["unique_tool_trace_builds"], 2)
+        _ = Cache().frame(for: key, throughput: history, gpu: history, requestTools: [:])
         XCTAssertEqual(
-            counters.snapshot()["direct_tool_plot_builds"], 2,
+            counters.snapshot()["unique_tool_trace_builds"], 2,
             "A chart without request tool overlays has no tool plot builds")
-        _ = build(false)
-        XCTAssertEqual(counters.snapshot()["legacy_tool_plot_builds"], 4)
+        _ = Cache().frame(for: key, throughput: history, gpu: history, requestTools: tools)
+        XCTAssertEqual(counters.snapshot()["unique_tool_trace_builds"], 4)
     }
 
     func testCacheRetainsOnlyOneFrameAndReleasesItWithItsOwner() {
@@ -174,43 +149,6 @@ final class LuminousChartGeometryCacheTests: XCTestCase {
                         expected.addLine(to: CGPoint(x: point.x - 3, y: point.y))
                         expected.closeSubpath()
                         XCTAssertEqual(diamond, expected)
-                    }
-                }
-            }
-        }
-    }
-
-    func testDirectToolPlotsPreserveProjectedPointsPathsAndMarkersAcrossLayoutsAndRanges() throws {
-        for compact in [false, true] {
-            for hasTools in [false, true] {
-                for size in [CGSize(width: 640, height: 320), CGSize(width: 401.5, height: 247.25)]
-                {
-                    for duration in [60.0, 75.25, 300] {
-                        let key = key(
-                            duration: duration, size: size, compact: compact, hasTools: hasTools)
-                        let cache = Cache()
-                        let history = history(duration: duration)
-                        let tools = toolHistory(duration: duration)
-                        let legacy = cache.frame(
-                            for: key, throughput: history, gpu: history,
-                            requestTools: [requestID: tools])
-                        let direct = cache.frame(
-                            for: key, throughput: history, gpu: history,
-                            requestTools: [requestID: tools], directToolPlot: true)
-                        XCTAssertFalse(direct === legacy)
-                        let actual = try XCTUnwrap(direct.requestTools[requestID])
-                        let expected = try XCTUnwrap(legacy.requestTools[requestID])
-                        assertEquivalent(
-                            actual.segments, to: tools.zeroFilledPlotSegments,
-                            key: key, rect: direct.layout.tools,
-                            upperBound: key.toolUpperBound, smoothed: false)
-                        XCTAssertEqual(
-                            actual.segments.map(\.points), expected.segments.map(\.points))
-                        XCTAssertEqual(actual.segments.map(\.trace), expected.segments.map(\.trace))
-                        XCTAssertEqual(actual.resultPoints, expected.resultPoints)
-                        XCTAssertEqual(actual.resultDiamonds, expected.resultDiamonds)
-                        XCTAssertEqual(direct.generated.map(\.trace), legacy.generated.map(\.trace))
-                        XCTAssertEqual(direct.device.map(\.trace), legacy.device.map(\.trace))
                     }
                 }
             }
@@ -324,11 +262,10 @@ final class LuminousChartGeometryCacheTests: XCTestCase {
             tokenUpperBound: tokenUpperBound, toolUpperBound: toolUpperBound)
     }
 
-    private func frame(_ cache: Cache, key: Cache.Key, directToolPlot: Bool = false) -> Cache.Frame
-    {
+    private func frame(_ cache: Cache, key: Cache.Key) -> Cache.Frame {
         cache.frame(
             for: key, throughput: history(), gpu: history(),
-            requestTools: [requestID: toolHistory()], directToolPlot: directToolPlot)
+            requestTools: [requestID: toolHistory()])
     }
 
     private func history(duration: TimeInterval = 60) -> ChartDisplayHistory {
