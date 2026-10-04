@@ -50,6 +50,10 @@ struct DashboardView: View {
             }
         }
         .background(TelemetryPanelBackground())
+        .modifier(
+            DashboardScalarFrameProbe(
+                presentation: presentation, epoch: store.monitoringEpoch)
+        )
         .onAppear { updateChartViewport(for: currentNavigation) }
         .onChange(of: store.monitoringEpoch) { _, _ in
             presentation.synchronize(with: store)
@@ -62,10 +66,12 @@ struct DashboardView: View {
 
     private var compactContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            DashboardScalarContent { header() }
+            DashboardScalarContent(presentation: presentation, leaf: .header) { header() }
             activityCard()
-            if store.backendKind != nil {
-                DashboardScalarContent { compactDetails }
+            if scalarBackendKind != nil {
+                DashboardScalarContent(presentation: presentation, leaf: .details) {
+                    compactDetails
+                }
             }
             Divider()
             Button(action: actions.onOpenDashboardWindow) {
@@ -87,18 +93,25 @@ struct DashboardView: View {
     }
 
     private func dashboardContent(narrow: Bool, density: DashboardHeightPolicy) -> some View {
-        DashboardStackLayout(spacing: density.rowSpacing) {
-            DashboardScalarContent { header(narrow: narrow, density: density) }
+        DashboardStackLayout(
+            spacing: density.rowSpacing,
+            layoutCounters: PerformanceGraphicsDiagnostics.shared.layoutCountersForPresentation
+        ) {
+            DashboardScalarContent(presentation: presentation, leaf: .header) {
+                header(narrow: narrow, density: density)
+            }
             historyControls(narrow: narrow)
             activityCard(narrow: narrow, density: density)
                 .layoutValue(key: DashboardFlexibleRow.self, value: true)
-            if store.backendKind != nil {
+            if scalarBackendKind != nil {
                 VStack(alignment: .leading, spacing: density.value(8, 4)) {
                     Divider()
-                    DashboardScalarContent { dashboardDetails(narrow: narrow, density: density) }
+                    DashboardScalarContent(presentation: presentation, leaf: .details) {
+                        dashboardDetails(narrow: narrow, density: density)
+                    }
                 }
             }
-            DashboardScalarContent {
+            DashboardScalarContent(presentation: presentation, leaf: .appFooter) {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "info.circle")
                     Text(GPUActivityPresentation.summary)
@@ -177,7 +190,7 @@ struct DashboardView: View {
             : AnyLayout(HStackLayout(spacing: 5))
         return layout {
             HStack(spacing: 5) {
-                Text(store.backendKind?.title ?? "LLM monitor").fixedSize()
+                Text(providerTitle).fixedSize()
                 Text("·")
                 Text(modelLabel).lineLimit(1).truncationMode(.middle)
                     .help(modelLabel)
@@ -186,7 +199,7 @@ struct DashboardView: View {
             if !narrow { Spacer(minLength: 6) }
             // Reserve the activity line even while idle so incoming requests
             // do not push the chart down in the stacked header.
-            Text(BackendPresentation.activityDetail(store: store) ?? "")
+            Text(activityDetail ?? "")
                 .lineLimit(1).minimumScaleFactor(0.85)
                 .monospacedDigit()
                 .frame(height: 14)
@@ -203,7 +216,7 @@ struct DashboardView: View {
     }
 
     @ViewBuilder private var statusControl: some View {
-        if let prompt = BackendPresentation.configurationPrompt(store: store) {
+        if let prompt = configurationPrompt {
             Button(action: actions.onShowSettings) { statusBadge }
                 .buttonStyle(.plain)
                 .help(prompt)
@@ -216,7 +229,7 @@ struct DashboardView: View {
 
     private func throughputValue(size: CGFloat) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 7) {
-            Text(BackendPresentation.rateLabel(store: store))
+            Text(rateLabel)
                 .font(.system(size: size, weight: .medium, design: .rounded))
                 .monospacedDigit()
                 .lineLimit(1).minimumScaleFactor(0.7)
@@ -226,7 +239,7 @@ struct DashboardView: View {
         .frame(height: ceil(size * 1.25))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Generated")
-        .accessibilityValue("\(BackendPresentation.rateLabel(store: store)) tokens per second")
+        .accessibilityValue("\(rateLabel) tokens per second")
         .accessibilityIdentifier("throughput-value")
         .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
             ["throughput-value": $0]
@@ -244,7 +257,7 @@ struct DashboardView: View {
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: density.value(12, 8)))
             : AnyLayout(HStackLayout(alignment: .top, spacing: 16))
         return VStack(alignment: .leading, spacing: isCompact ? 10 : density.cardSpacing) {
-            DashboardScalarContent {
+            DashboardScalarContent(presentation: presentation, leaf: .metrics) {
                 metricLayout {
                     VStack(alignment: .leading, spacing: isCompact ? 6 : density.metricLabelSpacing)
                     {
@@ -296,14 +309,10 @@ struct DashboardView: View {
                 $0["activity-chart"] = $1
             }
             .zIndex(1)
-            DashboardScalarContent {
+            DashboardScalarContent(presentation: presentation, leaf: .cardFooter) {
                 HStack(spacing: 8) {
-                    Text(
-                        prepared.omittedRequestCount > 0
-                            ? "\(observationScope) · \(prepared.omittedRequestCount) older rails omitted"
-                            : observationScope
-                    )
-                    .help(throughputHelp)
+                    Text(cardFooterLabel(omittedRequestCount: prepared.omittedRequestCount))
+                        .help(throughputHelp)
                     Spacer(minLength: 0)
                     Text("GPU · This Mac").help(gpuHelp)
                 }
@@ -329,7 +338,7 @@ struct DashboardView: View {
 
     private func gpuValue(size: CGFloat, height: CGFloat) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 5) {
-            Text(GPUActivityPresentation.valueLabel(store.systemGPUUtilizationPercent))
+            Text(gpuLabel)
                 .font(.system(size: size, weight: .medium, design: .rounded))
                 .monospacedDigit()
             Text("%").font(.system(size: 11)).foregroundStyle(.secondary)
@@ -344,7 +353,7 @@ struct DashboardView: View {
 
     private var compactDetails: some View {
         Group {
-            if store.backendKind == .ollama {
+            if scalarBackendKind == .ollama {
                 detailRow("Latest response tokens", responseTokensLabel)
                     .accessibilityElement(children: .combine)
                     .accessibilityIdentifier("total-response-tokens")
@@ -364,7 +373,7 @@ struct DashboardView: View {
 
     private func dashboardDetails(narrow: Bool, density: DashboardHeightPolicy) -> some View {
         VStack(alignment: .leading, spacing: density.value(8, 5)) {
-            if store.backendKind == .ollama {
+            if scalarBackendKind == .ollama {
                 let totals = displayedUsageSummary
                 HStack(spacing: 8) {
                     Text("Usage").font(.system(size: 11, weight: .semibold))
@@ -410,10 +419,10 @@ struct DashboardView: View {
                     : AnyLayout(HStackLayout(alignment: .top, spacing: 20))
                 layout {
                     summaryValue(
-                        "Server output total", store.backendOutputTokens?.formatted() ?? "—",
+                        "Server output total", backendOutputTokensLabel,
                         density: density)
                     summaryValue(
-                        "Server prompt total", store.backendPromptTokens?.formatted() ?? "—",
+                        "Server prompt total", backendPromptTokensLabel,
                         density: density)
                     summaryValue("Requests", requestCountLabel, density: density)
                 }
@@ -466,10 +475,10 @@ struct DashboardView: View {
     private var statusBadge: some View {
         HStack(spacing: 5) {
             Circle().fill(statusColor).frame(width: 6, height: 6)
-            Text(BackendPresentation.statusTitle(store: store))
+            Text(statusTitle)
                 .font(.system(size: 10, weight: .medium))
                 .lineLimit(1).fixedSize()
-            if BackendPresentation.configurationPrompt(store: store) != nil {
+            if configurationPrompt != nil {
                 Image(systemName: "gearshape")
                     .font(.system(size: 10))
                     .accessibilityHidden(true)
@@ -479,13 +488,21 @@ struct DashboardView: View {
         .background(statusColor.opacity(0.1), in: Capsule())
         .accessibilityElement(children: .combine)
         .help(
-            BackendPresentation.configurationPrompt(store: store)
-                ?? (store.backendKind == .ollama
+            configurationPrompt
+                ?? (scalarBackendKind == .ollama
                     ? "Observed generation activity for requests sent through FluxLLM."
                     : "Observed generation activity reported by the selected backend."))
     }
 
     private var statusColor: Color {
+        if let frozen = frozenScalars {
+            return switch frozen.statusTone {
+            case .throughput: throughputColor
+            case .secondary: .secondary
+            case .blue: .blue
+            case .orange: .orange
+            }
+        }
         if store.isBackendActive { return throughputColor }
         return switch store.connectionState {
         case .ready: store.isBackendActive ? throughputColor : .secondary
@@ -527,10 +544,12 @@ struct DashboardView: View {
     }
 
     private var usageScope: Binding<UsageScope> {
-        Binding(get: { store.usageScope }, set: { store.usageScope = $0 })
+        Binding(
+            get: { frozenScalars?.usageScope ?? store.usageScope }, set: { store.usageScope = $0 })
     }
     private var usageScopeHelp: String {
-        switch store.usageScope {
+        if let frozen = frozenScalars { return frozen.usageScopeHelp }
+        return switch store.usageScope {
         case .sinceLaunch:
             "All requests observed for this endpoint since FluxLLM launched, including active estimates."
         case .selectedPeriod:
@@ -551,7 +570,8 @@ struct DashboardView: View {
     }
     private var chartDuration: TimeInterval { chartInterval.duration }
     private var observationScope: String {
-        switch store.backendKind {
+        if let frozen = frozenScalars { return frozen.observationScope }
+        return switch store.backendKind {
         case .ollama: "Via FluxLLM"
         case .none: "Waiting for backend"
         default: "Server metrics"
@@ -573,10 +593,12 @@ struct DashboardView: View {
         store.systemGPUUtilizationPercent != nil
     }
     private var gpuHelp: String {
-        gpuIsAvailable ? GPUActivityPresentation.explanation : store.gpuAvailabilityMessage
+        if let frozen = frozenScalars { return frozen.gpuHelp }
+        return gpuIsAvailable ? GPUActivityPresentation.explanation : store.gpuAvailabilityMessage
     }
     private var throughputHelp: String {
-        switch store.throughputBasis {
+        if let frozen = frozenScalars { return frozen.throughputHelp }
+        return switch store.throughputBasis {
         case .estimated:
             if store.backendKind == .ollama {
                 "Generated and tool-call rates follow the latest request via FluxLLM. Active includes all open monitored requests. Live token rate is approximate until the backend reports final token counts."
@@ -590,10 +612,12 @@ struct DashboardView: View {
         }
     }
     private var modelLabel: String {
+        if let frozen = frozenScalars { return frozen.modelLabel }
         guard let model = store.currentModel, !model.isEmpty else { return "—" }
         return model
     }
     private var responseTokensLabel: String {
+        if let frozen = frozenScalars { return frozen.responseTokensLabel }
         if PerformanceGraphicsDiagnostics.shared.mode.usesCoalescedScalarPresentation {
             guard let response = store.dashboardScalarPresentation.latestResponse else {
                 return "—"
@@ -604,21 +628,74 @@ struct DashboardView: View {
             ? "—" : (store.outputIsEstimated ? "~" : "") + store.outputTokens.formatted()
     }
     private var displayedUsageSummary: UsageSummary {
+        if let frozen = frozenScalars { return frozen.usage }
         if PerformanceGraphicsDiagnostics.shared.mode.usesCoalescedScalarPresentation {
             return store.dashboardScalarPresentation.usage
         }
         return store.usageSummary(in: chartInterval)
     }
     private var displayedHistoryPersistenceError: String? {
+        if let frozen = frozenScalars { return frozen.historyPersistenceError }
         if PerformanceGraphicsDiagnostics.shared.mode.usesCoalescedScalarPresentation {
             return store.dashboardScalarPresentation.historyPersistenceError
         }
         return store.historyPersistenceError
     }
     private var requestCountLabel: String {
+        if let frozen = frozenScalars { return frozen.requestCountLabel }
         guard let running = store.runningRequests else { return "—" }
         let queued = store.queuedRequests ?? 0
         return queued > 0 ? "\(running) active · \(queued) queued" : running.formatted()
+    }
+
+    /// Normal rendering keeps each existing scalar's observation reads. The
+    /// diagnostic branch returns held values before touching any store scalar.
+    private var frozenScalars: DashboardFrozenScalars? {
+        guard PerformanceGraphicsDiagnostics.shared.mode.usesFrozenScalarPresentation else {
+            return nil
+        }
+        return presentation.frozenScalars
+    }
+    private var scalarBackendKind: BackendKind? {
+        if let frozen = frozenScalars { return frozen.backendKind }
+        return store.backendKind
+    }
+    private var providerTitle: String {
+        if let frozen = frozenScalars { return frozen.providerTitle }
+        return store.backendKind?.title ?? "LLM monitor"
+    }
+    private var activityDetail: String? {
+        if let frozen = frozenScalars { return frozen.activityDetail }
+        return BackendPresentation.activityDetail(store: store)
+    }
+    private var configurationPrompt: String? {
+        if let frozen = frozenScalars { return frozen.configurationPrompt }
+        return BackendPresentation.configurationPrompt(store: store)
+    }
+    private var statusTitle: String {
+        if let frozen = frozenScalars { return frozen.statusTitle }
+        return BackendPresentation.statusTitle(store: store)
+    }
+    private var rateLabel: String {
+        if let frozen = frozenScalars { return frozen.rateLabel }
+        return BackendPresentation.rateLabel(store: store)
+    }
+    private var gpuLabel: String {
+        if let frozen = frozenScalars { return frozen.gpuLabel }
+        return GPUActivityPresentation.valueLabel(store.systemGPUUtilizationPercent)
+    }
+    private var backendOutputTokensLabel: String {
+        if let frozen = frozenScalars { return frozen.backendOutputTokensLabel }
+        return store.backendOutputTokens?.formatted() ?? "—"
+    }
+    private var backendPromptTokensLabel: String {
+        if let frozen = frozenScalars { return frozen.backendPromptTokensLabel }
+        return store.backendPromptTokens?.formatted() ?? "—"
+    }
+    private func cardFooterLabel(omittedRequestCount: Int) -> String {
+        if let frozen = frozenScalars { return frozen.cardFooterLabel }
+        return omittedRequestCount > 0
+            ? "\(observationScope) · \(omittedRequestCount) older rails omitted" : observationScope
     }
 }
 
@@ -626,8 +703,54 @@ struct DashboardView: View {
 /// activity and GPU scalar changes therefore leave the chart parent untouched.
 private struct DashboardScalarContent<Content: View>: View {
     private let content: () -> Content
+    private let presentation: DashboardPresentationState
+    private let leaf: PerformanceGraphicsDiagnostics.ScalarLeaf
 
-    init(@ViewBuilder content: @escaping () -> Content) { self.content = content }
+    init(
+        presentation: DashboardPresentationState, leaf: PerformanceGraphicsDiagnostics.ScalarLeaf,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.presentation = presentation
+        self.leaf = leaf
+        self.content = content
+    }
 
-    var body: some View { content() }
+    var body: some View {
+        if PerformanceGraphicsDiagnostics.shared.isEnabled, presentation.isActive {
+            PerformanceGraphicsDiagnostics.shared.recordScalarLeafBody(
+                leaf, owner: presentation.scalarPerformanceOwnerID)
+        }
+        return content()
+    }
+}
+
+/// Resolve existing native layout landmarks only in authenticated captures.
+/// The receipt is nonobservable and creates no polling or animation work.
+private struct DashboardScalarFrameProbe: ViewModifier {
+    let presentation: DashboardPresentationState
+    let epoch: UUID
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        let diagnostics = PerformanceGraphicsDiagnostics.shared
+        if diagnostics.isEnabled
+            && (diagnostics.mode == .normal || diagnostics.mode.usesFrozenScalarPresentation)
+        {
+            let generation = presentation.scalarFrameGeneration
+            content.overlayPreferenceValue(DashboardFrameAnchors.self) { anchors in
+                GeometryReader { geometry in
+                    let frames = anchors.mapValues { geometry[$0] }
+                    Color.clear
+                        .onChange(of: frames, initial: true) { _, current in
+                            presentation.recordScalarPerformanceFrames(
+                                current, generation: generation, epoch: epoch)
+                        }
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
+        } else {
+            content
+        }
+    }
 }

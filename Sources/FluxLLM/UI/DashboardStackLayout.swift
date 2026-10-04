@@ -7,8 +7,13 @@ struct DashboardFlexibleRow: LayoutValueKey {
 
 struct DashboardStackLayout: Layout {
     var spacing: CGFloat = 18
+    var layoutCounters: PerformanceGraphicsDiagnostics.LayoutCounters? = nil
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        layoutCounters?.recordSize()
+        if proposal.width == nil {
+            layoutCounters?.recordChildMeasurements(subviews.count)
+        }
         let width =
             proposal.width ?? subviews.map { $0.sizeThatFits(.unspecified).width }.max() ?? 0
         let sizes = measurements(width: width, subviews: subviews)
@@ -19,6 +24,7 @@ struct DashboardStackLayout: Layout {
     func placeSubviews(
         in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
     ) {
+        layoutCounters?.recordPlace()
         let sizes = measurements(width: bounds.width, subviews: subviews)
         let naturalHeight = sizes.reduce(0) { $0 + $1.height } + gapHeight(subviews.count)
         let flexibleCount = subviews.filter { $0[DashboardFlexibleRow.self] }.count
@@ -36,7 +42,8 @@ struct DashboardStackLayout: Layout {
     }
 
     private func measurements(width: CGFloat, subviews: Subviews) -> [CGSize] {
-        subviews.map { $0.sizeThatFits(ProposedViewSize(width: width, height: nil)) }
+        layoutCounters?.recordChildMeasurements(subviews.count)
+        return subviews.map { $0.sizeThatFits(ProposedViewSize(width: width, height: nil)) }
     }
 
     private func gapHeight(_ count: Int) -> CGFloat {

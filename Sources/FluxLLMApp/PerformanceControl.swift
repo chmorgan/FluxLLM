@@ -41,6 +41,7 @@ final class PerformanceControl {
     private var reader: Thread?
     private var handshaken = false
     private var stopping = false
+    private var scalarPresentationFrozen = false
     private var stopTask: Task<Void, Never>?
     private(set) var hasStopped = false
     private var shutdownCommandID = "termination"
@@ -279,6 +280,21 @@ final class PerformanceControl {
             if !(await waitForVisibility(popover: false)) {
                 status = "error"
                 reason = "Popover did not close"
+            }
+        case "freeze_scalars":
+            guard configuration.graphics_mode == .runtimeFrozenScalars, !scalarPresentationFrozen
+            else {
+                status = "error"
+                reason =
+                    "Scalar freezing requires its diagnostic mode and is permitted exactly once"
+                break
+            }
+            do {
+                try session.menuBarController.performanceFreezeScalarPresentation()
+                scalarPresentationFrozen = true
+            } catch {
+                status = "error"
+                reason = "Scalar presentation capture failed: \(error)"
             }
         case "set_logging":
             guard let enabled = command.enabled else {
