@@ -44,6 +44,7 @@ public final class PerformanceGraphicsDiagnostics {
         case runtimeCompletedLaneCache = "runtime-completed-lane-cache"
         case runtimeCachedRailGeometry = "runtime-cached-rail-geometry"
         case runtimeReuseCaches = "runtime-reuse-caches"
+        case runtimeFrozenScalars = "runtime-frozen-scalars"
         case runtimeHeldStaticChart = "runtime-held-static-chart"
         case noBlur = "no-blur"
         case cpuGlow = "cpu-glow"
@@ -95,7 +96,8 @@ public final class PerformanceGraphicsDiagnostics {
                 .runtimeDeferredToolGeometry2Hz, .runtimeMetalArrivalBursts, .runtimeMetalFullChart,
                 .runtimeMetalCachedChart, .runtimeMetalPrimitiveEffects, .runtimeTelemetryBatch,
                 .runtimeAtomicChartScale, .runtimeEfficientEffects, .runtimeCompletedLaneCache,
-                .runtimeCachedRailGeometry, .runtimeReuseCaches, .runtimeHeldStaticChart:
+                .runtimeCachedRailGeometry, .runtimeReuseCaches, .runtimeFrozenScalars,
+                .runtimeHeldStaticChart:
                 true
             default:
                 false
@@ -124,6 +126,8 @@ public final class PerformanceGraphicsDiagnostics {
         var usesCachedRailGeometry: Bool {
             self == .runtimeCachedRailGeometry || self == .runtimeReuseCaches
         }
+        /// Diagnostic ablation only; authoritative metrics and chart data stay live.
+        var usesFrozenScalarPresentation: Bool { self == .runtimeFrozenScalars }
         /// Causal diagnostic only: the displayed static chart intentionally stops updating.
         var usesHeldStaticChart: Bool { self == .runtimeHeldStaticChart }
 
@@ -145,7 +149,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalArrivalBursts
                 || usesMetalFullChart
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
-                || usesCompletedLaneCache || usesCachedRailGeometry
+                || usesCompletedLaneCache || usesCachedRailGeometry || usesFrozenScalarPresentation
                 || usesHeldStaticChart
         }
 
@@ -176,7 +180,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesMetalArrivalBursts
                 || usesMetalFullChart
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
-                || usesCompletedLaneCache || usesCachedRailGeometry
+                || usesCompletedLaneCache || usesCachedRailGeometry || usesFrozenScalarPresentation
                 || usesHeldStaticChart
         }
 
@@ -190,7 +194,7 @@ public final class PerformanceGraphicsDiagnostics {
                 || usesDeferredToolGeometry
                 || usesMetalArrivalBursts
                 || usesMetalPrimitiveEffects || usesBatchedTelemetryDelivery || usesAtomicChartScale
-                || usesCompletedLaneCache || usesCachedRailGeometry
+                || usesCompletedLaneCache || usesCachedRailGeometry || usesFrozenScalarPresentation
                 || usesHeldStaticChart
         }
 
@@ -220,7 +224,86 @@ public final class PerformanceGraphicsDiagnostics {
 
     public enum ConfigurationError: Error {
         case liveCanvases
+        case liveScalarPresentations
     }
+
+    enum ScalarLeaf: String, CaseIterable, Sendable {
+        case header, metrics, details
+        case cardFooter = "card_footer"
+        case appFooter = "app_footer"
+    }
+
+    /// SwiftUI can perform Layout callbacks off the main actor. A performance
+    /// session injects this bounded probe once; ordinary layouts receive nil.
+    /// All mutable state, including retirement, is protected by the same lock.
+    final class LayoutCounters: @unchecked Sendable {
+        struct Snapshot: Sendable {
+            var sizeCalls: UInt64 = 0
+            var placeCalls: UInt64 = 0
+            var childMeasurements: UInt64 = 0
+            var invalidEvents: UInt64 = 0
+        }
+
+        private let lock = NSLock()
+        private var enabled = false
+        private var counters = Snapshot()
+
+        func recordSize() {
+            record(\.sizeCalls, by: 1)
+        }
+
+        func recordPlace() {
+            record(\.placeCalls, by: 1)
+        }
+
+        func recordChildMeasurements(_ count: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard enabled else { return }
+            guard let count = UInt64(exactly: count) else {
+                recordInvalidEvent()
+                return
+            }
+            increment(\.childMeasurements, by: count)
+        }
+
+        func snapshot() -> Snapshot {
+            lock.lock()
+            defer { lock.unlock() }
+            return counters
+        }
+
+        fileprivate func reset(enabled: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            self.enabled = enabled
+            counters = Snapshot()
+        }
+
+        private func record(_ field: WritableKeyPath<Snapshot, UInt64>, by amount: UInt64) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard enabled else { return }
+            increment(field, by: amount)
+        }
+
+        // The caller owns the lock for both additions and invalid events.
+        private func increment(_ field: WritableKeyPath<Snapshot, UInt64>, by amount: UInt64) {
+            let next = counters[keyPath: field].addingReportingOverflow(amount)
+            guard !next.overflow else {
+                recordInvalidEvent()
+                return
+            }
+            counters[keyPath: field] = next.partialValue
+        }
+
+        private func recordInvalidEvent() {
+            if counters.invalidEvents < UInt64.max { counters.invalidEvents += 1 }
+        }
+    }
+
+    static let maximumScalarPresentationOwners = 2
+    static let maximumScalarFrameAnchors = 16
 
     public static let shared = PerformanceGraphicsDiagnostics()
     public private(set) var mode: Mode = .normal
@@ -232,6 +315,40 @@ public final class PerformanceGraphicsDiagnostics {
         var bitmapBytes: UInt64 = 0
         var layerImageBytes: UInt64 = 0
         var hasRenderer = false
+        var currentWidth: Double = 0
+        var currentHeight: Double = 0
+        var currentScale: Double = 0
+        var scalarStaticDraws: UInt64 = 0
+    }
+
+    private struct ScalarPresentationOwner {
+        var role: String? = nil
+        var frames: [String: CGRect] = [:]
+        var leafBodyUpdates: [ScalarLeaf: UInt64] = [:]
+    }
+
+    private struct FrozenScalarOwner {
+        let role: String
+        let fingerprint: String
+        let frames: [String: CGRect]
+    }
+
+    private var scalarLeafBodyUpdates: [ScalarLeaf: UInt64] = [:]
+    private var scalarPresentationOwners: [UUID: ScalarPresentationOwner] = [:]
+    private var frozenScalarOwners: [UUID: FrozenScalarOwner] = [:]
+    private var dashboardLayoutCounters: LayoutCounters?
+    private var scalarFreezesCaptured: UInt64 = 0
+    private var scalarFreezesReleased: UInt64 = 0
+    private var scalarPeakFrozenOwners: UInt64 = 0
+
+    private var scalarInstrumentationEnabled: Bool {
+        isEnabled && (mode == .normal || mode.usesFrozenScalarPresentation)
+    }
+
+    /// Read only while constructing the view on the main actor. The retained
+    /// probe itself can be called synchronously from any Layout callback.
+    var layoutCountersForPresentation: LayoutCounters? {
+        scalarInstrumentationEnabled ? dashboardLayoutCounters : nil
     }
 
     private struct Counters {
@@ -467,15 +584,26 @@ public final class PerformanceGraphicsDiagnostics {
         guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty,
             metalPrimitiveEffectsHosts.isEmpty
         else { throw ConfigurationError.liveCanvases }
+        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty else {
+            throw ConfigurationError.liveScalarPresentations
+        }
         reset()
         self.mode = mode
         isEnabled = true
+        if scalarInstrumentationEnabled {
+            let counters = LayoutCounters()
+            counters.reset(enabled: true)
+            dashboardLayoutCounters = counters
+        }
     }
 
     public func disable() throws {
         guard canvases.isEmpty, twinkleHosts.isEmpty, metalFullChartHosts.isEmpty,
             metalPrimitiveEffectsHosts.isEmpty
         else { throw ConfigurationError.liveCanvases }
+        guard scalarPresentationOwners.isEmpty, frozenScalarOwners.isEmpty else {
+            throw ConfigurationError.liveScalarPresentations
+        }
         reset()
         mode = .normal
         isEnabled = false
@@ -510,6 +638,14 @@ public final class PerformanceGraphicsDiagnostics {
         railGeometryCachePeakEntries = 0
         railGeometryCacheOwners.removeAll(keepingCapacity: false)
         railGeometryCachePeakOwners = 0
+        scalarLeafBodyUpdates.removeAll(keepingCapacity: false)
+        scalarPresentationOwners.removeAll(keepingCapacity: false)
+        frozenScalarOwners.removeAll(keepingCapacity: false)
+        dashboardLayoutCounters?.reset(enabled: false)
+        dashboardLayoutCounters = nil
+        scalarFreezesCaptured = 0
+        scalarFreezesReleased = 0
+        scalarPeakFrozenOwners = 0
     }
 
     public func canvasCreated(role: Role) -> UInt64? {
@@ -562,6 +698,11 @@ public final class PerformanceGraphicsDiagnostics {
             return
         }
         canvases[id]!.pixelArea = area.partialValue
+        if scalarInstrumentationEnabled {
+            canvases[id]!.currentWidth = width
+            canvases[id]!.currentHeight = height
+            canvases[id]!.currentScale = scale
+        }
         var role = roles[canvas.role]!
         role.pixelArea = role.pixelArea - canvas.pixelArea + area.partialValue
         role.peakPixelArea = max(role.peakPixelArea, role.pixelArea)
@@ -730,16 +871,19 @@ public final class PerformanceGraphicsDiagnostics {
     /// GPU time. Call instead of canvasDrawn so role and backend totals agree.
     public func nativeGPUCanvasDrawn(_ id: UInt64?) {
         guard isEnabled, mode.usesNativeGPUCanvas,
-            let (_, canvas) = registered(id)
+            let (id, canvas) = registered(id)
         else { return }
         let next = nativeGPUCanvasDraws.addingReportingOverflow(1)
         let nextRole = roles[canvas.role]!.draws.addingReportingOverflow(1)
-        guard !next.overflow, !nextRole.overflow else {
+        let observesStatic = scalarInstrumentationEnabled && canvas.role == .staticChart
+        let nextCanvas = canvas.scalarStaticDraws.addingReportingOverflow(observesStatic ? 1 : 0)
+        guard !next.overflow, !nextRole.overflow, !nextCanvas.overflow else {
             invalidEvents += 1
             return
         }
         nativeGPUCanvasDraws = next.partialValue
         roles[canvas.role]!.draws = nextRole.partialValue
+        if observesStatic { canvases[id]!.scalarStaticDraws = nextCanvas.partialValue }
     }
 
     /// Bounded lifecycle evidence for retained Core Animation shapes. These
@@ -1197,9 +1341,205 @@ public final class PerformanceGraphicsDiagnostics {
         return true
     }
 
+    /// Optional work evidence for normal and frozen-scalar performance sessions.
+    /// A live owner has one fixed, bounded counter inventory and no model payload.
+    func recordScalarLeafBody(_ leaf: ScalarLeaf, owner: UUID) {
+        guard scalarInstrumentationEnabled else { return }
+        guard
+            scalarPresentationOwners[owner] != nil
+                || scalarPresentationOwners.count < Self.maximumScalarPresentationOwners
+        else {
+            invalidEvents += 1
+            return
+        }
+        let total = scalarLeafBodyUpdates[leaf, default: 0].addingReportingOverflow(1)
+        let previous = scalarPresentationOwners[owner]?.leafBodyUpdates[leaf] ?? 0
+        let local = previous.addingReportingOverflow(1)
+        guard !total.overflow, !local.overflow else {
+            invalidEvents += 1
+            return
+        }
+        var receipt = scalarPresentationOwners[owner] ?? ScalarPresentationOwner()
+        receipt.leafBodyUpdates[leaf] = local.partialValue
+        scalarPresentationOwners[owner] = receipt
+        scalarLeafBodyUpdates[leaf] = total.partialValue
+    }
+
+    func recordDashboardLayoutSize() {
+        dashboardLayoutCounters?.recordSize()
+    }
+
+    func recordDashboardLayoutPlace() {
+        dashboardLayoutCounters?.recordPlace()
+    }
+
+    func recordDashboardLayoutChildMeasurements(_ count: Int) {
+        dashboardLayoutCounters?.recordChildMeasurements(count)
+    }
+
+    /// Current anchor geometry comes from existing performance-only callbacks.
+    /// A captured receipt stays immutable so a later layout change is visible
+    /// as a discrepancy rather than silently rewriting the before-load proof.
+    @discardableResult
+    func performanceScalarFramesUpdated(owner: UUID, role: String, frames: [String: CGRect]) -> Bool
+    {
+        guard scalarInstrumentationEnabled else { return false }
+        guard validScalarRole(role), validScalarFrames(frames),
+            scalarPresentationOwners[owner] != nil
+                || scalarPresentationOwners.count < Self.maximumScalarPresentationOwners,
+            !scalarPresentationOwners.contains(where: { $0.key != owner && $0.value.role == role }),
+            scalarPresentationOwners[owner]?.role.map({ $0 == role }) ?? true
+        else {
+            invalidEvents += 1
+            return false
+        }
+        var receipt = scalarPresentationOwners[owner] ?? ScalarPresentationOwner()
+        receipt.role = role
+        receipt.frames = frames
+        scalarPresentationOwners[owner] = receipt
+        return true
+    }
+
+    /// A capture identifies the complete immutable scalar value receipt by its
+    /// SHA256. Capture never reads, retains or copies authoritative model data.
+    @discardableResult
+    func frozenScalarPresentationCaptured(
+        owner: UUID, role: String, fingerprint: String, frames: [String: CGRect]
+    ) -> Bool {
+        guard scalarInstrumentationEnabled, mode.usesFrozenScalarPresentation else { return false }
+        guard validScalarRole(role), validScalarFrames(frames), validScalarFingerprint(fingerprint),
+            frozenScalarOwners[owner] == nil,
+            frozenScalarOwners.count < Self.maximumScalarPresentationOwners,
+            let current = scalarPresentationOwners[owner], current.role == role,
+            current.frames == frames,
+            !frozenScalarOwners.contains(where: { $0.value.role == role })
+        else {
+            invalidEvents += 1
+            return false
+        }
+        let captured = scalarFreezesCaptured.addingReportingOverflow(1)
+        guard !captured.overflow else {
+            invalidEvents += 1
+            return false
+        }
+        frozenScalarOwners[owner] = FrozenScalarOwner(
+            role: role, fingerprint: fingerprint, frames: frames)
+        scalarFreezesCaptured = captured.partialValue
+        scalarPeakFrozenOwners = max(scalarPeakFrozenOwners, UInt64(frozenScalarOwners.count))
+        return true
+    }
+
+    /// Idempotent hidden/closed cleanup handles both instrumented controls.
+    /// Normal owners never increment freeze counters; cumulative body/layout
+    /// work survives cleanup while all per-owner state is released.
+    func frozenScalarPresentationReleased(owner: UUID) {
+        guard scalarInstrumentationEnabled else { return }
+        if frozenScalarOwners[owner] != nil {
+            let released = scalarFreezesReleased.addingReportingOverflow(1)
+            guard !released.overflow else {
+                invalidEvents += 1
+                return
+            }
+            scalarFreezesReleased = released.partialValue
+            frozenScalarOwners.removeValue(forKey: owner)
+        }
+        scalarPresentationOwners.removeValue(forKey: owner)
+    }
+
+    private func validScalarRole(_ role: String) -> Bool {
+        role == "dashboard" || role == "popover"
+    }
+
+    private func validScalarFrames(_ frames: [String: CGRect]) -> Bool {
+        !frames.isEmpty && frames.count <= Self.maximumScalarFrameAnchors
+            && frames.allSatisfy { name, rect in
+                !name.isEmpty && name.utf8.count <= 64
+                    && rect.origin.x.isFinite && rect.origin.y.isFinite
+                    && rect.size.width.isFinite && rect.size.height.isFinite
+                    && rect.maxX.isFinite && rect.maxY.isFinite
+                    && rect.size.width > 0 && rect.size.height > 0
+            }
+    }
+
+    private func validScalarFingerprint(_ value: String) -> Bool {
+        value.utf8.count == 64
+            && value.utf8.allSatisfy {
+                (48...57).contains($0) || (97...102).contains($0)
+            }
+    }
+
+    private func scalarFramesSnapshot(_ frames: [String: CGRect]) -> [String: [String: Double]] {
+        frames.mapValues { rect in
+            [
+                "x": Double(rect.origin.x), "y": Double(rect.origin.y),
+                "width": Double(rect.size.width), "height": Double(rect.size.height),
+            ]
+        }
+    }
+
+    private func scalarLeavesSnapshot(_ counts: [ScalarLeaf: UInt64]) -> [String: UInt64] {
+        Dictionary(
+            uniqueKeysWithValues: ScalarLeaf.allCases.map { ($0.rawValue, counts[$0, default: 0]) })
+    }
+
+    private func scalarPresentationSnapshot(layout: LayoutCounters.Snapshot) -> [String: Any] {
+        let frozen = Dictionary(
+            uniqueKeysWithValues: frozenScalarOwners.map { id, receipt in
+                (
+                    id.uuidString,
+                    [
+                        "role": receipt.role, "capture_identity": receipt.fingerprint,
+                        "frames": scalarFramesSnapshot(receipt.frames),
+                    ] as [String: Any]
+                )
+            })
+        let live = Dictionary(
+            uniqueKeysWithValues: scalarPresentationOwners.map { id, receipt in
+                (
+                    id.uuidString,
+                    [
+                        "role": receipt.role as Any? ?? NSNull(),
+                        "current_frames": scalarFramesSnapshot(receipt.frames),
+                        "leaf_body_updates": scalarLeavesSnapshot(receipt.leafBodyUpdates),
+                    ] as [String: Any]
+                )
+            })
+        return [
+            "leaf_body_updates": scalarLeavesSnapshot(scalarLeafBodyUpdates),
+            "layout_size_calls": layout.sizeCalls, "layout_place_calls": layout.placeCalls,
+            "layout_child_measurements": layout.childMeasurements,
+            "freezes_captured": scalarFreezesCaptured, "freezes_released": scalarFreezesReleased,
+            "current_frozen_owners": UInt64(frozenScalarOwners.count),
+            "peak_frozen_owners": scalarPeakFrozenOwners,
+            "frozen_owners": frozen, "presentation_owners": live,
+        ]
+    }
+
     public func snapshot() -> [String: Any] {
+        let layout = dashboardLayoutCounters?.snapshot() ?? LayoutCounters.Snapshot()
+        let invalid = invalidEvents.addingReportingOverflow(layout.invalidEvents)
         var result: [String: Any] = [
             "enabled": isEnabled, "mode": mode.rawValue,
+            "frozen_scalar_presentation_enabled": isEnabled && mode.usesFrozenScalarPresentation,
+            "scalar_instrumentation_enabled": scalarInstrumentationEnabled,
+            "scalar_presentation": scalarPresentationSnapshot(layout: layout),
+            "native_canvas_frames": scalarInstrumentationEnabled
+                ? Dictionary(
+                    uniqueKeysWithValues: canvases.filter { $0.value.role == .staticChart }.map {
+                        id, canvas in
+                        (
+                            String(id),
+                            [
+                                "role": canvas.role.rawValue, "width": canvas.currentWidth,
+                                "height": canvas.currentHeight, "scale": canvas.currentScale,
+                            ] as [String: Any]
+                        )
+                    }) : [:],
+            "native_canvas_draws": scalarInstrumentationEnabled
+                ? Dictionary(
+                    uniqueKeysWithValues: canvases.filter { $0.value.role == .staticChart }.map {
+                        (String($0.key), $0.value.scalarStaticDraws)
+                    }) : [:],
             "holds_static_chart_drawing": mode.usesHeldStaticChart,
             "metal_full_chart_enabled": isEnabled && mode.usesMetalFullChart,
             "metal_static_cache_enabled": isEnabled && mode.cachesMetalStaticChart,
@@ -1232,7 +1572,7 @@ public final class PerformanceGraphicsDiagnostics {
                 "max_entries_per_cache": UInt64(24),
             ],
             "rail_geometry_cache_used": railGeometryCacheBuilds > 0,
-            "invalid_events": invalidEvents,
+            "invalid_events": invalid.overflow ? UInt64.max : invalid.partialValue,
             "cpu_glow_fallbacks": cpuGlowFallbacks,
             "gradient_substitutions": gradientSubstitutions,
             "layer_bitmap_presentations": layerBitmapPresentations,
