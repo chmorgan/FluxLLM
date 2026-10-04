@@ -142,6 +142,26 @@ corresponding environment variable when running `swift test` to opt in:
 The live Ollama test does not start inference; start the required worker activity
 before running it. Regular GPU tests use fixtures and run in CI.
 
+### Local desktop previews
+
+Use [package-preview.sh](package-preview.sh) to package already-built Release
+products for testing on your own Mac. Supply their native products directory,
+the full commit SHA recorded in its `provenance.json`, and a new output directory:
+
+```sh
+./package-preview.sh --products /path/to/native-products \
+  --commit FULL_40_CHARACTER_COMMIT_SHA --output .build/desktop-preview
+```
+
+The input must include clean Release provenance and its source inventory. The
+packager verifies the executable and branding, creates a commit-labelled `.app`,
+stamps `FluxLLMCommitSHA`, signs it ad hoc, and writes `preview-info.json` with
+source and packaged hashes. It performs no build, installation, app launch or
+shutdown, and never overwrites an existing output. This local preview is not
+notarized and does not enable performance-test configuration. When ready to try
+it, quit the existing FluxLLM normally and open the generated app by its exact
+path; both use the same application identifier and settings.
+
 ## Releases
 
 [package-release.sh](package-release.sh) builds a tagged version, signs and
