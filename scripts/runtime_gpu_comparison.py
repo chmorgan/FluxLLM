@@ -30,7 +30,7 @@ REQUEST_INDICES = (CYCLE * 32, CYCLE * 32 + 1)
 STAGE = {"activity": "high-rate", "seconds": 8}
 WORK = {"chunks": 3200, "output_tokens": 6434, "prompt_tokens": 46,
         "requests": 2, "tool_calls": 2, "tool_results": 2}
-MODES = ("normal", memory.METAL_ARRIVAL_MODE, *memory.METAL_CHART_MODES, *memory.NEW_RUNTIME_MODES, *memory.REUSE_RUNTIME_MODES, memory.FROZEN_SCALARS_MODE)
+MODES = ("normal", memory.METAL_ARRIVAL_MODE, *memory.METAL_CHART_MODES, *memory.NEW_RUNTIME_MODES, *memory.REUSE_RUNTIME_MODES, memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE)
 ERRORS = (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError)
 
 
@@ -333,6 +333,11 @@ def validate_report(report, mode):
         boundary=lambda point: snapshot_time(report, point))
     if scalar_work is not None:
         report["scalar_presentation_work"] = scalar_work
+    usage_work = runtime.validate_held_usage_checkpoints(report, mode,
+        closed_labels=("closed-start", "closed-end"), minimum_closed_seconds=2,
+        boundary=lambda point: snapshot_time(report, point))
+    if usage_work is not None:
+        report["held_usage_work"] = usage_work
     # Reuse strict Mach/sample validation; these traced CPU values are diagnostics only.
     report["phase_cpu"] = runtime.phase_cpu(report, report["phase_windows"])
     for point in report["checkpoints"]:
@@ -421,8 +426,13 @@ def qualify_result(result):
     selected = result.get("capture_case", "both")
     require(selected in ("both", "reference", "candidate"), "Unknown GPU capture selection")
     expected_labels = ["reference", "candidate"] if selected == "both" else [selected]
+    held = any(row.get("mode") == memory.HELD_USAGE_MODE for row in result["rows"])
+    if held:
+        require(selected == "both" and [row.get("mode") for row in result["rows"]] == ["normal", memory.HELD_USAGE_MODE],
+                "Held usage GPU diagnostic requires the paired normal/held comparison")
+        runtime.validate_held_usage_rows(result["rows"])
     if (selected == "both" and len(result["rows"]) == 2
-            and all(row.get("mode") == "normal" for row in result["rows"])):
+            and (held or all(row.get("mode") == "normal" for row in result["rows"]))):
         scalar_geometry = runtime.validate_scalar_geometry_rows(result["rows"])
         if scalar_geometry is not None:
             result["scalar_geometry_comparison"] = scalar_geometry
@@ -448,14 +458,17 @@ def qualify_result(result):
         if row.get("mode") in (*memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES):
             row.update(promotion_eligible=False,
                        promotion_reason="Experimental renderer requires independent visual and frame-delivery qualification")
-        if row.get("mode") == memory.FROZEN_SCALARS_MODE:
+        if row.get("mode") in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE):
+            reason = ("Held dashboard usage is a diagnostic ablation, not live production presentation"
+                      if row.get("mode") == memory.HELD_USAGE_MODE else
+                      "Frozen scalar presentation is a diagnostic ablation, not live production presentation")
             row.update(promotion_eligible=False, gpu_acceptance_eligible=False,
-                       promotion_reason="Frozen scalar presentation is a diagnostic ablation, not live production presentation")
+                       promotion_reason=reason)
             for name, window, available_window in (("runtime", workload, available), ("lifetime", lifetime, life_available)):
                 observed = row["gpu_target"][name]["within_limit"]
                 row["gpu_target"][name].update(evaluated=False, acceptance_eligible=False, within_limit=None,
                     observed_within_limit=observed if available_window else None,
-                    reason="Frozen scalar presentation is a diagnostic ablation")
+                    reason=reason)
         if not available or not life_available:
             result["errors"].append(row["label"] + ": GPU window or owned exit/command-completion proof incomplete")
     if not provider_valid:
@@ -536,6 +549,9 @@ def run(argv=None):
               "workload_specification": STAGE, "expected_work": WORK}
     created, trace, products, sources = False, None, {}, None
     try:
+        if memory.HELD_USAGE_MODE in modes.values():
+            require(args.capture_case == "both" and modes == {"reference": "normal", "candidate": memory.HELD_USAGE_MODE},
+                    "Held usage GPU diagnostic requires the paired normal/held comparison")
         require(sys.platform == "darwin", "Native GPU comparison requires macOS")
         require(not output.exists(), "Never overwrite GPU comparison artifacts")
         require(app.ROOT not in output.parents or app.ROOT / ".performance-results" in output.parents,
@@ -559,6 +575,8 @@ def run(argv=None):
                     "GPU products must use identical frozen collector bytes")
             require(reference["provenance"]["fixture_equivalence_sha256"]["populated"] == candidate["provenance"]["fixture_equivalence_sha256"]["populated"],
                     "GPU products have different populated fixture identities")
+            if memory.HELD_USAGE_MODE in modes.values():
+                runtime.validate_scalar_comparison_products(products)
             report["products"] = {label: {"files": product["files"], "production_provenance": product["provenance"],
                                          "measurement_identity": product["identity"]} for label, product in products.items()}
             write_report(output, report)
@@ -588,6 +606,7 @@ def run(argv=None):
                 row = {"label": label, "mode": modes[label], "report_path": str(path), "report_sha256": app.path_hash(path),
                        "validated_work": case["workload"]["validated_work"], "visual_work": case["visual_work"],
                        "runtime_work": case["runtime_work"], "scalar_presentation_work": case.get("scalar_presentation_work"),
+                       "held_usage_work": case.get("held_usage_work"),
                        **register_report(trace, case, label, ended)}
                 report["rows"].append(row)
                 write_report(output, report)

@@ -636,6 +636,7 @@ compares the history and preparation optimizations separately and together again
 | `runtime-cached-rail-geometry` | Cache invariant normal-Canvas particle directions and lightning geometry by receipt profile and exact rectangle. |
 | `runtime-reuse-caches` | Combine completed-lane and normal-Canvas effect geometry caching. |
 | `runtime-frozen-scalars` | Hold complete scalar leaf snapshots for the two visible windows while chart data, normal effects, menu-bar status, streaming and accounting remain live. Diagnostic ablation only. |
+| `runtime-held-usage` | Hold only the full dashboard's `UsageSummary`; compact latest response, headers, rates, GPU labels, charts and effects remain live. Diagnostic ablation only. |
 
 The shared-preparation, stable-host, stream-write, and combined controls include
 the existing history and preparation optimizations. Compare individual candidates
@@ -1466,6 +1467,69 @@ metadata remain supported; a mixture of present and absent metadata or an
 incomplete proof invalidates the comparison. Source and original provenance
 remain immutable; any updated external validation uses a preserved, reviewed
 comparison binding.
+
+### Held dashboard usage diagnostic
+
+`runtime-held-usage` narrows the scalar experiment to the full dashboard's usage
+block. The runner sends the authenticated `freeze_usage` command exactly once
+after both windows are visible and before the measured `before-traffic` boundary.
+It captures one dashboard receipt with the monitoring epoch, usage scope, eight
+usage fields, native frames, and a SHA-256 fingerprint of the exact bounded JSON
+payload. Both complete scalar presentation owners remain live; the compact
+latest-response count and the unrelated headers, token rates, and GPU labels
+continue to render their normal values. The usage scope picker remains live;
+the fixed fixture performs no picker interaction.
+
+Run the automated normal/held/normal bracket with the same frozen products:
+
+```sh
+python3 scripts/run_performance_checks.py runtime compare \
+  --baseline-mode normal --controls runtime-held-usage \
+  --app-binary /absolute/products/FluxLLMApp \
+  --test-bundle /absolute/products/FluxLLMPackageTests.xctest \
+  --collector-binary /absolute/products/FluxLLMResourceCollector \
+  --provenance /absolute/products/provenance.json \
+  --output-dir .performance-results/held-usage-cpu-comparison
+```
+
+The existing 25-second two-stream fixture applies the load automatically. The
+three cases normally finish in about 130 seconds within the unchanged 300-second
+deadline. This mode selects the ordinary renderer, 1 Hz chart publication,
+30 Hz Canvas lifecycle effects and retained glints, with the experimental Metal,
+batching, atomic-scale and reuse-cache controls disabled. An explicit reference
+comparison must use identical app, test, collector and provenance bytes.
+
+Every interior checkpoint verifies the sole immutable dashboard receipt against
+the live monitoring epoch and the dashboard usage values actually read by its
+native details leaf. Separately recorded native leaf labels must prove an
+advancing compact response with the exact final token count, active two-request
+headers, positive live token rates, and idle headers around the workload. The
+normal controls must continue advancing their displayed dashboard usage. Both
+windows retain matching local chart bounds, native chart backing dimensions and
+scale, and native window sizes. Each chart proves full-rate drawing, and arrival,
+completion and ordinary retained-glint work remain positive. Global window
+origins remain report-only. Closing both windows must release the held owner and
+all live presentation owners, followed by the existing five-second quiet check.
+
+Reports retain kernel CPU measurements and the separate `held_usage_work`
+receipt/live-value evidence. Missing held metadata remains optional for older
+normal products; partial metadata fails closed. The held mode is **always
+ineligible for CPU, GPU, full resource acceptance, or production promotion**.
+The 5% CPU and calibrated 1% GPU targets remain unchanged. If CPU evidence merits
+a GPU follow-up, use the existing bounded `gpu-compare` with both products equal,
+`--reference-mode normal --candidate-mode runtime-held-usage --capture-case both`.
+Its shorter fixed replay repeats the receipt, live-value, per-chart and paired
+geometry proof; traced CPU remains diagnostic and held GPU measurements cannot
+qualify a production pass. Preserve original source/provenance and use a reviewed
+external comparison binding when validator bytes change.
+
+Native pixel, geometry, accounting and live-value tests are mandatory. A separate
+accessibility parity test first checks an independent SwiftUI `Text` sentinel in
+the same presented AppKit test host. If the sentinel exposes no accessibility
+tree, XCTest explicitly reports that check as skipped; an empty tree never counts
+as parity. If the sentinel works, missing dashboard labels or changed accessibility
+values fail the test. Keep this availability limitation with the captured results;
+the held-usage mode remains diagnostic-only.
 
 ## Baselines and comparison artifacts
 

@@ -14,7 +14,7 @@ from run_performance_checks import InvalidResult
 
 
 def graphics(mode="normal"):
-    if mode in memory.NEW_RUNTIME_MODES + memory.REUSE_RUNTIME_MODES + (memory.FROZEN_SCALARS_MODE,):
+    if mode in memory.NEW_RUNTIME_MODES + memory.REUSE_RUNTIME_MODES + (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE):
         snapshot = graphics(memory.METAL_ARRIVAL_MODE)
         value = snapshot["graphics_diagnostics"]
         value.update(mode=mode, metal_arrival_bursts_enabled=False,
@@ -34,13 +34,16 @@ def graphics(mode="normal"):
             for namespace, _flag, _enabled, counters, _maximum in memory.REUSE_CACHE_SPECS:
                 value[namespace] = dict.fromkeys(counters + memory.REUSE_CACHE_GAUGES, 0)
             value["rail_geometry_cache"].update(current_caches=0, peak_caches=0, max_entries_per_cache=24)
-        if mode == memory.FROZEN_SCALARS_MODE:
+        if mode in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE):
             value.update(completed_lane_cache_enabled=False, rail_geometry_cache_enabled=False, rail_geometry_cache_used=False)
             for namespace, _flag, _enabled, counters, _maximum in memory.REUSE_CACHE_SPECS:
                 value[namespace] = dict.fromkeys(counters + memory.REUSE_CACHE_GAUGES, 0)
             value["rail_geometry_cache"].update(current_caches=0, peak_caches=0, max_entries_per_cache=24)
             from test_runtime_frozen_scalars import add_scalar_metadata
             add_scalar_metadata(snapshot, mode)
+            if mode == memory.HELD_USAGE_MODE:
+                from test_runtime_held_usage import add_held_usage_metadata
+                add_held_usage_metadata(snapshot, mode)
         return snapshot
     if mode in memory.METAL_CHART_MODES:
         snapshot = graphics(memory.METAL_ARRIVAL_MODE)
@@ -173,7 +176,7 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
         value["roles"]["static_chart"].update(drawing_update_attempts=3, drawing_updates_applied=3)
     if mode in memory.CANVAS_CLOCK_MODES:
         snapshot["rail_frame_clock_ticks"] = 0 if mode in memory.PRIMITIVE_EFFECTS_MODES else 3
-    if mode in memory.NEW_RUNTIME_MODES + memory.REUSE_RUNTIME_MODES + (memory.FROZEN_SCALARS_MODE,):
+    if mode in memory.NEW_RUNTIME_MODES + memory.REUSE_RUNTIME_MODES + (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE):
         snapshot.update(grouped_native_canvas_draws=3, legacy_tool_plot_builds=3,
                         tool_path_input_points=30, tool_path_output_points=30)
         if mode in memory.PRIMITIVE_EFFECTS_MODES:
@@ -195,6 +198,11 @@ def drawn_native_gpu_graphics(mode="native-gpu-canvas"):
         if mode == memory.FROZEN_SCALARS_MODE:
             from test_runtime_frozen_scalars import add_scalar_metadata
             add_scalar_metadata(snapshot, mode, frozen=True, present=True, updates=2)
+        if mode == memory.HELD_USAGE_MODE:
+            from test_runtime_frozen_scalars import add_scalar_metadata
+            from test_runtime_held_usage import add_held_usage_metadata
+            add_scalar_metadata(snapshot, mode, present=True, updates=2)
+            add_held_usage_metadata(snapshot, mode, captured=True)
     if mode in ("runtime-stable-decoration-hosts", "runtime-next-optimized"):
         value.update(live_canvases=2, peak_live_canvases=2)
         value["roles"]["rail_decorations"].update(created=1, live=1, peak_live=1)
@@ -707,6 +715,11 @@ class GraphicsTests(unittest.TestCase):
             if mode == memory.FROZEN_SCALARS_MODE:
                 from test_runtime_frozen_scalars import add_scalar_metadata
                 add_scalar_metadata(snapshot, mode, frozen=True, present=True, closed=True, updates=2)
+            if mode == memory.HELD_USAGE_MODE:
+                from test_runtime_frozen_scalars import add_scalar_metadata
+                from test_runtime_held_usage import add_held_usage_metadata
+                add_scalar_metadata(snapshot, mode, present=True, closed=True, updates=2)
+                add_held_usage_metadata(snapshot, mode, captured=True, closed=True)
             with self.subTest(mode=mode), self.assertRaisesRegex(InvalidResult, "Retained twinkle resources remain live"):
                 memory.validate_graphics(snapshot, mode, expected_closed=True)
             value["retained_twinkles"].update(hosts_destroyed=1, live_hosts=0, instances_destroyed=2, live_instances=0)

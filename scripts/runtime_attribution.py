@@ -41,7 +41,7 @@ BASELINES = ("native-gpu-optimized", "runtime-optimized", "normal", memory.ORDER
 
 
 def cpu_acceptance_eligible(mode, *, profile=False):
-    return not profile and mode not in (memory.HELD_STATIC_CHART_MODE, memory.FROZEN_SCALARS_MODE, *memory.PRIMITIVE_EFFECTS_MODES,
+    return not profile and mode not in (memory.HELD_STATIC_CHART_MODE, memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE, *memory.PRIMITIVE_EFFECTS_MODES,
                                        *memory.METAL_CHART_MODES)
 
 
@@ -219,7 +219,7 @@ def scalar_presentation_work(before, after, mode):
                                          for leaf in memory.SCALAR_LEAVES},
             "native_canvas_draw_deltas": {identity: last["native_canvas_draws"][identity] - count
                                            for identity, count in first["native_canvas_draws"].items()},
-            "acceptance_eligible": False if first["enabled"] else True}
+            "acceptance_eligible": first["acceptance_eligible"]}
 
 
 def validate_scalar_presentation_checkpoints(report, mode, *, closed_labels=("07-both-closed-after-probe", "08-closed-after-five-more-seconds"),
@@ -232,7 +232,7 @@ def validate_scalar_presentation_checkpoints(report, mode, *, closed_labels=("07
         require(not commands, "Normal control unexpectedly issued a scalar-freeze command")
     if first is None:
         return None
-    if mode not in ("normal", memory.FROZEN_SCALARS_MODE):
+    if mode not in ("normal", memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE):
         return scalar_presentation_work(points[0]["snapshot"], points[-1]["snapshot"], mode)
     if boundary is None:
         clocks = report["runtime"]
@@ -370,7 +370,7 @@ def validate_scalar_presentation_checkpoints(report, mode, *, closed_labels=("07
         arrival_deltas=arrival_work, completion_deltas=completion_work,
         steady_retained_twinkle_animation_starts=glints[-1] - glints[0],
         held_scalar_identities={entry["role"]: entry["capture_identity"] for entry in first["frozen_owners"].values()},
-        closed_current_frozen_owners=0, promotion_eligible=False if mode == memory.FROZEN_SCALARS_MODE else True,
+        closed_current_frozen_owners=0, promotion_eligible=mode not in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE),
         scope="Fixed local chart bounds, native backing geometry and window sizes; global window origins are reported. Live chart/streaming work remains exact; frozen scalar leaves are a diagnostic ablation")
     return result
 
@@ -402,6 +402,143 @@ def scalar_comparison_geometry(work, mode):
             "native_chart_geometry": sorted(native, key=lambda frame: (frame["width"], frame["height"], frame["scale"]))}
 
 
+def rendered_response_tokens(label):
+    if label == "—":
+        return None
+    text = label.removeprefix("~")
+    require(text and all(character.isdecimal() or character in ",. \u00a0\u202f" for character in text)
+            and any(character.isdecimal() for character in text), "Rendered compact response label is not a token count")
+    count = int("".join(character for character in text if character.isdecimal()))
+    require(0 <= count <= 2**64 - 1, "Rendered compact response exceeds its unsigned token bound")
+    return count
+
+
+def validate_held_usage_checkpoints(report, mode, *, closed_labels=("07-both-closed-after-probe", "08-closed-after-five-more-seconds"),
+                                    minimum_closed_seconds=5, boundary=None):
+    """Prove only dashboard usage is held while compact and unrelated leaves render live."""
+    points = report["runtime"]["checkpoints"]
+    first = memory.held_usage_contract(points[0]["snapshot"], mode, require_held=mode == memory.HELD_USAGE_MODE)
+    commands = [entry for entry in report.get("commands", []) if entry.get("command") == "freeze_usage"]
+    if mode != memory.HELD_USAGE_MODE:
+        require(not commands and "usage_freeze_acknowledgment" not in report["runtime"],
+                "Normal control unexpectedly issued a usage-freeze command")
+    if first is None:
+        return None
+    if mode not in ("normal", memory.HELD_USAGE_MODE):
+        return None
+    scalar_work = validate_scalar_presentation_checkpoints(report, mode, closed_labels=closed_labels,
+        minimum_closed_seconds=minimum_closed_seconds, boundary=boundary)
+    require(scalar_work is not None, "Held usage requires complete live scalar/chart geometry instrumentation")
+    if boundary is None:
+        clocks = report["runtime"]
+        offset = sum(clocks[name]["absolute_minus_monotonic_seconds"] for name in ("mach_clock_start", "mach_clock_end")) / 2
+        boundary = lambda point: point["resource_sample"]["mach_absolute_seconds"] - offset
+    held = mode == memory.HELD_USAGE_MODE
+    receipt = next(iter(first["owners"].values())) if held else None
+    held_owner = next(iter(first["owners"])) if held else None
+    if held:
+        acknowledgment = report["runtime"].get("usage_freeze_acknowledgment")
+        require(len(commands) == 1 and isinstance(acknowledgment, dict) and commands[0].get("response") == acknowledgment
+                and acknowledgment.get("type") == "ack" and acknowledgment.get("command") == "freeze_usage"
+                and isinstance(acknowledgment.get("command_id"), str) and acknowledgment["command_id"].startswith("runner-")
+                and acknowledgment.get("status") == "ok", "Held usage lacks one authenticated pre-runtime acknowledgment")
+        edges = [acknowledgment.get("collector_control_before_seconds"), acknowledgment.get("collector_control_after_seconds")]
+        require(all(memory.finite_numeric(edge) and edge >= 0 for edge in edges)
+                and edges[0] <= edges[1] <= points[0]["snapshot"]["runner_collector_sample_monotonic_seconds"],
+                "Usage freeze did not finish before the measured before-traffic boundary")
+        captured = acknowledgment.get("snapshot")
+        require(isinstance(captured, dict) and captured.get("dashboard_visible") is True
+                and captured.get("popover_visible") is True and captured.get("active_requests") == 0,
+                "Usage freeze did not capture both visible idle windows")
+        ack = memory.held_usage_contract(captured, mode, require_held=True)
+        require(ack["owners"] == first["owners"] and acknowledgment.get("held_usage_capture") == {
+                    "frozen": True, "owner": held_owner, "epoch": receipt["epoch"], "capture_identity": receipt["capture_identity"]},
+                "Usage freeze owner, epoch, or fingerprint acknowledgment differs from capture")
+        require(receipt["values"]["active_requests"] == 0, "Usage freeze captured an active dashboard summary")
+    previous, rendered = first, []
+    for point in points:
+        current = memory.held_usage_contract(point["snapshot"], mode, require_held=held)
+        require(current is not None and current["monitoring_epoch"] == first["monitoring_epoch"]
+                and all(current["counters"][field] >= previous["counters"][field]
+                        for field in memory.HELD_USAGE_COUNTERS + ("peak_owners",)),
+                "Held usage metadata disappeared, changed epoch, or regressed counters")
+        if held:
+            require(current["owners"] == first["owners"], "Held dashboard receipt changed at an interior checkpoint")
+        scalar = memory.scalar_presentation_contract(point["snapshot"], mode)
+        owners = scalar["presentation_owners"]
+        values_by_role = {}
+        for owner, entry in owners.items():
+            values = memory.presented_scalar_values(entry.get("presented_values"))
+            required = {"header", "metrics", "dashboard_usage" if entry["role"] == "dashboard" else "compact_details"}
+            require(set(values) == required, "Held usage lacks complete actually rendered live leaf witnesses")
+            values_by_role[entry["role"]] = values
+            if held and entry["role"] == "dashboard":
+                require(owner == held_owner and values["dashboard_usage"] == {"scope": receipt["scope"], "values": receipt["values"]},
+                        "Rendered dashboard usage differs from its held receipt")
+                frames = entry["current_frames"]
+                required_frames = set(SCALAR_CRITICAL_FRAMES["dashboard"]) | {"statistics-row"}
+                require(required_frames <= set(frames) and all(all(frames[name][field] == receipt["frames"][name][field]
+                        for field in (("width", "height") if name == "native-window" else ("x", "y", "width", "height")))
+                        for name in required_frames), "Held dashboard captured/local native frames changed")
+        rendered.append((point, boundary(point), values_by_role))
+        previous = current
+    steady = report["phase_windows"]["steady"]
+    interior = [row for row in rendered if steady["start_monotonic_seconds"] < row[1] < steady["end_monotonic_seconds"]]
+    require(len(interior) >= 2, "Held usage lacks live steady scalar checkpoints")
+    for _point, _stamp, by_role in interior:
+        for values in by_role.values():
+            header, metrics = values["header"], values["metrics"]
+            require(header["status"] == "Active" and header["activity"] == "2 requests in flight",
+                    "Held usage stopped an unrelated live activity/status header")
+            try:
+                rate = float(metrics["rate"])
+            except (ValueError, TypeError) as error:
+                raise ValueError("Held usage stopped an unrelated rendered token rate") from error
+            require(math.isfinite(rate) and rate > 0, "Held usage stopped an unrelated rendered token rate")
+    for row in (rendered[0], rendered[-1]):
+        require(all(values["header"]["status"] == "Idle" for values in row[2].values()),
+                "Held usage did not preserve idle live headers around the workload")
+    responses = [rendered_response_tokens(row[2]["popover"]["compact_details"]["response"]) for row in interior]
+    require(all(count is not None for count in responses) and responses[-1] > responses[0]
+            and all(last >= first_count for first_count, last in zip(responses, responses[1:])),
+            "Held usage stopped or regressed the live compact response")
+    work = report["workload"]["validated_work"]
+    require(type(work.get("requests")) is int and work["requests"] == 2 and type(work.get("output_tokens")) is int
+            and work["output_tokens"] % work["requests"] == 0, "Held usage workload lacks exact two-request output accounting")
+    final_response = rendered_response_tokens(rendered[-1][2]["popover"]["compact_details"]["response"])
+    require(final_response == work["output_tokens"] // work["requests"], "Held usage final compact response differs from exact output accounting")
+    first_usage, final_usage = (row[2]["dashboard"]["dashboard_usage"] for row in (rendered[0], rendered[-1]))
+    require(first_usage["scope"] == final_usage["scope"], "Rendered dashboard usage scope changed during the fixture")
+    if not held:
+        output_delta = final_usage["values"]["output_tokens"] - first_usage["values"]["output_tokens"]
+        require(output_delta > 0 and (first_usage["scope"] != "sinceLaunch" or output_delta == work["output_tokens"]),
+                "Normal control dashboard usage stopped advancing with exact live accounting")
+    closed = []
+    for label in closed_labels:
+        matches = [point for point in report["checkpoints"] if point["label"] == label]
+        require(len(matches) == 1, "Held usage closed checkpoints are missing or duplicated")
+        point = matches[0]
+        current = memory.held_usage_contract(point["snapshot"], mode, expected_closed=True)
+        require(current is not None and current["monitoring_epoch"] == first["monitoring_epoch"]
+                and all(current["counters"][field] >= previous["counters"][field]
+                        for field in memory.HELD_USAGE_COUNTERS + ("peak_owners",)), "Held usage cleanup metadata or counters changed")
+        if held:
+            require(current["counters"]["captures"] == current["counters"]["releases"] == current["counters"]["peak_owners"] == 1,
+                    "Held usage cleanup did not release its sole dashboard owner")
+        closed.append((current, boundary(point)))
+        previous = current
+    require(closed[-1][1] - closed[0][1] >= minimum_closed_seconds and closed[0][0] == closed[-1][0],
+            "Held usage continued work after closing or lacks a quiet closed observation")
+    return {"enabled": held, "acceptance_eligible": not held, "promotion_eligible": not held,
+            "capture_identity": receipt["capture_identity"] if held else None,
+            "owner": held_owner, "monitoring_epoch": first["monitoring_epoch"],
+            "counter_deltas": {field: previous["counters"][field] - first["counters"][field] for field in memory.HELD_USAGE_COUNTERS},
+            "held_dashboard_usage_verified": held, "live_compact_response_steady_counts": responses,
+            "live_compact_response_final_count": final_response, "live_unrelated_headers_and_rates_verified": True,
+            "closed_current_owners": 0,
+            "scope": "One held dashboard UsageSummary; both native windows, compact latest response, headers, rates, charts and effects remain live"}
+
+
 def validate_scalar_geometry_rows(rows):
     """Old all-absent normal products remain optional; partial proof fails closed."""
     work = [row.get("scalar_presentation_work") for row in rows]
@@ -416,16 +553,42 @@ def validate_scalar_geometry_rows(rows):
 
 
 def validate_scalar_geometry_comparison(cases):
-    frozen = any(case.get("mode") == memory.FROZEN_SCALARS_MODE for case in cases)
-    if frozen:
+    diagnostics = (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE)
+    diagnostic = next((case.get("mode") for case in cases if case.get("mode") in diagnostics), None)
+    if diagnostic is not None:
         require(len(cases) == 3 and cases[0].get("mode") == cases[-1].get("mode") == "normal"
-                and cases[1].get("mode") == memory.FROZEN_SCALARS_MODE,
-                "Scalar ablation requires a normal/frozen/normal comparison")
+                and cases[1].get("mode") == diagnostic,
+                "Scalar ablation requires a normal/diagnostic/normal comparison")
         require(all(isinstance(case.get("scalar_presentation_work"), dict) for case in cases),
                 "Scalar ablation comparison lacks mandatory frame diagnostics")
+        if diagnostic == memory.HELD_USAGE_MODE:
+            validate_held_usage_rows(cases)
     elif len(cases) != 3 or any(case.get("mode") != "normal" for case in cases):
         return None
     return validate_scalar_geometry_rows(cases)
+
+
+def validate_held_usage_rows(rows):
+    for row in rows:
+        held = row.get("mode") == memory.HELD_USAGE_MODE
+        work = row.get("held_usage_work")
+        require(isinstance(work, dict) and work.get("enabled") is held
+                and work.get("acceptance_eligible") is (not held) and work.get("promotion_eligible") is (not held)
+                and work.get("held_dashboard_usage_verified") is held
+                and work.get("live_unrelated_headers_and_rates_verified") is True
+                and type(work.get("closed_current_owners")) is int and work["closed_current_owners"] == 0,
+                "Held usage comparison lacks complete live/held/release proof")
+        counts = work.get("live_compact_response_steady_counts")
+        require(isinstance(counts, list) and len(counts) >= 2
+                and all(type(count) is int and 0 <= count <= 2**64 - 1 for count in counts)
+                and counts[-1] > counts[0] and all(last >= first for first, last in zip(counts, counts[1:]))
+                and type(work.get("live_compact_response_final_count")) is int
+                and counts[-1] <= work["live_compact_response_final_count"] <= 2**64 - 1,
+                "Held usage comparison lacks an advancing exact compact response")
+        require((isinstance(work.get("capture_identity"), str) and len(work["capture_identity"]) == 64
+                 and all(character in "0123456789abcdef" for character in work["capture_identity"]))
+                if held else work.get("capture_identity") is None,
+                "Held usage comparison capture identity is missing or retained by a normal control")
 
 
 def validate_scalar_comparison_products(products):
@@ -1446,6 +1609,10 @@ class RuntimeDiagnostic(memory.MemoryDiagnostic):
             response = self.command("freeze_scalars")
             memory.scalar_presentation_contract(response.get("snapshot", {}), self.graphics_mode, require_frozen=True)
             self.runtime["scalar_freeze_acknowledgment"] = response
+        elif self.graphics_mode == memory.HELD_USAGE_MODE:
+            response = self.command("freeze_usage")
+            memory.held_usage_contract(response.get("snapshot", {}), self.graphics_mode, require_held=True)
+            self.runtime["usage_freeze_acknowledgment"] = response
         self.runtime["mach_clock_start"] = _mach_clock()
         if self.profile_enabled:
             self.begin_profile()
@@ -1648,6 +1815,9 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
         scalar_work = validate_scalar_presentation_checkpoints(report, mode)
         if scalar_work is not None:
             report["scalar_presentation_work"] = scalar_work
+        usage_work = validate_held_usage_checkpoints(report, mode)
+        if usage_work is not None:
+            report["held_usage_work"] = usage_work
         held_work = validate_held_static_chart_checkpoints(report, mode)
         if held_work is not None:
             report["held_static_chart_work"] = held_work
@@ -1659,11 +1829,12 @@ def capture_case(output, mode, paths, provenance, identity, deadline, *, profile
         report["runtime_cpu_target"] = {"evaluated": eligible, "acceptance_eligible": eligible, "limit_percent": 5.0,
             "within_limit": report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5 if eligible else None,
             "scope": "Contiguous visible traffic and completion only; separate from full resource gate"}
-        if mode in (memory.HELD_STATIC_CHART_MODE, memory.FROZEN_SCALARS_MODE, *memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES):
+        if mode in (memory.HELD_STATIC_CHART_MODE, memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE, *memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES):
             report["runtime_cpu_target"]["reason"] = ("Experimental Metal chart needs independent visual and frame-delivery qualification"
                 if mode in (*memory.METAL_CHART_MODES, *memory.PRIMITIVE_EFFECTS_MODES)
                 else "Frozen scalar presentation is a diagnostic ablation, not live production presentation"
-                if mode == memory.FROZEN_SCALARS_MODE else "Held static chart drawing is a diagnostic ablation, not production rendering")
+                if mode == memory.FROZEN_SCALARS_MODE else "Held dashboard usage is a diagnostic ablation, not live production presentation"
+                if mode == memory.HELD_USAGE_MODE else "Held static chart drawing is a diagnostic ablation, not production rendering")
             report["runtime_cpu_target"]["observed_within_limit"] = report["phase_cpu"]["whole_contiguous_runtime"]["rolling_1s_percent"] <= 5
             report["cpu_gate_evaluated"] = False
             report.setdefault("workload_cpu", {}).update(acceptance_eligible=False, gate_evaluated=False, within_limit=None)
@@ -1711,16 +1882,20 @@ def selected_cases(args):
     if args.operation == "compare" and not any(value is not None for value in references) and args.controls is not None:
         require(1 <= len(args.controls) <= 3 and len(set(args.controls)) == len(args.controls),
                 "Select one to three distinct runtime controls")
-    scalar_compare = (args.operation == "compare" and memory.FROZEN_SCALARS_MODE in
-        [args.baseline_mode, getattr(args, "candidate_mode", None), *(args.controls or [])])
+    diagnostic_modes = (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE)
+    requested = [args.baseline_mode, getattr(args, "candidate_mode", None), *(args.controls or [])]
+    scalar_mode = next((mode for mode in requested if mode in diagnostic_modes), None)
+    scalar_compare = args.operation == "compare" and scalar_mode is not None
     if scalar_compare:
         require(args.baseline_mode == "normal", "Scalar ablation comparison requires the normal baseline")
         if any(value is not None for value in references):
-            require(getattr(args, "candidate_mode", None) == memory.FROZEN_SCALARS_MODE and args.controls is None,
-                    "Scalar ablation version comparison requires one frozen-scalar candidate and normal reference")
+            require(getattr(args, "candidate_mode", None) == scalar_mode and args.controls is None,
+                    "Scalar ablation version comparison requires one diagnostic candidate and normal reference")
         else:
-            require(args.controls == [memory.FROZEN_SCALARS_MODE],
-                    "Scalar ablation comparison requires exactly one frozen-scalar control")
+            require(args.controls == [scalar_mode],
+                    "Scalar ablation comparison requires exactly one diagnostic control")
+    if memory.HELD_USAGE_MODE in requested or getattr(args, "graphics_mode", None) == memory.HELD_USAGE_MODE:
+        require(args.operation == "compare", "Held usage requires the automated normal/held/normal comparison")
     if any(value is not None for value in references):
         require(all(value is not None for value in references),
                 "Frozen reference comparison requires all three reference product/provenance arguments")
@@ -1866,7 +2041,7 @@ def _run(args, deadline):
                                                     "candidate": args.candidate_mode or args.baseline_mode}
             for product in products.values():
                 product["files"] = runtime_product_identity(product["paths"], product["provenance"])
-            if args.operation == "compare" and any(mode == memory.FROZEN_SCALARS_MODE for _label, mode in cases):
+            if args.operation == "compare" and any(mode in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE) for _label, mode in cases):
                 validate_scalar_comparison_products(products)
             report["products"] = {role: {"files": product["files"], "production_provenance": product["provenance"],
                                         "measurement_identity": product["identity"]} for role, product in products.items()}
@@ -1895,6 +2070,7 @@ def _run(args, deadline):
                    "runtime_cpu_work_counters": case.get("runtime_cpu_work_counters"),
                    "steady_twinkle_delivery": case.get("steady_twinkle_delivery"),
                    "scalar_presentation_work": case.get("scalar_presentation_work"),
+                   "held_usage_work": case.get("held_usage_work"),
                    "thread_cpu_analysis": case.get("thread_cpu_analysis"),
                    "nio_cpu_analysis": case.get("nio_cpu_analysis"),
                    "visual_work": case.get("visual_work"),

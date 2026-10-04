@@ -8,6 +8,8 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
+import json
 import os
 import math
 from pathlib import Path
@@ -34,6 +36,11 @@ NATIVE_CANVAS_GROUP_COUNTERS = ("ungrouped_native_canvas_draws", "grouped_native
 NO_ARRIVAL_MODE = "runtime-no-arrival-effects"
 HELD_STATIC_CHART_MODE = "runtime-held-static-chart"
 FROZEN_SCALARS_MODE = "runtime-frozen-scalars"
+HELD_USAGE_MODE = "runtime-held-usage"
+HELD_USAGE_COUNTERS = ("captures", "releases")
+HELD_USAGE_GAUGES = ("current_owners", "peak_owners")
+HELD_USAGE_VALUE_COUNTS = ("input_tokens", "unknown_input_requests", "output_tokens", "tool_calls", "requests", "active_requests")
+HELD_USAGE_VALUE_FLAGS = ("output_is_estimated", "is_partial")
 SCALAR_LEAVES = ("header", "metrics", "details", "card_footer", "app_footer")
 SCALAR_PRESENTATION_COUNTERS = ("layout_size_calls", "layout_place_calls", "layout_child_measurements",
                                 "freezes_captured", "freezes_released")
@@ -91,7 +98,7 @@ DEFERRED_TOOL_GEOMETRY_MODE = "runtime-deferred-tool-geometry"
 DEFERRED_TOOL_GEOMETRY_2HZ_MODE = "runtime-deferred-tool-geometry-2hz"
 DEFERRED_TOOL_GEOMETRY_MODES = (DEFERRED_TOOL_GEOMETRY_MODE, DEFERRED_TOOL_GEOMETRY_2HZ_MODE)
 TOOL_PATH_POINT_COUNTERS = ("tool_path_input_points", "tool_path_output_points")
-ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE) + DEFERRED_TOOL_GEOMETRY_MODES + NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES
+ORDERED_PUBLICATION_MODES = (ORDERED_PUBLICATION_MODE, DIRECT_TOOL_PLOT_MODE, UNGROUPED_CANVAS_MODE, NO_ARRIVAL_MODE, COMPACT_TOOL_PATHS_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, HELD_USAGE_MODE) + DEFERRED_TOOL_GEOMETRY_MODES + NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES
 CANVAS_CLOCK_MODES = ("runtime-canvas-clock", "runtime-stream-canvas-clock") + tuple(mode for mode in ORDERED_PUBLICATION_MODES if mode not in METAL_CHART_MODES)
 NEXT_RUNTIME_MODES = ("runtime-shared-preparation", "runtime-stable-decoration-hosts", "runtime-stream-writes", "runtime-next-optimized", *METAL_CHART_MODES) + CANVAS_CLOCK_MODES
 RUNTIME_MODES = ("runtime-no-lifecycle", "runtime-history-order", "runtime-chart-preparation", "runtime-optimized") + NEXT_RUNTIME_MODES
@@ -448,12 +455,12 @@ def runtime_feature_contract(value, mode):
         return None
     extras = {}
     for field, enabled_modes in zip(NEW_RUNTIME_FLAGS, (PRIMITIVE_EFFECTS_MODES, BATCHED_TELEMETRY_MODES, ATOMIC_CHART_SCALE_MODES)):
-        if mode in NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE,) or field in value:
+        if mode in NEW_RUNTIME_MODES + REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE, HELD_USAGE_MODE) or field in value:
             require(type(value.get(field)) is bool and value[field] is (mode in enabled_modes),
                     f"Graphics {field} does not match the requested runtime control")
             extras[field] = value[field]
     for field, enabled_modes in zip(REUSE_RUNTIME_FLAGS, (COMPLETED_LANE_CACHE_MODES, CACHED_RAIL_GEOMETRY_MODES)):
-        if mode in REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE,) or field in value:
+        if mode in REUSE_RUNTIME_MODES + (FROZEN_SCALARS_MODE, HELD_USAGE_MODE) or field in value:
             require(type(value.get(field)) is bool and value[field] is (mode in enabled_modes),
                     f"Graphics {field} does not match the requested runtime control")
             extras[field] = value[field]
@@ -462,6 +469,10 @@ def runtime_feature_contract(value, mode):
                 and value["frozen_scalar_presentation_enabled"] is (mode == FROZEN_SCALARS_MODE),
                 "Graphics frozen_scalar_presentation_enabled does not match the requested runtime control")
         extras["frozen_scalar_presentation_enabled"] = value["frozen_scalar_presentation_enabled"]
+    if mode == HELD_USAGE_MODE or "held_usage_enabled" in value:
+        require(type(value.get("held_usage_enabled")) is bool and value["held_usage_enabled"] is (mode == HELD_USAGE_MODE),
+                "Graphics held_usage_enabled does not match the requested runtime control")
+        extras["held_usage_enabled"] = value["held_usage_enabled"]
     if mode in METAL_CHART_MODES or "metal_full_chart_enabled" in value:
         require(type(value.get("metal_full_chart_enabled")) is bool
                 and value["metal_full_chart_enabled"] is (mode in METAL_CHART_MODES),
@@ -558,7 +569,7 @@ def tool_path_point_counts(snapshot):
 
 def chart_publication_interval(value, mode):
     field = "chart_publication_interval_seconds"
-    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, *NEW_RUNTIME_MODES, *REUSE_RUNTIME_MODES):
+    if field not in value and mode not in (DEFERRED_TOOL_GEOMETRY_2HZ_MODE, METAL_ARRIVAL_MODE, *METAL_CHART_MODES, HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, HELD_USAGE_MODE, *NEW_RUNTIME_MODES, *REUSE_RUNTIME_MODES):
         return None
     interval = value.get(field)
     expected = .5 if mode == DEFERRED_TOOL_GEOMETRY_2HZ_MODE else 1.0
@@ -873,9 +884,9 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
     """Authenticate the scalar ablation without treating held UI as a gate pass."""
     value = snapshot.get("graphics_diagnostics", {})
     fields = ("frozen_scalar_presentation_enabled", "scalar_instrumentation_enabled", "scalar_presentation")
-    if mode != FROZEN_SCALARS_MODE and not any(field in value for field in fields):
+    if mode not in (FROZEN_SCALARS_MODE, HELD_USAGE_MODE) and not any(field in value for field in fields):
         return None
-    enabled, instrumented = mode == FROZEN_SCALARS_MODE, mode in ("normal", FROZEN_SCALARS_MODE)
+    enabled, instrumented = mode == FROZEN_SCALARS_MODE, mode in ("normal", FROZEN_SCALARS_MODE, HELD_USAGE_MODE)
     for field, expected in zip(fields[:2], (enabled, instrumented)):
         require(type(value.get(field)) is bool and value[field] is expected,
                 f"Graphics {field} does not match the requested scalar diagnostic")
@@ -927,6 +938,8 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
             else:
                 frames(entry.get("current_frames"), "Scalar current")
                 leaf_counts(entry.get("leaf_body_updates"), "Scalar owner leaf_body_updates")
+                if "presented_values" in entry or mode == HELD_USAGE_MODE:
+                    presented_scalar_values(entry.get("presented_values"))
         require(len(roles) == len(set(roles)), f"Scalar {name} owner roles are duplicated")
     require(counts["freezes_captured"] >= counts["freezes_released"]
             and counts["freezes_captured"] - counts["freezes_released"] == counts["current_frozen_owners"] == len(frozen)
@@ -967,7 +980,122 @@ def scalar_presentation_contract(snapshot, mode, *, require_frozen=False, expect
     return {"enabled": enabled, "instrumented": instrumented, "counters": counts,
             "leaf_body_updates": leaves, "frozen_owners": frozen, "presentation_owners": owners,
             "native_canvas_frames": native, "native_canvas_draws": native_draws,
-            "acceptance_eligible": False if enabled else True}
+            "acceptance_eligible": mode not in (FROZEN_SCALARS_MODE, HELD_USAGE_MODE)}
+
+
+def presented_scalar_values(values):
+    require(isinstance(values, dict) and set(values) <= {"header", "metrics", "compact_details", "dashboard_usage"},
+            "Rendered scalar leaf inventory is invalid")
+    for leaf, fields in values.items():
+        inventory = {"header": {"status", "model", "activity"}, "metrics": {"rate", "gpu"},
+                     "compact_details": {"response"}, "dashboard_usage": {"scope", "values"}}[leaf]
+        require(isinstance(fields, dict) and set(fields) == inventory, "Rendered scalar leaf values are incomplete")
+        if leaf == "dashboard_usage":
+            require(fields["scope"] in ("sinceLaunch", "selectedPeriod", "today"), "Rendered usage scope is invalid")
+            usage_presentation_values(fields["values"], "Rendered dashboard")
+        else:
+            for field, text in fields.items():
+                require(leaf == "header" and field == "activity" and text is None
+                        or isinstance(text, str) and 0 < len(text.encode()) <= 1024,
+                        "Rendered scalar labels are missing or exceed their bound")
+    return values
+
+
+def usage_presentation_values(values, label):
+    require(isinstance(values, dict) and set(values) == set(HELD_USAGE_VALUE_COUNTS + HELD_USAGE_VALUE_FLAGS),
+            f"{label} usage value inventory is incomplete")
+    for field in HELD_USAGE_VALUE_COUNTS:
+        require(field == "input_tokens" and values[field] is None
+                or type(values[field]) is int and 0 <= values[field] <= 2**64 - 1,
+                f"{label}.{field} must be an unsigned count (input may be unavailable)")
+    require(all(type(values[field]) is bool for field in HELD_USAGE_VALUE_FLAGS),
+            f"{label} usage flags must be complete booleans")
+    require(values["active_requests"] <= values["requests"], f"{label} active usage exceeds requests")
+    return values
+
+
+def captured_json_equal(left, right):
+    """JSON number representation may differ; booleans must never equal counts."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        return set(left) == set(right) and all(captured_json_equal(left[key], right[key]) for key in left)
+    if type(left) is bool or type(right) is bool:
+        return type(left) is type(right) and left == right
+    if type(left) in (int, float) and type(right) in (int, float):
+        return finite_numeric(left) and finite_numeric(right) and left == right
+    return type(left) is type(right) and left == right
+
+
+def held_usage_contract(snapshot, mode, *, require_held=False, expected_closed=False):
+    """One dashboard usage receipt; this does not freeze either complete window."""
+    value = snapshot.get("graphics_diagnostics", {})
+    if mode != HELD_USAGE_MODE and not any(field in value for field in ("held_usage_enabled", "held_usage")):
+        return None
+    enabled = mode == HELD_USAGE_MODE
+    require(type(value.get("held_usage_enabled")) is bool and value["held_usage_enabled"] is enabled,
+            "Graphics held_usage_enabled does not match the requested diagnostic")
+    raw = value.get("held_usage")
+    require(isinstance(raw, dict) and set(raw) == set(("enabled", "monitoring_epoch", "owners")
+            + HELD_USAGE_COUNTERS + HELD_USAGE_GAUGES) and type(raw["enabled"]) is bool and raw["enabled"] is enabled,
+            "Held usage namespace is incomplete or its enabled flag differs")
+    counts = {field: unsigned(raw.get(field), "held_usage." + field)
+              for field in HELD_USAGE_COUNTERS + HELD_USAGE_GAUGES}
+    uuid_pattern = r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}"
+    epoch = raw["monitoring_epoch"]
+    require(epoch is None or isinstance(epoch, str) and re.fullmatch(uuid_pattern, epoch),
+            "Held usage live monitoring epoch is invalid")
+    owners = raw["owners"]
+    require(isinstance(owners, dict) and len(owners) <= 1, "Held usage may retain only one dashboard owner")
+    for owner, entry in owners.items():
+        require(isinstance(owner, str) and re.fullmatch(uuid_pattern, owner) and isinstance(entry, dict)
+                and set(entry) == {"role", "epoch", "capture_identity", "capture_payload_json", "scope", "values", "frames"}
+                and entry["role"] == "dashboard", "Held usage dashboard receipt is incomplete")
+        require(isinstance(entry["epoch"], str) and re.fullmatch(uuid_pattern, entry["epoch"])
+                and entry["epoch"] == epoch, "Held usage receipt belongs to a stale monitoring epoch")
+        require(entry["scope"] in ("sinceLaunch", "selectedPeriod", "today"), "Held usage scope is invalid")
+        usage_presentation_values(entry["values"], "Held dashboard")
+        frames = entry["frames"]
+        required_frames = {"activity-chart", "main-activity-plot", "request-rail-band", "statistics-row", "native-window"}
+        require(isinstance(frames, dict) and 0 < len(frames) <= 16 and required_frames <= set(frames),
+                "Held usage capture lacks a bounded complete native frame inventory")
+        for name, rect in frames.items():
+            require(isinstance(name, str) and 0 < len(name.encode()) <= 64 and isinstance(rect, dict)
+                    and set(rect) == {"x", "y", "width", "height"}
+                    and all(finite_numeric(rect[field]) for field in rect)
+                    and rect["width"] > 0 and rect["height"] > 0
+                    and math.isfinite(float(rect["x"]) + float(rect["width"]))
+                    and math.isfinite(float(rect["y"]) + float(rect["height"])),
+                    "Held usage captured frame is malformed, nonfinite, or empty")
+        identity, payload = entry["capture_identity"], entry["capture_payload_json"]
+        require(isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity)
+                and isinstance(payload, str) and 0 < len(payload.encode()) <= 8192
+                and hashlib.sha256(payload.encode()).hexdigest() == identity,
+                "Held usage fingerprint does not bind its captured payload")
+        def unique_fields(pairs):
+            require(len({key for key, _value in pairs}) == len(pairs), "Held usage payload repeats a JSON field")
+            return dict(pairs)
+        try:
+            envelope = json.loads(payload, object_pairs_hook=unique_fields,
+                                  parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+        except (ValueError, TypeError) as error:
+            raise ValueError("Held usage captured payload is invalid JSON") from error
+        require(isinstance(envelope, dict), "Held usage fingerprint envelope is invalid")
+        usage_presentation_values(envelope.get("values"), "Held usage fingerprint")
+        require(captured_json_equal(envelope, {"schema": "dashboard-held-usage-v1", "owner": owner, "epoch": entry["epoch"],
+                            "scope": entry["scope"], "values": entry["values"], "frames": frames}),
+                "Held usage fingerprint payload differs from the native receipt")
+    require(counts["captures"] >= counts["releases"]
+            and counts["captures"] - counts["releases"] == counts["current_owners"] == len(owners)
+            and counts["current_owners"] <= counts["peak_owners"] <= counts["captures"] <= 1,
+            "Held usage owner capture/release counters do not reconcile")
+    if not enabled:
+        require(not owners and all(count == 0 for count in counts.values()), "Normal control retained held usage")
+    if require_held:
+        require(enabled and counts["captures"] == counts["current_owners"] == counts["peak_owners"] == 1
+                and counts["releases"] == 0, "Runtime held usage requires one immutable dashboard capture")
+    if expected_closed:
+        require(not owners and counts["current_owners"] == 0, "Held usage owner remains after closing")
+    return {"enabled": enabled, "monitoring_epoch": epoch, "counters": counts, "owners": owners,
+            "acceptance_eligible": not enabled}
 
 
 def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expected_closed=False,
@@ -1001,6 +1129,9 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
                                        expected_closed=expected_closed)
     scalar_presentation = scalar_presentation_contract(snapshot, mode,
         require_frozen=completed_visible_workload and mode == FROZEN_SCALARS_MODE and not expected_closed,
+        expected_closed=expected_closed)
+    held_usage = held_usage_contract(snapshot, mode,
+        require_held=completed_visible_workload and mode == HELD_USAGE_MODE and not expected_closed,
         expected_closed=expected_closed)
     if completed_visible_workload and mode == FROZEN_SCALARS_MODE:
         require(scalar_presentation["counters"]["freezes_captured"] == 2,
@@ -1232,6 +1363,7 @@ def validate_graphics(snapshot, mode, *, completed_visible_workload=False, expec
             **({"atomic_chart_scale": atomic_chart_scale} if atomic_chart_scale is not None else {}),
             **({"reuse_caches": reuse_caches} if reuse_caches is not None else {}),
             **({"scalar_presentation": scalar_presentation} if scalar_presentation is not None else {}),
+            **({"held_usage": held_usage} if held_usage is not None else {}),
             **({"arrival_backend": metal_arrival["arrival_backend"]} if metal_arrival and metal_arrival["arrival_backend"] is not None else {}),
             **({"chart_publication_interval_seconds": publication_interval} if publication_interval is not None else {}),
             **({"runtime_feature_contract": runtime_features} if runtime_features is not None else {}),
@@ -1308,10 +1440,10 @@ class MemoryDiagnostic:
                        "errors": [], "checkpoints": [], "probes": [], "inspection_stages": [], "commands": [],
                        "driver_sha256": app.path_hash(Path(__file__)),
                        "caveat": "Native VM/heap inspection and graphics modes perturb runtime. These are attribution diagnostics, not CPU/GPU or regression passes. Pixel/bitmap requests are not measured GPU allocations."}
-        if graphics_mode == HELD_STATIC_CHART_MODE:
+        if graphics_mode in (HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, HELD_USAGE_MODE):
             self.report.update(cpu_acceptance_eligible=False,
                 runtime_cpu_target={"evaluated": False, "within_limit": None, "acceptance_eligible": False,
-                    "reason": "Held static chart drawing is a diagnostic ablation, not production rendering"})
+                    "reason": "Held drawing or scalar presentation is a diagnostic ablation, not production rendering"})
 
     def save(self):
         write_json(self.output / "in-progress.json", self.report)
@@ -1569,7 +1701,7 @@ class MemoryDiagnostic:
                     self.report["workload_cpu"] = workload_cpu_diagnostic(
                         self.collector.samples, self.collector.events, self.report.get("workload", {}),
                         self.identity, self.report["memory_validation"])
-                    if self.graphics_mode == HELD_STATIC_CHART_MODE:
+                    if self.graphics_mode in (HELD_STATIC_CHART_MODE, FROZEN_SCALARS_MODE, HELD_USAGE_MODE):
                         self.report["workload_cpu"].update(acceptance_eligible=False, within_limit=None)
                     cpu = self.report["workload_cpu"]
                     if cpu.get("available"):
