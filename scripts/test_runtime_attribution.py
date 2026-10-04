@@ -152,7 +152,7 @@ def clock_work_report(mode="runtime-canvas-clock"):
 
 def options(**kwargs):
     return SimpleNamespace(**({"operation": "compare", "graphics_mode": "normal",
-                              "baseline_mode": "native-gpu-optimized", "controls": None} | kwargs))
+                              "baseline_mode": "normal", "controls": None} | kwargs))
 
 
 def case(label, average=3.25, peak=4.75):
@@ -182,11 +182,11 @@ class CaseSelectionTests(unittest.TestCase):
                     raise ValueError("test error")
             self.assertEqual(os.environ["FLUXLLM_PERF_THREAD_CPU"], "inherited")
 
-    def test_default_compare_brackets_combined_control(self):
+    def test_default_compare_brackets_production_rendering(self):
         self.assertEqual(runtime.selected_cases(options()), [
-            ("baseline-before", "native-gpu-optimized"),
-            ("runtime-optimized", "runtime-optimized"),
-            ("baseline-after", "native-gpu-optimized")])
+            ("baseline-before", "normal"),
+            ("normal", "normal"),
+            ("baseline-after", "normal")])
 
     def test_profile_selects_one_requested_mode(self):
         self.assertEqual(runtime.selected_cases(options(operation="profile")), [("profile", "normal")])
@@ -201,8 +201,8 @@ class CaseSelectionTests(unittest.TestCase):
     def test_normal_control_exercises_the_production_default_between_baselines(self):
         args = runtime.parser().parse_args(["compare", "--app-binary", "/app", "--test-bundle", "/tests",
             "--collector-binary", "/collector", "--provenance", "/provenance", "--controls", "normal"])
-        self.assertEqual(runtime.selected_cases(args), [("baseline-before", "native-gpu-optimized"),
-            ("normal", "normal"), ("baseline-after", "native-gpu-optimized")])
+        self.assertEqual(runtime.selected_cases(args), [("baseline-before", "normal"),
+            ("normal", "normal"), ("baseline-after", "normal")])
         with self.assertRaisesRegex(ValueError, "distinct runtime controls"):
             runtime.selected_cases(options(controls=["normal", "normal"]))
 

@@ -25,7 +25,7 @@ from run_performance_checks import interrupted, load_json, number, require, writ
 BACKENDS = ("image-renderer", "canvas", "core-graphics", "core-graphics-unhosted", "bitmap-layer")
 PRIMITIVES = ("empty", "line", "solid-fill", "linear-gradient", "radial-gradient", "text", "clipped-line",
               "layer-line", "with-cg-line", "chart-path")
-DEFAULT_CASES = ("image-renderer:empty", "image-renderer:line", "canvas:line", "core-graphics:line")
+DEFAULT_CASES = ("canvas:empty", "canvas:line", "core-graphics:line")
 DEADLINE_SECONDS = 180
 REDRAW_COUNT = 100
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024

@@ -28,27 +28,36 @@ let package = Package(
           // library so the test target can link the core without a duplicate _main.
           .executableTarget(
             name: "FluxLLMApp",
-            dependencies: [
-                  "FluxLLM",
-                  .product(name: "NIO", package: "swift-nio"),
-              ],
+            dependencies: ["FluxLLM"],
             path: "Sources/FluxLLMApp"
+          ),
+          // Control pipes, synthetic history and drawing experiments are linked
+          // only by performance executables and tests, never the desktop app.
+          .target(
+            name: "FluxLLMPerformanceSupport",
+            dependencies: ["FluxLLM"],
+            path: "Sources/FluxLLMPerformanceSupport"
+          ),
+          .executableTarget(
+            name: "FluxLLMPerformanceApp",
+            dependencies: ["FluxLLM", "FluxLLMPerformanceSupport"],
+            path: "Sources/FluxLLMPerformanceApp"
           ),
           .executableTarget(
             name: "FluxLLMResourceCollector",
-            dependencies: ["FluxLLM"],
+            dependencies: ["FluxLLM", "FluxLLMPerformanceSupport"],
             path: "Sources/FluxLLMResourceCollector"
           ),
           // Opt-in, inherited-pipe drawing isolation. It starts no application
           // services and is never part of the normal FluxLLM app lifecycle.
           .executableTarget(
             name: "FluxLLMDrawingProbe",
-            dependencies: ["FluxLLM"],
+            dependencies: ["FluxLLM", "FluxLLMPerformanceSupport"],
             path: "Sources/FluxLLMDrawingProbe"
           ),
           .testTarget(
             name: "FluxLLMTests",
-            dependencies: ["FluxLLM"],
+            dependencies: ["FluxLLM", "FluxLLMPerformanceSupport"],
             path: "Tests/FluxLLMTests"
           ),
       ]

@@ -51,10 +51,11 @@ def product_identity(paths, provenance):
 def load_products(directory, output, label, *, rebind_measurement=False):
     """Bind a new external measurement without modifying original provenance."""
     directory = directory.resolve()
-    paths = {"app": directory / "FluxLLMApp", "tests": directory / "FluxLLMPackageTests.xctest",
-             "collector": directory / "FluxLLMResourceCollector"}
     original = directory / "provenance.json"
     raw = load_json(original)
+    paths = {"app": app.frozen_performance_executable(directory, raw),
+             "tests": app.frozen_test_bundle(directory, raw),
+             "collector": directory / "FluxLLMResourceCollector"}
     identity = app.measurement_identity()
     provenance_path = original
     if raw.get("instrumentation_sha256") != identity["sha256"]:
@@ -595,6 +596,8 @@ def run(argv=None):
                     "GPU products have different populated fixture identities")
             if any(mode in (memory.HELD_USAGE_MODE, memory.RETAINED_USAGE_MODE) for mode in modes.values()):
                 runtime.validate_scalar_comparison_products(products)
+            for label in selected_labels:
+                app.validate_graphics_mode(products[label]["provenance"], modes[label])
             report["products"] = {label: {"files": product["files"], "production_provenance": product["provenance"],
                                          "measurement_identity": product["identity"]} for label, product in products.items()}
             write_report(output, report)

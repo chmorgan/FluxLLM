@@ -380,6 +380,8 @@ def validate_products(args):
     require(isinstance(raw, dict), "Explicit provenance must be an object")
     mode = "baseline" if raw.get("kind") == "reconstructed-pre-optimization" else "check"
     provenance = app.validated_provenance(args.provenance, paths, mode, identity["sha256"])
+    if getattr(args, "graphics_mode", None) is not None:
+        app.validate_graphics_mode(provenance, args.graphics_mode)
     require(app.path_hash(paths["collector"]) == provenance.get("common_collector", {}).get("sha256"),
             "Explicit common collector does not match provenance")
     bundles = provenance.get("resource_bundle_sha256")

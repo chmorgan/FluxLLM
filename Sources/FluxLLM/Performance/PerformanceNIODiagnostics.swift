@@ -5,7 +5,7 @@ import NIO
 /// Created only by the isolated performance session on its single NIO loop.
 /// Every mutation and snapshot stays on that thread. Only immutable snapshots
 /// cross to the main actor; production handlers receive nil instead.
-final class PerformanceNIODiagnostics: @unchecked Sendable {
+package final class PerformanceNIODiagnostics: @unchecked Sendable {
     enum Metric: String, CaseIterable, Sendable {
         case upstreamRead = "upstream_read"
         case upstreamReadComplete = "upstream_read_complete"
@@ -70,9 +70,9 @@ final class PerformanceNIODiagnostics: @unchecked Sendable {
         }
     }
 
-    struct Snapshot: Sendable {
+    package struct Snapshot: Sendable {
         let processID: Int32
-        let threadID: UInt64
+        package let threadID: UInt64
         let sequence: UInt64
         let captureBeginMachTicks: UInt64
         let captureEndMachTicks: UInt64
@@ -82,7 +82,7 @@ final class PerformanceNIODiagnostics: @unchecked Sendable {
         let calibration: Calibration
         let clockReads: UInt64
         let error: String?
-        var dictionary: [String: Any] {
+        package var dictionary: [String: Any] {
             var value: [String: Any] = [
                 "schema_version": 1, "available": error == nil,
                 "process_id": processID, "thread_id": threadID, "sequence": sequence,

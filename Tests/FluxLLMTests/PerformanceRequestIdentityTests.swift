@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 
 @testable import FluxLLM
+@testable import FluxLLMPerformanceSupport
 
 final class PerformanceRequestIdentityTests: XCTestCase {
     func testIndependentSessionsMapIndicesIdenticallyRegardlessOfArrivalOrder() throws {

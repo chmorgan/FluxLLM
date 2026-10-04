@@ -157,7 +157,7 @@ class ScalarPhaseTests(unittest.TestCase):
     def test_comparison_matrix_is_rejected_before_capture_unless_normal_frozen_normal(self):
         self.assertEqual(runtime.selected_cases(options(baseline_mode="normal", controls=[memory.FROZEN_SCALARS_MODE])),
             [("baseline-before", "normal"), (memory.FROZEN_SCALARS_MODE, memory.FROZEN_SCALARS_MODE), ("baseline-after", "normal")])
-        for args in (options(controls=[memory.FROZEN_SCALARS_MODE]),
+        for args in (options(baseline_mode="native-gpu-optimized", controls=[memory.FROZEN_SCALARS_MODE]),
                      options(baseline_mode="normal", controls=[memory.FROZEN_SCALARS_MODE, memory.REUSE_CACHES_MODE]),
                      options(baseline_mode=memory.FROZEN_SCALARS_MODE, controls=["normal"])):
             with self.subTest(args=args), self.assertRaisesRegex(ValueError, "Scalar ablation"):

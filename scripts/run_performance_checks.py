@@ -37,7 +37,7 @@ WORKLOAD_SOURCES = (
     "Tests/FluxLLMTests/ResourceUsageRegressionTests.swift",
     "Tests/FluxLLMTests/Fixtures/ResourceHistoryFixture.swift",
     "Tests/FluxLLMTests/Fixtures/ProcessResourceProbe.swift",
-    "Sources/FluxLLM/Performance/PerformanceHistoryFixture.swift",
+    "Sources/FluxLLMPerformanceSupport/PerformanceHistoryFixture.swift",
 )
 
 

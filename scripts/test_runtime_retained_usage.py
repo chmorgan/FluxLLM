@@ -230,7 +230,7 @@ class RetainedUsageRuntimeTests(unittest.TestCase):
     def test_cpu_matrix_requires_one_normal_retained_normal_same_product_bracket(self):
         self.assertEqual(runtime.selected_cases(options(baseline_mode="normal", controls=[memory.RETAINED_USAGE_MODE]))[1],
                          (memory.RETAINED_USAGE_MODE, memory.RETAINED_USAGE_MODE))
-        for args in (options(controls=[memory.RETAINED_USAGE_MODE]),
+        for args in (options(baseline_mode="native-gpu-optimized", controls=[memory.RETAINED_USAGE_MODE]),
                      options(baseline_mode="normal", controls=[memory.RETAINED_USAGE_MODE, memory.HELD_USAGE_MODE]),
                      options(baseline_mode=memory.RETAINED_USAGE_MODE, controls=["normal"])):
             with self.subTest(args=args), self.assertRaises(ValueError): runtime.selected_cases(args)

@@ -4,6 +4,7 @@ import SwiftUI
 import XCTest
 
 @testable import FluxLLM
+@testable import FluxLLMPerformanceSupport
 
 @MainActor
 private final class DrawingProbeObservationNotice {

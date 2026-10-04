@@ -829,7 +829,7 @@ public final class MetricsStore {
     /// Instrumentation-only restoration of an already observed fixture window.
     /// Production ingestion, timers and publication retain their normal paths.
     /// The caller supplies all but the final point, then invokes ordinary sample().
-    func restorePerformanceFixtureSamples(
+    package func restorePerformanceFixtureSamples(
         throughput: [TimeSeriesPoint], gpu: [TimeSeriesPoint],
         toolObservation: [TimeSeriesPoint]
     ) {
@@ -863,7 +863,7 @@ public final class MetricsStore {
 
     /// Read actual retained archive contents for the fixture equivalence digest.
     /// This does not publish a dashboard snapshot or alter demand.
-    func performanceFixtureArchive(endingAt: Date) -> ArchivedChartHistory {
+    package func performanceFixtureArchive(endingAt: Date) -> ArchivedChartHistory {
         chartArchive.history(
             source: historySource, before: endingAt.addingTimeInterval(1), now: endingAt)
     }
@@ -1498,7 +1498,7 @@ public final class MetricsStore {
 
 public struct ChartPresentationSnapshot: Sendable, Equatable {
     /// Identifies a held publication without comparing entire raw histories.
-    let publicationID = UUID()
+    package let publicationID = UUID()
     public let timestamp: Date
     public let throughput: [TimeSeriesPoint]
     public let systemGPU: [TimeSeriesPoint]

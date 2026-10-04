@@ -3,7 +3,7 @@ import Foundation
 import ServiceManagement
 
 @MainActor
-protocol LaunchAtLoginService {
+package protocol LaunchAtLoginService {
     var status: SMAppService.Status { get }
     func register() throws
     func unregister() async throws
@@ -27,7 +27,7 @@ public final class LaunchAtLoginController: ObservableObject {
         self.init(service: MainAppLoginService())
     }
 
-    init(service: any LaunchAtLoginService) {
+    package init(service: any LaunchAtLoginService) {
         self.service = service
         status = service.status
     }

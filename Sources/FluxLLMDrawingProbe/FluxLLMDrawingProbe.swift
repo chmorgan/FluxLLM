@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import FluxLLM
+import FluxLLMPerformanceSupport
 import Foundation
 
 /// A minimal native application for drawing isolation. The external resource

@@ -302,7 +302,7 @@ class HeldUsageRuntimeTests(unittest.TestCase):
     def test_matrix_is_normal_held_normal_only_and_products_remain_identical(self):
         self.assertEqual(runtime.selected_cases(options(baseline_mode="normal", controls=[memory.HELD_USAGE_MODE])),
                          [("baseline-before", "normal"), (memory.HELD_USAGE_MODE, memory.HELD_USAGE_MODE), ("baseline-after", "normal")])
-        for args in (options(controls=[memory.HELD_USAGE_MODE]),
+        for args in (options(baseline_mode="native-gpu-optimized", controls=[memory.HELD_USAGE_MODE]),
                      options(baseline_mode="normal", controls=[memory.HELD_USAGE_MODE, memory.FROZEN_SCALARS_MODE]),
                      options(operation="profile", graphics_mode=memory.HELD_USAGE_MODE),
                      options(baseline_mode=memory.HELD_USAGE_MODE, controls=["normal"])):

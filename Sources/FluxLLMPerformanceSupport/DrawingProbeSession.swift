@@ -1,4 +1,5 @@
 import AppKit
+import FluxLLM
 import Observation
 import QuartzCore
 import SwiftUI
@@ -10,7 +11,6 @@ import SwiftUI
 @MainActor
 public final class DrawingProbeSession {
     enum Backend: String, CaseIterable {
-        case imageRenderer = "image-renderer"
         case canvas
         case coreGraphics = "core-graphics"
         case coreGraphicsUnhosted = "core-graphics-unhosted"
@@ -314,14 +314,12 @@ private struct DrawingProbeRoot: View {
     var body: some View {
         let enabled = state.enabled
         let revision = state.revision
-        let drawing: ChartCanvas.Drawing = { context, _ in
+        let drawing: (inout GraphicsContext, CGSize) -> Void = { context, _ in
             if enabled { DrawingProbeArtwork.draw(primitive, in: &context) }
             state.didDraw(revision: revision, nonempty: enabled && primitive != .empty)
         }
         Group {
             switch backend {
-            case .imageRenderer:
-                ChartCanvas(revision: AnyHashable(revision), renderer: drawing)
             case .canvas:
                 Canvas(opaque: false, rendersAsynchronously: false, renderer: drawing)
             case .coreGraphics, .coreGraphicsUnhosted:

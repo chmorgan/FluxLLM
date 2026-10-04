@@ -44,8 +44,10 @@ jobs:
       - name: Run Swift tests with coverage
         run: swift test --enable-code-coverage
 
-      - name: Compile release app
-        run: swift build -c release --product FluxLLMApp
+      - name: Compile release desktop and performance apps
+        run: |
+          swift build -c release --product FluxLLMApp
+          swift build -c release --product FluxLLMPerformanceApp
 
   python-tests:
     name: Python tests

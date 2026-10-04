@@ -1187,7 +1187,9 @@ def measurement_identity():
 
 def adapter_identity():
     paths = [*ROOT.glob("Sources/FluxLLM/Performance/**/*.swift"),
-             *ROOT.glob("Sources/FluxLLMApp/*Performance*.swift")]
+             *ROOT.glob("Sources/FluxLLMPerformanceSupport/**/*.swift"),
+             *ROOT.glob("Sources/FluxLLMPerformanceApp/**/*.swift"),
+             ROOT / "Package.swift"]
     manifest = {str(path.relative_to(ROOT)): path_hash(path) for path in sorted(paths) if path.is_file()}
     return {"sha256": hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
             "sources": manifest}
@@ -1228,6 +1230,23 @@ def validated_provenance(path, paths, mode, measurement_sha256):
         require(helper.is_absolute() and helper.is_file() and os.access(helper, os.X_OK), "Legacy history seeder must be an explicit executable")
         require(preparation.get("sha256") == path_hash(helper), "Legacy history seeder differs from provenance")
     return value | {"provenance_file": str(path.resolve()), "provenance_file_sha256": path_hash(path)}
+
+
+
+def validate_graphics_mode(provenance, mode):
+    """Current products expose production rendering; frozen older products keep their declared capabilities."""
+    supported = provenance.get("supported_graphics_modes")
+    if supported is not None:
+        require(isinstance(supported, list) and supported and all(isinstance(item, str) for item in supported)
+                and len(set(supported)) == len(supported), "Invalid supported graphics mode inventory")
+        require(mode in supported, f"Frozen executable does not support graphics mode {mode}; supported: {', '.join(supported)}")
+
+
+def frozen_performance_executable(directory, provenance):
+    """Never select the desktop app when provenance pins the separated harness."""
+    executable = provenance.get("performance_executable", "FluxLLMApp")
+    require(executable in ("FluxLLMApp", "FluxLLMPerformanceApp"), "Unknown performance executable target")
+    return directory / executable
 
 
 def prepare_history(configuration, run_directory, provenance, output, deadline):
@@ -1374,6 +1393,23 @@ def apply_trace_results(report, result):
         case["invalid"] = sorted(set(case["invalid"]))
 
 
+
+def release_test_bundle(directory):
+    # SwiftPM's swiftbuild backend emits the target bundle; its native backend
+    # emits the package bundle. Resolve only within the just-built products.
+    for name in ("FluxLLMTests.xctest", "FluxLLMPackageTests.xctest"):
+        path = directory / name
+        if path.is_dir():
+            return path
+    raise InvalidResult(f"The successful build did not produce a Release XCTest bundle: {directory}")
+
+
+def frozen_test_bundle(directory, provenance):
+    name = provenance.get("test_bundle", "FluxLLMPackageTests.xctest")
+    require(name in ("FluxLLMTests.xctest", "FluxLLMPackageTests.xctest"), "Unknown frozen XCTest bundle")
+    return directory / name
+
+
 def build_products(output, timeout):
     build = execute_logged(["swift", "build", "-c", "release", "--build-tests", "-Xswiftc", "-enable-testing"],
                            output / "build.log", timeout)
@@ -1383,8 +1419,8 @@ def build_products(output, timeout):
                              capture_output=True, text=True, timeout=30, check=False)
     require(located.returncode == 0, f"Could not locate newly built Release products: {located.stderr.strip()}")
     directory = Path(located.stdout.strip()).resolve()
-    paths = {"app": directory / "FluxLLMApp", "collector": directory / "FluxLLMResourceCollector",
-             "tests": directory / "FluxLLMPackageTests.xctest"}
+    paths = {"app": directory / "FluxLLMPerformanceApp", "collector": directory / "FluxLLMResourceCollector",
+             "tests": release_test_bundle(directory)}
     for kind, path in paths.items():
         require(path.exists(), f"The successful build did not produce {kind}: {path}")
     hashes = {kind: {"path": str(path), "sha256": path_hash(path)} for kind, path in paths.items()}
@@ -1419,6 +1455,8 @@ def resolve_products(args, output, measurement_sha256):
                       "build_configuration": "release", "instrumentation_sha256": measurement_sha256,
                       "adapter_sha256": adapter_identity()["sha256"],
                       "logging_supported": True, "history_preparation": {"kind": "in-app"}, "fixture_schema_version": 2,
+                      "performance_executable": "FluxLLMPerformanceApp", "supported_graphics_modes": ["normal"],
+                      "test_bundle": paths["tests"].name,
                       "popover_lifecycle_policy": POPOVER_LIFECYCLE_POLICY}
     return paths, hashes, build, provenance
 

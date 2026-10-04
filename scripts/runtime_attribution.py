@@ -2065,7 +2065,7 @@ def selected_cases(args):
     if args.operation in ("threads", "nio"):
         require(args.controls is None, "CPU accounting cannot combine graphics controls")
         return [(label, args.graphics_mode) for label in ("observer-before", args.operation, "observer-after")]
-    controls = args.controls or ["runtime-optimized"]
+    controls = args.controls or ["normal"]
     require(1 <= len(controls) <= 3 and len(set(controls)) == len(controls), "Select one to three distinct runtime controls")
     return [("baseline-before", args.baseline_mode), *[(mode, mode) for mode in controls], ("baseline-after", args.baseline_mode)]
 
@@ -2132,7 +2132,7 @@ def parser():
                             help="Compare frozen versions in reference/candidate/reference order using --baseline-mode")
     result.add_argument("--graphics-mode", choices=BASELINES + memory.RUNTIME_MODES, default="normal")
     result.add_argument("--baseline-mode", choices=BASELINES + memory.METAL_CHART_MODES + memory.NEW_RUNTIME_MODES,
-                        default="native-gpu-optimized")
+                        default="normal")
     result.add_argument("--candidate-mode", choices=BASELINES + memory.RUNTIME_MODES,
                         help="Candidate-only rendering mode for a frozen reference/candidate/reference comparison")
     result.add_argument("--controls", nargs="+", choices=memory.RUNTIME_MODES + ("normal",))
@@ -2195,6 +2195,9 @@ def _run(args, deadline):
                 report["graphics_mode"] = args.baseline_mode
                 report["product_graphics_modes"] = {"reference": args.baseline_mode,
                                                     "candidate": args.candidate_mode or args.baseline_mode}
+            for label, mode in cases:
+                role = "reference" if version_compare and label != "candidate" else "candidate"
+                app.validate_graphics_mode(products[role]["provenance"], mode)
             for product in products.values():
                 product["files"] = runtime_product_identity(product["paths"], product["provenance"])
             if args.operation == "compare" and any(mode in (memory.FROZEN_SCALARS_MODE, memory.HELD_USAGE_MODE, memory.RETAINED_USAGE_MODE) for _label, mode in cases):

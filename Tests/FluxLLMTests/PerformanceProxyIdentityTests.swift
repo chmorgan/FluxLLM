@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 
 @testable import FluxLLM
+@testable import FluxLLMPerformanceSupport
 
 @MainActor
 final class PerformanceProxyIdentityTests: XCTestCase {

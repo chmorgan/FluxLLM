@@ -1,6 +1,7 @@
 import CoreGraphics
 import Darwin
 import FluxLLM
+import FluxLLMPerformanceSupport
 import Foundation
 
 nonisolated(unsafe) private var collectorInterrupted: sig_atomic_t = 0
@@ -80,7 +81,7 @@ struct FluxLLMResourceCollector {
 
     private static func usageError() -> CollectorFailure {
         .message(
-            "Usage: FluxLLMResourceCollector --preflight | --self-test | --thread-cpu-self-test | --app /absolute/FluxLLMApp [--deadline 300] | --terminate-owned PID --birth-time-us MICROSECONDS"
+            "Usage: FluxLLMResourceCollector --preflight | --self-test | --thread-cpu-self-test | --app /absolute/FluxLLMPerformanceApp [--deadline 300] | --terminate-owned PID --birth-time-us MICROSECONDS"
         )
     }
 

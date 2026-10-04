@@ -109,7 +109,7 @@ The [CI workflow](.github/workflows/ci.yml) runs on pull requests and pushes wit
 two independent jobs. Both use Python 3.12:
 
 - **macOS:** `macos-15` on Apple Silicon with Xcode 26.3 runs the Swift tests
-  with coverage, compiles the release app, and tests all release scripts.
+  with coverage, compiles both Release app executables, and tests all release scripts.
 - **Python:** `ubuntu-26.04` runs the mock server tests.
 
 Run the same checks locally from the repository root. The Swift checks require
@@ -118,6 +118,7 @@ a supported Mac with Xcode installed:
 ```sh
 swift test --enable-code-coverage
 swift build -c release --product FluxLLMApp
+swift build -c release --product FluxLLMPerformanceApp
 (
   for test_script in Tests/Scripts/*-tests.sh; do
     bash "$test_script" || exit

@@ -7,7 +7,7 @@ import Foundation
 /// Nothing in this adapter listens on a control network port or uses real app
 /// preferences/history. The external collector owns resource measurements.
 @MainActor
-final class PerformanceControl {
+package final class PerformanceControl {
     // Preserve the field names in the performance JSON protocol.
     // swift-format-ignore: AlwaysUseLowerCamelCase
     private struct Configuration: Decodable {
@@ -41,15 +41,13 @@ final class PerformanceControl {
     private var reader: Thread?
     private var handshaken = false
     private var stopping = false
-    private var scalarPresentationFrozen = false
-    private var usagePresentationFrozen = false
     private var stopTask: Task<Void, Never>?
-    private(set) var hasStopped = false
+    package private(set) var hasStopped = false
     private var shutdownCommandID = "termination"
     private var checkpointSequence = 0
     private var checkpointParentCommandID = "collector-handshake"
 
-    init(environment: [String: String] = ProcessInfo.processInfo.environment) throws {
+    package init(environment: [String: String] = ProcessInfo.processInfo.environment) throws {
         guard ProcessInfo.processInfo.arguments.contains("--performance-control") else {
             throw ControlError.invalid("The explicit performance-control argument is required")
         }
@@ -115,7 +113,7 @@ final class PerformanceControl {
         reporter.start()
     }
 
-    func start() {
+    package func start() {
         NSApp.setActivationPolicy(.accessory)
         let thread = Thread { [weak self] in
             var buffer = Data()
@@ -239,7 +237,6 @@ final class PerformanceControl {
         var reason: String?
         var popoverReadinessBeforeShow: [String: Any]?
         var uiFailurePhase: String?
-        var usageAcknowledgment: [String: Any]?
         switch command.command {
         case "snapshot":
             break
@@ -282,35 +279,6 @@ final class PerformanceControl {
             if !(await waitForVisibility(popover: false)) {
                 status = "error"
                 reason = "Popover did not close"
-            }
-        case "freeze_scalars":
-            guard configuration.graphics_mode == .runtimeFrozenScalars, !scalarPresentationFrozen
-            else {
-                status = "error"
-                reason =
-                    "Scalar freezing requires its diagnostic mode and is permitted exactly once"
-                break
-            }
-            do {
-                try session.menuBarController.performanceFreezeScalarPresentation()
-                scalarPresentationFrozen = true
-            } catch {
-                status = "error"
-                reason = "Scalar presentation capture failed: \(error)"
-            }
-        case "freeze_usage":
-            guard configuration.graphics_mode == .runtimeHeldUsage, !usagePresentationFrozen else {
-                status = "error"
-                reason = "Usage holding requires its diagnostic mode and is permitted exactly once"
-                break
-            }
-            do {
-                usageAcknowledgment = try session.menuBarController
-                    .performanceFreezeUsagePresentation()
-                usagePresentationFrozen = true
-            } catch {
-                status = "error"
-                reason = "Usage presentation capture failed: \(error)"
             }
         case "set_logging":
             guard let enabled = command.enabled else {
@@ -359,7 +327,6 @@ final class PerformanceControl {
             event["popover_readiness_before_show"] = popoverReadinessBeforeShow
         }
         if let uiFailurePhase { event["ui_failure_phase"] = uiFailurePhase }
-        if let usageAcknowledgment { event["held_usage_capture"] = usageAcknowledgment }
         event["monotonic_seconds"] = Self.monotonicSeconds()
         if let reason { event["reason"] = reason }
         gpuReporter?.sample()
@@ -391,7 +358,7 @@ final class PerformanceControl {
         return false
     }
 
-    func stop() async {
+    package func stop() async {
         if let stopTask {
             await stopTask.value
             return
@@ -507,15 +474,6 @@ final class PerformanceControl {
 
     private func snapshot(of session: PerformanceApplicationSession) -> [String: Any] {
         var value = session.snapshot()
-        // This is the current authoritative epoch, independent of an immutable
-        // held receipt and of SwiftUI's asynchronously processed epoch callback.
-        if var graphics = value["graphics_diagnostics"] as? [String: Any],
-            var usage = graphics["held_usage"] as? [String: Any]
-        {
-            usage["monitoring_epoch"] = session.store.monitoringEpoch.uuidString
-            graphics["held_usage"] = usage
-            value["graphics_diagnostics"] = graphics
-        }
         let logger = session.store.diagnosticLogger
         value["logging_enabled"] = logger.isEnabled
         value["logging_supported"] = true

@@ -1,4 +1,5 @@
 import CryptoKit
+import FluxLLM
 import Foundation
 
 /// Aged telemetry shared by the resource regression harness and isolated app playback.

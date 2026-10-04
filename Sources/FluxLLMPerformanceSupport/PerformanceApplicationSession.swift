@@ -1,4 +1,5 @@
 import AppKit
+import FluxLLM
 import Foundation
 import ServiceManagement
 
@@ -396,8 +397,4 @@ private final class PerformanceLoginService: LaunchAtLoginService {
         throw PerformanceSessionError.invalid("Login items are disabled in performance mode")
     }
     func openSystemSettings() {}
-}
-
-enum PerformanceSessionError: Error {
-    case invalid(String)
 }

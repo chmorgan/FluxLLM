@@ -76,7 +76,7 @@ public final class ProxyManager: ObservableObject {
     /// Used once by the isolated performance session after the listener is
     /// ready. Fail if the proxy gains additional event loops; a partial NIO
     /// total must never masquerade as the complete networking-thread cost.
-    func performanceEventLoopThreadID() async throws -> UInt64 {
+    package func performanceEventLoopThreadID() async throws -> UInt64 {
         guard isRunning, let group = eventLoopGroup else {
             throw PerformanceSessionError.invalid("The measured proxy is not running")
         }
@@ -88,7 +88,7 @@ public final class ProxyManager: ObservableObject {
         return try await loop.submit { try PerformanceThreadIdentity.current() }.get()
     }
 
-    func performanceNIOSnapshot() async throws -> PerformanceNIODiagnostics.Snapshot? {
+    package func performanceNIOSnapshot() async throws -> PerformanceNIODiagnostics.Snapshot? {
         guard let diagnostics = nioCPUDiagnostics else { return nil }
         guard isRunning, let group = eventLoopGroup else {
             throw PerformanceSessionError.invalid("The measured NIO loop is unavailable")

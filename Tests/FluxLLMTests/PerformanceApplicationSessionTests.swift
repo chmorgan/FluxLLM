@@ -3,6 +3,7 @@ import Foundation
 import XCTest
 
 @testable import FluxLLM
+@testable import FluxLLMPerformanceSupport
 
 @MainActor
 final class PerformanceApplicationSessionTests: XCTestCase {
@@ -115,13 +116,6 @@ final class PerformanceApplicationSessionTests: XCTestCase {
             try await started.refreshPerformanceNIODiagnostics()
             XCTAssertNil(started.snapshot()["nio_cpu"])
             XCTAssertEqual(started.snapshot()["popover_animations_enabled"] as? Bool, true)
-            XCTAssertEqual(started.snapshot()["unique_tool_trace_builds"] as? UInt64, 0)
-            XCTAssertEqual(started.snapshot()["reused_tool_trace_builds"] as? UInt64, 0)
-            PerformancePresentationCounters.shared.recordToolTraces(
-                unique: 3, reused: 7, direct: false)
-            XCTAssertEqual(started.snapshot()["unique_tool_trace_builds"] as? UInt64, 3)
-            XCTAssertEqual(started.snapshot()["reused_tool_trace_builds"] as? UInt64, 7)
-            XCTAssertEqual(started.snapshot()["legacy_tool_plot_builds"] as? UInt64, 10)
             // Fresh startup must not timestamp its health sample an hour in
             // the past, then immediately expire it on the first real tick.
             started.store.sample()

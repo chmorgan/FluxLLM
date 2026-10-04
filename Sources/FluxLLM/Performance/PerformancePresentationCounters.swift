@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// Optional diagnostic counters; disabled during ordinary app operation.
 /// An absent key means the metric is not instrumented. These work counters
@@ -37,6 +38,7 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
 
     public static let shared = PerformancePresentationCounters()
     private let lock = NSLock()
+    private let enabledFastPath = Atomic<Bool>(false)
     private var enabled = false
     private var values: [String: UInt64] = [:]
 
@@ -62,9 +64,11 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
             values[metric.rawValue] = 0
         }
         enabled = true
+        enabledFastPath.store(true, ordering: .releasing)
     }
 
     public func record(_ metric: Metric, by count: UInt64 = 1) {
+        guard enabledFastPath.load(ordering: .acquiring) else { return }
         lock.lock()
         defer { lock.unlock() }
         guard enabled else { return }
@@ -74,6 +78,7 @@ public final class PerformancePresentationCounters: @unchecked Sendable {
     /// Publish the partition together so a snapshot taken during deferred
     /// drawing always sees total tracks equal unique builds plus reuses.
     func recordToolTraces(unique: UInt64, reused: UInt64, direct: Bool) {
+        guard enabledFastPath.load(ordering: .acquiring) else { return }
         lock.lock()
         defer { lock.unlock() }
         guard enabled else { return }

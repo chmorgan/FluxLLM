@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import Synchronization
 
 /// Opt-in scoped arrival timings. CPU values come from the calling thread's
 /// native CPU clock, while wall values use monotonic uptime. These diagnostic
@@ -76,6 +77,7 @@ public final class PerformanceArrivalDiagnostics: @unchecked Sendable {
     private let lock = NSLock()
     private let owner = OwnerIdentity()
     private let clock: @Sendable () -> ClockSample?
+    private let enabledFastPath = Atomic<Bool>(false)
     private var enabled = false
     private var generation: UInt64 = 0
     private var measurements: [Metric: Measurement] = [:]
@@ -95,17 +97,20 @@ public final class PerformanceArrivalDiagnostics: @unchecked Sendable {
         generation &+= 1
         measurements = Dictionary(uniqueKeysWithValues: Metric.allCases.map { ($0, Measurement()) })
         enabled = true
+        enabledFastPath.store(true, ordering: .releasing)
     }
 
     /// Stops measurement without clearing the completed results.
     public func disable() {
         lock.lock()
         defer { lock.unlock() }
+        enabledFastPath.store(false, ordering: .releasing)
         enabled = false
         generation &+= 1
     }
 
     public func begin(_ metric: Metric) -> Token? {
+        guard enabledFastPath.load(ordering: .acquiring) else { return nil }
         lock.lock()
         defer { lock.unlock() }
         guard enabled else { return nil }
