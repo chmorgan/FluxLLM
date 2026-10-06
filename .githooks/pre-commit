@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+repository=$(git rev-parse --show-toplevel)
+exec python3 "$repository/scripts/check-swift-format.py" --staged

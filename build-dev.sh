@@ -56,7 +56,7 @@ run_format_fix() {
 
 run_format_check() {
     echo "=== Formatting (check) ==="
-    if ! xcrun swift-format lint --strict --configuration ./.swift-format --recursive Sources Tests; then
+    if ! python3 scripts/check-swift-format.py --worktree; then
         echo "Formatting check failed. Run './build-dev.sh --format' to fix, or './build-dev.sh --no-format' to skip."
         exit 1
     fi

@@ -110,6 +110,30 @@ again on the next launch.
 
 See [DESIGN.md](DESIGN.md) for architecture, measurement semantics, and limitations.
 
+## Development checks
+
+Install the repository's pre-commit hook after cloning:
+
+```sh
+scripts/install-git-hooks.sh
+```
+
+The installer preserves other Git hooks. It refuses to replace an existing
+unowned `pre-commit` hook or a custom `core.hooksPath`; resolve that conflict
+before installing. The installed dispatcher runs the tracked
+[pre-commit hook](.githooks/pre-commit), which calls:
+
+```sh
+python3 scripts/check-swift-format.py --staged
+```
+
+The hook checks staged Swift contents with the staged `.swift-format`
+configuration, including partially staged files. A configuration change checks
+all indexed Swift files. It never reformats files or changes the index, and a
+failed check rejects the commit. Use the checker's `--worktree` mode to check
+current files while preparing changes; `build-dev.sh` uses the same checker
+before building. Full builds and tests run separately.
+
 ## Continuous integration
 
 The [CI workflow](.github/workflows/ci.yml) runs on pull requests and pushes with
