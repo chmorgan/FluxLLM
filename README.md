@@ -139,14 +139,16 @@ before building. Full builds and tests run separately.
 The [CI workflow](.github/workflows/ci.yml) runs on pull requests and pushes with
 two independent jobs. Both use Python 3.12:
 
-- **macOS:** `macos-15` on Apple Silicon with Xcode 26.3 runs the Swift tests
-  with coverage, compiles both Release app executables, and tests all release scripts.
-- **Python:** `ubuntu-26.04` runs the mock server tests.
+- **macOS:** `macos-15` on Apple Silicon with Xcode 26.3 checks Swift formatting,
+  runs the Swift tests with coverage, compiles both Release app executables,
+  and tests all release scripts.
+- **Python:** `ubuntu-26.04` runs the mock server and development tooling tests.
 
 Run the same checks locally from the repository root. The Swift checks require
 a supported Mac with Xcode installed:
 
 ```sh
+python3 scripts/check-swift-format.py --all
 swift test --enable-code-coverage
 swift build -c release --product FluxLLMApp
 swift build -c release --product FluxLLMPerformanceApp
@@ -155,12 +157,15 @@ swift build -c release --product FluxLLMPerformanceApp
     bash "$test_script" || exit
   done
 )
-python3 -m unittest discover -s scripts -p 'test_mock*.py' -v
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
 These checks need no downloaded models, external inference servers, or signing
 secrets. Backend integration tests use local mock servers; release-script tests
 use fixtures and mock builds, signing, notarization, and GitHub operations.
+The macOS formatting gate uses the same checker as the pre-commit hook, checks
+all tracked Swift files, and fails before builds or tests. CI provides enforcement
+even when a local hook has not been installed or has been bypassed.
 
 Hardware tests are skipped by default. On a supported Mac, set the
 corresponding environment variable when running `swift test` to opt in:

@@ -33,7 +33,11 @@ jobs:
         run: |
           xcodebuild -version
           swift --version
+          xcrun swift-format --version
           python3 --version
+
+      - name: Check Swift formatting
+        run: python3 scripts/check-swift-format.py --all
 
       - name: Test release scripts
         run: |
