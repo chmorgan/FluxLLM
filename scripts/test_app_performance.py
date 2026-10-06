@@ -90,6 +90,95 @@ class GPUProviderSelectionTests(unittest.TestCase):
             app.make_trace_session(Path("unused"), app.Deadline(5), "unknown")
 
 
+class UnslothPerformanceTests(unittest.TestCase):
+    def snapshot(self, output=0, prompt=0, running=0, rate=0):
+        return {"backend_kind": "unsloth", "request_observation": "unavailable-native-aggregate",
+                "backend_output_tokens": output, "backend_prompt_tokens": prompt,
+                "running_requests": running, "queued_requests": 0, "current_tps": rate,
+                "throughput_basis": "serverReportedAverage",
+                **dict.fromkeys(("requests", "output_tokens", "prompt_tokens", "tool_calls", "tool_results", "active_requests"), 0)}
+
+    def test_unsloth_selection_is_fresh_only_short_and_preserves_original_default(self):
+        original = budget()
+        self.assertEqual(app.backend_cases(original, "ollama"), original["cases"])
+        cases = app.backend_cases(original, "unsloth")
+        self.assertEqual([case["name"] for case in cases],
+                         ["unsloth-fresh-never-opened", "unsloth-fresh-visible", "unsloth-logging-transitions"])
+        self.assertEqual(sum(stage["seconds"] for case in cases for stage in case["stages"]), 90)
+        self.assertTrue(all(case["history"] == "fresh" for case in cases))
+        self.assertEqual([(stage["activity"], stage["logging_enabled"]) for stage in cases[2]["stages"]],
+                         [("ordinary", False), ("ordinary", True), ("ordinary", False)])
+        self.assertEqual(original, budget())
+        with self.assertRaises(app.InvalidResult):
+            app.backend_cases(original, "invented")
+
+    def test_native_work_validates_aggregate_tokens_without_forging_request_observation(self):
+        stage = {"activity": "ordinary", "seconds": 10}
+        expected = app.expected_work(stage)
+        acknowledgement, status = fixture_evidence(stage)
+        before = self.snapshot(output=500, prompt=100)
+        after = self.snapshot(output=500 + expected["output_tokens"], prompt=100 + expected["prompt_tokens"])
+        result = app.validate_workload(stage, status, before, after, acknowledgement, backend="unsloth")
+        self.assertEqual(result["aggregate_output_tokens"], expected["output_tokens"])
+        self.assertEqual(result["observed_requests"], "unavailable")
+        self.assertEqual(result["observed_tools"], "unavailable")
+        for field in ("backend_output_tokens", "backend_prompt_tokens"):
+            with self.subTest(field=field), self.assertRaises(app.InvalidResult):
+                app.validate_workload(stage, status, before, after | {field: after[field] - 1},
+                                      acknowledgement, backend="unsloth")
+        for field in ("requests", "tool_calls", "tool_results", "active_requests"):
+            with self.subTest(field=field), self.assertRaises(app.InvalidResult):
+                app.validate_workload(stage, status, before, after | {field: 1},
+                                      acknowledgement, backend="unsloth")
+        with self.assertRaises(app.InvalidResult):
+            app.validate_workload(stage, status, before, after | {"running_requests": 2},
+                                  acknowledgement, backend="unsloth")
+
+    def test_native_live_progress_requires_real_polled_counts_and_rate(self):
+        before = self.snapshot(output=200)
+        active = self.snapshot(output=210, prompt=46, running=2, rate=160)
+        app.validate_live_progress(before, active, "unsloth")
+        for change in ({"backend_output_tokens": 200}, {"running_requests": 0},
+                       {"current_tps": 0}, {"throughput_basis": "estimated"}, {"tool_calls": 1}):
+            with self.subTest(change=change), self.assertRaises(app.InvalidResult):
+                app.validate_live_progress(before, active | change, "unsloth")
+
+    def test_three_case_native_baselines_compare_only_same_backend_and_discovery_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selected = app.backend_cases(budget(), "unsloth")
+            current = {"mode": "check", "backend": "unsloth",
+                       "workload_scope": "native-metrics-with-synthetic-discovery", "selected_cases": selected,
+                       "artifact_directory": str(root / "check-native"), "budget": budget(),
+                       "environment": {"os": "test", "hardware": "test", "display": "test", "build_configuration": "release"},
+                       "measurement_identity": {"sha256": "a" * 64},
+                       "binary_identity": {"collector": {"sha256": "b" * 64}},
+                       "production_provenance": {"popover_lifecycle_policy": app.POPOVER_LIFECYCLE_POLICY},
+                       "cases": [{"name": case["name"], "workload_validated": True, "logging_supported": True,
+                                  "ready": {"fixture_equivalence_sha256": "e" * 64,
+                                            "popover_lifecycle_policy": app.POPOVER_LIFECYCLE_POLICY,
+                                            "snapshot": {"popover_lifecycle_policy": app.POPOVER_LIFECYCLE_POLICY}},
+                                  "invalid": [], "metrics": {"cpu_rolling_1s_percent": 2.0}}
+                                 for case in selected]}
+            baseline = copy.deepcopy(current)
+            baseline.update(mode="baseline", artifact_directory=str(root / "baseline-native"))
+            for case in baseline["cases"]:
+                case["metrics"]["cpu_rolling_1s_percent"] = 3.0
+            (root / "baseline-native").mkdir()
+            path = root / "baseline-native" / "report.json"
+            app.write_json(path, baseline)
+            comparison = app.compare_baseline(current, root)
+            self.assertEqual(comparison["status"], "compared")
+            self.assertEqual(set(comparison["metric_deltas"]), {case["name"] for case in selected})
+            for case in comparison["metric_deltas"].values():
+                self.assertEqual(case["cpu_rolling_1s_percent"], -1.0)
+            for changes in ({"backend": "ollama"}, {"workload_scope": "real-process-discovery"},
+                            {"selected_cases": selected[:2]}):
+                with self.subTest(changes=changes):
+                    app.write_json(path, baseline | changes)
+                    self.assertEqual(app.compare_baseline(current, root)["status"], "unavailable")
+
+
 class ResourceGateTests(unittest.TestCase):
     def test_external_gpu_trace_keeps_independent_fs_usage_coverage_required(self):
         points = samples()

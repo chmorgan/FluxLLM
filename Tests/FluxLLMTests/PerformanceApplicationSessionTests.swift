@@ -135,6 +135,97 @@ final class PerformanceApplicationSessionTests: XCTestCase {
         }
     }
 
+    func testUnslothSessionRejectsInventedRetainedRequestHistoryAndNIOAccounting() async throws {
+        for (populated, nio) in [(true, false), (false, true)] {
+            let preferencesSuite = "FluxLLM.Performance.SessionTests.\(UUID().uuidString)"
+            do {
+                let session = try await PerformanceApplicationSession.start(
+                    upstream: URL(string: "http://127.0.0.1:49152")!,
+                    historyDirectory: FileManager.default.temporaryDirectory,
+                    preferencesSuite: preferencesSuite, populated: populated,
+                    backendKind: .unsloth, threadCPUAccountingEnabled: nio,
+                    nioCPUAccountingEnabled: nio)
+                await session.stop()
+                XCTFail(
+                    "A native-only session must reject unsupported retained-request/NIO evidence")
+            } catch {
+                XCTAssertTrue(
+                    String(describing: error).contains(populated ? "fresh history" : "NIO"))
+                XCTAssertNil(
+                    UserDefaults(suiteName: preferencesSuite)?.persistentDomain(
+                        forName: preferencesSuite))
+                XCTAssertFalse(PerformanceGraphicsDiagnostics.shared.isEnabled)
+            }
+        }
+    }
+
+    func testFreshUnslothSessionUsesNativeMetricsWithoutCreatingProxyOrRequestHistory() async throws
+    {
+        _ = NSApplication.shared
+        defer { XCTAssertNoThrow(try PerformanceGraphicsDiagnostics.shared.disable()) }
+        let metrics = """
+            llamacpp:requests_processing 2
+            llamacpp:requests_deferred 0
+            llamacpp:tokens_predicted_total 100
+            llamacpp:prompt_tokens_total 46
+            llamacpp:predicted_tokens_seconds 160
+            """
+        let upstream = MockOllamaServer(
+            response: MockOllamaResponse(
+                contentType: "text/plain", firstBytes: Array(metrics.utf8)))
+        try await upstream.start()
+        let runID = UUID().uuidString
+        let preferencesSuite = "FluxLLM.Performance.SessionTests.\(runID)"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "PerformanceSession-\(runID)")
+        defer {
+            UserDefaults(suiteName: preferencesSuite)?.removePersistentDomain(
+                forName: preferencesSuite)
+        }
+        var session: PerformanceApplicationSession?
+        do {
+            let started = try await PerformanceApplicationSession.start(
+                upstream: URL(string: "http://127.0.0.1:\(upstream.port)")!,
+                historyDirectory: directory, preferencesSuite: preferencesSuite, populated: false,
+                backendKind: .unsloth, threadCPUAccountingEnabled: true)
+            session = started
+            let snapshot = started.snapshot()
+            XCTAssertEqual(started.settings.backendSelection, .unsloth)
+            XCTAssertEqual(started.store.backendKind, .unsloth)
+            XCTAssertEqual(started.store.connectionState, .ready)
+            XCTAssertEqual(started.proxyPort, 0)
+            XCTAssertEqual(started.store.proxyState, .stopped)
+            XCTAssertEqual(snapshot["backend_output_tokens"] as? Int, 100)
+            XCTAssertEqual(snapshot["backend_prompt_tokens"] as? Int, 46)
+            XCTAssertEqual(snapshot["running_requests"] as? Int, 2)
+            XCTAssertEqual(snapshot["current_tps"] as? Double, 160)
+            XCTAssertEqual(snapshot["throughput_basis"] as? String, "serverReportedAverage")
+            XCTAssertEqual(
+                snapshot["request_observation"] as? String, "unavailable-native-aggregate")
+            XCTAssertEqual(snapshot["discovery_scope"] as? String, "synthetic-stable-loopback")
+            for field in [
+                "requests", "tool_calls", "tool_results", "active_requests", "seed_raw_requests",
+                "seed_tool_events",
+            ] {
+                XCTAssertEqual(snapshot[field] as? Int, 0, field)
+            }
+            XCTAssertTrue(started.store.requestLanes.isEmpty)
+            XCTAssertTrue(started.store.toolActivityEvents.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+            let registration = try XCTUnwrap(snapshot["thread_cpu_registration"] as? [String: Any])
+            let roles = try XCTUnwrap(registration["roles"] as? [String: UInt64])
+            XCTAssertEqual(Set(roles.keys), ["main"])
+            XCTAssertNil(snapshot["nio_cpu"])
+            await started.stop()
+            XCTAssertNil(started.shutdownError)
+            await upstream.stop()
+        } catch {
+            await session?.stop()
+            await upstream.stop()
+            throw error
+        }
+    }
+
     func testPopulatedSessionStartsThroughProductionLifecycleWithoutHiddenSnapshots() async throws {
         _ = NSApplication.shared
         defer { XCTAssertNoThrow(try PerformanceGraphicsDiagnostics.shared.disable()) }

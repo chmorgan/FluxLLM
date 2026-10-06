@@ -221,13 +221,26 @@ class FixtureServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, port=0):
+    def __init__(self, port=0, backend="ollama"):
+        if backend not in ("ollama", "unsloth"):
+            raise ValueError("backend must be ollama or unsloth")
+        self.backend = backend
         self.stopping = threading.Event()
         self.lock = threading.Lock()
         self.status = idle_status()
         self.source_completions = {}
         self.connections = set()
         self.workers = []
+        self.native_metrics_enabled = backend == "unsloth"
+        # Independent source-side counters for the native metrics workload.
+        # They never represent FluxLLM resource measurements or request lanes.
+        self.native_metrics = {
+            "llamacpp:requests_processing": 0,
+            "llamacpp:requests_deferred": 0,
+            "llamacpp:tokens_predicted_total": 0,
+            "llamacpp:prompt_tokens_total": 0,
+            "llamacpp:predicted_tokens_seconds": 0,
+        }
         super().__init__(("127.0.0.1", port), FixtureHandler)
 
     @property
@@ -236,7 +249,14 @@ class FixtureServer(ThreadingHTTPServer):
 
     def snapshot(self):
         with self.lock:
-            return dict(self.status)
+            value = dict(self.status)
+            if self.native_metrics_enabled:
+                value["native_metrics"] = dict(self.native_metrics)
+            return value
+
+    def metrics_snapshot(self):
+        with self.lock:
+            return dict(self.native_metrics)
 
     def start_workload(self, workload):
         with self.lock:
@@ -389,17 +409,38 @@ class FixtureHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        # Production llama.cpp probes add autoload=false and optional model;
+        # only the native endpoints accept query strings. Existing Ollama and
+        # fixture-control routing retain their exact request-target semantics.
+        native_path = urlsplit(self.path).path if self.server.backend == "unsloth" else self.path
         if self.path == "/control/status":
             self.send_json(200, self.server.snapshot())
-        elif self.path == "/api/version":
+        elif self.path == "/api/version" and self.server.backend == "ollama":
             self.send_json(200, {"version": "0.0.0-fluxllm-performance-fixture"})
-        elif self.path in ("/api/ps", "/api/tags"):
+        elif self.path in ("/api/ps", "/api/tags") and self.server.backend == "ollama":
             self.send_json(200, {"models": [{
                 "name": MODEL, "model": MODEL, "modified_at": CREATED_AT,
                 "size": 4_000_000_000, "size_vram": 4_000_000_000,
                 "digest": "0" * 64, "expires_at": "2099-01-01T00:00:00Z",
                 "details": {"format": "gguf", "family": "fixture", "parameter_size": "synthetic", "quantization_level": "Q4_0"},
             }]})
+        elif native_path == "/props" and self.server.backend == "unsloth":
+            self.send_json(200, {"model_alias": MODEL, "endpoint_metrics": True})
+        elif native_path == "/health" and self.server.backend == "unsloth":
+            self.send_json(200, {"status": "ok"})
+        elif native_path == "/metrics" and self.server.backend == "unsloth":
+            payload = "".join(f"{name} {value}\n" for name, value in self.server.metrics_snapshot().items()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.wfile.write(payload)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         else:
             self.send_json(404, {"error": "unknown fixture route"})
 
@@ -454,6 +495,13 @@ class FixtureHandler(BaseHTTPRequestHandler):
         timing = StreamTiming(index, chunks, rate, duration, started)
         with self.server.lock:
             progress = self.server.source_completions.get((run_id, index))
+            native_metrics_enabled = getattr(self.server, "native_metrics_enabled", False)
+            native_stream_active = native_metrics_enabled
+            if native_metrics_enabled:
+                self.server.native_metrics["llamacpp:requests_processing"] += 1
+                self.server.native_metrics["llamacpp:prompt_tokens_total"] += 23
+                self.server.native_metrics["llamacpp:predicted_tokens_seconds"] = (
+                    self.server.native_metrics["llamacpp:requests_processing"] * 2 * rate)
         try:
             for chunk_index in range(chunks + 1):
                 due = started + (duration if chunk_index == chunks else chunk_index / rate)
@@ -466,6 +514,13 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n")
                 self.wfile.flush()
                 timing.observed(chunk_index, write_started, time.monotonic())
+                if native_metrics_enabled:
+                    with self.server.lock:
+                        self.server.native_metrics["llamacpp:tokens_predicted_total"] += 17 if chunk_index == chunks else 2
+            if native_stream_active:
+                with self.server.lock:
+                    self.server.native_metrics["llamacpp:requests_processing"] -= 1
+                native_stream_active = False
             # Publish before the HTTP terminator: drive() cannot finish its
             # final read until the complete timing evidence is available.
             if progress is not None:
@@ -474,19 +529,24 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+        finally:
+            if native_stream_active:
+                with self.server.lock:
+                    self.server.native_metrics["llamacpp:requests_processing"] -= 1
 
 
-def create_server(port=0):
-    return FixtureServer(port)
+def create_server(port=0, backend="ollama"):
+    return FixtureServer(port, backend=backend)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=0, help="loopback port, default 0 selects a free port")
+    parser.add_argument("--backend", choices=("ollama", "unsloth"), default="ollama")
     arguments = parser.parse_args(argv)
     if not 0 <= arguments.port <= 65535:
         parser.error("port must be between 0 and 65535")
-    server = create_server(arguments.port)
+    server = create_server(arguments.port, backend=arguments.backend)
 
     def stop(*_):
         server.stopping.set()

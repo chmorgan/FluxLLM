@@ -55,7 +55,7 @@ def metrics(server):
 def open_stream(server):
     connection = HTTPConnection(*server.server_address, timeout=3)
     connection.request("POST", "/v1/chat/completions", json.dumps({
-        "model": server.config.model, "messages": [{"role": "user", "content": "hello"}], "stream": True,
+        "model": server.snapshot()["model"], "messages": [{"role": "user", "content": "hello"}], "stream": True,
     }), {"Content-Type": "application/json"})
     return connection, connection.getresponse()
 
@@ -231,6 +231,98 @@ class MockMetricsBackendTests(unittest.TestCase):
         for config in ({"backend": "ollama"}, {"pace": -1}, {"pace": float("nan")}, {"pace": float("inf")}, {"chunks": 0}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 FixtureConfig(**config)
+
+    def test_unsloth_lifecycle_is_explicit_and_read_only_observation_never_changes_it(self):
+        with running_fixture(backend="unsloth") as server:
+            initial = get_json(server, "/fixture/status")
+            self.assertTrue(initial["loaded"])
+            self.assertEqual(initial["model"], "Fixture/unsloth-synthetic")
+            status, _ = request(server, "POST", "/v1/chat/completions", {"stream": False})
+            self.assertEqual(status, 200)
+            self.assertEqual(metrics(server)["llamacpp:tokens_predicted_total"], 8)
+            # The reported decode average survives completion; activity is idle.
+            self.assertEqual(metrics(server)["llamacpp:requests_processing"], 0)
+            self.assertGreater(metrics(server)["llamacpp:predicted_tokens_seconds"], 0)
+            self.assertEqual(request(server, "POST", "/fixture/state", {"loaded": False})[0], 200)
+            unloaded = get_json(server, "/fixture/status")
+            for _ in range(3):
+                self.assertEqual(request(server, "GET", "/health")[0], 503)
+                self.assertEqual(request(server, "GET", "/metrics")[0], 503)
+                self.assertEqual(get_json(server, "/v1/models")["data"], [])
+            self.assertEqual(get_json(server, "/fixture/status"), unloaded)
+            self.assertEqual(request(server, "POST", "/v1/chat/completions", {"stream": True})[0], 503)
+            self.assertEqual(request(server, "POST", "/fixture/state", {
+                "loaded": True, "model": "Fixture/unsloth-second",
+            })[0], 200)
+            self.assertEqual(get_json(server, "/v1/models")["data"][0]["id"], "Fixture/unsloth-second")
+            self.assertEqual(get_json(server, "/props")["model_alias"], "Fixture/unsloth-second")
+            self.assertEqual(metrics(server)["llamacpp:tokens_predicted_total"], 0)
+            self.assertEqual(request(server, "POST", "/v1/chat/completions", {"stream": False})[0], 200)
+            self.assertEqual(get_json(server, "/fixture/status")["completed_output"], 8)
+            connection, response = open_stream(server)
+            try:
+                self.assertEqual(response.status, 200)
+                stream = events(response.read().decode())
+                self.assertTrue(all(event["model"] == "Fixture/unsloth-second" for event in stream[:-1]))
+            finally:
+                connection.close()
+
+    def test_unsloth_state_change_cannot_cross_running_request_or_invalid_input(self):
+        reached, release = threading.Event(), threading.Event()
+
+        def hold(_, index):
+            if index == 1:
+                reached.set()
+                release.wait()
+
+        with running_fixture(backend="unsloth", before_chunk=hold) as server:
+            connection, response = open_stream(server)
+            try:
+                self.assertTrue(reached.wait(timeout=3))
+                before = get_json(server, "/fixture/status")
+                self.assertEqual(request(server, "POST", "/fixture/state", {"loaded": False})[0], 409)
+                self.assertEqual(get_json(server, "/fixture/status"), before)
+            finally:
+                release.set()
+                response.read()
+                connection.close()
+            before = get_json(server, "/fixture/status")
+            for body in ([], {"loaded": "false"}, {"model": ""}, {"model": "x" * 257},
+                         {"metrics_status": 418}, {"metrics_enabled": 1}, {"unexpected": True}):
+                with self.subTest(body=body):
+                    self.assertEqual(request(server, "POST", "/fixture/state", body)[0], 400)
+                    self.assertEqual(get_json(server, "/fixture/status"), before)
+
+    def test_unsloth_missing_metrics_auth_failures_and_restart_have_distinct_states(self):
+        with running_fixture(backend="unsloth") as first:
+            first_port = first.server_port
+            self.assertEqual(request(first, "POST", "/v1/chat/completions", {"stream": False})[0], 200)
+            for status in (401, 403):
+                self.assertEqual(request(first, "POST", "/fixture/state", {"metrics_status": status})[0], 200)
+                self.assertEqual(request(first, "GET", "/metrics")[0], status)
+                self.assertEqual(get_json(first, "/fixture/status")["completed_output"], 8)
+            self.assertEqual(request(first, "POST", "/fixture/state", {
+                "metrics_status": 200, "metrics_enabled": False,
+            })[0], 200)
+            self.assertEqual(request(first, "GET", "/metrics")[0], 404)
+            self.assertFalse(get_json(first, "/props")["endpoint_metrics"])
+            # A second external worker uses a genuinely new socket and fresh counters.
+            with running_fixture(backend="unsloth") as restarted:
+                self.assertNotEqual(restarted.server_port, first_port)
+                self.assertEqual(metrics(restarted)["llamacpp:tokens_predicted_total"], 0)
+                self.assertEqual(get_json(restarted, "/fixture/status")["completed_requests"], 0)
+
+    def test_fixture_request_start_revalidates_model_before_accounting(self):
+        with running_fixture(backend="unsloth") as server:
+            model = server.snapshot()["model"]
+            self.assertTrue(server.set_state({"loaded": False}))
+            with self.assertRaises(ValueError):
+                server.begin(model)
+            self.assertTrue(server.set_state({"loaded": True, "model": "Fixture/unsloth-second"}))
+            with self.assertRaises(ValueError):
+                server.begin(model)
+            self.assertEqual(server.snapshot()["running"], 0)
+            self.assertEqual(server.snapshot()["prompt"], 0)
 
 
 if __name__ == "__main__":

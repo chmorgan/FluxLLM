@@ -284,8 +284,11 @@ def stop_process_group(process, grace=2):
     process.wait()
 
 
-def launch_fixture(directory, command=None, timeout=10):
+def launch_fixture(directory, command=None, timeout=10, backend="ollama"):
+    require(backend in ("ollama", "unsloth"), "Unsupported fixture backend")
     command = command or [sys.executable, str(Path(__file__).resolve().with_name("performance_fixture.py")), "--port", "0"]
+    if backend == "unsloth":
+        command = list(command) + ["--backend", "unsloth"]
     log_path = directory / "fixture.log"
     with log_path.open("wb") as log:
         process = subprocess.Popen(command, cwd=directory, stdout=log, stderr=subprocess.STDOUT,

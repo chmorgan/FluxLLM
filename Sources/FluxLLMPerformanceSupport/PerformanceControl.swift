@@ -18,6 +18,7 @@ package final class PerformanceControl {
         let fixture_ending_at_epoch: Double?
         let graphics_mode: PerformanceGraphicsDiagnostics.Mode?
         let popover_animations_enabled: Bool?
+        let backend_kind: BackendKind?
     }
 
     // Preserve the field names in the performance JSON protocol.
@@ -66,6 +67,12 @@ package final class PerformanceControl {
             let upstream = parts.url
         else {
             throw ControlError.invalid("Invalid performance configuration or non-loopback upstream")
+        }
+        let backend = configuration.backend_kind ?? .ollama
+        guard [.ollama, .unsloth].contains(backend),
+            backend != .unsloth || configuration.history == "fresh"
+        else {
+            throw ControlError.invalid("Native Unsloth performance supports fresh history only")
         }
         if let epoch = configuration.fixture_ending_at_epoch {
             guard epoch.isFinite, abs(Date().timeIntervalSince1970 - epoch) < 120 else {
@@ -183,6 +190,7 @@ package final class PerformanceControl {
                     populated: configuration.history == "populated",
                     fixtureEndingAt: configuration.fixture_ending_at_epoch.map(
                         Date.init(timeIntervalSince1970:)),
+                    backendKind: configuration.backend_kind ?? .ollama,
                     graphicsMode: configuration.graphics_mode ?? .normal,
                     popoverAnimationsEnabled: configuration.popover_animations_enabled ?? true,
                     threadCPUAccountingEnabled: ProcessInfo.processInfo.environment[
@@ -200,7 +208,7 @@ package final class PerformanceControl {
                     directory: try validatedLoggingDirectory())
                 gpuReporter?.sample()
                 try await started.refreshPerformanceNIODiagnostics()
-                send([
+                var event: [String: Any] = [
                     "type": "ready", "command_id": command.command_id, "protocol_version": 1,
                     "proxy_port": started.proxyPort,
                     "proxy_url": "http://127.0.0.1:\(started.proxyPort)",
@@ -217,7 +225,15 @@ package final class PerformanceControl {
                     "logging_destination": loggingDestination.path,
                     "logging_destinations": loggingDestinations,
                     "monotonic_seconds": Self.monotonicSeconds(),
-                ])
+                ]
+                if started.backendKind == .unsloth {
+                    event.removeValue(forKey: "proxy_port")
+                    event.removeValue(forKey: "proxy_url")
+                    event["load_url"] = started.loadURL.absoluteString
+                    event["backend_kind"] = started.backendKind.rawValue
+                    event["discovery_scope"] = "synthetic-stable-loopback"
+                }
+                send(event)
             } catch {
                 startupTask = nil
                 fail("Performance startup failed: \(error)", commandID: command.command_id)

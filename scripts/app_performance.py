@@ -110,6 +110,25 @@ def validate_budget(value):
     return value
 
 
+def backend_cases(budget, backend="ollama"):
+    """Choose one bounded, honest provider workload without altering its budget."""
+    if backend == "ollama":
+        return budget["cases"]
+    require(backend == "unsloth", "Unsupported synthetic performance backend")
+    return [
+        {"name": "unsloth-fresh-never-opened", "history": "fresh", "ui": "never-opened", "stages": [
+            {"activity": "idle", "seconds": 10}, {"activity": "ordinary", "seconds": 10},
+            {"activity": "high-rate", "seconds": 10}]},
+        {"name": "unsloth-fresh-visible", "history": "fresh", "ui": "visible", "stages": [
+            {"activity": "ordinary", "seconds": 10}, {"activity": "high-rate", "seconds": 10},
+            {"activity": "idle", "seconds": 10, "open_close_cycles": 3}]},
+        {"name": "unsloth-logging-transitions", "history": "fresh", "ui": "never-opened", "stages": [
+            {"activity": "ordinary", "seconds": 10, "logging_enabled": False},
+            {"activity": "ordinary", "seconds": 10, "logging_enabled": True},
+            {"activity": "ordinary", "seconds": 10, "logging_enabled": False}]},
+    ]
+
+
 def memory_evidence(samples, final_exit=None):
     """Resolve read-order skew only with the child's actual final kernel peak."""
     problems, anomalies, peaks, footprints = [], [], [], []
@@ -625,7 +644,33 @@ def validate_fixture_timing(stage, status, acknowledgement):
             "Concurrent source streams started more than 50 ms apart")
 
 
-def validate_workload(stage, status, before, after, acknowledgement=None):
+def validate_native_snapshot(snapshot):
+    require(snapshot.get("backend_kind") == "unsloth"
+            and snapshot.get("request_observation") == "unavailable-native-aggregate",
+            "Native Unsloth capability evidence is missing")
+    require(snapshot.get("throughput_basis") == "serverReportedAverage",
+            "Unsloth metrics must retain their server-reported average semantics")
+    for field in ("requests", "output_tokens", "prompt_tokens", "tool_calls", "tool_results", "active_requests"):
+        require(type(snapshot.get(field)) is int and snapshot[field] == 0,
+                f"Native Unsloth cannot claim observed {field}")
+    for field in ("backend_output_tokens", "backend_prompt_tokens", "running_requests", "queued_requests"):
+        number(snapshot.get(field), field, integer=True)
+
+
+def validate_live_progress(before, progress, backend="ollama"):
+    if backend == "unsloth":
+        validate_native_snapshot(progress)
+        require(progress["running_requests"] == 2 and progress["queued_requests"] == 0
+                and number(progress.get("current_tps"), "current_tps") > 0
+                and progress["backend_output_tokens"] > before["backend_output_tokens"],
+                "Polled native metrics did not advance while external streams were active")
+    else:
+        require(progress.get("active_requests", 0) > 0
+                and progress.get("partial_output_tokens", 0) > before.get("partial_output_tokens", 0),
+                "Live telemetry did not advance while network streams were active")
+
+
+def validate_workload(stage, status, before, after, acknowledgement=None, backend="ollama"):
     expected = expected_work(stage)
     require(isinstance(before, dict) and isinstance(after, dict), "App snapshots are required")
     if stage["activity"] != "idle":
@@ -635,10 +680,37 @@ def validate_workload(stage, status, before, after, acknowledgement=None):
         for field, expected_field in (("completed_requests", "requests"), ("received_chunks", "chunks"),
                                       ("tool_calls", "tool_calls"), ("tool_results", "tool_results")):
             require(type(status.get(field)) is int and status[field] == expected[expected_field], f"Fixture {field} differs from expected work")
+    if backend == "unsloth":
+        validate_native_snapshot(before)
+        validate_native_snapshot(after)
+        require(after["running_requests"] == 0 and after["queued_requests"] == 0,
+                "Native request counts did not return to idle")
+        for field, expected_field in (("backend_output_tokens", "output_tokens"), ("backend_prompt_tokens", "prompt_tokens")):
+            require(after[field] - before[field] == expected[expected_field],
+                    f"App {field} delta differs from external source work")
+        return {"external_source_requests": expected["requests"], "external_source_chunks": expected["chunks"],
+                "aggregate_output_tokens": expected["output_tokens"], "aggregate_prompt_tokens": expected["prompt_tokens"],
+                "observed_requests": "unavailable", "observed_tools": "unavailable",
+                "protocol_scope": "native-llamacpp-metrics-ingestion"}
     for field in ("requests", "output_tokens", "prompt_tokens", "tool_calls", "tool_results"):
         require(type(before.get(field)) is int and type(after.get(field)) is int, f"App snapshot {field} is missing")
         require(after[field] - before[field] == expected[field], f"App {field} delta differs from expected work")
     return expected
+
+
+def settled_snapshot(collector, upstream, deadline, backend, before, stage):
+    if backend != "unsloth":
+        return collector.snapshot()
+    expected = expected_work(stage)
+    end = min(deadline.end, time.monotonic() + 3)
+    while True:
+        snapshot = collector.snapshot()
+        if (snapshot.get("backend_output_tokens") == before["backend_output_tokens"] + expected["output_tokens"]
+                and snapshot.get("backend_prompt_tokens") == before["backend_prompt_tokens"] + expected["prompt_tokens"]
+                and snapshot.get("running_requests") == 0):
+            return snapshot
+        require(time.monotonic() < end, "Native metrics did not observe completed source work within three seconds")
+        collector.wait_until(min(end, time.monotonic() + 0.1))
 
 
 def presentation_checks(before, after, specification, stage):
@@ -943,6 +1015,7 @@ def completed_status(collector, upstream, deadline):
 
 
 def run_continuous_logging(collector, specification, case, proxy_url, upstream, deadline, cycle):
+    backend = case.get("backend", "ollama")
     whole = {"activity": "ordinary", "seconds": 30}
     initial = collector.snapshot()
     started = time.monotonic()
@@ -972,19 +1045,19 @@ def run_continuous_logging(collector, specification, case, proxy_url, upstream, 
         case["stages"].append(stage_result)
         collector.wait_until(started + index * 10 + 2)
         progress = collector.snapshot()
-        require(progress.get("active_requests", 0) > 0 and progress.get("partial_output_tokens", 0) > before.get("partial_output_tokens", 0),
-                "Continuous streaming telemetry stopped during the logging transition")
+        validate_live_progress(before, progress, backend)
         stage_result["live_progress"] = progress
         collector.wait_until(started + (index + 1) * 10)
         if index < 2:
             after = collector.snapshot()
-            require(after.get("active_requests", 0) > 0, "Logging transition interrupted the active streams")
+            require(after.get("running_requests" if backend == "unsloth" else "active_requests", 0) > 0,
+                    "Logging transition interrupted the active streams")
             stage_result.update(after=after, validated_work={"live_progress_verified": True})
         else:
             status = completed_status(collector, upstream, deadline)
-            after = collector.snapshot()
+            after = settled_snapshot(collector, upstream, deadline, backend, initial, whole)
             stage_result.update(after=after, fixture_status=status)
-            stage_result["validated_work"] = validate_workload(whole, status, initial, after, acknowledgement)
+            stage_result["validated_work"] = validate_workload(whole, status, initial, after, acknowledgement, backend)
         stage_result["measurement_end_monotonic_seconds"] = started + (index + 1) * 10 if index < 2 else time.monotonic()
         failures, invalid = presentation_checks(before, after, specification, stage)
         case["failures"].extend(failures)
@@ -995,11 +1068,22 @@ def run_continuous_logging(collector, specification, case, proxy_url, upstream, 
 def run_case(specification, collector_path, app_path, upstream, gpu_capability, directory, deadline, limits, cycle_start, measurement=None):
     directory.mkdir()
     measurement = measurement or {}
+    backend = measurement.get("backend", "ollama")
+    require(backend in ("ollama", "unsloth"), "Unsupported synthetic performance backend")
+    require(backend != "unsloth" or specification["history"] == "fresh", "Unsloth native performance supports fresh history only")
     external_trace = measurement.get("external_trace", False)
     case = {"name": specification["name"], "specification": specification, "stages": [],
             "logging_transitions": [], "logging_intervals": [], "logging_destinations": [], "failures": [], "invalid": []}
     configuration = {"upstream_url": upstream, "history": specification["history"], "protocol_version": 1,
                      "logging_enabled": False, "fixture_ending_at_epoch": time.time()}
+    if backend == "unsloth":
+        configuration["backend_kind"] = "unsloth"
+        case.update(backend=backend, workload_scope={
+            "monitoring_path": "production-UnslothBackendClient-native-metrics",
+            "discovery": "injected-stable-synthetic-studio-and-worker-identities",
+            "external_load_protocol": "synthetic-/api/chat-NDJSON-external-driver",
+            "observed_requests": "unavailable", "observed_tools": "unavailable",
+            "real_process_discovery": "excluded-from-synthetic-capture"})
     write_json(directory / "configuration.json", configuration)
     collector = None
     open_interval = None
@@ -1010,9 +1094,14 @@ def run_case(specification, collector_path, app_path, upstream, gpu_capability, 
         require(isinstance(ready.get("snapshot"), dict), "Ready event is missing the seeded counter baseline")
         validate_popover_policy(ready, "App ready event")
         validate_popover_policy(ready["snapshot"], "App ready snapshot")
-        proxy_url = ready.get("proxy_url")
+        proxy_url = ready.get("load_url") if backend == "unsloth" else ready.get("proxy_url")
         parsed = urlparse(proxy_url or "")
         require(parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and parsed.port, "App proxy is not on numeric loopback")
+        if backend == "unsloth":
+            require(proxy_url == upstream and ready.get("proxy_url") is None
+                    and ready.get("backend_kind") == "unsloth"
+                    and ready.get("discovery_scope") == "synthetic-stable-loopback",
+                    "Native performance must apply external load directly and identify synthetic discovery")
         case["ready"] = ready
         if measurement.get("fixture_schema_version") is not None:
             require(ready.get("fixture_schema_version") == measurement["fixture_schema_version"],
@@ -1043,9 +1132,10 @@ def run_case(specification, collector_path, app_path, upstream, gpu_capability, 
             visible(collector, True, case["invalid"])
             if specification["ui"] == "closed":
                 visible(collector, False, case["invalid"])
-        if specification["name"] == "logging-transitions":
+        continuous_logging = specification["name"] in ("logging-transitions", "unsloth-logging-transitions")
+        if continuous_logging:
             run_continuous_logging(collector, specification, case, proxy_url, upstream, deadline, cycle_start)
-        for stage_index, stage in enumerate([] if specification["name"] == "logging-transitions" else specification["stages"]):
+        for stage_index, stage in enumerate([] if continuous_logging else specification["stages"]):
             if "logging_enabled" in stage and case["logging_supported"]:
                 open_interval = set_logging(collector, stage["logging_enabled"], case, open_interval)
             before = collector.snapshot()
@@ -1065,8 +1155,11 @@ def run_case(specification, collector_path, app_path, upstream, gpu_capability, 
                 collector.wait_until(started + min(2, stage["seconds"] / 2))
                 progress = collector.snapshot()
                 stage_result["live_progress"] = progress
-                require(progress.get("active_requests", 0) > 0 and progress.get("partial_output_tokens", 0) > 0,
-                        "Live telemetry did not advance while network streams were active")
+                if backend == "unsloth":
+                    validate_live_progress(before, progress, backend)
+                else:
+                    require(progress.get("active_requests", 0) > 0 and progress.get("partial_output_tokens", 0) > 0,
+                            "Live telemetry did not advance while network streams were active")
             if stage.get("open_close_cycles"):
                 for cycle in range(stage["open_close_cycles"]):
                     visible(collector, True, case["invalid"])
@@ -1078,10 +1171,10 @@ def run_case(specification, collector_path, app_path, upstream, gpu_capability, 
             status = {}
             if stage["activity"] != "idle":
                 status = completed_status(collector, upstream, deadline)
-            after = collector.snapshot()
+            after = settled_snapshot(collector, upstream, deadline, backend, before, stage)
             stage_result["measurement_end_monotonic_seconds"] = time.monotonic()
             stage_result.update(after=after, fixture_status=status, elapsed_seconds=time.monotonic() - started)
-            stage_result["validated_work"] = validate_workload(stage, status, before, after, acknowledgement)
+            stage_result["validated_work"] = validate_workload(stage, status, before, after, acknowledgement, backend)
             failures, invalid = presentation_checks(before, after, specification, stage)
             case["failures"].extend(failures)
             case["invalid"].extend(invalid)
@@ -1571,9 +1664,14 @@ def comparison_key(report):
                  if isinstance(capability, dict) and kind not in ("environment", "gpu", "trace_coverage")}
     providers["shared_trace"] = report.get("trace", {}).get("provider")
     providers["filesystem"] = report.get("filesystem_provider", "fs_usage")
-    return {"measurement_sha256": report["measurement_identity"]["sha256"], "collector_sha256": collector_sha256,
-            "environment": environment, "popover_lifecycle_policy": popover_policy, "cpu_policy": CPU_POLICY,
-            "providers": providers, "limits": report["budget"]["limits"]}
+    key = {"measurement_sha256": report["measurement_identity"]["sha256"], "collector_sha256": collector_sha256,
+           "environment": environment, "popover_lifecycle_policy": popover_policy, "cpu_policy": CPU_POLICY,
+           "providers": providers, "limits": report["budget"]["limits"]}
+    if report.get("backend", "ollama") != "ollama":
+        key["workload_backend"] = report["backend"]
+        key["workload_scope"] = report.get("workload_scope")
+        key["selected_cases"] = report.get("selected_cases")
+    return key
 
 
 def compare_baseline(report, parent):
@@ -1585,7 +1683,7 @@ def compare_baseline(report, parent):
             baseline = load_json(path)
             if path.parent == Path(report["artifact_directory"]) or baseline.get("mode") != "baseline" or comparison_key(baseline) != key:
                 continue
-            if len(baseline.get("cases", [])) != 4:
+            if len(baseline.get("cases", [])) != len(report.get("selected_cases", report["budget"]["cases"])):
                 continue
             changes, excluded, off_changes, gpu_changes = {}, {}, {}, {}
             for current, earlier in zip(report["cases"], baseline["cases"]):
@@ -1609,7 +1707,7 @@ def compare_baseline(report, parent):
                        for case in (current, earlier) for issue in case.get("invalid", [])):
                     excluded[name] = "The requested native presentation workload was not completed in both runs"
                     continue
-                if name == "logging-transitions" and current.get("logging_supported") != earlier.get("logging_supported"):
+                if name.endswith("logging-transitions") and current.get("logging_supported") != earlier.get("logging_supported"):
                     off_changes[name] = {}
                     for index in (0, 2):
                         now = current["stages"][index].get("off_gpu_trace") or {}
@@ -1666,6 +1764,8 @@ def freeze_artifacts(directory):
 def run(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("check", "baseline"))
+    parser.add_argument("--backend", choices=("ollama", "unsloth"), default="ollama",
+                        help="Select Ollama proxy workload (default) or the 90-second native Unsloth metrics workload")
     parser.add_argument("--output-dir", type=Path, help="New artifact directory; defaults to a unique untracked .performance-results directory")
     parser.add_argument("--budget", type=Path, default=BUDGET_PATH)
     parser.add_argument("--gpu-provider", choices=("powermetrics", "instruments"), default="powermetrics",
@@ -1704,6 +1804,10 @@ def run(argv=None):
     try:
         number(args.build_timeout, "--build-timeout", minimum=1, maximum=3600)
         report["budget"] = validate_budget(load_json(args.budget))
+        cases = backend_cases(report["budget"], args.backend)
+        if args.backend != "ollama":
+            report.update(backend=args.backend, workload_scope="native-metrics-with-synthetic-discovery",
+                          selected_cases=cases, scheduled_workload_seconds=90)
         suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + secrets.token_hex(3)
         output = args.output_dir.expanduser().resolve() if args.output_dir else ROOT / ".performance-results" / f"{args.mode}-{suffix}"
         require(not output.exists(), "Artifact directory already exists; evidence is never overwritten")
@@ -1718,7 +1822,8 @@ def run(argv=None):
         require(platform.system() == "Darwin", "Actual-app resource measurement requires macOS")
         started = time.monotonic()
         deadline = Deadline(300, cleanup_reserve=30)
-        print("Starting the 300-second performance stage (180 seconds of scheduled workloads).", flush=True)
+        scheduled = sum(stage["seconds"] for case in cases for stage in case["stages"])
+        print(f"Starting the 300-second performance stage ({scheduled} seconds of scheduled workloads).", flush=True)
         try:
             trace = make_trace_session(output, deadline, args.gpu_provider)
             report["trace_start"] = trace.start()
@@ -1739,10 +1844,15 @@ def run(argv=None):
         if capabilities.get("trace_coverage", {}).get("available") is not True:
             report["invalid"].append("Required fs_usage filesystem coverage is unavailable: "
                                      + str(capabilities.get("trace_coverage", {}).get("reason", "unspecified")))
-        fixture, upstream = launch_fixture(output, timeout=deadline.remaining(10))
+        if args.backend == "unsloth":
+            fixture, upstream = launch_fixture(output, timeout=deadline.remaining(10), backend="unsloth")
+        else:
+            fixture, upstream = launch_fixture(output, timeout=deadline.remaining(10))
         measurement = {"external_trace": True, "filesystem_provider": "fs_usage",
                        "fixture_schema_version": 2, "provenance": provenance}
-        for index, case in enumerate(report["budget"]["cases"]):
+        if args.backend != "ollama":
+            measurement["backend"] = args.backend
+        for index, case in enumerate(cases):
             deadline.remaining()
             print(f"Measuring {case['name']}…", flush=True)
             measured = run_case(case, paths["collector"], paths["app"], upstream, capabilities.get("gpu", {}),
@@ -1799,8 +1909,10 @@ def run(argv=None):
             report["performance_elapsed_seconds"] = time.monotonic() - (deadline.end - 300)
             if report["performance_elapsed_seconds"] > 300:
                 report["invalid"].append("The performance stage exceeded its hard 300-second deadline")
-        if len(report["cases"]) != 4:
-            report["invalid"].append("All four fresh-process cases were not completed")
+        expected_case_count = 3 if args.backend == "unsloth" else 4
+        if len(report["cases"]) != expected_case_count:
+            report["invalid"].append("All three selected fresh-process cases were not completed" if args.backend == "unsloth"
+                                     else "All four fresh-process cases were not completed")
         failures = bool(report["failures"] or any(case.get("failures") for case in report["cases"]))
         invalid = bool(report["invalid"] or any(case.get("invalid") for case in report["cases"]))
         report["status"] = "incomplete" if invalid else ("failed" if failures else ("baseline_recorded" if args.mode == "baseline" else "passed"))

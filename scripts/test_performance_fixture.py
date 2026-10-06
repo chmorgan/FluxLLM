@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -61,6 +62,63 @@ def await_result(server):
 
 
 class PerformanceFixtureTests(unittest.TestCase):
+    def test_native_routes_accept_production_non_autoloading_query_without_changing_ollama_routes(self):
+        for path in ("/metrics?autoload=false", "/props?autoload=false", "/health?autoload=false",
+                     "/metrics?autoload=false&model=fixture%3Alatest"):
+            with self.subTest(path=path):
+                handler = SimpleNamespace(
+                    path=path, server=SimpleNamespace(backend="unsloth", metrics_snapshot=lambda: {
+                        "llamacpp:requests_processing": 0}), send_json=mock.Mock(),
+                    send_response=mock.Mock(), send_header=mock.Mock(), end_headers=mock.Mock(),
+                    wfile=io.BytesIO())
+                FixtureHandler.do_GET(handler)
+                if path.startswith("/metrics"):
+                    handler.send_response.assert_called_once_with(200)
+                    self.assertEqual(handler.wfile.getvalue(), b"llamacpp:requests_processing 0\n")
+                else:
+                    self.assertEqual(handler.send_json.call_args.args[0], 200)
+        handler = SimpleNamespace(path="/api/version?autoload=false", server=SimpleNamespace(backend="ollama"),
+                                  send_json=mock.Mock())
+        FixtureHandler.do_GET(handler)
+        self.assertEqual(handler.send_json.call_args.args[0], 404)
+
+    def test_unsloth_metrics_expose_observed_external_stream_work_as_numeric_aggregates(self):
+        with running_server(create_server(backend="unsloth")) as server:
+            def metrics():
+                connection = HTTPConnection(*server.server_address, timeout=3)
+                try:
+                    connection.request("GET", "/metrics?autoload=false")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    return {line.split()[0]: float(line.split()[1])
+                            for line in response.read().decode().splitlines() if line and not line.startswith("#")}
+                finally:
+                    connection.close()
+            initial = metrics()
+            self.assertEqual(initial["llamacpp:tokens_predicted_total"], 0)
+            self.assertEqual(initial["llamacpp:requests_processing"], 0)
+            self.assertEqual(request(server, "/props?autoload=false")[1], {"model_alias": MODEL, "endpoint_metrics": True})
+            for path in ("/api/version", "/api/ps", "/api/tags"):
+                self.assertEqual(request(server, path)[0], 404)
+            acknowledgement = request(server, "/control/start", workload(server, duration_seconds=0.4))[1]
+            time.sleep(0.12)
+            active = metrics()
+            self.assertEqual(active["llamacpp:requests_processing"], 2)
+            self.assertGreater(active["llamacpp:tokens_predicted_total"], 0)
+            self.assertEqual(active["llamacpp:prompt_tokens_total"], 46)
+            self.assertEqual(active["llamacpp:predicted_tokens_seconds"], 160)
+            result = await_result(server)
+            terminal = metrics()
+            self.assertEqual(terminal["llamacpp:requests_processing"], 0)
+            self.assertEqual(terminal["llamacpp:tokens_predicted_total"], acknowledgement["expected_output_tokens"])
+            self.assertEqual(result["native_metrics"], terminal)
+            # Server counters remain cumulative over sequential workloads;
+            # new app lifetimes observe a baseline rather than forged usage.
+            request(server, "/control/start", workload(server, cycle=1))
+            second = await_result(server)
+            self.assertEqual(metrics()["llamacpp:tokens_predicted_total"],
+                             acknowledgement["expected_output_tokens"] + second["expected_output_tokens"])
+
     def test_discovery_and_idle_status(self):
         with running_server() as server:
             self.assertEqual(request(server, "/api/version")[1]["version"], "0.0.0-fluxllm-performance-fixture")
@@ -69,6 +127,9 @@ class PerformanceFixtureTests(unittest.TestCase):
             self.assertFalse(value["running"])
             self.assertFalse(value["forwarding_verified"])
             self.assertIsNone(value["error"])
+            self.assertNotIn("native_metrics", value)
+            self.assertEqual(request(server, "/metrics")[0], 404)
+            self.assertEqual(request(server, "/props")[0], 404)
 
     def test_incremental_streaming_counts_and_sequential_cycles(self):
         with running_server() as server:

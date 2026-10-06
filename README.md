@@ -62,7 +62,7 @@ available.
 ## Features
 
 A macOS 15+ menu bar app for monitoring LLM inference with Ollama, vLLM,
-Rapid-MLX, and llama.cpp. Shows token throughput, activity history, and this
+Rapid-MLX, llama.cpp, and local Unsloth Desktop/Studio. Shows token throughput, activity history, and this
 Mac’s total GPU utilization.
 
 Choose a backend in Settings. For Ollama, point clients using `/api/chat` or
@@ -70,6 +70,13 @@ Choose a backend in Settings. For Ollama, point clients using `/api/chat` or
 `localhost:11434`. Other backends are monitored directly through their metrics
 or status endpoints. Backend and menu-bar preference changes apply for the
 current launch and are not saved. Previously saved preferences are read at startup.
+
+For **Unsloth**, choose **Unsloth** and enter its local Studio address, normally
+`http://127.0.0.1:8888`. FluxLLM discovers the managed GGUF inference worker and
+follows its changing port when models reload. Clients keep using Unsloth directly.
+Monitoring is read-only and does not load models. Throughput is the worker's
+reported average; token counts are its server totals. Individual request history,
+tool-call accounting, remote Unsloth, and training telemetry are not included.
 
 Enable **Settings → General → Launch at login** to start FluxLLM automatically
 when you sign in. The change takes effect immediately, separately from other
@@ -131,17 +138,52 @@ These checks need no downloaded models, external inference servers, or signing
 secrets. Backend integration tests use local mock servers; release-script tests
 use fixtures and mock builds, signing, notarization, and GitHub operations.
 
-Three hardware tests are skipped by default. On a supported Mac, set the
+Hardware tests are skipped by default. On a supported Mac, set the
 corresponding environment variable when running `swift test` to opt in:
 
 | Environment variable | Hardware check |
 | --- | --- |
 | `FLUXLLM_GPU_PROBE=1` | Enumerate GPU accelerators and clients through IOKit. |
 | `FLUXLLM_GPU_LIVE=1` | Read GPU activity from an already-running local Ollama worker. |
+| `FLUXLLM_UNSLOTH_LIVE=1` | Read metrics from an already-running local Unsloth GGUF worker; never start inference. |
 | `FLUXLLM_SYSTEM_GPU_LIVE=1` | Read total system GPU utilization. |
 
 The live Ollama test does not start inference; start the required worker activity
 before running it. Regular GPU tests use fixtures and run in CI.
+
+Run the automated native Unsloth resource workload with:
+
+```sh
+python3 scripts/run_performance_checks.py baseline --backend unsloth
+```
+
+It builds the Release performance app and runs three fresh app lifetimes with
+90 seconds of scheduled load: never-opened UI, visible UI, and logging off/on/off.
+An external synthetic server applies idle, ordinary, and high-rate generation
+load. The app uses the production native metrics adapter with synthetic process
+discovery; real process discovery is covered separately by deterministic tests
+and the opt-in live check. No requests are sent to your real model.
+
+CPU, memory, writes, visibility, and GPU evidence use the existing resource gates.
+The default coarse GPU provider is still a capability probe and cannot grant a
+performance pass. Use `--gpu-provider instruments` for calibrated process GPU
+execution measurements; those recordings can affect CPU measurements. Missing
+administrator authorization for filesystem tracing also prevents a pass.
+Results and comparison tables are kept in ignored `.performance-results/`
+directories and are never overwritten. Use `check` instead of `baseline` to
+enforce the budgets against later changes. Native metrics do not supply individual
+request or tool histories, so this workload does not seed fabricated request data.
+
+For a read-only HTTP compatibility check against an already loaded model:
+
+```sh
+python3 scripts/unsloth_live_check.py --studio http://127.0.0.1:8888 \
+  --worker http://127.0.0.1:54234 --samples 10 \
+  --output .performance-results/unsloth-live-new
+```
+
+Replace the worker port with the current native worker's port. This check reports
+compatibility and counters; it does not measure app CPU or GPU consumption.
 
 ### Local desktop previews
 

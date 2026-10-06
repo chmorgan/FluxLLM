@@ -16,6 +16,8 @@ public final class PerformanceApplicationSession {
     public let preferencesSuite: String
     public let historyKind: String
     public let proxyPort: Int
+    public let backendKind: BackendKind
+    public let loadURL: URL
     public let fixtureManifest: PerformanceHistoryFixture.EquivalenceManifest
     public private(set) var shutdownError: String?
 
@@ -32,7 +34,8 @@ public final class PerformanceApplicationSession {
         store: MetricsStore, coordinator: MonitoringCoordinator,
         controller: MenuBarController, settings: AppSettings,
         historyDirectory: URL, preferencesSuite: String,
-        historyKind: String, proxyPort: Int, clock: PerformanceWorkloadClock,
+        historyKind: String, proxyPort: Int, backendKind: BackendKind, loadURL: URL,
+        clock: PerformanceWorkloadClock,
         defaults: UserDefaults, rawEnd: Date,
         fixtureManifest: PerformanceHistoryFixture.EquivalenceManifest,
         requestIdentity: PerformanceRequestIdentity, threadCPURegistration: [String: Any]?,
@@ -46,6 +49,8 @@ public final class PerformanceApplicationSession {
         self.preferencesSuite = preferencesSuite
         self.historyKind = historyKind
         self.proxyPort = proxyPort
+        self.backendKind = backendKind
+        self.loadURL = loadURL
         self.clock = clock
         self.defaults = defaults
         self.rawEnd = rawEnd
@@ -58,10 +63,23 @@ public final class PerformanceApplicationSession {
     public static func start(
         upstream: URL, historyDirectory: URL, preferencesSuite: String,
         populated: Bool, fixtureEndingAt: Date? = nil,
+        backendKind: BackendKind = .ollama,
         graphicsMode: PerformanceGraphicsDiagnostics.Mode = .normal,
         popoverAnimationsEnabled: Bool = true, threadCPUAccountingEnabled: Bool = false,
         nioCPUAccountingEnabled: Bool = false
     ) async throws -> PerformanceApplicationSession {
+        guard [.ollama, .unsloth].contains(backendKind) else {
+            throw PerformanceSessionError.invalid("Unsupported performance backend")
+        }
+        guard backendKind != .unsloth || !populated else {
+            throw PerformanceSessionError.invalid(
+                "Native Unsloth performance requires fresh history; request/tool history is not observed"
+            )
+        }
+        guard backendKind != .unsloth || !nioCPUAccountingEnabled else {
+            throw PerformanceSessionError.invalid(
+                "Native Unsloth uses no proxy; NIO CPU accounting is unavailable")
+        }
         guard !nioCPUAccountingEnabled || threadCPUAccountingEnabled else {
             throw PerformanceSessionError.invalid(
                 "Scoped NIO CPU accounting requires direct thread CPU accounting")
@@ -79,10 +97,11 @@ public final class PerformanceApplicationSession {
             PerformanceArrivalDiagnostics.shared.enable()
         }
         let settings = AppSettings(defaults: defaults)
-        settings.backendSelection = .ollama
+        settings.backendSelection = backendKind == .unsloth ? .unsloth : .ollama
         settings.ollamaHost = "127.0.0.1"
         settings.ollamaPort = upstreamPort
-        let source = "ollama|\(upstream.absoluteString)|"
+        if backendKind == .unsloth { settings.backendEndpoints[.unsloth] = upstream.absoluteString }
+        let source = "\(backendKind.rawValue)|\(upstream.absoluteString)|"
         let rawEnd = fixtureEndingAt ?? Date()
         let clock = PerformanceWorkloadClock(
             now: populated ? rawEnd.addingTimeInterval(-MetricsStore.chartWindow) : rawEnd)
@@ -93,9 +112,19 @@ public final class PerformanceApplicationSession {
             clock: { clock.now }, usageHistory: seeded?.usage, chartArchive: seeded?.archive)
         let proxyHolder = PerformanceProxyHolder()
         let requestIdentity = PerformanceRequestIdentity()
+        let client: any BackendClientProtocol
+        if backendKind == .unsloth {
+            // Only discovery is synthetic. Worker detection, capabilities,
+            // scrapes, resets, activity and UI follow the production adapter.
+            client = UnslothBackendClient(
+                normal: HTTPBackendClient(),
+                discovery: PerformanceFixtureUnslothDiscovery(upstream: upstream))
+        } else {
+            client = PerformanceBackendClient(upstream: upstream, clock: clock)
+        }
         let coordinator = MonitoringCoordinator(
             settings: settings, store: store,
-            client: PerformanceBackendClient(upstream: upstream, clock: clock),
+            client: client,
             gpuMonitor: PerformanceWorkloadGPU(clock: clock),
             proxyFactory: { configuration, epoch in
                 let proxy = ProxyManager(
@@ -118,28 +147,35 @@ public final class PerformanceApplicationSession {
         controller.start()
         await coordinator.start()
         guard store.connectionState == .ready, store.historySource == source,
-            let proxyPort = proxyHolder.proxy?.boundPort
+            backendKind == .unsloth || proxyHolder.proxy?.boundPort != nil
         else {
             controller.stop()
             await coordinator.stop()
             throw PerformanceSessionError.invalid("The isolated fixture failed to become ready")
         }
+        let proxyPort = proxyHolder.proxy?.boundPort ?? 0
         let threadCPURegistration: [String: Any]?
         do {
             if threadCPUAccountingEnabled {
-                guard pthread_main_np() == 1, let proxy = proxyHolder.proxy else {
-                    throw PerformanceSessionError.invalid(
-                        "The measured UI thread or proxy is unavailable")
+                guard pthread_main_np() == 1 else {
+                    throw PerformanceSessionError.invalid("The measured UI thread is unavailable")
                 }
                 let mainID = try PerformanceThreadIdentity.current()
-                let nioID = try await proxy.performanceEventLoopThreadID()
-                guard mainID != nioID else {
-                    throw PerformanceSessionError.invalid(
-                        "UI and networking thread identities must differ")
+                var roles = ["main": mainID]
+                if backendKind == .ollama {
+                    guard let proxy = proxyHolder.proxy else {
+                        throw PerformanceSessionError.invalid("The measured proxy is unavailable")
+                    }
+                    let nioID = try await proxy.performanceEventLoopThreadID()
+                    guard mainID != nioID else {
+                        throw PerformanceSessionError.invalid(
+                            "UI and networking thread identities must differ")
+                    }
+                    roles["nio"] = nioID
                 }
                 threadCPURegistration = [
                     "schema_version": 1, "process_id": getpid(),
-                    "roles": ["main": mainID, "nio": nioID],
+                    "roles": roles,
                 ]
             } else {
                 threadCPURegistration = nil
@@ -191,7 +227,8 @@ public final class PerformanceApplicationSession {
             store: store, coordinator: coordinator, controller: controller,
             settings: settings, historyDirectory: historyDirectory,
             preferencesSuite: preferencesSuite, historyKind: populated ? "populated" : "fresh",
-            proxyPort: proxyPort, clock: clock, defaults: defaults, rawEnd: rawEnd,
+            proxyPort: proxyPort, backendKind: backendKind, loadURL: upstream,
+            clock: clock, defaults: defaults, rawEnd: rawEnd,
             fixtureManifest: manifest, requestIdentity: requestIdentity,
             threadCPURegistration: threadCPURegistration,
             nioCPUProxy: nioCPUAccountingEnabled ? proxyHolder.proxy : nil)
@@ -312,6 +349,16 @@ public final class PerformanceApplicationSession {
         ]
         if let threadCPURegistration { snapshot["thread_cpu_registration"] = threadCPURegistration }
         if let nioCPUSnapshot { snapshot["nio_cpu"] = nioCPUSnapshot.dictionary }
+        if backendKind == .unsloth {
+            snapshot["backend_kind"] = backendKind.rawValue
+            snapshot["discovery_scope"] = "synthetic-stable-loopback"
+            snapshot["request_observation"] = "unavailable-native-aggregate"
+            snapshot["backend_output_tokens"] = store.backendOutputTokens as Any? ?? NSNull()
+            snapshot["backend_prompt_tokens"] = store.backendPromptTokens as Any? ?? NSNull()
+            snapshot["running_requests"] = store.runningRequests as Any? ?? NSNull()
+            snapshot["queued_requests"] = store.queuedRequests as Any? ?? NSNull()
+            snapshot["throughput_basis"] = store.throughputBasis.rawValue
+        }
         return snapshot
     }
 
@@ -346,6 +393,23 @@ private final class PerformanceWorkloadClock {
 @MainActor
 private final class PerformanceProxyHolder {
     var proxy: ProxyManager?
+}
+
+/// This fixture does not discover or attribute resource use to real processes.
+/// Negative identities cannot be confused with a real macOS PID; the external
+/// resource collector independently measures the performance app and children.
+private actor PerformanceFixtureUnslothDiscovery: UnslothDiscovering {
+    let upstream: URL
+    init(upstream: URL) { self.upstream = upstream }
+    func servers() async -> [UnslothServer] {
+        [
+            UnslothServer(
+                studioURL: upstream, workerURL: upstream,
+                studioIdentity: GPUProcessIdentity(pid: -1, startTimeMicroseconds: 1),
+                workerIdentity: GPUProcessIdentity(pid: -2, startTimeMicroseconds: 1))
+        ]
+    }
+    func reset() async {}
 }
 
 private actor PerformanceBackendClient: BackendClientProtocol {
