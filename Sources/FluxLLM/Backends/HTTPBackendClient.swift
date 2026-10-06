@@ -136,6 +136,9 @@ public actor HTTPBackendClient: BackendClientProtocol {
             case .vllm: return try await sampleVLLM(configuration)
             case .rapidMLX: return try await sampleRapid(configuration)
             case .llamaCpp: return try await sampleLlama(configuration)
+            case .unsloth:
+                throw BackendClientError.configurationRequired(
+                    "Unsloth monitoring requires local inference-worker discovery.")
             }
         } catch {
             // Never bridge an outage with a throughput estimate on reconnection.

@@ -75,6 +75,7 @@ public final class AppSettings: ObservableObject {
             return BackendConfiguration(kind: kind, baseURL: url, proxyPort: proxyPort)
         }
         let url = try Self.endpointURL(backendEndpoints[kind] ?? kind.defaultEndpoint)
+        if kind == .unsloth { try Self.validateUnslothEndpoint(url) }
         let model = llamaCppModel.trimmingCharacters(in: .whitespacesAndNewlines)
         return BackendConfiguration(
             kind: kind, baseURL: url,
@@ -101,6 +102,18 @@ public final class AppSettings: ObservableObject {
             throw SettingsError.invalid("Enter a valid backend URL.")
         }
         return url
+    }
+
+    /// Passive Unsloth monitoring resolves the local worker behind Studio.
+    /// A public API URL is not the native metrics endpoint.
+    public nonisolated static func validateUnslothEndpoint(_ url: URL) throws {
+        guard url.scheme == "http", LocalBackendEndpoint(url) != nil,
+            url.path.isEmpty || url.path == "/"
+        else {
+            throw SettingsError.invalid(
+                "Enter the local Unsloth Studio address, such as http://127.0.0.1:8888, without an API path. Remote Unsloth monitoring is not supported."
+            )
+        }
     }
 
     public nonisolated static func validationError(

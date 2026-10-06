@@ -36,7 +36,7 @@ public final class MonitoringCoordinator {
 
     public init(
         settings: AppSettings, store: MetricsStore,
-        client: any BackendClientProtocol = HTTPBackendClient(),
+        client: any BackendClientProtocol = UnslothBackendClient(),
         gpuMonitor: any BackendGPUMonitoring = SystemGPUMonitor(),
         proxyFactory: (@MainActor (BackendConfiguration, UUID) -> any MonitoringProxy)? = nil,
         pollInterval: Duration = .seconds(1), discoveryInterval: Duration = .seconds(5),
@@ -325,7 +325,8 @@ public final class MonitoringCoordinator {
     private func detectBackends() async -> [DetectedBackend] {
         let urls = detectionURLs()
         let client = client
-        return await withTaskGroup(of: DetectedBackend?.self) { group in
+        async let local = client.discoverLocalBackends()
+        let probed = await withTaskGroup(of: DetectedBackend?.self) { group in
             for url in urls {
                 group.addTask { try? await client.detect(at: url) }
             }
@@ -335,9 +336,12 @@ public final class MonitoringCoordinator {
             }
             return found.sorted { $0.id < $1.id }
         }
+        let found = await local + probed
+        return Dictionary(found.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            .values.sorted { $0.id < $1.id }
     }
 
-    /// Saved endpoints first, then three known loopback ports. Never scan a network.
+    /// Saved endpoints and known loopback defaults. Never scan a network.
     func detectionURLs() -> [URL] {
         let configured = BackendKind.allCases.compactMap {
             try? settings.configuration(for: $0).baseURL

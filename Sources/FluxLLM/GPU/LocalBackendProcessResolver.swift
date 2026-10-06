@@ -169,7 +169,7 @@ public actor LocalBackendProcessResolver: BackendProcessResolving {
                 return false
             }
             return arguments.dropFirst().first == "serve"
-        case .llamaCpp:
+        case .llamaCpp, .unsloth:
             return name == "llama-server" || name == "llama-server-metal"
         case .rapidMLX:
             guard isPython(process), let arguments = inspector.arguments(of: process.identity)
@@ -200,7 +200,7 @@ public actor LocalBackendProcessResolver: BackendProcessResolving {
             return (name == "ollama" && arguments.dropFirst().first == "runner")
                 || name == "ollama_llama_server" || name == "ollama-runner"
                 || name == "llama-server"
-        case .llamaCpp:
+        case .llamaCpp, .unsloth:
             return name == "llama-server" || name == "llama-server-metal"
         case .rapidMLX, .vllm:
             guard isPython(process), process.executablePath == root.executablePath else {
@@ -323,18 +323,26 @@ protocol LocalBackendProcessInspecting: Sendable {
 }
 
 /// Public libproc socket/process interfaces avoid spawning helpers or requiring root.
-struct DarwinBackendProcessInspector: LocalBackendProcessInspecting {
+struct DarwinBackendProcessInspector: LocalBackendProcessInspecting, UnslothProcessInspecting {
     func snapshot(for endpoint: LocalBackendEndpoint) -> LocalBackendProcessSnapshot {
-        let requested = Int(proc_listallpids(nil, 0))
-        guard requested > 0 else {
-            return LocalBackendProcessSnapshot(processes: [:], listeners: [])
+        let processes = inventory()
+        var listeners: Set<Int32> = []
+        for process in processes.values {
+            if listens(process.identity.pid, at: endpoint) {
+                listeners.insert(process.identity.pid)
+            }
         }
+        return LocalBackendProcessSnapshot(processes: processes, listeners: listeners)
+    }
+
+    func inventory() -> [Int32: LocalBackendProcess] {
+        let requested = Int(proc_listallpids(nil, 0))
+        guard requested > 0 else { return [:] }
         var pids = [Int32](repeating: 0, count: min(requested + 128, 32_768))
         let count = pids.withUnsafeMutableBytes {
             Int(proc_listallpids($0.baseAddress, Int32($0.count)))
         }
         var processes: [Int32: LocalBackendProcess] = [:]
-        var listeners: Set<Int32> = []
         for pid in pids.prefix(max(0, min(count, pids.count))) where pid > 0 {
             guard let info = bsdInfo(pid), let identity = identity(pid, info: info),
                 let path = executablePath(pid)
@@ -342,9 +350,20 @@ struct DarwinBackendProcessInspector: LocalBackendProcessInspecting {
             processes[pid] = LocalBackendProcess(
                 identity: identity, parentPID: Int32(bitPattern: info.pbi_ppid),
                 executablePath: path)
-            if listens(pid, at: endpoint) { listeners.insert(pid) }
         }
-        return LocalBackendProcessSnapshot(processes: processes, listeners: listeners)
+        return processes
+    }
+
+    func listeningEndpoints(of identity: GPUProcessIdentity) -> [LocalBackendTCPListener] {
+        guard self.identity(of: identity.pid) == identity else { return [] }
+        let endpoints = Set(listeningSockets(identity.pid).flatMap { literalLoopbackEndpoints($0) })
+        // Do not attach descriptors read during process exit or PID reuse to the
+        // previous owner. The caller also revalidates the ancestry before publishing.
+        guard self.identity(of: identity.pid) == identity else { return [] }
+        return endpoints.sorted {
+            if $0.port != $1.port { return $0.port < $1.port }
+            return $0.host == .ipv4 && $1.host == .ipv6
+        }
     }
 
     func identity(of pid: Int32) -> GPUProcessIdentity? {
@@ -418,15 +437,23 @@ struct DarwinBackendProcessInspector: LocalBackendProcessInspecting {
     }
 
     private func listens(_ pid: Int32, at endpoint: LocalBackendEndpoint) -> Bool {
+        listeningSockets(pid).contains {
+            UInt16(bigEndian: UInt16(truncatingIfNeeded: $0.insi_lport)) == endpoint.port
+                && matches($0, endpoint: endpoint)
+        }
+    }
+
+    private func listeningSockets(_ pid: Int32) -> [in_sockinfo] {
         let needed = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
-        guard needed > 0 else { return false }
+        guard needed > 0 else { return [] }
         let size = MemoryLayout<proc_fdinfo>.size
         let capacity = min(Int(needed) / size + 16, 16_384)
         var descriptors = [proc_fdinfo](repeating: proc_fdinfo(), count: capacity)
         let count = descriptors.withUnsafeMutableBytes {
             proc_pidinfo(pid, PROC_PIDLISTFDS, 0, $0.baseAddress, Int32($0.count))
         }
-        guard count > 0 else { return false }
+        guard count > 0 else { return [] }
+        var sockets: [in_sockinfo] = []
         for descriptor in descriptors.prefix(min(Int(count) / size, capacity))
         where descriptor.proc_fdtype == PROX_FDTYPE_SOCKET {
             var socket = socket_fdinfo()
@@ -438,14 +465,29 @@ struct DarwinBackendProcessInspector: LocalBackendProcessInspecting {
                 socket.psi.soi_kind == SOCKINFO_TCP
             else { continue }
             let tcp = socket.psi.soi_proto.pri_tcp
-            guard tcp.tcpsi_state == TSI_S_LISTEN,
-                UInt16(bigEndian: UInt16(truncatingIfNeeded: tcp.tcpsi_ini.insi_lport))
-                    == endpoint.port,
-                matches(tcp.tcpsi_ini, endpoint: endpoint)
-            else { continue }
-            return true
+            guard tcp.tcpsi_state == TSI_S_LISTEN else { continue }
+            sockets.append(tcp.tcpsi_ini)
         }
-        return false
+        return sockets
+    }
+
+    func literalLoopbackEndpoints(_ socket: in_sockinfo) -> [LocalBackendTCPListener] {
+        let port = UInt16(bigEndian: UInt16(truncatingIfNeeded: socket.insi_lport))
+        guard port > 0 else { return [] }
+        var endpoints: [LocalBackendTCPListener] = []
+        if socket.insi_vflag & UInt8(INI_IPV4) != 0,
+            UInt32(bigEndian: socket.insi_laddr.ina_46.i46a_addr4.s_addr) == 0x7F00_0001
+        {
+            endpoints.append(LocalBackendTCPListener(host: .ipv4, port: port))
+        }
+        if socket.insi_vflag & UInt8(INI_IPV6) != 0 {
+            var address = socket.insi_laddr.ina_6
+            let bytes = withUnsafeBytes(of: &address) { Array($0) }
+            if bytes.prefix(15).allSatisfy({ $0 == 0 }) && bytes.last == 1 {
+                endpoints.append(LocalBackendTCPListener(host: .ipv6, port: port))
+            }
+        }
+        return endpoints
     }
 
     func matches(_ socket: in_sockinfo, endpoint: LocalBackendEndpoint) -> Bool {

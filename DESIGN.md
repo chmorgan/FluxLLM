@@ -35,6 +35,7 @@ menu-bar startup path. Registration changes are serialized, and failures show th
 | vLLM | `http://127.0.0.1:8000` | `/metrics` generated-token counter deltas over monotonic elapsed time |
 | Rapid-MLX | `http://127.0.0.1:8000` | `/v1/status` server-reported average |
 | llama.cpp | `http://127.0.0.1:8080` | `/metrics` server-reported throughput gauge |
+| Unsloth | Studio at `http://127.0.0.1:8888` | Managed local GGUF worker's llama.cpp `/metrics` |
 
 Native collectors observe direct client traffic without a proxy or Prometheus installation. vLLM needs two valid
 scrapes; resets, changed series, or gaps reset the baseline. llama.cpp requires `--metrics`; router mode
@@ -44,6 +45,12 @@ Discovery probes configured endpoints and these loopback defaults using bounded,
 Backend-specific responses establish identity; a port or generic OpenAI-compatible model list does not. Automatic selection
 retains its previous detected choice or selects a sole detection; unresolved choices go to Settings. Manual
 selection remains in effect for the current launch. Scan Again does not restart collection.
+
+Unsloth discovery verifies its managed Studio launch, worker ancestry, PID birth identity, and native
+listening sockets. The configured Studio address stays stable while the worker's port changes. Cached
+libproc inspection avoids spawning process-list helpers or scanning unrelated sockets on each poll.
+The native llama.cpp collector supplies average throughput and server token totals; it does not observe
+individual requests or tools. Remote Studio and non-GGUF/training backends are outside this adapter's scope.
 
 App settings read existing saved preferences at startup for compatibility. Changes to backend selection,
 endpoints, menu-bar preferences, and automatic-selection memory apply only to the current launch. They do not

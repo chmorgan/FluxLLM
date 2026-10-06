@@ -1,7 +1,7 @@
 import Foundation
 
 public enum BackendKind: String, Codable, CaseIterable, Identifiable, Sendable {
-    case ollama, vllm, rapidMLX, llamaCpp
+    case ollama, vllm, rapidMLX, llamaCpp, unsloth
 
     public var id: String { rawValue }
     public var title: String {
@@ -10,6 +10,7 @@ public enum BackendKind: String, Codable, CaseIterable, Identifiable, Sendable {
         case .vllm: "vLLM"
         case .rapidMLX: "Rapid-MLX"
         case .llamaCpp: "llama.cpp"
+        case .unsloth: "Unsloth"
         }
     }
     public var defaultEndpoint: String {
@@ -17,12 +18,13 @@ public enum BackendKind: String, Codable, CaseIterable, Identifiable, Sendable {
         case .ollama: "http://127.0.0.1:11434"
         case .vllm, .rapidMLX: "http://127.0.0.1:8000"
         case .llamaCpp: "http://127.0.0.1:8080"
+        case .unsloth: "http://127.0.0.1:8888"
         }
     }
 }
 
 public enum BackendSelection: String, Codable, CaseIterable, Identifiable, Sendable {
-    case automatic, ollama, vllm, rapidMLX, llamaCpp
+    case automatic, ollama, vllm, rapidMLX, llamaCpp, unsloth
     public var id: String { rawValue }
     public var kind: BackendKind? { BackendKind(rawValue: rawValue) }
     public var title: String { kind?.title ?? "Automatic" }
@@ -123,12 +125,14 @@ public struct BackendSample: Sendable {
 
 /// Implementations must make read-only requests and never activate a model.
 public protocol BackendClientProtocol: Sendable {
+    func discoverLocalBackends() async -> [DetectedBackend]
     func detect(at baseURL: URL) async throws -> DetectedBackend?
     func sample(_ configuration: BackendConfiguration) async throws -> BackendSample
     func reset() async
 }
 
 extension BackendClientProtocol {
+    public func discoverLocalBackends() async -> [DetectedBackend] { [] }
     public func reset() async {}
 }
 

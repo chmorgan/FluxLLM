@@ -320,11 +320,21 @@ public struct SettingsView: View {
     private func nativeConfiguration(_ kind: BackendKind) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("\(kind.title) connection").font(.headline)
-            TextField("Server URL", text: endpointBinding(kind))
+            TextField(
+                kind == .unsloth ? "Unsloth Studio URL" : "Server URL", text: endpointBinding(kind))
             if kind == .llamaCpp {
                 TextField("Model name (optional)", text: $llamaCppModel)
                 Text(
                     "Start llama.cpp with --metrics. For router mode, enter the model name you want to monitor."
+                )
+                .font(.caption).foregroundStyle(.secondary)
+            } else if kind == .unsloth {
+                Text(
+                    "Enter the local Studio address, normally http://127.0.0.1:8888. FluxLLM follows its GGUF inference worker automatically. Keep using Unsloth normally; no client proxy is needed."
+                )
+                .font(.caption).foregroundStyle(.secondary)
+                Text(
+                    "Request history and tool-call accounting are not available for Unsloth. System GPU measures this Mac."
                 )
                 .font(.caption).foregroundStyle(.secondary)
             } else {
@@ -370,7 +380,10 @@ public struct SettingsView: View {
             ? BackendKind.allCases.filter { $0 != .ollama }
             : selection.kind.map { $0 == .ollama ? [] : [$0] } ?? []
         for kind in kinds {
-            do { _ = try AppSettings.endpointURL(endpoints[kind] ?? kind.defaultEndpoint) } catch {
+            do {
+                let url = try AppSettings.endpointURL(endpoints[kind] ?? kind.defaultEndpoint)
+                if kind == .unsloth { try AppSettings.validateUnslothEndpoint(url) }
+            } catch {
                 return "\(kind.title): \(error.localizedDescription)"
             }
         }

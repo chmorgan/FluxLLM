@@ -118,10 +118,10 @@ final class MonitoringCoordinatorTests: XCTestCase {
 
     func testDetectionIsBoundedAndCoalescesDefaultPortAndLocalhostAliases() throws {
         let context = try makeContext(detections: [])
-        XCTAssertEqual(context.coordinator.detectionURLs().count, 3)
+        XCTAssertEqual(context.coordinator.detectionURLs().count, 4)
         context.settings.backendEndpoints[.vllm] = "https://inference.example/service"
         let urls = context.coordinator.detectionURLs()
-        XCTAssertEqual(urls.count, 4)
+        XCTAssertEqual(urls.count, 5)
         XCTAssertTrue(urls.contains { $0.absoluteString == "https://inference.example/service" })
         context.removeDefaults()
     }
