@@ -36,7 +36,8 @@ public struct BackendConfiguration: Equatable, Sendable {
     public let model: String?
     public let proxyPort: Int
     public let studioMonitorToken: String?
-    /// An explicitly supplied, session-only credential for the verified local Unsloth worker.
+    /// A session-only worker credential override. Unsloth resolves the verified worker's
+    /// current launch key automatically when this is nil.
     public let workerAPIKey: String?
 
     public init(

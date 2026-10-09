@@ -1,7 +1,8 @@
 import Foundation
 
 /// Follows a verified local Studio's native inference worker without changing the
-/// configured endpoint, requesting generation, loading models, or discovering credentials.
+/// configured endpoint, requesting generation, or loading models. Automatic credentials
+/// come only from the verified worker's private launch key file.
 /// The production llama.cpp adapter remains the source of every reported value.
 public actor UnslothBackendClient: BackendClientProtocol {
     private struct CachedWorker {
@@ -17,12 +18,15 @@ public actor UnslothBackendClient: BackendClientProtocol {
 
     private let normal: any BackendClientProtocol
     private let discovery: any UnslothDiscovering
+    private let workerKeyReader: any UnslothWorkerKeyReading
     private let studioMonitor: UnslothStudioMonitor
     private let wallClock: @Sendable () -> Date
     private var workers: [String: CachedWorker] = [:]
     private var monitorSources: [String: MonitorSource] = [:]
     private var epoch: UInt64 = 0
     private var workerRevision: UInt64 = 0
+    private var nextCredentialLookup: UInt64 = 0
+    private var credentialLookups: [String: UInt64] = [:]
 
     private struct MonitorSource {
         let studioIdentity: GPUProcessIdentity
@@ -33,11 +37,13 @@ public actor UnslothBackendClient: BackendClientProtocol {
     public init(
         normal: any BackendClientProtocol = HTTPBackendClient(),
         discovery: any UnslothDiscovering = UnslothProcessDiscovery(),
+        workerKeyReader: any UnslothWorkerKeyReading = UnslothWorkerKeyReader(),
         studioMonitorTransport: HTTPBackendClient.Transport? = nil,
         wallClock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.normal = normal
         self.discovery = discovery
+        self.workerKeyReader = workerKeyReader
         self.studioMonitor = UnslothStudioMonitor(transport: studioMonitorTransport)
         self.wallClock = wallClock
     }
@@ -46,6 +52,7 @@ public actor UnslothBackendClient: BackendClientProtocol {
         epoch &+= 1
         workerRevision &+= 1
         workers.removeAll()
+        credentialLookups.removeAll()
         monitorSources.removeAll()
         await discovery.reset()
         await normal.reset()
@@ -151,14 +158,14 @@ public actor UnslothBackendClient: BackendClientProtocol {
             await discardWorker(key)
             throw BackendClientError.configurationRequired(Self.unloadedMessage)
         }
-        let verified: (DetectedBackend, Operation)
+        let verified: (DetectedBackend, Operation, String?)
         do {
             verified = try await verifiedWorker(
                 server, workerAPIKey: configuration.workerAPIKey, requestedEpoch: requestedEpoch)
         } catch {
             throw Self.workerError(error)
         }
-        let (detected, operation) = verified
+        let (detected, operation, resolvedWorkerAPIKey) = verified
         guard detected.supportsLiveMetrics else {
             throw BackendClientError.configurationRequired(Self.metricsMessage)
         }
@@ -172,7 +179,7 @@ public actor UnslothBackendClient: BackendClientProtocol {
             let sample = try await normal.sample(
                 .init(
                     kind: .llamaCpp, baseURL: workerURL, model: configuration.model,
-                    proxyPort: configuration.proxyPort, workerAPIKey: configuration.workerAPIKey))
+                    proxyPort: configuration.proxyPort, workerAPIKey: resolvedWorkerAPIKey))
             try check(operation)
             var nativeRequests = sample.nativeRequests
             var detail = sample.detail
@@ -264,7 +271,7 @@ public actor UnslothBackendClient: BackendClientProtocol {
             return unavailable(studio.studioURL, detail: Self.unloadedMessage)
         }
         do {
-            let (native, operation) = try await verifiedWorker(
+            let (native, operation, _) = try await verifiedWorker(
                 studio, workerAPIKey: workerAPIKey, requestedEpoch: requestedEpoch)
             let current = await discovery.servers().filter {
                 Self.localEndpointKey($0.studioURL) == Self.localEndpointKey(studio.studioURL)
@@ -292,14 +299,15 @@ public actor UnslothBackendClient: BackendClientProtocol {
     private func verifiedWorker(
         _ server: UnslothServer, workerAPIKey: String?, requestedEpoch: UInt64
     ) async throws
-        -> (DetectedBackend, Operation)
+        -> (DetectedBackend, Operation, String?)
     {
         try checkEpoch(requestedEpoch)
         guard let key = Self.localEndpointKey(server.studioURL),
             let workerURL = server.workerURL, let workerIdentity = server.workerIdentity,
             workerIdentity != server.studioIdentity,
             let workerKey = Self.localEndpointKey(workerURL),
-            Self.credentialScope(workerAPIKey) == nil || workerKey != key,
+            (Self.credentialScope(workerAPIKey) == nil && server.workerKeySource == .none)
+                || workerKey != key,
             let workerHost = URLComponents(url: workerURL, resolvingAgainstBaseURL: false)?.host,
             ["127.0.0.1", "::1"].contains(
                 workerHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]")))
@@ -307,11 +315,14 @@ public actor UnslothBackendClient: BackendClientProtocol {
             throw BackendClientError.configurationRequired(
                 "Unsloth monitoring requires a verified local llama.cpp inference worker.")
         }
-        let credentialScope = Self.credentialScope(workerAPIKey)
+        let resolvedKey = try await resolveWorkerAPIKey(
+            for: server, endpointKey: key, override: workerAPIKey,
+            requestedEpoch: requestedEpoch)
+        let credentialScope = Self.credentialScope(resolvedKey)
         if let cached = workers[key], cached.server == server,
             cached.credentialScope == credentialScope, let detected = cached.detected
         {
-            return (detected, currentOperation)
+            return (detected, currentOperation, resolvedKey)
         }
         if let cached = workers[key],
             cached.server != server || cached.credentialScope != credentialScope
@@ -331,7 +342,7 @@ public actor UnslothBackendClient: BackendClientProtocol {
         do {
             guard
                 let detected = try await normal.detect(
-                    .init(kind: .llamaCpp, baseURL: workerURL, workerAPIKey: workerAPIKey)),
+                    .init(kind: .llamaCpp, baseURL: workerURL, workerAPIKey: resolvedKey)),
                 detected.kind == .llamaCpp
             else {
                 try check(operation)
@@ -342,10 +353,37 @@ public actor UnslothBackendClient: BackendClientProtocol {
             try check(operation)
             workers[key] = CachedWorker(
                 server: server, credentialScope: credentialScope, detected: detected)
-            return (detected, operation)
+            return (detected, operation, resolvedKey)
         } catch {
             try check(operation)
             workers.removeValue(forKey: key)
+            throw error
+        }
+    }
+
+    private func resolveWorkerAPIKey(
+        for server: UnslothServer, endpointKey: String, override: String?, requestedEpoch: UInt64
+    ) async throws -> String? {
+        try checkEpoch(requestedEpoch)
+        nextCredentialLookup &+= 1
+        let lookup = nextCredentialLookup
+        if credentialLookups.count >= 16, credentialLookups[endpointKey] == nil {
+            credentialLookups.removeAll()
+        }
+        credentialLookups[endpointKey] = lookup
+        if let explicitKey = Self.credentialScope(override) { return explicitKey }
+        // Confirmed keyless workers need neither file I/O nor another suspension.
+        if server.workerKeySource == .none { return nil }
+        let operation = currentOperation
+        do {
+            let automaticKey = try await workerKeyReader.key(for: server)
+            try check(operation)
+            guard credentialLookups[endpointKey] == lookup else { throw CancellationError() }
+            return Self.credentialScope(automaticKey)
+        } catch {
+            try check(operation)
+            guard credentialLookups[endpointKey] == lookup else { throw CancellationError() }
+            await discardWorker(endpointKey)
             throw error
         }
     }
@@ -383,7 +421,10 @@ public actor UnslothBackendClient: BackendClientProtocol {
         "The Unsloth inference worker has metrics disabled. Enable metrics support in Studio's llama.cpp backend and reload the model."
 
     private static func credentialScope(_ key: String?) -> String? {
-        key.flatMap { $0.isEmpty ? nil : $0 }
+        key.flatMap {
+            let normalized = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return normalized.isEmpty ? nil : normalized
+        }
     }
 
     private static func workerError(_ error: Error) -> Error {
@@ -391,7 +432,7 @@ public actor UnslothBackendClient: BackendClientProtocol {
             code == 401 || code == 403
         else { return error }
         return BackendClientError.configurationRequired(
-            "Unsloth worker authentication failed (HTTP \(code)). Enter the current worker API key in Settings. Unsloth can replace this key when the worker restarts; the Studio monitor token is separate."
+            "Unsloth worker authentication failed (HTTP \(code)). Clear any manual worker API key in Settings to use automatic authentication, or update the override when the worker restarts. The Studio monitor token is separate and does not authenticate the worker."
         )
     }
 

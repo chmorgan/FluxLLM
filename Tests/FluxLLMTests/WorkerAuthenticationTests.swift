@@ -225,6 +225,207 @@ final class WorkerAuthenticationTests: XCTestCase {
             studioRequests.first?.value(forHTTPHeaderField: "Authorization"), "Bearer studio-token")
     }
 
+    func testAutomaticWorkerKeyAuthenticatesDiscoveryAndSamplingWithoutEnteringSettings()
+        async throws
+    {
+        let transport = AuthenticatedWorkerTransport(key: "automatic-key")
+        let reader = AutomaticWorkerKeyStub(key: "automatic-key")
+        let server = verifiedServer(workerKeySource: automaticSource())
+        let client = makeUnsloth(transport, servers: [server], workerKeyReader: reader)
+        let configuration = BackendConfiguration(
+            kind: .unsloth, baseURL: studio, studioMonitorToken: "studio-token")
+        let detections = await client.discoverLocalBackends(configurations: [configuration])
+        XCTAssertTrue(detections.first?.isReady == true)
+        let sample = try await client.sample(configuration)
+        XCTAssertEqual(sample.kind, .unsloth)
+        XCTAssertEqual(sample.model, "worker-model")
+        XCTAssertNil(configuration.workerAPIKey)
+        let reads = await reader.servers
+        XCTAssertEqual(reads, [server, server])
+        let requests = await transport.requests
+        let workerRequests = requests.filter { $0.url?.port == 54234 }
+        XCTAssertEqual(
+            workerRequests.map { $0.url?.path }, ["/metrics", "/metrics", "/props", "/slots"])
+        XCTAssertTrue(
+            workerRequests.allSatisfy {
+                $0.value(forHTTPHeaderField: "Authorization") == "Bearer automatic-key"
+                    && $0.httpMethod == "GET"
+            })
+        let studioRequests = requests.filter { $0.url?.port == 8888 }
+        XCTAssertEqual(studioRequests.map { $0.url?.path }, ["/api/inference/monitor"])
+        XCTAssertEqual(
+            studioRequests.first?.value(forHTTPHeaderField: "Authorization"), "Bearer studio-token")
+    }
+
+    func testManualWorkerOverrideTakesPrecedenceAndBlankRestoresAutomaticLookup() async throws {
+        let transport = AuthenticatedWorkerTransport(key: "override-key")
+        let reader = AutomaticWorkerKeyStub(key: "automatic-key")
+        let client = makeUnsloth(
+            transport, servers: [verifiedServer(workerKeySource: automaticSource())],
+            workerKeyReader: reader)
+        let manual = BackendConfiguration(
+            kind: .unsloth, baseURL: studio, workerAPIKey: "override-key")
+        _ = try await client.sample(manual)
+        let manualReads = await reader.servers
+        XCTAssertTrue(manualReads.isEmpty)
+        await transport.replaceKey("automatic-key", model: "automatic-model")
+        let automatic = try await client.sample(
+            .init(kind: .unsloth, baseURL: studio, workerAPIKey: " \t\r\n"))
+        XCTAssertEqual(automatic.model, "automatic-model")
+        XCTAssertEqual(automatic.throughputState, .warmingUp)
+        let automaticReads = await reader.servers
+        XCTAssertEqual(automaticReads.count, 1)
+        let requests = await transport.requests
+        XCTAssertTrue(
+            requests.prefix(4).allSatisfy {
+                $0.value(forHTTPHeaderField: "Authorization") == "Bearer override-key"
+            })
+        XCTAssertTrue(
+            requests.suffix(4).allSatisfy {
+                $0.value(forHTTPHeaderField: "Authorization") == "Bearer automatic-key"
+            })
+    }
+
+    func testAutomaticLookupFailureStopsRequestsAndExplicitOverrideCanRecover() async throws {
+        let transport = AuthenticatedWorkerTransport(key: "override-key")
+        let reader = AutomaticWorkerKeyStub(key: nil, unavailable: true)
+        let client = makeUnsloth(
+            transport, servers: [verifiedServer(workerKeySource: .unavailable)],
+            workerKeyReader: reader)
+        let automatic = BackendConfiguration(kind: .unsloth, baseURL: studio)
+        let detected = try await client.detect(automatic)
+        XCTAssertFalse(detected?.isReady ?? true)
+        XCTAssertTrue(detected?.detail?.localizedCaseInsensitiveContains("automatic") == true)
+        do {
+            _ = try await client.sample(automatic)
+            XCTFail("An unavailable automatic key must not produce unauthenticated probes")
+        } catch {
+            guard case .configurationRequired(let message) = error as? BackendClientError else {
+                return XCTFail("Expected safe lookup guidance")
+            }
+            XCTAssertTrue(message.contains("override"))
+        }
+        let failedRequests = await transport.requests
+        XCTAssertTrue(failedRequests.isEmpty)
+        let recovered = try await client.sample(
+            .init(kind: .unsloth, baseURL: studio, workerAPIKey: "override-key"))
+        XCTAssertEqual(recovered.kind, .unsloth)
+        let reads = await reader.servers
+        XCTAssertEqual(reads.count, 2, "The manual override must not consult the failing reader")
+    }
+
+    func testAutomaticKeyRotationRefreshesCapabilitiesAndThroughputWithoutSettingsChanges()
+        async throws
+    {
+        let transport = AuthenticatedWorkerTransport(key: "first-key")
+        let reader = AutomaticWorkerKeyStub(key: "first-key")
+        let clock = WorkerAuthenticationClock()
+        let client = makeUnsloth(
+            transport, clock: clock,
+            servers: [verifiedServer(workerKeySource: automaticSource())], workerKeyReader: reader)
+        let configuration = BackendConfiguration(kind: .unsloth, baseURL: studio)
+        let first = try await client.sample(configuration)
+        clock.advance()
+        let measured = try await client.sample(configuration)
+        XCTAssertEqual(measured.currentTPS, 50)
+        await reader.replaceKey("second-key")
+        await transport.replaceKey("second-key", model: "reloaded-model")
+        clock.advance()
+        let rotated = try await client.sample(configuration)
+        XCTAssertEqual(rotated.model, "reloaded-model")
+        XCTAssertEqual(rotated.throughputState, .warmingUp)
+        XCTAssertNil(rotated.currentTPS)
+        XCTAssertNotEqual(rotated.nativeRequests?.sourceEpoch, first.nativeRequests?.sourceEpoch)
+        XCTAssertNil(configuration.workerAPIKey)
+        let requests = await transport.requests
+        XCTAssertEqual(requests.filter { $0.url?.path == "/props" }.count, 2)
+        XCTAssertTrue(
+            requests.suffix(4).allSatisfy {
+                $0.value(forHTTPHeaderField: "Authorization") == "Bearer second-key"
+            })
+    }
+
+    func testSupersededAutomaticLookupCannotInvalidateNewCredentials() async throws {
+        let gate = WorkerAuthenticationGate()
+        let transport = AuthenticatedWorkerTransport(key: "first-key")
+        let reader = AutomaticWorkerKeyStub(key: "first-key", initialGate: gate)
+        let client = makeUnsloth(
+            transport, servers: [verifiedServer(workerKeySource: automaticSource())],
+            workerKeyReader: reader)
+        let configuration = BackendConfiguration(kind: .unsloth, baseURL: studio)
+        let old = Task { try await client.sample(configuration) }
+        await gate.waitUntilStarted()
+        await reader.replaceKey("second-key")
+        await transport.replaceKey("second-key", model: "replacement-model")
+        let current = try await client.sample(configuration)
+        XCTAssertEqual(current.model, "replacement-model")
+        await gate.release()
+        do {
+            _ = try await old.value
+            XCTFail("A superseded automatic lookup must be cancelled")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        let recovered = try await client.sample(configuration)
+        XCTAssertEqual(recovered.model, "replacement-model")
+        let requests = await transport.requests
+        XCTAssertEqual(requests.filter { $0.url?.path == "/props" }.count, 1)
+        XCTAssertTrue(
+            requests.allSatisfy {
+                $0.value(forHTTPHeaderField: "Authorization") == "Bearer second-key"
+            })
+    }
+
+    func testResetRejectsDelayedAutomaticKeyBeforeMakingAnyRequests() async throws {
+        let gate = WorkerAuthenticationGate()
+        let transport = AuthenticatedWorkerTransport(key: "first-key")
+        let reader = AutomaticWorkerKeyStub(key: "first-key", initialGate: gate)
+        let client = makeUnsloth(
+            transport, servers: [verifiedServer(workerKeySource: automaticSource())],
+            workerKeyReader: reader)
+        let configuration = BackendConfiguration(kind: .unsloth, baseURL: studio)
+        let old = Task { try await client.sample(configuration) }
+        await gate.waitUntilStarted()
+        await client.reset()
+        await reader.replaceKey("second-key")
+        await transport.replaceKey("second-key", model: "replacement-model")
+        _ = try await client.sample(configuration)
+        await gate.release()
+        do {
+            _ = try await old.value
+            XCTFail("Reset must reject a delayed automatic key")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        let requests = await transport.requests
+        XCTAssertTrue(
+            requests.allSatisfy {
+                $0.value(forHTTPHeaderField: "Authorization") == "Bearer second-key"
+            })
+    }
+
+    func testAutomaticKeyReaderIsNotUsedForKeylessUnverifiedOrOtherBackends() async throws {
+        let keylessTransport = AuthenticatedWorkerTransport(key: nil)
+        let reader = AutomaticWorkerKeyStub(key: "automatic-key", unavailable: true)
+        let keyless = makeUnsloth(keylessTransport, workerKeyReader: reader)
+        _ = try await keyless.sample(.init(kind: .unsloth, baseURL: studio))
+        for server in [
+            verifiedServer(workerURL: studio, workerKeySource: automaticSource()),
+            verifiedServer(
+                workerURL: URL(string: "http://remote.example:54234")!,
+                workerKeySource: automaticSource()),
+            verifiedServer(workerIdentity: nil, workerKeySource: automaticSource()),
+        ] {
+            let client = makeUnsloth(keylessTransport, servers: [server], workerKeyReader: reader)
+            do {
+                _ = try await client.sample(.init(kind: .unsloth, baseURL: studio))
+                XCTFail("Unverified worker bindings must not retrieve a key")
+            } catch { XCTAssertTrue(error is BackendClientError) }
+        }
+        _ = try await keyless.detect(.init(kind: .vllm, baseURL: worker))
+        _ = try await keyless.detect(at: URL(string: "http://127.0.0.1:9999")!)
+        let reads = await reader.servers
+        XCTAssertTrue(reads.isEmpty)
+        let requests = await keylessTransport.requests
+        XCTAssertTrue(requests.allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == nil })
+    }
+
     func testUnslothDiscoveryDoesNotBorrowKeysFromOtherKindsOrStudioPorts() async throws {
         for configurations in [
             [BackendConfiguration(kind: .llamaCpp, baseURL: studio, workerAPIKey: "worker-key")],
@@ -345,23 +546,63 @@ final class WorkerAuthenticationTests: XCTestCase {
     private func makeUnsloth(
         _ transport: AuthenticatedWorkerTransport,
         clock: WorkerAuthenticationClock = WorkerAuthenticationClock(),
-        servers: [UnslothServer]? = nil
+        servers: [UnslothServer]? = nil,
+        workerKeyReader: any UnslothWorkerKeyReading = UnslothWorkerKeyReader()
     ) -> UnslothBackendClient {
         UnslothBackendClient(
             normal: HTTPBackendClient(
                 transport: { try await transport.respond($0) }, monotonicTime: { clock.now() }),
             discovery: WorkerAuthenticationDiscovery(servers ?? [verifiedServer()]),
+            workerKeyReader: workerKeyReader,
             studioMonitorTransport: { try await transport.respond($0) })
     }
 
     private func verifiedServer(
         workerURL: URL? = URL(string: "http://127.0.0.1:54234")!,
-        workerIdentity: GPUProcessIdentity? = .init(pid: 202, startTimeMicroseconds: 200)
+        workerIdentity: GPUProcessIdentity? = .init(pid: 202, startTimeMicroseconds: 200),
+        workerKeySource: UnslothWorkerKeySource = .none
     ) -> UnslothServer {
         .init(
             studioURL: studio, workerURL: workerURL,
             studioIdentity: .init(pid: 101, startTimeMicroseconds: 100),
-            workerIdentity: workerIdentity)
+            workerIdentity: workerIdentity, workerKeySource: workerKeySource)
+    }
+
+    private func automaticSource() -> UnslothWorkerKeySource {
+        let directory = URL(fileURLWithPath: "/Users/example/.unsloth/studio/auth")
+        return .file(
+            .init(
+                fileURL: directory.appendingPathComponent("llama_api_key_0123456789abcdef"),
+                authDirectoryURL: directory))
+    }
+}
+
+private actor AutomaticWorkerKeyStub: UnslothWorkerKeyReading {
+    private var key: String?
+    private let unavailable: Bool
+    private var initialGate: WorkerAuthenticationGate?
+    private(set) var servers: [UnslothServer] = []
+
+    init(key: String?, unavailable: Bool = false, initialGate: WorkerAuthenticationGate? = nil) {
+        self.key = key
+        self.unavailable = unavailable
+        self.initialGate = initialGate
+    }
+
+    func replaceKey(_ key: String) { self.key = key }
+
+    func key(for server: UnslothServer) async throws -> String? {
+        servers.append(server)
+        if unavailable {
+            throw BackendClientError.configurationRequired(
+                "Automatic worker authentication is unavailable; enter a manual override.")
+        }
+        let result = key
+        if let gate = initialGate {
+            initialGate = nil
+            await gate.hold()
+        }
+        return result
     }
 }
 

@@ -55,11 +55,15 @@ server totals. Active slot/task identities supply passive request lanes, with fi
 sampled observation endings. Missing polls expire identities independently of aggregate activity;
 worker/source epochs and decoded-counter resets keep reused identities separate. The in-memory
 tracker retains at most 256 lanes for one hour without adding authoritative usage records.
-An explicitly supplied, session-only worker API key authorizes metrics, properties, and slots
-GETs only after local worker verification. Worker authentication failures remain explicit during
-discovery, and changing the supplied key invalidates worker capabilities and throughput baselines.
-Worker credentials are kept separate from Studio credentials and never sent to other backends.
-An explicitly supplied, session-only Studio sign-in token enables bounded authenticated GETs to
+After local worker verification, discovery retains only its exact launch key-file reference.
+Automatic authentication reads a bounded, private, current-user file inside that installation's
+auth directory, rejects unsafe paths and symlinks, and rechecks process identities around the read.
+The key stays in backend memory and authorizes only worker metrics, properties, and slots GETs.
+A nonempty, session-only worker API key in Settings overrides automatic lookup; clearing it restores
+automatic authentication. Worker or credential changes invalidate capabilities and throughput
+baselines. Authentication and lookup failures remain explicit during discovery. Worker credentials
+are kept separate from Studio credentials and never sent to other backends or copied into Settings.
+A session-only Studio API key or sign-in token enables bounded authenticated GETs to
 `/api/inference/monitor`. The adapter retains only scalar identity, timing, status, usage, and rate
 metadata from its at-most-50 retained entries. Disabled or unavailable history falls back to slots;
 an omitted monitor entry cannot establish completion. Neither endpoint exposes structured tool

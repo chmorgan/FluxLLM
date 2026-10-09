@@ -36,6 +36,125 @@ final class UnslothProcessDiscoveryTests: XCTestCase {
         XCTAssertEqual(result, [server(studio: studio, worker: nil)])
     }
 
+    func testOnlyVerifiedWorkerKeyFileArgumentIsAttachedToDiscovery() async {
+        let file = installation + "/studio/auth/llama_api_key_0123456789abcdef"
+        let reference = UnslothWorkerKeyFile(
+            fileURL: URL(fileURLWithPath: file),
+            authDirectoryURL: URL(fileURLWithPath: installation + "/studio/auth"))
+        for flags in [["--api-key-file", file], ["--api-key-file=" + file]] {
+            let inspector = UnslothInspectorStub(
+                [studioProcess(), workerProcess()],
+                arguments: [10: studioArguments(), 20: workerArguments() + flags],
+                listeners: [10: [listener(8888)], 20: [listener(54234)]])
+            let result = await UnslothProcessDiscovery(inspector: inspector).servers()
+            XCTAssertEqual(result.first?.workerKeySource, .file(reference))
+            XCTAssertEqual(inspector.argumentPIDs, [10, 20])
+        }
+    }
+
+    func testUnreadableOrEmptyWorkerArgumentsAreNotAssumedKeyless() async {
+        for unreadable in [true, false] {
+            let inspector = loadedInspector()
+            if unreadable {
+                inspector.removeArguments(pid: 20)
+            } else {
+                inspector.replace(
+                    [studioProcess(), workerProcess()],
+                    arguments: [10: studioArguments(), 20: []],
+                    listeners: [10: [listener(8888)], 20: [listener(54234)]])
+            }
+            let result = await UnslothProcessDiscovery(inspector: inspector).servers()
+            XCTAssertEqual(result.first?.workerIdentity, workerProcess().identity)
+            XCTAssertEqual(result.first?.workerKeySource, .unavailable)
+        }
+        let result = await UnslothProcessDiscovery(inspector: loadedInspector()).servers()
+        XCTAssertEqual(result.first?.workerKeySource, UnslothWorkerKeySource.none)
+    }
+
+    func testUnsafeDuplicateOrUnsupportedKeyArgumentsAreUnavailable() async {
+        let file = installation + "/studio/auth/llama_api_key_0123456789abcdef"
+        let invalidFlags = [
+            ["--api-key-file"], ["--api-key-file="], ["--api-key-file", "--metrics"],
+            ["--api-key-file", file, "--api-key-file=" + file],
+            ["--api-key-file", "relative/llama_api_key_0123456789abcdef"],
+            ["--api-key-file", "/Users/other/.unsloth/studio/auth/llama_api_key_0123456789abcdef"],
+            ["--api-key-file", installation + "/studio/auth/auth.db"],
+            ["--api-key-file", installation + "/studio/auth/llama_api_key_0123456789ABCDEf"],
+            [
+                "--api-key-file",
+                installation + "/studio/auth/sub/../llama_api_key_0123456789abcdef",
+            ],
+            ["--api-key-file", installation + "/studio/auth/./llama_api_key_0123456789abcdef"],
+            ["--api-key-file", installation + "/studio/auth//llama_api_key_0123456789abcdef"],
+            ["--api-key-file", file + "/"],
+            ["--api-key", "synthetic-inline-key"], ["--api-key=synthetic-inline-key"],
+        ]
+        for flags in invalidFlags {
+            let inspector = UnslothInspectorStub(
+                [studioProcess(), workerProcess()],
+                arguments: [10: studioArguments(), 20: workerArguments() + flags],
+                listeners: [10: [listener(8888)], 20: [listener(54234)]])
+            let result = await UnslothProcessDiscovery(inspector: inspector).servers()
+            XCTAssertEqual(result.first?.workerKeySource, .unavailable, "Rejected flags: \(flags)")
+        }
+    }
+
+    func testUnrelatedWorkersCannotContributeKeyFileMetadata() async {
+        let unrelated = workerProcess(pid: 21, parent: 1)
+        let foreign = process(
+            22, parent: 10, path: "/Users/other/.unsloth/llama.cpp/build/bin/llama-server")
+        let file = installation + "/studio/auth/llama_api_key_0123456789abcdef"
+        let inspector = UnslothInspectorStub(
+            [studioProcess(), workerProcess(), unrelated, foreign],
+            arguments: [
+                10: studioArguments(), 21: [unrelated.executablePath, "--api-key-file", file],
+                22: [foreign.executablePath, "--api-key-file", file],
+            ],
+            listeners: [
+                10: [listener(8888)], 20: [listener(54234)],
+                21: [listener(54235)], 22: [listener(54236)],
+            ])
+        let result = await UnslothProcessDiscovery(inspector: inspector).servers()
+        XCTAssertEqual(result.first?.workerKeySource, UnslothWorkerKeySource.none)
+        XCTAssertEqual(inspector.argumentPIDs, [10, 20])
+    }
+
+    func testWorkerKeyMetadataFollowsBirthChangesWithoutReusingCachedArguments() async {
+        let firstFile = installation + "/studio/auth/llama_api_key_0123456789abcdef"
+        let secondFile = installation + "/studio/auth/llama_api_key_fedcba9876543210"
+        let inspector = UnslothInspectorStub(
+            [studioProcess(), workerProcess()],
+            arguments: [
+                10: studioArguments(), 20: workerArguments() + ["--api-key-file", firstFile],
+            ],
+            listeners: [10: [listener(8888)], 20: [listener(54234)]])
+        let discovery = UnslothProcessDiscovery(inspector: inspector)
+        let first = await discovery.servers()
+        _ = await discovery.servers()
+        XCTAssertEqual(inspector.argumentPIDs, [10, 20])
+        let replacement = workerProcess(birth: 99_000)
+        inspector.replace(
+            [studioProcess(), replacement],
+            arguments: [
+                10: studioArguments(), 20: workerArguments() + ["--api-key-file", secondFile],
+            ],
+            listeners: [10: [listener(8888)], 20: [listener(54321)]])
+        let refreshed = await discovery.servers()
+        XCTAssertNotEqual(refreshed.first?.workerKeySource, first.first?.workerKeySource)
+        XCTAssertEqual(refreshed.first?.workerIdentity, replacement.identity)
+        guard case .file(let reference) = refreshed.first?.workerKeySource else {
+            return XCTFail("Expected the replacement worker's key file")
+        }
+        XCTAssertEqual(reference.fileURL.path, secondFile)
+    }
+
+    func testWorkerDisappearingDuringArgumentReadDoesNotPublishItsKeyReference() async {
+        let inspector = loadedInspector()
+        inspector.removeIdentityAfterArguments(pid: 20)
+        let result = await UnslothProcessDiscovery(inspector: inspector).servers()
+        XCTAssertEqual(result, [server(studio: studioProcess(), worker: nil)])
+    }
+
     func testPositiveCacheChecksIdentitiesWithoutInventoriesOrSocketRescans() async {
         let inspector = loadedInspector()
         let clock = UnslothDiscoveryClock()
@@ -402,6 +521,10 @@ final class UnslothProcessDiscoveryTests: XCTestCase {
             birth: birth)
     }
 
+    private func workerArguments() -> [String] {
+        [installation + "/llama.cpp/build/bin/llama-server", "--metrics"]
+    }
+
     private func process(_ pid: Int32, parent: Int32, path: String, birth: UInt64? = nil)
         -> LocalBackendProcess
     {
@@ -441,7 +564,9 @@ private final class UnslothInspectorStub: UnslothProcessInspecting, @unchecked S
     private var inventories = 0
     private var identities = 0
     private var listeners: [Int32] = []
+    private var argumentsRead: [Int32] = []
     private var removeAfterListeners: Int32?
+    private var removeAfterArguments: Int32?
     private var blocked: (started: @Sendable () -> Void, gate: DispatchSemaphore)?
     private var inventoryGate: DispatchSemaphore?
     private var blockedIdentity: (@Sendable () -> Void)?
@@ -457,6 +582,7 @@ private final class UnslothInspectorStub: UnslothProcessInspecting, @unchecked S
     var inventoryCount: Int { lock.withLock { inventories } }
     var identityCount: Int { lock.withLock { identities } }
     var listenerPIDs: [Int32] { lock.withLock { listeners } }
+    var argumentPIDs: [Int32] { lock.withLock { argumentsRead } }
 
     func inventory() -> [Int32: LocalBackendProcess] {
         let (value, started) = lock.withLock {
@@ -487,7 +613,15 @@ private final class UnslothInspectorStub: UnslothProcessInspecting, @unchecked S
     }
 
     func arguments(of identity: GPUProcessIdentity) -> [String]? {
-        lock.withLock { argumentsByPID[identity.pid] }
+        lock.withLock {
+            argumentsRead.append(identity.pid)
+            let result = argumentsByPID[identity.pid]
+            if removeAfterArguments == identity.pid {
+                liveIdentities.removeValue(forKey: identity.pid)
+                removeAfterArguments = nil
+            }
+            return result
+        }
     }
 
     func listeningEndpoints(of identity: GPUProcessIdentity) -> [LocalBackendTCPListener] {
@@ -509,7 +643,13 @@ private final class UnslothInspectorStub: UnslothProcessInspecting, @unchecked S
         lock.withLock {
             self.processes = Dictionary(
                 uniqueKeysWithValues: processes.map { ($0.identity.pid, $0) })
-            argumentsByPID = arguments
+            // Existing loaded fixtures explicitly model a worker without authentication.
+            // A missing argv read is injected separately and must stay unavailable.
+            argumentsByPID = Dictionary(
+                uniqueKeysWithValues: processes.filter { $0.executableName == "llama-server" }
+                    .map { ($0.identity.pid, [$0.executablePath, "--metrics"]) }
+            )
+            .merging(arguments) { _, supplied in supplied }
             listenersByPID = listeners
             liveIdentities = Dictionary(
                 uniqueKeysWithValues: processes.map { ($0.identity.pid, $0.identity) })
@@ -517,6 +657,10 @@ private final class UnslothInspectorStub: UnslothProcessInspecting, @unchecked S
     }
 
     func removeIdentityAfterListeners(pid: Int32) { lock.withLock { removeAfterListeners = pid } }
+    func removeIdentityAfterArguments(pid: Int32) { lock.withLock { removeAfterArguments = pid } }
+    func removeArguments(pid: Int32) {
+        _ = lock.withLock { argumentsByPID.removeValue(forKey: pid) }
+    }
     @discardableResult
     func blockInventory(started: @escaping @Sendable () -> Void) -> DispatchSemaphore {
         let gate = DispatchSemaphore(value: 0)

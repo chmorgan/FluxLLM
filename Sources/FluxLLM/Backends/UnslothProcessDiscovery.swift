@@ -1,5 +1,54 @@
 import Foundation
 
+/// File locations only. Discovery never opens or retains the worker credential.
+public struct UnslothWorkerKeyFile: Equatable, Sendable {
+    public let fileURL: URL
+    public let authDirectoryURL: URL
+
+    public init(fileURL: URL, authDirectoryURL: URL) {
+        self.fileURL = fileURL
+        self.authDirectoryURL = authDirectoryURL
+    }
+
+    var hasManagedPath: Bool {
+        guard Self.isAbsoluteFileURL(fileURL), Self.isAbsoluteFileURL(authDirectoryURL),
+            !fileURL.hasDirectoryPath,
+            authDirectoryURL.path.hasSuffix("/.unsloth/studio/auth"),
+            fileURL.deletingLastPathComponent().path == authDirectoryURL.path
+        else { return false }
+        let name = fileURL.lastPathComponent
+        let prefix = "llama_api_key_"
+        guard name.hasPrefix(prefix) else { return false }
+        let suffix = name.dropFirst(prefix.count)
+        return suffix.utf8.count == 16
+            && suffix.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
+    private static func isAbsoluteFileURL(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            components.scheme == "file", components.host?.isEmpty != false,
+            components.user == nil, components.password == nil,
+            components.query == nil, components.fragment == nil,
+            isAbsolutePath(url.path)
+        else { return false }
+        return true
+    }
+
+    static func isAbsolutePath(_ path: String) -> Bool {
+        // Foundation standardization can rewrite valid /private paths on macOS.
+        // Validate only spelling here; the reader rejects filesystem links with openat.
+        guard path.hasPrefix("/"), !path.utf8.contains(0) else { return false }
+        return path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+            .allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+    }
+}
+
+public enum UnslothWorkerKeySource: Equatable, Sendable {
+    case none
+    case file(UnslothWorkerKeyFile)
+    case unavailable
+}
+
 /// A locally verified Studio endpoint and, when loaded, its managed GGUF worker.
 /// PID birth identities prevent a restarted process from inheriting an old binding.
 public struct UnslothServer: Equatable, Sendable {
@@ -7,15 +56,17 @@ public struct UnslothServer: Equatable, Sendable {
     public let workerURL: URL?
     public let studioIdentity: GPUProcessIdentity
     public let workerIdentity: GPUProcessIdentity?
+    public let workerKeySource: UnslothWorkerKeySource
 
     public init(
         studioURL: URL, workerURL: URL?, studioIdentity: GPUProcessIdentity,
-        workerIdentity: GPUProcessIdentity?
+        workerIdentity: GPUProcessIdentity?, workerKeySource: UnslothWorkerKeySource = .none
     ) {
         self.studioURL = studioURL
         self.workerURL = workerURL
         self.studioIdentity = studioIdentity
         self.workerIdentity = workerIdentity
+        self.workerKeySource = workerKeySource
     }
 }
 
@@ -172,7 +223,7 @@ public actor UnslothProcessDiscovery: UnslothDiscovering {
             var bindings:
                 [(
                     worker: LocalBackendProcess, endpoint: LocalBackendTCPListener,
-                    lineage: Set<GPUProcessIdentity>
+                    lineage: Set<GPUProcessIdentity>, keySource: UnslothWorkerKeySource
                 )] = []
             for worker in workers {
                 guard
@@ -180,6 +231,11 @@ public actor UnslothProcessDiscovery: UnslothDiscovering {
                         of: worker, to: studio, processes: processes, inspector: inspector)
                 else { continue }
                 let endpoints = ordered(inspector.listeningEndpoints(of: worker.identity))
+                guard !endpoints.isEmpty,
+                    lineage.allSatisfy({ inspector.identity(of: $0.pid) == $0 })
+                else { continue }
+                let keySource = workerKeySource(
+                    arguments: inspector.arguments(of: worker.identity), installation: installation)
                 guard lineage.allSatisfy({ inspector.identity(of: $0.pid) == $0 }) else { continue }
                 for endpoint in endpoints {
                     // A pair of literal v4/v6 listeners at the same port is a single
@@ -190,7 +246,7 @@ public actor UnslothProcessDiscovery: UnslothDiscovering {
                     }) {
                         continue
                     }
-                    bindings.append((worker, endpoint, lineage))
+                    bindings.append((worker, endpoint, lineage, keySource))
                     guard bindings.count <= 128 else {
                         return Snapshot(servers: [], identities: [])
                     }
@@ -208,7 +264,9 @@ public actor UnslothProcessDiscovery: UnslothDiscovering {
                     servers.append(
                         UnslothServer(
                             studioURL: studioEndpoint.url, workerURL: binding.endpoint.url,
-                            studioIdentity: studio.identity, workerIdentity: binding.worker.identity
+                            studioIdentity: studio.identity,
+                            workerIdentity: binding.worker.identity,
+                            workerKeySource: binding.keySource
                         ))
                     identities.formUnion(binding.lineage)
                 }
@@ -216,6 +274,39 @@ public actor UnslothProcessDiscovery: UnslothDiscovering {
             guard servers.count <= 128 else { return Snapshot(servers: [], identities: []) }
         }
         return Snapshot(servers: servers, identities: identities)
+    }
+
+    private nonisolated static func workerKeySource(
+        arguments: [String]?, installation: String
+    ) -> UnslothWorkerKeySource {
+        guard let arguments, !arguments.isEmpty else { return .unavailable }
+        var path: String?
+        var index = 1
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument == "--api-key" || argument.hasPrefix("--api-key=") {
+                // Inline credentials are neither collected nor assumed to be keyless.
+                return .unavailable
+            }
+            if argument == "--api-key-file" {
+                guard path == nil, index + 1 < arguments.count,
+                    !arguments[index + 1].hasPrefix("--")
+                else { return .unavailable }
+                path = arguments[index + 1]
+                index += 1
+            } else if argument.hasPrefix("--api-key-file=") {
+                guard path == nil else { return .unavailable }
+                path = String(argument.dropFirst("--api-key-file=".count))
+            }
+            index += 1
+        }
+        guard let path else { return .none }
+        guard UnslothWorkerKeyFile.isAbsolutePath(path)
+        else { return .unavailable }
+        let reference = UnslothWorkerKeyFile(
+            fileURL: URL(fileURLWithPath: path),
+            authDirectoryURL: URL(fileURLWithPath: installation + "/studio/auth"))
+        return reference.hasManagedPath ? .file(reference) : .unavailable
     }
 
     private nonisolated static func ordered(_ endpoints: [LocalBackendTCPListener])
