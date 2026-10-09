@@ -24,6 +24,17 @@ final class ChartInspectionCardTests: XCTestCase {
             id: UUID(), startedAt: date, endedAt: date.addingTimeInterval(5_400),
             model: longRequest.model, outputTokens: Int.max, outputIsEstimated: false,
             terminal: true)
+        let nativeWarmup = RequestLane(
+            id: UUID(), startedAt: date, model: "provider/Qwen3-8B", outputTokens: 1000,
+            outputIsEstimated: false, observationSource: .slotPolling)
+        let nativeGenerating = RequestLane(
+            id: UUID(), startedAt: date, model: longRequest.model, outputTokens: Int.max,
+            outputIsEstimated: false, observationSource: .slotPolling, sampledAverageTPS: 56)
+        let nativeCompleted = RequestLane(
+            id: UUID(), startedAt: date, endedAt: date.addingTimeInterval(12.4),
+            model: "provider/Qwen3-8B", outputTokens: 645, outputIsEstimated: false,
+            terminal: true, observationSource: .studioMonitor, endStatus: .completed,
+            sampledAverageTPS: 52)
         let bucket = ToolActivityBucket(
             start: date, end: date.addingTimeInterval(3), callCount: 100,
             callsPerMinute: 2_000,
@@ -37,6 +48,9 @@ final class ChartInspectionCardTests: XCTestCase {
             ChartInspectionContent.request(completedRequest, at: date.addingTimeInterval(20)),
             ChartInspectionContent.request(
                 longCompletedRequest, at: date.addingTimeInterval(6_000)),
+            ChartInspectionContent.request(nativeWarmup, at: date.addingTimeInterval(1)),
+            ChartInspectionContent.request(nativeGenerating, at: date.addingTimeInterval(20)),
+            ChartInspectionContent.request(nativeCompleted, at: date.addingTimeInterval(20)),
             ChartInspectionContent.plot(at: date, generated: 5_000, gpu: nil, requestCount: 100),
             ChartInspectionContent.tools(at: date, bucket: bucket, results: results),
             ChartInspectionContent.overflow(at: date, lanes: [shortRequest, longRequest]),
@@ -66,8 +80,8 @@ final class ChartInspectionCardTests: XCTestCase {
                         "Even dense activity must fit in one header and at most four detail rows")
                     if content.requestMetrics != nil {
                         XCTAssertEqual(
-                            size.height, 50, accuracy: 1,
-                            "Requests must stay two lines even with long names, rates, and counters"
+                            size.height, content.rows.isEmpty ? 50 : 86, accuracy: 1,
+                            "Request metrics stay one line, with bounded native provenance rows"
                         )
                     }
                 }

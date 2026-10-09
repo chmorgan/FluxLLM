@@ -34,8 +34,8 @@ menu-bar startup path. Registration changes are serialized, and failures show th
 | Ollama | `http://localhost:11434` | Observed native `/api/chat` and `/api/generate` responses |
 | vLLM | `http://127.0.0.1:8000` | `/metrics` generated-token counter deltas over monotonic elapsed time |
 | Rapid-MLX | `http://127.0.0.1:8000` | `/v1/status` server-reported average |
-| llama.cpp | `http://127.0.0.1:8080` | `/metrics` server-reported throughput gauge |
-| Unsloth | Studio at `http://127.0.0.1:8888` | Managed local GGUF worker's llama.cpp `/metrics` |
+| llama.cpp | `http://127.0.0.1:8080` | `/slots` decoded-token counter deltas; `/metrics` throughput gauge fallback |
+| Unsloth | Studio at `http://127.0.0.1:8888` | Managed local GGUF worker's llama.cpp collector |
 
 Native collectors observe direct client traffic without a proxy or Prometheus installation. vLLM needs two valid
 scrapes; resets, changed series, or gaps reset the baseline. llama.cpp requires `--metrics`; router mode
@@ -49,8 +49,22 @@ selection remains in effect for the current launch. Scan Again does not restart 
 Unsloth discovery verifies its managed Studio launch, worker ancestry, PID birth identity, and native
 listening sockets. The configured Studio address stays stable while the worker's port changes. Cached
 libproc inspection avoids spawning process-list helpers or scanning unrelated sockets on each poll.
-The native llama.cpp collector supplies average throughput and server token totals; it does not observe
-individual requests or tools. Remote Studio and non-GGUF/training backends are outside this adapter's scope.
+The native llama.cpp collector supplies live throughput when the worker's `/slots` endpoint is enabled,
+with the server-reported average as a fallback when slots are disabled or unavailable. Token totals remain
+server totals. Active slot/task identities supply passive request lanes, with first-seen starts and
+sampled observation endings. Missing polls expire identities independently of aggregate activity;
+worker/source epochs and decoded-counter resets keep reused identities separate. The in-memory
+tracker retains at most 256 lanes for one hour without adding authoritative usage records.
+An explicitly supplied, session-only worker API key authorizes metrics, properties, and slots
+GETs only after local worker verification. Worker authentication failures remain explicit during
+discovery, and changing the supplied key invalidates worker capabilities and throughput baselines.
+Worker credentials are kept separate from Studio credentials and never sent to other backends.
+An explicitly supplied, session-only Studio sign-in token enables bounded authenticated GETs to
+`/api/inference/monitor`. The adapter retains only scalar identity, timing, status, usage, and rate
+metadata from its at-most-50 retained entries. Disabled or unavailable history falls back to slots;
+an omitted monitor entry cannot establish completion. Neither endpoint exposes structured tool
+activity, and no Studio event-stream listener is attached. Remote Studio and non-GGUF/training
+backends are outside this adapter's scope.
 
 App settings read existing saved preferences at startup for compatibility. Changes to backend selection,
 endpoints, menu-bar preferences, and automatic-selection memory apply only to the current launch. They do not
@@ -70,11 +84,36 @@ tokens. The rate divides that count by elapsed time since the first text. Valid 
 request's count; its completed-request average is `eval_count × 1,000,000,000 / eval_duration`. Non-streaming
 usage appears at completion. Final averages are not live activity.
 
+llama.cpp and Unsloth live throughput sums per-slot decoded-token count changes over monotonic elapsed
+time, combining concurrent requests. Active collection adds one bounded, read-only `/slots` request per
+poll; idle polling adds none. Startup, new requests, counter resets, and outages require fresh baselines
+so counts cannot bridge unrelated requests or gaps. Verified Unsloth worker changes also clear slot and
+capability state. Direct llama.cpp workers without a process-start metric require a session reset after
+a same-address restart.
+
+Native request hover averages divide the decoded-count increase by the time between the first and
+latest valid counter observations. Initial counts are excluded because generation may predate
+collection. The average is marked approximate and remains unavailable until two valid observations
+span positive time. Missing counts do not extend its window; idle detection, expiry, and repeated
+terminal monitor rows retain the last measured average. Slot resets restart observation; Studio
+usage corrections rebaseline the counter window while preserving the request identity.
+
+Healthy slot counter baselines are explicitly unmeasured: numeric displays show zero, while raw
+throughput remains unavailable until a measurable interval. The latest successful slot snapshot supplies
+current running activity, so a request finishing between `/metrics` and `/slots` reads clears its running
+count.
+
 Backend and GPU polling normally occur every second; failed backend polls back off to 30 seconds, and unresolved
 discovery retries every five seconds. History samples every half-second. Numeric throughput publishes once
 per second; coherent chart snapshots publish once per second while a chart surface is visible, with immediate
 clearing/reset transitions. Ollama's numeric estimate waits for one second of output: healthy loading and
 warmup display zero while raw post-output history can already contain estimates. Help and metadata preserve measurement basis despite plain numeric labels.
+
+Slot-derived llama.cpp and Unsloth numeric throughput uses a three-second time-weighted average, refreshed
+once per second. Poll measurements and chart samples retain raw rates. Smoothing resets on session, model,
+measurement-basis, idle, error, or warmup transitions, preventing old worker or request speeds from carrying
+into a new baseline. Errors and stale data remain visible; displaying zero during healthy warmup does not
+create a measured raw rate.
 
 Health, request output, native activity counts, and GPU readings have separate freshness evidence, generally
 expiring after five seconds. Successful health polling cannot refresh stale output rates. Outstanding observed

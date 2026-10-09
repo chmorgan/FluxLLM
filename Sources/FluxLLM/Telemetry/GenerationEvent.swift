@@ -116,25 +116,31 @@ public struct TimeSeriesPoint: Sendable, Equatable {
         self.isAvailable = isAvailable
     }
 }
-/// One in-flight or recently-finished proxied request, drawn as a horizontal
-/// lane in the dashboard chart. The main throughput line is the sum of every
-/// open request's live rate; each request also gets its own lane so concurrent
-/// streams can be seen overlapping in time.
+/// One running or recently ended request observation, drawn as a horizontal
+/// lane in the dashboard chart. Native lanes use sampled endpoint metadata;
+/// protocol-stream lanes use events from the Ollama proxy.
 public struct RequestLane: Sendable, Equatable {
     public let id: UUID
     public let startedAt: Date
-    /// `nil` while the request is still running; set when it finishes.
+    /// `nil` while observed running; set on completion or observation loss.
     public let endedAt: Date?
     public let model: String?
     public let outputTokens: Int
     public let outputIsEstimated: Bool
     public let liveTPS: Double
     public let terminal: Bool
+    public let observationSource: RequestObservationSource
+    public let endStatus: ObservedRequestStatus?
+    /// Token-count increase over the valid counter observation window, not full-request timing.
+    public let sampledAverageTPS: Double?
 
     public init(
         id: UUID, startedAt: Date, endedAt: Date? = nil, model: String? = nil,
         outputTokens: Int = 0, outputIsEstimated: Bool = true,
-        liveTPS: Double = 0, terminal: Bool = false
+        liveTPS: Double = 0, terminal: Bool = false,
+        observationSource: RequestObservationSource = .protocolStream,
+        endStatus: ObservedRequestStatus? = nil,
+        sampledAverageTPS: Double? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -144,6 +150,9 @@ public struct RequestLane: Sendable, Equatable {
         self.outputIsEstimated = outputIsEstimated
         self.liveTPS = liveTPS
         self.terminal = terminal
+        self.observationSource = observationSource
+        self.endStatus = endStatus
+        self.sampledAverageTPS = sampledAverageTPS
     }
 
     /// A lane is visible on the chart while it is running, or until its finish

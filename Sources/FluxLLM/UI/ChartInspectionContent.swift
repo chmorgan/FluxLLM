@@ -1,7 +1,7 @@
 import Foundation
 
-/// Small, bounded summaries. Request metrics describe the full request, not
-/// history at the cursor; tool rates and counts come from the same observed bin.
+/// Small, bounded summaries. Native request metadata retains its observation
+/// provenance; tool rates and counts come from the same observed bin.
 struct ChartInspectionContent: Equatable {
     enum Accent: Equatable {
         case generated, gpu, tools, secondary
@@ -53,18 +53,44 @@ struct ChartInspectionContent: Equatable {
         let tokens = max(0, lane.outputTokens)
         let estimate = lane.outputIsEstimated ? "~" : ""
         var average = "—"
-        if let elapsed, elapsed > 0 {
+        if lane.observationSource == .protocolStream, let elapsed, elapsed > 0 {
             let rate = Double(tokens) / elapsed
             if rate.isFinite {
                 average = estimate + String(format: "%.1f tok/s", rate)
             }
+        } else if lane.observationSource != .protocolStream,
+            let rate = lane.sampledAverageTPS, rate.isFinite, rate >= 0
+        {
+            average = "~" + String(format: "%.1f tok/s", rate)
+        }
+        let native = lane.observationSource != .protocolStream
+        let rows: [Row] =
+            native
+            ? [
+                Row(
+                    label: "Source",
+                    value: lane.observationSource == .slotPolling
+                        ? "Slot samples" : "Studio monitor"),
+                Row(
+                    label: "Coverage",
+                    value: lane.observationSource == .slotPolling
+                        ? "Sampled times and average" : "Reported times; sampled avg"),
+            ] : []
+        let badge: String
+        switch lane.endStatus {
+        case .observationEnded: badge = "Observation ended"
+        case .completed: badge = "Completed"
+        case .cancelled: badge = "Cancelled"
+        case .failed: badge = "Failed"
+        case .running, nil: badge = ended ? "Ended" : "In progress"
         }
         return Self(
-            title: modelName(lane.model), badge: ended ? "Ended" : "In progress",
-            accent: .request(lane.id), rows: [],
+            title: modelName(lane.model), badge: badge,
+            accent: .request(lane.id), rows: rows,
             requestMetrics: RequestMetrics(
                 duration: elapsed.map(requestDuration) ?? "—", averageRate: average,
-                outputTokens: "\(estimate)\(tokens.formatted()) tok"))
+                outputTokens: native && lane.outputIsEstimated
+                    ? "—" : "\(estimate)\(tokens.formatted()) tok"))
     }
 
     static func tools(

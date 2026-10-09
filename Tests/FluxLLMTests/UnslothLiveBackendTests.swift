@@ -41,14 +41,51 @@ final class UnslothLiveBackendTests: XCTestCase {
         let client = UnslothBackendClient(discovery: discovery)
         let detections = await client.discoverLocalBackends()
         XCTAssertTrue(detections.contains { $0.kind == .unsloth && $0.baseURL == server.studioURL })
-        let sample = try await client.sample(BackendConfiguration(kind: .unsloth, baseURL: url))
+        let configuration = BackendConfiguration(kind: .unsloth, baseURL: url)
+        _ = try await client.sample(configuration)
+        // Live slot counters need a second observation; this never starts inference.
+        try await Task.sleep(for: .seconds(1))
+        let sample = try await client.sample(configuration)
         XCTAssertEqual(sample.kind, .unsloth)
-        XCTAssertEqual(sample.basis, .serverReportedAverage)
+        XCTAssertTrue(
+            [ThroughputBasis.serverAggregate, .serverReportedAverage].contains(sample.basis))
+        if let rate = sample.currentTPS {
+            XCTAssertTrue(rate.isFinite)
+            XCTAssertGreaterThanOrEqual(rate, 0)
+            XCTAssertEqual(sample.throughputState, .measured)
+        }
+        if sample.throughputState == .warmingUp {
+            XCTAssertNil(sample.currentTPS)
+            XCTAssertNil(sample.measurementDuration)
+        }
+        if let duration = sample.measurementDuration {
+            XCTAssertTrue(duration.isFinite)
+            XCTAssertGreaterThan(duration, 0)
+            XCTAssertEqual(sample.basis, .serverAggregate)
+            XCTAssertEqual(sample.throughputState, .measured)
+        }
         XCTAssertNotNil(sample.model)
         XCTAssertGreaterThanOrEqual(try XCTUnwrap(sample.runningRequests), 0)
         XCTAssertGreaterThanOrEqual(try XCTUnwrap(sample.outputTokens), 0)
         XCTAssertGreaterThanOrEqual(try XCTUnwrap(sample.promptTokens), 0)
         XCTAssertNil(sample.inferenceGPUPercent)
+
+        let observedStore = MetricsStore()
+        let observedEpoch = UUID()
+        observedStore.beginBackendSession(kind: .unsloth, epoch: observedEpoch)
+        observedStore.applyBackendSample(sample, epoch: observedEpoch)
+        observedStore.sample(at: sample.timestamp)
+        if let requests = sample.nativeRequests {
+            XCTAssertEqual(requests.source, .slotPolling)
+            XCTAssertEqual(
+                observedStore.chartPresentation.requestLanes.count, requests.requests.count)
+            XCTAssertTrue(
+                observedStore.chartPresentation.requestLanes.allSatisfy {
+                    $0.observationSource == .slotPolling && !$0.terminal
+                })
+        }
+        XCTAssertNil(observedStore.activeGeneration)
+        XCTAssertFalse(observedStore.chartPresentation.supportsToolActivity)
 
         let suite = "com.cmorgan.FluxLLM.unsloth-live.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -82,7 +119,15 @@ final class UnslothLiveBackendTests: XCTestCase {
                 "queued_requests": sample.queuedRequests ?? -1,
                 "output_tokens": sample.outputTokens ?? -1,
                 "prompt_tokens": sample.promptTokens ?? -1,
-                "throughput_basis": sample.basis.rawValue, "ready": ready,
+                "current_tps": sample.currentTPS.map { $0 as Any } ?? NSNull(),
+                "throughput_basis": sample.basis.rawValue,
+                "throughput_state": sample.throughputState.rawValue,
+                "native_request_source": sample.nativeRequests?.source.rawValue ?? "unavailable",
+                "native_request_count": sample.nativeRequests?.requests.count ?? -1,
+                "chart_request_lanes": observedStore.chartPresentation.requestLanes.count,
+                "measurement_duration_seconds":
+                    sample.measurementDuration.map { $0 as Any } ?? NSNull(),
+                "ready": ready,
                 "discovery_cold_wall_ms": coldMilliseconds, "discovery_warm_calls": 100,
                 "discovery_warm_wall_ms": warmMilliseconds,
                 "discovery_warm_process_cpu_ms": warmCPUMilliseconds,

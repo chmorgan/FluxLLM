@@ -306,7 +306,8 @@ public final class MonitoringCoordinator {
         let template = try settings.configuration(for: chosen.kind)
         return BackendConfiguration(
             kind: chosen.kind, baseURL: chosen.baseURL,
-            model: template.model, proxyPort: template.proxyPort)
+            model: template.model, proxyPort: template.proxyPort,
+            studioMonitorToken: template.studioMonitorToken, workerAPIKey: template.workerAPIKey)
     }
 
     private func publishSelectionNotice(_ detections: [DetectedBackend]) {
@@ -324,11 +325,20 @@ public final class MonitoringCoordinator {
 
     private func detectBackends() async -> [DetectedBackend] {
         let urls = detectionURLs()
+        let configurations =
+            (selectedConfiguration.map { [$0] } ?? [])
+            + BackendKind.allCases.compactMap { try? settings.configuration(for: $0) }
         let client = client
-        async let local = client.discoverLocalBackends()
+        async let local = client.discoverLocalBackends(configurations: configurations)
         let probed = await withTaskGroup(of: DetectedBackend?.self) { group in
             for url in urls {
-                group.addTask { try? await client.detect(at: url) }
+                let configuration = configurations.first {
+                    $0.kind == .unsloth && Self.endpointKey($0.baseURL) == Self.endpointKey(url)
+                }
+                group.addTask {
+                    if let configuration { return try? await client.detect(configuration) }
+                    return try? await client.detect(at: url)
+                }
             }
             var found: [DetectedBackend] = []
             for await result in group {

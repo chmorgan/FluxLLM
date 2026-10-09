@@ -35,12 +35,20 @@ public struct BackendConfiguration: Equatable, Sendable {
     public let baseURL: URL
     public let model: String?
     public let proxyPort: Int
+    public let studioMonitorToken: String?
+    /// An explicitly supplied, session-only credential for the verified local Unsloth worker.
+    public let workerAPIKey: String?
 
-    public init(kind: BackendKind, baseURL: URL, model: String? = nil, proxyPort: Int = 11435) {
+    public init(
+        kind: BackendKind, baseURL: URL, model: String? = nil, proxyPort: Int = 11435,
+        studioMonitorToken: String? = nil, workerAPIKey: String? = nil
+    ) {
         self.kind = kind
         self.baseURL = baseURL
         self.model = model
         self.proxyPort = proxyPort
+        self.studioMonitorToken = studioMonitorToken
+        self.workerAPIKey = workerAPIKey
     }
 }
 
@@ -82,6 +90,64 @@ public enum ThroughputBasis: String, Sendable {
     }
 }
 
+/// A healthy counter baseline has no measured rate yet, but is distinct from missing telemetry.
+public enum ThroughputMeasurementState: String, Sendable {
+    case measured, warmingUp, unavailable
+}
+
+public enum RequestObservationSource: String, Sendable {
+    case slotPolling, studioMonitor, protocolStream
+}
+
+public enum ObservedRequestStatus: String, Sendable {
+    case running, completed, cancelled, failed, observationEnded
+}
+
+/// Reduced request metadata. No prompt, reply, tool arguments, or result contents are retained.
+public struct NativeRequestObservation: Sendable {
+    public let id: String
+    public let model: String?
+    public let startedAt: Date?
+    public let endedAt: Date?
+    public let outputTokens: Int?
+    public let promptTokens: Int?
+    public let liveTPS: Double?
+    public let status: ObservedRequestStatus
+
+    public init(
+        id: String, model: String? = nil, startedAt: Date? = nil, endedAt: Date? = nil,
+        outputTokens: Int? = nil, promptTokens: Int? = nil, liveTPS: Double? = nil,
+        status: ObservedRequestStatus = .running
+    ) {
+        self.id = id
+        self.model = model
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.outputTokens = outputTokens
+        self.promptTokens = promptTokens
+        self.liveTPS = liveTPS
+        self.status = status
+    }
+}
+
+/// Nil snapshots mean unavailable observation; an empty complete snapshot establishes idle.
+public struct NativeRequestSnapshot: Sendable {
+    public let sourceEpoch: UUID
+    public let source: RequestObservationSource
+    public let requests: [NativeRequestObservation]
+    public let isComplete: Bool
+
+    public init(
+        sourceEpoch: UUID, source: RequestObservationSource,
+        requests: [NativeRequestObservation], isComplete: Bool = true
+    ) {
+        self.sourceEpoch = sourceEpoch
+        self.source = source
+        self.requests = requests
+        self.isComplete = isComplete
+    }
+}
+
 /// Server-level telemetry is distinct from the proxy's individual request events.
 /// Missing measurements remain optional; hardware memory is never GPU utilization.
 public struct BackendSample: Sendable {
@@ -91,6 +157,10 @@ public struct BackendSample: Sendable {
     public let isReady: Bool
     public let currentTPS: Double?
     public let basis: ThroughputBasis
+    public let throughputState: ThroughputMeasurementState
+    /// Monotonic duration represented by a slot-counter measurement, for display smoothing.
+    public let measurementDuration: TimeInterval?
+    public let nativeRequests: NativeRequestSnapshot?
     public let runningRequests: Int?
     public let queuedRequests: Int?
     public let outputTokens: Int?
@@ -103,6 +173,9 @@ public struct BackendSample: Sendable {
         kind: BackendKind, timestamp: Date = Date(), model: String? = nil,
         isReady: Bool = true, currentTPS: Double? = nil,
         basis: ThroughputBasis = .serverAggregate,
+        throughputState: ThroughputMeasurementState? = nil,
+        measurementDuration: TimeInterval? = nil,
+        nativeRequests: NativeRequestSnapshot? = nil,
         runningRequests: Int? = nil, queuedRequests: Int? = nil,
         outputTokens: Int? = nil, promptTokens: Int? = nil,
         inferenceGPUPercent: Double? = nil, gpuSource: String? = nil, detail: String? = nil
@@ -113,6 +186,11 @@ public struct BackendSample: Sendable {
         self.isReady = isReady
         self.currentTPS = currentTPS
         self.basis = basis
+        self.throughputState =
+            throughputState
+            ?? (currentTPS.map { $0.isFinite && $0 >= 0 } == true ? .measured : .unavailable)
+        self.measurementDuration = measurementDuration
+        self.nativeRequests = nativeRequests
         self.runningRequests = runningRequests
         self.queuedRequests = queuedRequests
         self.outputTokens = outputTokens
@@ -126,13 +204,24 @@ public struct BackendSample: Sendable {
 /// Implementations must make read-only requests and never activate a model.
 public protocol BackendClientProtocol: Sendable {
     func discoverLocalBackends() async -> [DetectedBackend]
+    func discoverLocalBackends(configurations: [BackendConfiguration]) async -> [DetectedBackend]
     func detect(at baseURL: URL) async throws -> DetectedBackend?
+    func detect(_ configuration: BackendConfiguration) async throws -> DetectedBackend?
     func sample(_ configuration: BackendConfiguration) async throws -> BackendSample
     func reset() async
 }
 
 extension BackendClientProtocol {
     public func discoverLocalBackends() async -> [DetectedBackend] { [] }
+    /// Clients without authenticated local discovery keep their existing behavior.
+    public func discoverLocalBackends(configurations: [BackendConfiguration]) async
+        -> [DetectedBackend]
+    {
+        await discoverLocalBackends()
+    }
+    public func detect(_ configuration: BackendConfiguration) async throws -> DetectedBackend? {
+        try await detect(at: configuration.baseURL)
+    }
     public func reset() async {}
 }
 

@@ -15,6 +15,8 @@ public final class AppSettings: ObservableObject {
     @Published public var backendEndpoints: [BackendKind: String]
     @Published public var llamaCppModel: String
     @Published public var lastAutomaticBackendID: String?
+    @Published public var unslothMonitorToken: String?
+    @Published public var unslothWorkerAPIKey: String?
 
     private let settingsKey = "appSettings"
 
@@ -52,6 +54,8 @@ public final class AppSettings: ObservableObject {
                 .map { ($0, snapshot?.backendEndpoints?[$0.rawValue] ?? $0.defaultEndpoint) })
         llamaCppModel = snapshot?.llamaCppModel ?? ""
         lastAutomaticBackendID = snapshot?.lastAutomaticBackendID
+        unslothMonitorToken = nil
+        unslothWorkerAPIKey = nil
     }
 
     public var configurationError: String? {
@@ -77,10 +81,16 @@ public final class AppSettings: ObservableObject {
         let url = try Self.endpointURL(backendEndpoints[kind] ?? kind.defaultEndpoint)
         if kind == .unsloth { try Self.validateUnslothEndpoint(url) }
         let model = llamaCppModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let monitorToken = unslothMonitorToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let workerAPIKey =
+            kind == .unsloth ? try Self.normalizedUnslothWorkerAPIKey(unslothWorkerAPIKey) : nil
         return BackendConfiguration(
             kind: kind, baseURL: url,
             model: kind == .llamaCpp && !model.isEmpty ? model : nil,
-            proxyPort: proxyPort)
+            proxyPort: proxyPort,
+            studioMonitorToken: kind == .unsloth && monitorToken?.isEmpty == false
+                ? monitorToken : nil,
+            workerAPIKey: workerAPIKey)
     }
 
     public nonisolated static func endpointURL(_ endpoint: String) throws -> URL {
@@ -114,6 +124,20 @@ public final class AppSettings: ObservableObject {
                 "Enter the local Unsloth Studio address, such as http://127.0.0.1:8888, without an API path. Remote Unsloth monitoring is not supported."
             )
         }
+    }
+
+    public nonisolated static func normalizedUnslothWorkerAPIKey(_ key: String?) throws -> String? {
+        guard let key else { return nil }
+        let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        guard normalized.utf8.count <= 16_384,
+            normalized.utf8.allSatisfy({ (33...126).contains($0) })
+        else {
+            throw SettingsError.invalid(
+                "Enter a worker API key using printable ASCII characters without spaces, up to 16,384 bytes."
+            )
+        }
+        return normalized
     }
 
     public nonisolated static func validationError(

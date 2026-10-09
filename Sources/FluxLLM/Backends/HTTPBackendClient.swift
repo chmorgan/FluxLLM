@@ -42,7 +42,20 @@ public actor HTTPBackendClient: BackendClientProtocol {
     private let monotonicTime: @Sendable () -> TimeInterval
     private let wallClock: @Sendable () -> Date
     private var counters: [String: CounterSnapshot] = [:]
-    private var knownModels: [String: String] = [:]
+    private var llamaProperties: [String: LlamaProperties] = [:]
+    private var llamaSlotThroughput: [String: LlamaSlotThroughput] = [:]
+    private var llamaRequestSources: [String: LlamaRequestSource] = [:]
+    private var resetEpoch = UUID()
+
+    private struct LlamaProperties {
+        let model: String?
+        let supportsSlots: Bool
+    }
+
+    private struct LlamaRequestSource {
+        let epoch: UUID
+        let processStart: Double?
+    }
 
     private struct CounterSnapshot {
         let time: TimeInterval
@@ -124,25 +137,68 @@ public actor HTTPBackendClient: BackendClientProtocol {
         return nil
     }
 
+    public func detect(_ configuration: BackendConfiguration) async throws -> DetectedBackend? {
+        guard configuration.kind == .llamaCpp else {
+            // A worker credential never participates in generic/native backend probes.
+            return try await detect(at: configuration.baseURL)
+        }
+        let key = try Self.workerAPIKey(configuration)
+        _ = try Self.endpoint(configuration.baseURL, path: "metrics")
+        if let metrics = try await optionalMetrics(
+            configuration.baseURL, model: configuration.model, workerAPIKey: key,
+            preserveAuthenticationErrors: true),
+            metrics.samples.contains(where: { $0.name.hasPrefix("llamacpp:") })
+        {
+            return DetectedBackend(kind: .llamaCpp, baseURL: configuration.baseURL)
+        }
+        if let props = try await optionalJSON(
+            configuration.baseURL, path: "props", model: configuration.model,
+            workerAPIKey: key, preserveAuthenticationErrors: true), Self.isLlamaProps(props)
+        {
+            let enabled = props["endpoint_metrics"] as? Bool ?? false
+            return DetectedBackend(
+                kind: .llamaCpp, baseURL: configuration.baseURL,
+                version: props["build_info"] as? String,
+                isReady: enabled, supportsLiveMetrics: enabled,
+                detail: enabled ? nil : "Start llama.cpp with --metrics to enable monitoring.")
+        }
+        if let models = try await optionalJSON(configuration.baseURL, path: "models"),
+            Self.isLlamaRouter(models)
+        {
+            return DetectedBackend(
+                kind: .llamaCpp, baseURL: configuration.baseURL,
+                isReady: false, supportsLiveMetrics: false,
+                detail: "Select a loaded llama.cpp router model in Settings.")
+        }
+        return nil
+    }
+
     public func reset() async {
+        resetEpoch = UUID()
         counters.removeAll()
-        knownModels.removeAll()
+        llamaProperties.removeAll()
+        llamaSlotThroughput.removeAll()
+        llamaRequestSources.removeAll()
     }
 
     public func sample(_ configuration: BackendConfiguration) async throws -> BackendSample {
+        let epoch = resetEpoch
         do {
             switch configuration.kind {
             case .ollama: return try await sampleOllama(configuration)
             case .vllm: return try await sampleVLLM(configuration)
             case .rapidMLX: return try await sampleRapid(configuration)
-            case .llamaCpp: return try await sampleLlama(configuration)
+            case .llamaCpp: return try await sampleLlama(configuration, epoch: epoch)
             case .unsloth:
                 throw BackendClientError.configurationRequired(
                     "Unsloth monitoring requires local inference-worker discovery.")
             }
         } catch {
             // Never bridge an outage with a throughput estimate on reconnection.
-            counters.removeValue(forKey: counterKey(configuration))
+            if epoch == resetEpoch {
+                counters.removeValue(forKey: counterKey(configuration))
+                llamaSlotThroughput.removeValue(forKey: counterKey(configuration))
+            }
             throw error
         }
     }
@@ -221,14 +277,21 @@ public actor HTTPBackendClient: BackendClientProtocol {
             detail: Self.rapidReady(status) ? nil : "The configured Rapid-MLX model is not loaded.")
     }
 
-    private func sampleLlama(_ configuration: BackendConfiguration) async throws -> BackendSample {
+    private func sampleLlama(_ configuration: BackendConfiguration, epoch: UUID) async throws
+        -> BackendSample
+    {
+        let workerAPIKey = try Self.workerAPIKey(configuration)
         let metrics: PrometheusMetrics
         do {
-            metrics = try await fetchMetrics(configuration.baseURL, model: configuration.model)
+            metrics = try await fetchMetrics(
+                configuration.baseURL, model: configuration.model, workerAPIKey: workerAPIKey)
         } catch {
-            try Task.checkCancellation()
+            try checkSampleEpoch(epoch)
+            if Self.isAuthenticationError(error) { throw error }
             if let props = try await optionalJSON(
-                configuration.baseURL, path: "props", model: configuration.model),
+                configuration.baseURL, path: "props", model: configuration.model,
+                workerAPIKey: workerAPIKey,
+                preserveAuthenticationErrors: workerAPIKey != nil),
                 Self.isLlamaProps(props), props["endpoint_metrics"] as? Bool == false
             {
                 throw BackendClientError.configurationRequired(
@@ -243,27 +306,98 @@ public actor HTTPBackendClient: BackendClientProtocol {
             }
             throw error
         }
+        try checkSampleEpoch(epoch)
         guard metrics.samples.contains(where: { $0.name.hasPrefix("llamacpp:") }) else {
             throw BackendClientError.unsupportedMetrics
         }
-        let running = Self.integer(metrics.sum("llamacpp:requests_processing"))
+        var running = Self.integer(metrics.sum("llamacpp:requests_processing"))
         let reported = Self.nonnegative(metrics.sum("llamacpp:predicted_tokens_seconds"))
         // llama.cpp's documented gauge is an average; older counter implementations
         // publish completed work in batches, so counter deltas are not a live token feed.
-        let current = running == nil ? nil : reported
-        if knownModels[counterKey(configuration)] == nil,
-            let props = try await optionalJSON(
-                configuration.baseURL, path: "props", model: configuration.model)
+        var current = running == nil ? nil : reported
+        var basis = ThroughputBasis.serverReportedAverage
+        var throughputState: ThroughputMeasurementState = current == nil ? .unavailable : .measured
+        var measurementDuration: TimeInterval? = nil
+        var nativeRequests: NativeRequestSnapshot?
+        let key = counterKey(configuration)
+        let processStart = Self.nonnegative(metrics.sum("process_start_time_seconds"))
+        if llamaRequestSources[key] == nil || llamaRequestSources[key]?.processStart != processStart
         {
-            knownModels[counterKey(configuration)] = props["model_alias"] as? String
+            llamaRequestSources[key] = LlamaRequestSource(epoch: UUID(), processStart: processStart)
+        }
+        let requestEpoch = llamaRequestSources[key]!.epoch
+        if llamaProperties[key] == nil,
+            let props = try await optionalJSON(
+                configuration.baseURL, path: "props", model: configuration.model,
+                workerAPIKey: workerAPIKey,
+                preserveAuthenticationErrors: workerAPIKey != nil)
+        {
+            try checkSampleEpoch(epoch)
+            let slots = props["endpoint_slots"] as? NSNumber
+            llamaProperties[key] = LlamaProperties(
+                model: props["model_alias"] as? String,
+                supportsSlots: slots.map {
+                    CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue
+                } ?? false)
+        }
+        try checkSampleEpoch(epoch)
+        if let processing = running, processing > 0, llamaProperties[key]?.supportsSlots == true {
+            do {
+                let response = try await get(
+                    configuration.baseURL, path: "slots", model: configuration.model,
+                    workerAPIKey: workerAPIKey)
+                try checkSampleEpoch(epoch)
+                var throughput = llamaSlotThroughput[key] ?? LlamaSlotThroughput()
+                let measurement = try throughput.sample(
+                    response.data, at: monotonicTime(),
+                    processStart: processStart)
+                current = measurement.currentTPS
+                running = measurement.activeRequests
+                throughputState = measurement.state
+                measurementDuration = measurement.measurementDuration
+                let model = configuration.model ?? llamaProperties[key]?.model
+                nativeRequests = NativeRequestSnapshot(
+                    sourceEpoch: requestEpoch, source: .slotPolling,
+                    requests: measurement.requests.map {
+                        NativeRequestObservation(
+                            id: $0.id, model: model, outputTokens: $0.outputTokens,
+                            liveTPS: $0.liveTPS, status: $0.status)
+                    })
+                llamaSlotThroughput[key] = throughput
+                basis = .serverAggregate
+            } catch {
+                try checkSampleEpoch(epoch)
+                llamaSlotThroughput.removeValue(forKey: key)
+                if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                    throw error
+                }
+                if workerAPIKey != nil, Self.isAuthenticationError(error) { throw error }
+                // Slots are optional monitoring; retain the original reported gauge
+                // when disabled, unavailable, oversized, or malformed.
+            }
+        } else {
+            // No additional slot request is needed while idle or activity is unknown.
+            llamaSlotThroughput.removeValue(forKey: key)
+            if running == 0, llamaProperties[key]?.supportsSlots == true {
+                nativeRequests = NativeRequestSnapshot(
+                    sourceEpoch: requestEpoch, source: .slotPolling, requests: [])
+            }
         }
         return BackendSample(
             kind: .llamaCpp, timestamp: wallClock(),
-            model: configuration.model ?? knownModels[counterKey(configuration)],
-            currentTPS: current, basis: .serverReportedAverage, runningRequests: running,
+            model: configuration.model ?? llamaProperties[key]?.model,
+            currentTPS: current, basis: basis,
+            throughputState: throughputState, measurementDuration: measurementDuration,
+            nativeRequests: nativeRequests,
+            runningRequests: running,
             queuedRequests: Self.integer(metrics.sum("llamacpp:requests_deferred")),
             outputTokens: Self.integer(metrics.sum("llamacpp:tokens_predicted_total")),
             promptTokens: Self.integer(metrics.sum("llamacpp:prompt_tokens_total")))
+    }
+
+    private func checkSampleEpoch(_ epoch: UUID) throws {
+        try Task.checkCancellation()
+        guard epoch == resetEpoch else { throw CancellationError() }
     }
 
     private func counterKey(_ configuration: BackendConfiguration) -> String {
@@ -294,36 +428,54 @@ public actor HTTPBackendClient: BackendClientProtocol {
         return rate.isFinite ? rate : nil
     }
 
-    private func fetchMetrics(_ baseURL: URL, model: String? = nil) async throws
+    private func fetchMetrics(
+        _ baseURL: URL, model: String? = nil, workerAPIKey: String? = nil
+    ) async throws
         -> PrometheusMetrics
     {
-        let response = try await get(baseURL, path: "metrics", model: model)
+        let response = try await get(
+            baseURL, path: "metrics", model: model, workerAPIKey: workerAPIKey)
         guard let text = String(data: response.data, encoding: .utf8) else {
             throw BackendClientError.invalidResponse
         }
         return PrometheusMetrics(text)
     }
 
-    private func optionalMetrics(_ baseURL: URL) async throws -> PrometheusMetrics? {
-        do { return try await fetchMetrics(baseURL) } catch {
+    private func optionalMetrics(
+        _ baseURL: URL, model: String? = nil, workerAPIKey: String? = nil,
+        preserveAuthenticationErrors: Bool = false
+    ) async throws -> PrometheusMetrics? {
+        do {
+            return try await fetchMetrics(baseURL, model: model, workerAPIKey: workerAPIKey)
+        } catch {
             try Task.checkCancellation()
+            if preserveAuthenticationErrors, Self.isAuthenticationError(error) { throw error }
             return nil
         }
     }
 
-    private func optionalJSON(_ baseURL: URL, path: String, model: String? = nil) async throws
+    private func optionalJSON(
+        _ baseURL: URL, path: String, model: String? = nil, workerAPIKey: String? = nil,
+        preserveAuthenticationErrors: Bool = false
+    ) async throws
         -> [String: Any]?
     {
-        do { return try await json(baseURL, path: path, model: model) } catch {
+        do {
+            return try await json(baseURL, path: path, model: model, workerAPIKey: workerAPIKey)
+        } catch {
             try Task.checkCancellation()
+            if preserveAuthenticationErrors, Self.isAuthenticationError(error) { throw error }
             return nil
         }
     }
 
-    private func json(_ baseURL: URL, path: String, model: String? = nil) async throws -> [String:
+    private func json(
+        _ baseURL: URL, path: String, model: String? = nil, workerAPIKey: String? = nil
+    ) async throws -> [String:
         Any]
     {
-        let response = try await get(baseURL, path: path, model: model)
+        let response = try await get(
+            baseURL, path: path, model: model, workerAPIKey: workerAPIKey)
         guard let value = try JSONSerialization.jsonObject(with: response.data) as? [String: Any]
         else {
             throw BackendClientError.invalidResponse
@@ -331,7 +483,9 @@ public actor HTTPBackendClient: BackendClientProtocol {
         return value
     }
 
-    private func get(_ baseURL: URL, path: String, model: String? = nil) async throws
+    private func get(
+        _ baseURL: URL, path: String, model: String? = nil, workerAPIKey: String? = nil
+    ) async throws
         -> BackendHTTPResponse
     {
         try Task.checkCancellation()
@@ -342,6 +496,10 @@ public actor HTTPBackendClient: BackendClientProtocol {
         request.setValue(
             path == "metrics" ? "text/plain; version=0.0.4" : "application/json",
             forHTTPHeaderField: "Accept")
+        if let workerAPIKey, ["metrics", "props", "slots"].contains(path) {
+            // This value is request-scoped; no subsequent probe inherits a credential.
+            request.setValue("Bearer \(workerAPIKey)", forHTTPHeaderField: "Authorization")
+        }
         let response = try await transport(request)
         try Task.checkCancellation()
         guard response.data.count <= Self.maximumResponseBytes else {
@@ -351,6 +509,38 @@ public actor HTTPBackendClient: BackendClientProtocol {
             throw BackendClientError.httpStatus(response.statusCode)
         }
         return response
+    }
+
+    private static func workerAPIKey(_ configuration: BackendConfiguration) throws -> String? {
+        guard let key = configuration.workerAPIKey, !key.isEmpty else { return nil }
+        guard key.utf8.count <= 16_384,
+            key.utf8.allSatisfy({ (33...126).contains($0) })
+        else {
+            throw BackendClientError.configurationRequired(
+                "Enter a valid Unsloth worker API key in Settings. The key must contain only printable ASCII characters without spaces and be at most 16384 bytes."
+            )
+        }
+        guard
+            let components = URLComponents(
+                url: configuration.baseURL, resolvingAgainstBaseURL: false),
+            components.scheme?.lowercased() == "http", components.user == nil,
+            components.password == nil, components.query == nil, components.fragment == nil,
+            components.path.isEmpty || components.path == "/",
+            let hostname = components.host,
+            ["127.0.0.1", "::1"].contains(
+                hostname.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))),
+            (1...65535).contains(components.port ?? 80)
+        else {
+            throw BackendClientError.configurationRequired(
+                "Unsloth worker authentication requires a verified local worker at a loopback HTTP address without an API path."
+            )
+        }
+        return key
+    }
+
+    private static func isAuthenticationError(_ error: Error) -> Bool {
+        guard case .httpStatus(let code) = error as? BackendClientError else { return false }
+        return code == 401 || code == 403
     }
 
     private static func endpoint(_ baseURL: URL, path: String, model: String? = nil) throws -> URL {
@@ -367,7 +557,7 @@ public actor HTTPBackendClient: BackendClientProtocol {
         else {
             throw BackendClientError.invalidEndpoint
         }
-        if path == "metrics" || path == "props" {
+        if path == "metrics" || path == "props" || path == "slots" {
             // llama.cpp's router can otherwise load a model merely to answer a GET.
             // Unknown query fields are ignored by the other supported metrics servers.
             endpoint.queryItems = [URLQueryItem(name: "autoload", value: "false")]

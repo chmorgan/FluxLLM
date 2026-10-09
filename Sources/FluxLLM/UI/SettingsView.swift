@@ -14,6 +14,8 @@ public struct SettingsView: View {
     @State private var proxyPort: String
     @State private var ollamaHost: String
     @State private var ollamaPort: String
+    @State private var unslothMonitorToken: String
+    @State private var unslothWorkerAPIKey: String
     @State private var isApplying = false
     @State private var isScanning = false
     @State private var applyError: String?
@@ -36,6 +38,8 @@ public struct SettingsView: View {
         _proxyPort = State(initialValue: String(settings.proxyPort))
         _ollamaHost = State(initialValue: settings.ollamaHost)
         _ollamaPort = State(initialValue: String(settings.ollamaPort))
+        _unslothMonitorToken = State(initialValue: settings.unslothMonitorToken ?? "")
+        _unslothWorkerAPIKey = State(initialValue: settings.unslothWorkerAPIKey ?? "")
     }
 
     public var body: some View {
@@ -256,15 +260,21 @@ public struct SettingsView: View {
             }
             if let detected = store?.detectedBackends, !detected.isEmpty {
                 ForEach(detected) { backend in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Image(
-                            systemName: backend.isReady
-                                ? "checkmark.circle" : "exclamationmark.circle"
-                        )
-                        .foregroundStyle(backend.isReady ? Color.green : Color.orange)
-                        Text(backend.kind.title).fontWeight(.medium)
-                        Text(backend.baseURL.absoluteString)
-                            .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(
+                                systemName: backend.isReady
+                                    ? "checkmark.circle" : "exclamationmark.circle"
+                            )
+                            .foregroundStyle(backend.isReady ? Color.green : Color.orange)
+                            Text(backend.kind.title).fontWeight(.medium)
+                            Text(backend.baseURL.absoluteString)
+                                .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        }
+                        if !backend.isReady, let detail = backend.detail, !detail.isEmpty {
+                            Text(detail).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                     .font(.caption).textSelection(.enabled)
                 }
@@ -333,8 +343,20 @@ public struct SettingsView: View {
                     "Enter the local Studio address, normally http://127.0.0.1:8888. FluxLLM follows its GGUF inference worker automatically. Keep using Unsloth normally; no client proxy is needed."
                 )
                 .font(.caption).foregroundStyle(.secondary)
+                SecureField("Worker API key (optional)", text: $unslothWorkerAPIKey)
                 Text(
-                    "Request history and tool-call accounting are not available for Unsloth. System GPU measures this Mac."
+                    "If the worker requires authentication, enter its API key to read native metrics and request tracking. The key may change when Unsloth reloads a model and is kept only until FluxLLM quits."
+                )
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                SecureField("Studio monitor token (optional)", text: $unslothMonitorToken)
+                Text(
+                    "The separate Studio sign-in token adds Studio request history. It is kept only until FluxLLM quits."
+                )
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                Text(
+                    "Studio’s monitor endpoint does not expose structured tool activity. System GPU measures this Mac."
                 )
                 .font(.caption).foregroundStyle(.secondary)
             } else {
@@ -352,18 +374,21 @@ public struct SettingsView: View {
 
     private var clientEndpoint: String { "http://127.0.0.1:\(proxyPort)" }
     private var draftFingerprint: [String] {
-        [selection.rawValue, proxyPort, ollamaHost, ollamaPort, llamaCppModel]
+        [
+            selection.rawValue, proxyPort, ollamaHost, ollamaPort, llamaCppModel,
+            unslothMonitorToken, unslothWorkerAPIKey,
+        ]
             + BackendKind.allCases.map { endpoints[$0] ?? "" }
     }
     private var draftError: String? {
         Self.validationError(
             selection: selection, proxyPort: proxyPort, ollamaHost: ollamaHost,
-            ollamaPort: ollamaPort, endpoints: endpoints)
+            ollamaPort: ollamaPort, endpoints: endpoints, unslothWorkerAPIKey: unslothWorkerAPIKey)
     }
 
     static func validationError(
         selection: BackendSelection, proxyPort: String, ollamaHost: String,
-        ollamaPort: String, endpoints: [BackendKind: String]
+        ollamaPort: String, endpoints: [BackendKind: String], unslothWorkerAPIKey: String = ""
     ) -> String? {
         if selection == .automatic || selection == .ollama {
             guard let localPort = Int(proxyPort), let upstreamPort = Int(ollamaPort) else {
@@ -382,7 +407,10 @@ public struct SettingsView: View {
         for kind in kinds {
             do {
                 let url = try AppSettings.endpointURL(endpoints[kind] ?? kind.defaultEndpoint)
-                if kind == .unsloth { try AppSettings.validateUnslothEndpoint(url) }
+                if kind == .unsloth {
+                    try AppSettings.validateUnslothEndpoint(url)
+                    _ = try AppSettings.normalizedUnslothWorkerAPIKey(unslothWorkerAPIKey)
+                }
             } catch {
                 return "\(kind.title): \(error.localizedDescription)"
             }
@@ -406,6 +434,12 @@ public struct SettingsView: View {
         }
         if selection == .automatic || selection == .llamaCpp {
             settings.llamaCppModel = llamaCppModel
+        }
+        if selection == .automatic || selection == .unsloth {
+            let token = unslothMonitorToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            settings.unslothMonitorToken = token.isEmpty ? nil : token
+            settings.unslothWorkerAPIKey = try? AppSettings.normalizedUnslothWorkerAPIKey(
+                unslothWorkerAPIKey)
         }
         settings.backendSelection = selection
         isApplying = true

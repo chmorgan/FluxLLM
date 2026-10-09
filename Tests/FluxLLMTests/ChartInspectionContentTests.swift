@@ -78,6 +78,63 @@ final class ChartInspectionContentTests: XCTestCase {
         XCTAssertEqual(metrics.outputTokens, "~125 tok")
     }
 
+    func testNativeRequestUsesSampledAverageInsteadOfTotalAndFirstSeenDuration() throws {
+        for source in [RequestObservationSource.slotPolling, .studioMonitor] {
+            let lane = RequestLane(
+                id: UUID(), startedAt: origin, outputTokens: 1050, outputIsEstimated: false,
+                liveTPS: 999, observationSource: source, sampledAverageTPS: 50)
+            let content = ChartInspectionContent.request(lane, at: date(2))
+            let metrics = try XCTUnwrap(content.requestMetrics)
+
+            XCTAssertEqual(metrics.duration, "2.0 s")
+            XCTAssertEqual(metrics.outputTokens, "\(1050.formatted()) tok")
+            XCTAssertEqual(metrics.averageRate, "~50.0 tok/s")
+            XCTAssertEqual(
+                content.rows.first { $0.label == "Coverage" }?.value,
+                source == .slotPolling
+                    ? "Sampled times and average" : "Reported times; sampled avg")
+            XCTAssertEqual(content.rows.count, 2)
+        }
+    }
+
+    func testNativeWarmupNeverFallsBackToLiveRateOrTotalTokens() throws {
+        for source in [RequestObservationSource.slotPolling, .studioMonitor] {
+            let lane = RequestLane(
+                id: UUID(), startedAt: origin, outputTokens: 1000, outputIsEstimated: false,
+                liveTPS: 50, observationSource: source)
+            let metrics = try XCTUnwrap(
+                ChartInspectionContent.request(lane, at: date(10)).requestMetrics)
+            XCTAssertEqual(metrics.averageRate, "—")
+        }
+    }
+
+    func testNativeMeasuredZeroIsAvailableAndInvalidAveragesStayUnknown() throws {
+        let zero = RequestLane(
+            id: UUID(), startedAt: origin, observationSource: .slotPolling,
+            sampledAverageTPS: 0)
+        let zeroMetrics = try XCTUnwrap(
+            ChartInspectionContent.request(zero, at: date(5)).requestMetrics)
+        XCTAssertEqual(zeroMetrics.averageRate, "~0.0 tok/s")
+
+        for rate in [Double.nan, .infinity, -.infinity, -1] {
+            let lane = RequestLane(
+                id: UUID(), startedAt: origin, observationSource: .slotPolling,
+                sampledAverageTPS: rate)
+            let metrics = try XCTUnwrap(
+                ChartInspectionContent.request(lane, at: date(5)).requestMetrics)
+            XCTAssertEqual(metrics.averageRate, "—")
+        }
+    }
+
+    func testProtocolAverageIgnoresSampledNativeAverage() throws {
+        let lane = RequestLane(
+            id: UUID(), startedAt: origin, endedAt: date(10), outputTokens: 100,
+            outputIsEstimated: false, terminal: true, sampledAverageTPS: 999)
+        let metrics = try XCTUnwrap(
+            ChartInspectionContent.request(lane, at: date(20)).requestMetrics)
+        XCTAssertEqual(metrics.averageRate, "10.0 tok/s")
+    }
+
     func testZeroMissingAndInvalidDurationNeverProduceAnInvalidAverage() throws {
         let zero = RequestLane(
             id: UUID(), startedAt: origin, endedAt: origin, outputTokens: 100,

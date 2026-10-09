@@ -298,11 +298,14 @@ public final class MetricsStore {
     @ObservationIgnored private var retiredRequestLanes: [RequestLane] = []
     @ObservationIgnored private var seenProxyRequestIDs: Set<UUID> = []
     @ObservationIgnored private var retiredProxyRequestIDs: [UUID] = []
+    @ObservationIgnored private var nativeRequestTracker = NativeRequestTracker()
     private var nativeActivity: BackendActivity = .unknown {
         didSet { if nativeActivity != oldValue { refreshLiveActivity() } }
     }
     @ObservationIgnored private var nativeActivityObservedAt: Date?
     @ObservationIgnored private var lastRatePublicationAt: Date?
+    @ObservationIgnored private var slotDisplayAverage = SlotThroughputDisplayAverage()
+    @ObservationIgnored private var slotThroughputIsWarmingUp = false
     @ObservationIgnored private var lastChartPublicationAt: Date?
     @ObservationIgnored private let clock: () -> Date
     @ObservationIgnored private var lastGPUSampleAt: Date?
@@ -616,10 +619,13 @@ public final class MetricsStore {
         retiredRequestLanes.removeAll(keepingCapacity: true)
         seenProxyRequestIDs.removeAll(keepingCapacity: true)
         retiredProxyRequestIDs.removeAll(keepingCapacity: true)
+        nativeRequestTracker.reset()
         nativeActivity = .unknown
         nativeActivityObservedAt = nil
         currentTPS = 0
+        resetSlotThroughputDisplay()
         clearDisplayRate()
+        lastRatePublicationAt = nil
         generationElapsed = 0
         requestHasInvalidRate = false
         requestHasOutputEvidence = false
@@ -680,7 +686,7 @@ public final class MetricsStore {
         if backendKind == .ollama {
             refreshOllamaConnection(at: date)
         } else {
-            setEffectiveConnection(state, message: message)
+            setEffectiveConnection(state, message: message, at: date)
         }
     }
 
@@ -754,6 +760,7 @@ public final class MetricsStore {
         updateConnection(
             sample.isReady ? .ready : .connecting, message: sample.detail, at: sample.timestamp)
         if sample.kind != .ollama {
+            nativeRequestTracker.apply(sample.nativeRequests, at: sample.timestamp)
             // Counts from the scrape remain direct activity evidence even when
             // that provider's separate readiness endpoint is failing.
             nativeActivity = .native(
@@ -772,6 +779,9 @@ public final class MetricsStore {
             }
             return
         }
+        if currentModel != sample.model || throughputBasis != sample.basis {
+            resetSlotThroughputDisplay()
+        }
         currentModel = sample.model
         throughputBasis = sample.basis
         outputIsEstimated = sample.basis == .estimated
@@ -779,8 +789,25 @@ public final class MetricsStore {
         queuedRequests = sample.queuedRequests.map { max(0, $0) }
         backendOutputTokens = sample.outputTokens.flatMap { $0 >= 0 ? $0 : nil }
         backendPromptTokens = sample.promptTokens.flatMap { $0 >= 0 ? $0 : nil }
-        let rate = validRate(sample.currentTPS)
+        let slotPresentation = usesSlotThroughputDisplay
+        let rate =
+            slotPresentation && sample.throughputState != .measured
+            ? nil : validRate(sample.currentTPS)
         rateIsAvailable = rate != nil
+        slotThroughputIsWarmingUp =
+            slotPresentation && sample.throughputState == .warmingUp
+            && sample.currentTPS == nil && sample.measurementDuration == nil
+            && (runningRequests ?? 0) > 0
+        if slotThroughputIsWarmingUp {
+            slotDisplayAverage.reset()
+        } else if slotPresentation, let rate, let duration = sample.measurementDuration,
+            duration.isFinite, duration > 0, duration <= Self.freshnessInterval,
+            runningRequests != 0
+        {
+            slotDisplayAverage.record(rate: rate, duration: duration, endingAt: sample.timestamp)
+        } else {
+            slotDisplayAverage.reset()
+        }
         // Some backends retain their last average while idle. Keep this separate
         // from current activity, and let a counter collector supply real deltas.
         if sample.basis == .serverReportedAverage, runningRequests == 0 {
@@ -789,8 +816,11 @@ public final class MetricsStore {
         } else {
             currentTPS = rate ?? 0
         }
-        if !rateIsAvailable {
-            clearDisplayRate()
+        if slotThroughputIsWarmingUp {
+            // Healthy counter setup is a presentation zero, not a measured chart point.
+            displayIdleRate(at: sample.timestamp)
+        } else if !rateIsAvailable {
+            clearDisplayRate(at: sample.timestamp)
         } else if currentTPS == 0, runningRequests == 0, (queuedRequests ?? 0) == 0 {
             displayIdleRate(at: sample.timestamp)
         }
@@ -867,6 +897,7 @@ public final class MetricsStore {
         sampleDate = date
         historyBufferRevision &+= 1
         expireNativeActivity(at: date)
+        nativeRequestTracker.advance(at: date)
         // In proxy/ollama mode the displayed rate is the sum of every open
         // request's live rate. Refresh it against this sample time so a stalled
         // request (no chunk in `freshnessInterval`) drops out of the trace. The
@@ -1073,13 +1104,16 @@ public final class MetricsStore {
         return date.timeIntervalSince(evidence) <= Self.freshnessInterval
     }
 
-    private func setEffectiveConnection(_ state: BackendConnectionState, message: String?) {
+    private func setEffectiveConnection(
+        _ state: BackendConnectionState, message: String?, at date: Date? = nil
+    ) {
         connectionState = state
         connectionMessage = message
         if state != .ready {
             currentTPS = 0
             rateIsAvailable = false
-            clearDisplayRate()
+            resetSlotThroughputDisplay()
+            clearDisplayRate(at: date)
             runningRequests = nil
             queuedRequests = nil
             inferenceGPUPercent = nil
@@ -1087,27 +1121,54 @@ public final class MetricsStore {
         }
     }
 
-    private func clearDisplayRate() {
+    private var usesNativeThroughputCadence: Bool {
+        backendKind == .unsloth || backendKind == .llamaCpp
+    }
+
+    private var usesSlotThroughputDisplay: Bool {
+        usesNativeThroughputCadence && throughputBasis == .serverAggregate
+    }
+
+    private func resetSlotThroughputDisplay() {
+        slotDisplayAverage.reset()
+        slotThroughputIsWarmingUp = false
+    }
+
+    private func clearDisplayRate(at date: Date? = nil) {
+        let changed = displayTPS != nil
         displayTPS = nil
         displayRateIsEstimated = false
         displayUpdatedAt = nil
-        lastRatePublicationAt = nil
+        if usesNativeThroughputCadence {
+            if changed { lastRatePublicationAt = date ?? clock() }
+        } else {
+            lastRatePublicationAt = nil
+        }
     }
 
     private func displayIdleRate(at date: Date) {
+        let changed = displayTPS != 0
         displayTPS = 0
         displayRateIsEstimated = false
         displayUpdatedAt = date
-        lastRatePublicationAt = nil
+        if usesNativeThroughputCadence {
+            if changed { lastRatePublicationAt = date }
+        } else {
+            lastRatePublicationAt = nil
+        }
     }
 
     private func publishDisplayRateIfDue(at date: Date) {
         guard backendKind == nil || connectionState == .ready else {
-            clearDisplayRate()
+            clearDisplayRate(at: date)
+            return
+        }
+        if slotThroughputIsWarmingUp {
+            displayIdleRate(at: date)
             return
         }
         guard rateIsAvailable else {
-            clearDisplayRate()
+            clearDisplayRate(at: date)
             return
         }
         if backendKind != nil, backendKind != .ollama,
@@ -1132,7 +1193,7 @@ public final class MetricsStore {
         guard lastRatePublicationAt.map({ date.timeIntervalSince($0) >= 1 }) ?? true else {
             return
         }
-        displayTPS = currentTPS
+        displayTPS = usesSlotThroughputDisplay ? slotDisplayAverage.value ?? currentTPS : currentTPS
         displayRateIsEstimated = isRateEstimated
         displayUpdatedAt = date
         lastRatePublicationAt = date
@@ -1429,7 +1490,10 @@ public final class MetricsStore {
                 liveTPS: request.liveTPS, terminal: false)
         }
         let retired = retiredRequestLanes.filter { $0.isVisible(at: cutoff) }
-        return (open + retired).sorted { $0.startedAt < $1.startedAt }
+        return (open + retired + nativeRequestTracker.lanes(at: sampleDate)).sorted {
+            $0.startedAt == $1.startedAt
+                ? $0.id.uuidString < $1.id.uuidString : $0.startedAt < $1.startedAt
+        }
     }
 
     private func expireNativeActivity(at date: Date) {

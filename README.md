@@ -74,9 +74,29 @@ current launch and are not saved. Previously saved preferences are read at start
 For **Unsloth**, choose **Unsloth** and enter its local Studio address, normally
 `http://127.0.0.1:8888`. FluxLLM discovers the managed GGUF inference worker and
 follows its changing port when models reload. Clients keep using Unsloth directly.
-Monitoring is read-only and does not load models. Throughput is the worker's
-reported average; token counts are its server totals. Individual request history,
-tool-call accounting, remote Unsloth, and training telemetry are not included.
+Monitoring is read-only and does not load models. For llama.cpp and Unsloth,
+live throughput combines decoded-token count changes across active slots when
+the worker's `/slots` endpoint is enabled. It falls back to the server's reported
+average when slots are disabled or unavailable; token counts remain server totals.
+Healthy slot baseline warmup shows zero in numeric displays. Slot-derived numeric
+throughput uses a three-second time-weighted average; charts keep raw rates, and
+errors or stale data remain visible.
+Active slot/task identities also draw request bars without a proxy or Studio sign-in token.
+Their start and end times are sampled once per second; short requests and final
+token counts can be missed. Request hover cards show an approximate average from
+the token-count increase between the first and latest valid counter observations,
+marked `~`. It becomes available after two observations and remains at the last
+measured value when observation ends. If Unsloth protects its worker endpoints,
+enter the current worker API key in Settings. FluxLLM keeps it only until it quits
+and sends it only to the verified local worker's metrics, properties, and slots
+endpoints. Unsloth may replace the key when a model reloads; update the field and
+apply Settings again if authentication fails. This key is separate from the optional
+Studio sign-in token, which adds
+recorded request metadata from `/api/inference/monitor` when supported and enabled. The token is
+kept only until FluxLLM quits; unavailable monitor history falls back to slots.
+Sampled requests do not add to the Ollama usage ledger. These exposed endpoints
+do not provide structured tool-call activity. Remote Unsloth and training
+telemetry are not included.
 
 Enable **Settings → General → Launch at login** to start FluxLLM automatically
 when you sign in. The change takes effect immediately, separately from other
