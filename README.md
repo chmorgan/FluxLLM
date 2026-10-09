@@ -86,14 +86,17 @@ Their start and end times are sampled once per second; short requests and final
 token counts can be missed. Request hover cards show an approximate average from
 the token-count increase between the first and latest valid counter observations,
 marked `~`. It becomes available after two observations and remains at the last
-measured value when observation ends. If Unsloth protects its worker endpoints,
-enter the current worker API key in Settings. FluxLLM keeps it only until it quits
-and sends it only to the verified local worker's metrics, properties, and slots
-endpoints. Unsloth may replace the key when a model reloads; update the field and
-apply Settings again if authentication fails. This key is separate from the optional
-Studio sign-in token, which adds
-recorded request metadata from `/api/inference/monitor` when supported and enabled. The token is
-kept only until FluxLLM quits; unavailable monitor history falls back to slots.
+measured value when observation ends. FluxLLM automatically reads the authentication
+key from the verified local worker's launch key file and follows key changes when
+Unsloth reloads a model. Automatic keys stay inside the backend and are never copied
+into Settings or saved preferences. They authorize only the verified worker's
+metrics, properties, and slots endpoints. Leave **Worker API key override** blank
+for automatic authentication; enter a current worker key there only when an override
+is needed. Unsloth's web interface creates Studio API tokens, which belong in the
+separate **Studio API key or monitor token (optional)** field. This token adds recorded request
+metadata from `/api/inference/monitor` when supported and enabled; unavailable monitor
+history falls back to slots. Settings shows these controls near detected Unsloth.
+Apply keeps explicit credentials for the session without changing the selected system.
 Sampled requests do not add to the Ollama usage ledger. These exposed endpoints
 do not provide structured tool-call activity. Remote Unsloth and training
 telemetry are not included.

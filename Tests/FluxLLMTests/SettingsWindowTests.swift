@@ -74,6 +74,48 @@ final class SettingsWindowTests: XCTestCase {
         }
     }
 
+    func testUnslothCredentialLayoutsKeepWindowSizeAcrossSelectionAndDetection() throws {
+        try withSettings { settings in
+            let cases: [(BackendSelection, Bool, String?)] = [
+                (.automatic, true, nil), (.unsloth, false, nil),
+                (.automatic, true, "session-worker-key"),
+                (.ollama, true, "session-worker-key"), (.vllm, true, "session-worker-key"),
+            ]
+            for (selection, hasDetectedUnsloth, workerOverride) in cases {
+                settings.backendSelection = selection
+                settings.unslothWorkerAPIKey = workerOverride
+                settings.unslothMonitorToken = "session-monitor-token"
+                let store = MetricsStore()
+                if hasDetectedUnsloth {
+                    store.setDetections([
+                        DetectedBackend(
+                            kind: .vllm, baseURL: URL(string: "http://localhost:8000")!),
+                        DetectedBackend(
+                            kind: .unsloth, baseURL: URL(string: "http://127.0.0.1:8888")!,
+                            isReady: false,
+                            detail:
+                                workerOverride == nil
+                                ? "Automatic worker authentication is unavailable. Enter a manual worker key override in Settings."
+                                : "The worker rejected the manual key override (HTTP 401). Clear the override to use automatic authentication."
+                        ),
+                    ])
+                }
+                let window = MenuBarController.makeSettingsWindow(
+                    settings: settings, store: store, onApply: {})
+                defer { window.close() }
+                try assertStableLayout(window)
+
+                // A rescan can remove the detection while credential drafts
+                // remain present for a manually selected Unsloth connection.
+                store.setDetections([])
+                try assertStableLayout(window)
+                XCTAssertEqual(settings.backendSelection, selection)
+                XCTAssertEqual(settings.unslothWorkerAPIKey, workerOverride)
+                XCTAssertEqual(settings.unslothMonitorToken, "session-monitor-token")
+            }
+        }
+    }
+
     func testLaunchAtLoginUpdatesKeepWindowSizeAndDoNotApplyInvalidConnectionDraft() async throws {
         _ = NSApplication.shared
         let suite = "com.cmorgan.FluxLLM.login-settings-window-tests.\(UUID().uuidString)"

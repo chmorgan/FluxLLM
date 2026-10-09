@@ -80,6 +80,106 @@ final class UnslothSettingsAndCoordinatorTests: XCTestCase {
         }
     }
 
+    func testApplyingUnslothCredentialsPreservesManualBackendSettingsAndSavedPreferences() throws {
+        for selection in [BackendSelection.vllm, .ollama] {
+            try withSettings { settings, defaults in
+                let saved = Data(
+                    """
+                    {"proxyPort":12035,"ollamaHost":"localhost","ollamaPort":11499,
+                     "autoStartProxy":false}
+                    """.utf8)
+                defaults.set(saved, forKey: "appSettings")
+                settings.backendSelection = selection
+                settings.backendEndpoints[.vllm] = "http://localhost:9001"
+                settings.backendEndpoints[.unsloth] = "http://localhost:9000"
+                settings.ollamaHost = "127.0.0.1"
+                settings.ollamaPort = 12034
+                settings.proxyPort = 12035
+                settings.llamaCppModel = "unchanged-model"
+                let endpoints = settings.backendEndpoints
+
+                try settings.applyUnslothCredentials(
+                    workerAPIKey: " \tfixture-worker-key\r\n",
+                    monitorToken: " \tfixture-monitor-token\r\n")
+
+                XCTAssertEqual(settings.unslothWorkerAPIKey, "fixture-worker-key")
+                XCTAssertEqual(settings.unslothMonitorToken, "fixture-monitor-token")
+                XCTAssertEqual(settings.backendSelection, selection)
+                XCTAssertEqual(settings.backendEndpoints, endpoints)
+                XCTAssertEqual(settings.ollamaHost, "127.0.0.1")
+                XCTAssertEqual(settings.ollamaPort, 12034)
+                XCTAssertEqual(settings.proxyPort, 12035)
+                XCTAssertEqual(settings.llamaCppModel, "unchanged-model")
+                XCTAssertEqual(defaults.data(forKey: "appSettings"), saved)
+                let nextSession = AppSettings(defaults: defaults)
+                XCTAssertNil(nextSession.unslothWorkerAPIKey)
+                XCTAssertNil(nextSession.unslothMonitorToken)
+                let selected = try settings.configuration(for: XCTUnwrap(selection.kind))
+                XCTAssertNil(selected.workerAPIKey)
+                XCTAssertNil(selected.studioMonitorToken)
+                let unsloth = try settings.configuration(for: .unsloth)
+                XCTAssertEqual(unsloth.workerAPIKey, "fixture-worker-key")
+                XCTAssertEqual(unsloth.studioMonitorToken, "fixture-monitor-token")
+            }
+        }
+    }
+
+    func testApplyingBlankUnslothCredentialsRestoresAutomaticWorkerAuthentication() throws {
+        try withSettings { settings, defaults in
+            settings.backendSelection = .vllm
+            settings.unslothWorkerAPIKey = "existing-worker-key"
+            settings.unslothMonitorToken = "existing-monitor-token"
+            try settings.applyUnslothCredentials(workerAPIKey: " \t\r\n", monitorToken: " \t\r\n")
+            XCTAssertNil(settings.unslothWorkerAPIKey)
+            XCTAssertNil(settings.unslothMonitorToken)
+            let configuration = try settings.configuration(for: .unsloth)
+            XCTAssertNil(configuration.workerAPIKey)
+            XCTAssertNil(configuration.studioMonitorToken)
+            XCTAssertEqual(settings.backendSelection, .vllm)
+            XCTAssertNil(defaults.data(forKey: "appSettings"))
+        }
+    }
+
+    func testInvalidUnslothWorkerKeyDoesNotPartiallyReplaceSessionCredentials() throws {
+        try withSettings { settings, defaults in
+            settings.backendSelection = .ollama
+            settings.unslothWorkerAPIKey = "existing-worker-key"
+            settings.unslothMonitorToken = "existing-monitor-token"
+            XCTAssertThrowsError(
+                try settings.applyUnslothCredentials(
+                    workerAPIKey: "invalid worker key", monitorToken: "replacement-monitor-token"))
+            XCTAssertEqual(settings.unslothWorkerAPIKey, "existing-worker-key")
+            XCTAssertEqual(settings.unslothMonitorToken, "existing-monitor-token")
+            XCTAssertEqual(settings.backendSelection, .ollama)
+            XCTAssertNil(defaults.data(forKey: "appSettings"))
+        }
+    }
+
+    func testDetectedUnslothValidatesVisibleWorkerKeyWithoutChangingManualBackend() throws {
+        try withSettings { settings, _ in
+            for selection in [BackendSelection.vllm, .ollama] {
+                let invalidKey = "invalid worker key"
+                let error = try XCTUnwrap(
+                    SettingsView.validationError(
+                        selection: selection, proxyPort: "11435", ollamaHost: "localhost",
+                        ollamaPort: "11434", endpoints: settings.backendEndpoints,
+                        unslothWorkerAPIKey: invalidKey, unslothDetected: true))
+                XCTAssertTrue(error.contains("worker API key"))
+                XCTAssertFalse(error.contains(invalidKey))
+                XCTAssertNil(
+                    SettingsView.validationError(
+                        selection: selection, proxyPort: "11435", ollamaHost: "localhost",
+                        ollamaPort: "11434", endpoints: settings.backendEndpoints,
+                        unslothWorkerAPIKey: invalidKey))
+                XCTAssertNil(
+                    SettingsView.validationError(
+                        selection: selection, proxyPort: "11435", ollamaHost: "localhost",
+                        ollamaPort: "11434", endpoints: settings.backendEndpoints,
+                        unslothWorkerAPIKey: "fixture-worker-key", unslothDetected: true))
+            }
+        }
+    }
+
     func testWorkerAPIKeyRejectsInvalidHeadersWithoutIncludingKeyInErrors() throws {
         try withSettings { settings, _ in
             let invalidKeys = [

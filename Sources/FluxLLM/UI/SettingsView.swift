@@ -16,6 +16,7 @@ public struct SettingsView: View {
     @State private var ollamaPort: String
     @State private var unslothMonitorToken: String
     @State private var unslothWorkerAPIKey: String
+    @State private var isWorkerKeyOverrideExpanded: Bool
     @State private var isApplying = false
     @State private var isScanning = false
     @State private var applyError: String?
@@ -40,15 +41,22 @@ public struct SettingsView: View {
         _ollamaPort = State(initialValue: String(settings.ollamaPort))
         _unslothMonitorToken = State(initialValue: settings.unslothMonitorToken ?? "")
         _unslothWorkerAPIKey = State(initialValue: settings.unslothWorkerAPIKey ?? "")
+        _isWorkerKeyOverrideExpanded = State(
+            initialValue: settings.unslothWorkerAPIKey?
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    generalSection
+                    connectionDiscoverySection
                     Divider()
                     connectionSections
+                    Divider()
+                    generalSection
+                    Divider()
+                    menuBarSection
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -150,13 +158,6 @@ public struct SettingsView: View {
     private var connectionSections: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Menu bar").font(.headline)
-                Toggle("Show tokens per second", isOn: $settings.showMenuBarTokensPerSecond)
-                Toggle("Show FluxLLM logo", isOn: $settings.showMenuBarLogo)
-            }
-            Divider()
-
-            VStack(alignment: .leading, spacing: 10) {
                 Text("LLM system").font(.headline)
                 Picker("System", selection: $selection) {
                     ForEach(BackendSelection.allCases) { choice in
@@ -180,7 +181,6 @@ public struct SettingsView: View {
                 }
             }
 
-            detectionSection
             Divider()
 
             if selection == .ollama {
@@ -243,6 +243,32 @@ public struct SettingsView: View {
         .disabled(isApplying)
     }
 
+    private var menuBarSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Menu bar").font(.headline)
+            Toggle("Show tokens per second", isOn: $settings.showMenuBarTokensPerSecond)
+            Toggle("Show FluxLLM logo", isOn: $settings.showMenuBarLogo)
+        }
+        .disabled(isApplying)
+    }
+
+    private var firstDetectedUnsloth: DetectedBackend? {
+        store?.detectedBackends.first { $0.kind == .unsloth }
+    }
+
+    private var unslothDetected: Bool { firstDetectedUnsloth != nil }
+    private var showsUnslothCredentialsAtTop: Bool { unslothDetected || selection == .unsloth }
+
+    private var connectionDiscoverySection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            detectionSection
+            if selection == .unsloth && !unslothDetected {
+                unslothCredentialsSection
+            }
+        }
+        .disabled(isApplying)
+    }
+
     private var detectionSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -277,6 +303,9 @@ public struct SettingsView: View {
                         }
                     }
                     .font(.caption).textSelection(.enabled)
+                    if backend.kind == .unsloth, backend.id == firstDetectedUnsloth?.id {
+                        unslothCredentialsSection.padding(.top, 6)
+                    }
                 }
             } else {
                 Text(
@@ -286,6 +315,39 @@ public struct SettingsView: View {
                 )
                 .font(.caption).foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private var unslothCredentialsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Unsloth credentials").font(.headline)
+            Text("Automatic worker authentication").fontWeight(.medium)
+            Text(
+                "FluxLLM uses the current key from the verified local Unsloth worker unless you enter an override."
+            )
+            .font(.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup("Manual worker key override", isExpanded: $isWorkerKeyOverrideExpanded)
+            {
+                VStack(alignment: .leading, spacing: 8) {
+                    SecureField("Worker API key override", text: $unslothWorkerAPIKey)
+                    Text(
+                        "Leave blank for automatic authentication. Studio keys starting with sk-unsloth belong in the Studio field below."
+                    )
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 8)
+            }
+            SecureField("Studio API key or monitor token (optional)", text: $unslothMonitorToken)
+            Text(
+                "Optional: a Studio API key created in Studio, or a Studio monitor token, adds recorded request history."
+            )
+            .font(.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            Text("Manual credentials are kept only until FluxLLM quits. Click Apply to use them.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -343,18 +405,7 @@ public struct SettingsView: View {
                     "Enter the local Studio address, normally http://127.0.0.1:8888. FluxLLM follows its GGUF inference worker automatically. Keep using Unsloth normally; no client proxy is needed."
                 )
                 .font(.caption).foregroundStyle(.secondary)
-                SecureField("Worker API key (optional)", text: $unslothWorkerAPIKey)
-                Text(
-                    "If the worker requires authentication, enter its API key to read native metrics and request tracking. The key may change when Unsloth reloads a model and is kept only until FluxLLM quits."
-                )
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                SecureField("Studio monitor token (optional)", text: $unslothMonitorToken)
-                Text(
-                    "The separate Studio sign-in token adds Studio request history. It is kept only until FluxLLM quits."
-                )
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+                if !showsUnslothCredentialsAtTop { unslothCredentialsSection }
                 Text(
                     "Studio’s monitor endpoint does not expose structured tool activity. System GPU measures this Mac."
                 )
@@ -383,12 +434,14 @@ public struct SettingsView: View {
     private var draftError: String? {
         Self.validationError(
             selection: selection, proxyPort: proxyPort, ollamaHost: ollamaHost,
-            ollamaPort: ollamaPort, endpoints: endpoints, unslothWorkerAPIKey: unslothWorkerAPIKey)
+            ollamaPort: ollamaPort, endpoints: endpoints, unslothWorkerAPIKey: unslothWorkerAPIKey,
+            unslothDetected: unslothDetected)
     }
 
     static func validationError(
         selection: BackendSelection, proxyPort: String, ollamaHost: String,
-        ollamaPort: String, endpoints: [BackendKind: String], unslothWorkerAPIKey: String = ""
+        ollamaPort: String, endpoints: [BackendKind: String], unslothWorkerAPIKey: String = "",
+        unslothDetected: Bool = false
     ) -> String? {
         if selection == .automatic || selection == .ollama {
             guard let localPort = Int(proxyPort), let upstreamPort = Int(ollamaPort) else {
@@ -400,6 +453,13 @@ public struct SettingsView: View {
                 return error
             }
         }
+        if selection == .automatic || selection == .unsloth || unslothDetected {
+            do {
+                _ = try AppSettings.normalizedUnslothWorkerAPIKey(unslothWorkerAPIKey)
+            } catch {
+                return "Unsloth: \(error.localizedDescription)"
+            }
+        }
         let kinds =
             selection == .automatic
             ? BackendKind.allCases.filter { $0 != .ollama }
@@ -409,7 +469,6 @@ public struct SettingsView: View {
                 let url = try AppSettings.endpointURL(endpoints[kind] ?? kind.defaultEndpoint)
                 if kind == .unsloth {
                     try AppSettings.validateUnslothEndpoint(url)
-                    _ = try AppSettings.normalizedUnslothWorkerAPIKey(unslothWorkerAPIKey)
                 }
             } catch {
                 return "\(kind.title): \(error.localizedDescription)"
@@ -420,6 +479,15 @@ public struct SettingsView: View {
 
     private func apply() {
         guard draftError == nil else { return }
+        if selection == .automatic || selection == .unsloth || unslothDetected {
+            do {
+                try settings.applyUnslothCredentials(
+                    workerAPIKey: unslothWorkerAPIKey, monitorToken: unslothMonitorToken)
+            } catch {
+                applyError = error.localizedDescription
+                return
+            }
+        }
         if selection == .automatic || selection == .ollama,
             let localPort = Int(proxyPort), let upstreamPort = Int(ollamaPort)
         {
@@ -434,12 +502,6 @@ public struct SettingsView: View {
         }
         if selection == .automatic || selection == .llamaCpp {
             settings.llamaCppModel = llamaCppModel
-        }
-        if selection == .automatic || selection == .unsloth {
-            let token = unslothMonitorToken.trimmingCharacters(in: .whitespacesAndNewlines)
-            settings.unslothMonitorToken = token.isEmpty ? nil : token
-            settings.unslothWorkerAPIKey = try? AppSettings.normalizedUnslothWorkerAPIKey(
-                unslothWorkerAPIKey)
         }
         settings.backendSelection = selection
         isApplying = true

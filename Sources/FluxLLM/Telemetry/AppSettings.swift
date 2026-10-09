@@ -15,7 +15,10 @@ public final class AppSettings: ObservableObject {
     @Published public var backendEndpoints: [BackendKind: String]
     @Published public var llamaCppModel: String
     @Published public var lastAutomaticBackendID: String?
+    /// Optional, session-only Studio API key or monitor token for recorded request history.
     @Published public var unslothMonitorToken: String?
+    /// Session-only manual worker key override. Nil uses automatic authentication;
+    /// automatically discovered worker secrets remain in the backend client.
     @Published public var unslothWorkerAPIKey: String?
 
     private let settingsKey = "appSettings"
@@ -64,6 +67,15 @@ public final class AppSettings: ObservableObject {
     }
 
     public var normalizedOllamaHost: String { Self.normalizedHost(ollamaHost) }
+
+    /// Updates manual session credentials without changing backend selection or saved preferences.
+    /// A blank worker override restores automatic authentication.
+    func applyUnslothCredentials(workerAPIKey: String, monitorToken: String) throws {
+        let normalizedWorkerKey = try Self.normalizedUnslothWorkerAPIKey(workerAPIKey)
+        let normalizedMonitorToken = monitorToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        unslothWorkerAPIKey = normalizedWorkerKey
+        unslothMonitorToken = normalizedMonitorToken.isEmpty ? nil : normalizedMonitorToken
+    }
 
     public func configuration(for kind: BackendKind) throws -> BackendConfiguration {
         if kind == .ollama {
