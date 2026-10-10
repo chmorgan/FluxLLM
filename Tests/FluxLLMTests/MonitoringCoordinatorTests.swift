@@ -66,6 +66,232 @@ final class MonitoringCoordinatorTests: XCTestCase {
         await context.close()
     }
 
+    func testUnchangedOllamaApplyPreservesActiveRequestAndProxy() async throws {
+        let context = try makeContext(detections: [.ollama])
+        context.settings.backendSelection = .ollama
+        await context.coordinator.start()
+        let epoch = context.store.monitoringEpoch
+        let request = GenerationRequest(model: "ongoing")
+        context.store.apply(.began(request), epoch: epoch)
+        context.store.sample(at: request.startedAt)
+        let history = context.store.tpsHistory
+        let proxy = try XCTUnwrap(context.proxies.instances.first)
+
+        try await context.coordinator.applySettings()
+
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertEqual(context.store.activeGeneration?.id, request.id)
+        XCTAssertTrue(context.store.isBackendActive)
+        XCTAssertEqual(context.store.requestLanes.map(\.id), [request.id])
+        XCTAssertEqual(context.store.tpsHistory, history)
+        XCTAssertEqual(proxy.starts, 1)
+        XCTAssertEqual(proxy.stops, 0)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 1)
+        await context.close()
+    }
+
+    func testUnchangedAutomaticApplyPreservesHistoryAndRecoversWithoutRediscovery() async throws {
+        let context = try makeContext(detections: [.vllm], pollInterval: .milliseconds(10))
+        await context.coordinator.start()
+        context.store.sample()
+        let epoch = context.store.monitoringEpoch
+        let history = context.store.tpsHistory
+        await context.client.setDetections([])
+        context.store.updateConnection(.unavailable, message: "Temporary connection loss")
+
+        try await context.coordinator.applySettings()
+
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertEqual(context.store.tpsHistory, history)
+        XCTAssertEqual(context.coordinator.selectedConfiguration?.kind, .vllm)
+        try await eventually { context.store.connectionState == .ready }
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 1)
+        await context.close()
+    }
+
+    func testEquivalentNativeEndpointAndUnrelatedSettingsDoNotRestartCollector() async throws {
+        let context = try makeContext(detections: [.vllm])
+        context.settings.backendSelection = .vllm
+        await context.coordinator.start()
+        let epoch = context.store.monitoringEpoch
+        context.settings.backendEndpoints[.vllm] = " HTTP://LOCALHOST:8000/ "
+        context.settings.proxyPort = 12035
+        context.settings.llamaCppModel = "unused-model"
+        context.settings.showMenuBarLogo.toggle()
+
+        try await context.coordinator.applySettings()
+
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 1)
+        await context.close()
+    }
+
+    func testAutomaticFailedDiscoveryPreservesOnlyUnchangedActiveTarget() async throws {
+        let context = try makeContext(detections: [.vllm], pollInterval: .milliseconds(10))
+        await context.coordinator.start()
+        context.store.sample()
+        let epoch = context.store.monitoringEpoch
+        let history = context.store.tpsHistory
+        context.settings.llamaCppModel = "unused-model"
+        context.settings.proxyPort = 12035
+        await context.client.setDetections([])
+        context.store.updateConnection(.unavailable, message: "Temporary connection loss")
+
+        try await context.coordinator.applySettings()
+
+        XCTAssertTrue(context.store.detectedBackends.isEmpty)
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertEqual(context.store.tpsHistory, history)
+        XCTAssertEqual(context.coordinator.selectedConfiguration?.kind, .vllm)
+        try await eventually { context.store.connectionState == .ready }
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 1)
+
+        context.settings.backendEndpoints[.vllm] = "http://127.0.0.1:9001"
+        try await context.coordinator.applySettings()
+        XCTAssertNotEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertNil(context.coordinator.selectedConfiguration)
+        XCTAssertEqual(context.store.connectionState, .needsConfiguration)
+        let changedResets = await context.client.resetCount
+        XCTAssertEqual(changedResets, 2)
+        await context.close()
+    }
+
+    func testChangedNativeEndpointRestartsAndRejectsOldSamples() async throws {
+        let context = try makeContext(detections: [.vllm])
+        context.settings.backendSelection = .vllm
+        await context.coordinator.start()
+        let epoch = context.store.monitoringEpoch
+        context.settings.backendEndpoints[.vllm] = "http://127.0.0.1:9001"
+
+        try await context.coordinator.applySettings()
+
+        XCTAssertNotEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertEqual(context.coordinator.selectedConfiguration?.baseURL.port, 9001)
+        context.store.applyBackendSample(BackendSample(kind: .vllm, currentTPS: 999), epoch: epoch)
+        XCTAssertEqual(context.store.currentTPS, 42)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 2)
+        await context.close()
+    }
+
+    func testChangingLlamaModelAndOllamaProxyPortRestartsTheirCollectors() async throws {
+        let native = try makeContext(detections: [.llamaCpp])
+        native.settings.backendSelection = .llamaCpp
+        await native.coordinator.start()
+        let nativeEpoch = native.store.monitoringEpoch
+        native.settings.llamaCppModel = "new-model"
+        try await native.coordinator.applySettings()
+        XCTAssertNotEqual(native.store.monitoringEpoch, nativeEpoch)
+        XCTAssertEqual(native.coordinator.selectedConfiguration?.model, "new-model")
+        let nativeResets = await native.client.resetCount
+        XCTAssertEqual(nativeResets, 2)
+        await native.close()
+
+        let ollama = try makeContext(detections: [.ollama])
+        ollama.settings.backendSelection = .ollama
+        await ollama.coordinator.start()
+        let ollamaEpoch = ollama.store.monitoringEpoch
+        let oldProxy = try XCTUnwrap(ollama.proxies.instances.first)
+        ollama.settings.proxyPort = 12035
+        try await ollama.coordinator.applySettings()
+        XCTAssertNotEqual(ollama.store.monitoringEpoch, ollamaEpoch)
+        XCTAssertEqual(oldProxy.stops, 1)
+        XCTAssertEqual(ollama.proxies.instances.count, 2)
+        XCTAssertEqual(ollama.coordinator.selectedConfiguration?.proxyPort, 12035)
+        await ollama.close()
+    }
+
+    func testApplyUsesCapturedDraftWhileDiscoveryIsSuspended() async throws {
+        let context = try makeContext(detections: [.ollama, .vllm])
+        context.settings.backendSelection = .ollama
+        await context.coordinator.start()
+        let proxy = try XCTUnwrap(context.proxies.instances.first)
+        context.settings.backendSelection = .vllm
+        await context.client.holdNextDiscovery()
+        let applying = Task { try await context.coordinator.applySettings() }
+        try await eventually { await context.client.isDiscoveryHeld }
+        XCTAssertEqual(proxy.stops, 0)
+        context.settings.backendSelection = .llamaCpp
+        context.settings.backendEndpoints[.vllm] = "http://127.0.0.1:9001"
+        await context.client.releaseDiscovery()
+        try await applying.value
+
+        XCTAssertEqual(context.coordinator.selectedConfiguration?.kind, .vllm)
+        XCTAssertEqual(context.coordinator.selectedConfiguration?.baseURL.port, 8000)
+        XCTAssertEqual(proxy.stops, 1)
+        await context.close()
+    }
+
+    func testSupersededApplyDuringDiscoveryKeepsOriginalCollector() async throws {
+        let context = try makeContext(detections: [.ollama, .vllm])
+        context.settings.backendSelection = .ollama
+        await context.coordinator.start()
+        let epoch = context.store.monitoringEpoch
+        let proxy = try XCTUnwrap(context.proxies.instances.first)
+        context.settings.backendSelection = .vllm
+        await context.client.holdNextDiscovery()
+        let first = Task { try await context.coordinator.applySettings() }
+        try await eventually { await context.client.isDiscoveryHeld }
+        context.settings.backendSelection = .ollama
+        var latestStarted = false
+        let latest = Task { @MainActor in
+            latestStarted = true
+            try await context.coordinator.applySettings()
+        }
+        try await eventually { latestStarted }
+        await context.client.releaseDiscovery()
+        do {
+            try await first.value
+            XCTFail("The superseded Apply must be cancelled")
+        } catch is CancellationError {}
+        try await latest.value
+
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertEqual(context.coordinator.selectedConfiguration?.kind, .ollama)
+        XCTAssertEqual(proxy.stops, 0)
+        XCTAssertEqual(proxy.starts, 1)
+        XCTAssertFalse(context.coordinator.isApplying)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 1)
+        await context.close()
+    }
+
+    func testShutdownDuringApplyDiscoveryCannotPublishNewSession() async throws {
+        let context = try makeContext(detections: [.ollama, .vllm])
+        context.settings.backendSelection = .ollama
+        await context.coordinator.start()
+        let proxy = try XCTUnwrap(context.proxies.instances.first)
+        context.settings.backendSelection = .vllm
+        await context.client.holdNextDiscovery()
+        let applying = Task { try await context.coordinator.applySettings() }
+        try await eventually { await context.client.isDiscoveryHeld }
+        var shutdownStarted = false
+        let stopping = Task { @MainActor in
+            shutdownStarted = true
+            await context.coordinator.stop()
+        }
+        try await eventually { shutdownStarted }
+        await context.client.releaseDiscovery()
+        do {
+            try await applying.value
+            XCTFail("Shutdown must cancel Apply")
+        } catch is CancellationError {}
+        await stopping.value
+
+        XCTAssertNil(context.coordinator.selectedConfiguration)
+        XCTAssertNil(context.store.backendKind)
+        XCTAssertEqual(proxy.stops, 1)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 1)
+        context.removeDefaults()
+    }
+
     func testLeavingOllamaAwaitsProxyShutdownAndRejectsOldRequestEvents() async throws {
         let context = try makeContext(detections: [.ollama, .vllm])
         context.settings.backendSelection = .ollama
@@ -126,7 +352,9 @@ final class MonitoringCoordinatorTests: XCTestCase {
         context.removeDefaults()
     }
 
-    private func makeContext(detections: [BackendKind]) throws -> CoordinatorContext {
+    private func makeContext(
+        detections: [BackendKind], pollInterval: Duration = .seconds(60)
+    ) throws -> CoordinatorContext {
         let suite = "com.cmorgan.FluxLLM.coordinator-tests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         let settings = AppSettings(defaults: defaults)
@@ -137,15 +365,15 @@ final class MonitoringCoordinatorTests: XCTestCase {
             settings: settings, store: store, client: client,
             gpuMonitor: UnavailableBackendGPUMonitor(),
             proxyFactory: { _, _ in proxies.makeProxy() },
-            pollInterval: .seconds(60), discoveryInterval: .seconds(60))
+            pollInterval: pollInterval, discoveryInterval: .seconds(60))
         return CoordinatorContext(
             settings: settings, store: store, proxies: proxies,
             coordinator: coordinator, client: client, defaults: defaults, suite: suite)
     }
 
-    private func eventually(_ condition: @MainActor () -> Bool) async throws {
+    private func eventually(_ condition: @MainActor () async -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
-        while !condition() {
+        while !(await condition()) {
             guard ContinuousClock.now < deadline else {
                 XCTFail("Coordinator did not reach the expected lifecycle point")
                 throw CancellationError()
@@ -156,8 +384,11 @@ final class MonitoringCoordinatorTests: XCTestCase {
 }
 
 private actor FixtureBackendClient: BackendClientProtocol {
-    let detections: [DetectedBackend]
+    private var detections: [DetectedBackend]
     private(set) var resetCount = 0
+    private var holdDiscovery = false
+    private var discoveryContinuation: CheckedContinuation<Void, Never>?
+    var isDiscoveryHeld: Bool { discoveryContinuation != nil }
 
     init(detections: [BackendKind]) {
         self.detections = detections.map {
@@ -167,6 +398,27 @@ private actor FixtureBackendClient: BackendClientProtocol {
 
     func detect(at baseURL: URL) async throws -> DetectedBackend? {
         detections.first { $0.baseURL.port == baseURL.port }
+    }
+
+    func setDetections(_ kinds: [BackendKind]) {
+        detections = kinds.map {
+            DetectedBackend(kind: $0, baseURL: URL(string: $0.defaultEndpoint)!)
+        }
+    }
+
+    func holdNextDiscovery() { holdDiscovery = true }
+
+    func discoverLocalBackends(configurations: [BackendConfiguration]) async -> [DetectedBackend] {
+        if holdDiscovery {
+            holdDiscovery = false
+            await withCheckedContinuation { discoveryContinuation = $0 }
+        }
+        return []
+    }
+
+    func releaseDiscovery() {
+        discoveryContinuation?.resume()
+        discoveryContinuation = nil
     }
 
     func sample(_ configuration: BackendConfiguration) async throws -> BackendSample {

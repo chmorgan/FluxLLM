@@ -325,6 +325,122 @@ final class UnslothSettingsAndCoordinatorTests: XCTestCase {
         XCTAssertNil(defaults.data(forKey: "appSettings"))
     }
 
+    func testUnchangedAndEquivalentUnslothApplyPreservesOngoingRequestAndPinnedChart() async throws
+    {
+        let suite = "com.cmorgan.FluxLLM.unsloth-continuity.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        let origin = Date(timeIntervalSince1970: 1000)
+        var now = origin
+        let store = MetricsStore(clock: { now })
+        let client = UnslothCoordinatorClient(timestamp: origin, observesRequests: true)
+        let coordinator = MonitoringCoordinator(
+            settings: settings, store: store, client: client,
+            gpuMonitor: UnavailableBackendGPUMonitor(),
+            pollInterval: .seconds(60), discoveryInterval: .seconds(60))
+        await coordinator.start()
+        store.setChartPresentationDemand(true, consumer: .dashboard)
+        store.sample(at: now)
+        let epoch = store.monitoringEpoch
+        let requestID = try XCTUnwrap(store.requestLanes.first?.id)
+        now = origin.addingTimeInterval(1)
+        store.applyBackendSample(await client.progress(at: now, outputTokens: 104), epoch: epoch)
+        store.sample(at: now)
+        let pinned = DateInterval(start: origin, end: now)
+        store.setChartPresentationViewport(.fixed(pinned), consumer: .dashboard)
+        let history = store.tpsHistory
+        let chart = store.chartPresentation
+        let source = store.historySource
+        XCTAssertFalse(history.isEmpty)
+        XCTAssertTrue(store.isBackendActive)
+        XCTAssertFalse(try XCTUnwrap(store.requestLanes.first).terminal)
+
+        try await coordinator.applySettings()
+        XCTAssertEqual(store.monitoringEpoch, epoch)
+        XCTAssertEqual(store.requestLanes.map(\.id), [requestID])
+        XCTAssertEqual(store.tpsHistory, history)
+        XCTAssertEqual(store.chartPresentation, chart)
+        XCTAssertEqual(store.historySource, source)
+        XCTAssertTrue(store.isBackendActive)
+
+        // Automatic selected port 9000 even though its saved discovery template uses 8888.
+        settings.backendSelection = .unsloth
+        settings.backendEndpoints[.unsloth] = " http://LOCALHOST:9000/ "
+        settings.proxyPort = 12035
+        settings.llamaCppModel = "unrelated-model"
+        settings.showMenuBarLogo.toggle()
+        try await coordinator.applySettings()
+        XCTAssertEqual(store.monitoringEpoch, epoch)
+        XCTAssertEqual(store.requestLanes.map(\.id), [requestID])
+        XCTAssertEqual(store.tpsHistory, history)
+        XCTAssertEqual(store.chartPresentation, chart)
+        XCTAssertTrue(store.isBackendActive)
+
+        // Returning to Automatic resolves discovery again, then keeps the same effective target.
+        settings.backendSelection = .automatic
+        try await coordinator.applySettings()
+        XCTAssertEqual(store.monitoringEpoch, epoch)
+        XCTAssertEqual(store.requestLanes.map(\.id), [requestID])
+        XCTAssertEqual(store.tpsHistory, history)
+        XCTAssertEqual(store.chartPresentation, chart)
+        XCTAssertTrue(store.isBackendActive)
+        let resets = await client.resetCount
+        XCTAssertEqual(resets, 1)
+
+        now = origin.addingTimeInterval(2)
+        store.applyBackendSample(await client.progress(at: now, outputTokens: 128), epoch: epoch)
+        store.sample(at: now)
+        XCTAssertEqual(store.requestLanes.map(\.id), [requestID])
+        XCTAssertEqual(store.requestLanes.first?.outputTokens, 128)
+        XCTAssertFalse(try XCTUnwrap(store.requestLanes.first).terminal)
+        XCTAssertTrue(store.isBackendActive)
+        XCTAssertEqual(Array(store.tpsHistory.prefix(history.count)), history)
+        XCTAssertTrue(store.chartPresentation.throughput.allSatisfy { $0.timestamp <= pinned.end })
+        await coordinator.stop()
+    }
+
+    func testChangedAutomaticUnslothCredentialsRestartWithNewDiscoveryCredentials() async throws {
+        let suite = "com.cmorgan.FluxLLM.unsloth-credential-apply.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.unslothWorkerAPIKey = "original-worker-key"
+        let store = MetricsStore()
+        let client = UnslothCoordinatorClient()
+        let coordinator = MonitoringCoordinator(
+            settings: settings, store: store, client: client,
+            gpuMonitor: UnavailableBackendGPUMonitor(),
+            pollInterval: .seconds(60), discoveryInterval: .seconds(60))
+        await coordinator.start()
+        let initialEpoch = store.monitoringEpoch
+        settings.unslothWorkerAPIKey = "replacement-worker-key"
+
+        try await coordinator.applySettings()
+
+        XCTAssertNotEqual(store.monitoringEpoch, initialEpoch)
+        XCTAssertEqual(coordinator.selectedConfiguration?.baseURL.port, 9000)
+        XCTAssertEqual(coordinator.selectedConfiguration?.workerAPIKey, "replacement-worker-key")
+        let calls = await client.calls
+        let configurations = try XCTUnwrap(
+            calls.compactMap { call -> [BackendConfiguration]? in
+                guard case .discovery(let configurations) = call else { return nil }
+                return configurations
+            }.last)
+        let unsloth = configurations.filter { $0.kind == .unsloth }
+        XCTAssertEqual(Set(unsloth.compactMap { $0.baseURL.port }), [8888, 9000])
+        XCTAssertTrue(unsloth.allSatisfy { $0.workerAPIKey == "replacement-worker-key" })
+
+        let workerEpoch = store.monitoringEpoch
+        settings.unslothMonitorToken = "new-studio-token"
+        try await coordinator.applySettings()
+        XCTAssertNotEqual(store.monitoringEpoch, workerEpoch)
+        XCTAssertEqual(coordinator.selectedConfiguration?.studioMonitorToken, "new-studio-token")
+        let resets = await client.resetCount
+        XCTAssertEqual(resets, 3)
+        await coordinator.stop()
+    }
+
     private func assertCredentialsForwardedBeforeSampling(
         _ client: UnslothCoordinatorClient, probePort: Int, samplePort: Int
     ) async throws {
@@ -376,7 +492,22 @@ private enum UnslothCoordinatorCall: Sendable {
 
 private actor UnslothCoordinatorClient: BackendClientProtocol {
     private let studio = URL(string: "http://127.0.0.1:9000")!
+    private let timestamp: Date?
+    private let observesRequests: Bool
+    private var sourceEpoch = UUID()
+    private(set) var resetCount = 0
     private(set) var calls: [UnslothCoordinatorCall] = []
+
+    init(timestamp: Date? = nil, observesRequests: Bool = false) {
+        self.timestamp = timestamp
+        self.observesRequests = observesRequests
+    }
+
+    func reset() {
+        resetCount += 1
+        sourceEpoch = UUID()
+    }
+
     func discoverLocalBackends() async -> [DetectedBackend] {
         [DetectedBackend(kind: .unsloth, baseURL: studio)]
     }
@@ -392,9 +523,29 @@ private actor UnslothCoordinatorClient: BackendClientProtocol {
     func sample(_ configuration: BackendConfiguration) async throws -> BackendSample {
         calls.append(.sample(configuration))
         return BackendSample(
-            kind: configuration.kind, model: "Synthetic/Unsloth", currentTPS: 24,
-            basis: .serverReportedAverage, runningRequests: 1, queuedRequests: 0,
+            kind: configuration.kind, timestamp: timestamp ?? Date(),
+            model: "Synthetic/Unsloth", currentTPS: 24,
+            basis: .serverReportedAverage,
+            nativeRequests: observesRequests ? requestSnapshot(outputTokens: 80) : nil,
+            runningRequests: 1, queuedRequests: 0,
             outputTokens: 80, promptTokens: 32)
+    }
+
+    func progress(at timestamp: Date, outputTokens: Int) -> BackendSample {
+        BackendSample(
+            kind: .unsloth, timestamp: timestamp, model: "Synthetic/Unsloth", currentTPS: 24,
+            basis: .serverReportedAverage,
+            nativeRequests: requestSnapshot(outputTokens: outputTokens),
+            runningRequests: 1, queuedRequests: 0, outputTokens: outputTokens, promptTokens: 32)
+    }
+
+    private func requestSnapshot(outputTokens: Int) -> NativeRequestSnapshot {
+        NativeRequestSnapshot(
+            sourceEpoch: sourceEpoch, source: .slotPolling,
+            requests: [
+                NativeRequestObservation(
+                    id: "ongoing-unsloth", outputTokens: outputTokens, liveTPS: 24)
+            ])
     }
 }
 

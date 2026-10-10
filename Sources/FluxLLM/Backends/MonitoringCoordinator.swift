@@ -29,10 +29,39 @@ public final class MonitoringCoordinator {
     private var proxyStarted = false
     private var running = false
     private var revision = 0
+    private var applyRevision = 0
     private var epoch = UUID()
     private var monitorTask: Task<Void, Never>?
     private var gpuTask: Task<Void, Never>?
     private var operationTask: Task<Void, Error>?
+    private var appliedSettings: SettingsSnapshot?
+
+    /// Capture every connection draft before discovery suspends on network or process reads.
+    private struct SettingsSnapshot {
+        let selection: BackendSelection
+        let lastAutomaticBackendID: String?
+        let configurations: [BackendKind: Result<BackendConfiguration, Error>]
+
+        @MainActor
+        init(_ settings: AppSettings) {
+            selection = settings.backendSelection
+            lastAutomaticBackendID = settings.lastAutomaticBackendID
+            configurations = Dictionary(
+                uniqueKeysWithValues: BackendKind.allCases.map { kind in
+                    (kind, Result { try settings.configuration(for: kind) })
+                })
+        }
+
+        func configuration(for kind: BackendKind) throws -> BackendConfiguration {
+            try configurations[kind]!.get()
+        }
+    }
+
+    private struct Selection {
+        let configuration: BackendConfiguration?
+        var message: String? = nil
+        var automaticBackendID: String? = nil
+    }
 
     public init(
         settings: AppSettings, store: MetricsStore,
@@ -71,37 +100,62 @@ public final class MonitoringCoordinator {
     /// Validation precedes shutdown; a malformed draft cannot stop a working monitor.
     public func applySettings() async throws {
         guard running else { throw CancellationError() }
-        if let kind = settings.backendSelection.kind { _ = try settings.configuration(for: kind) }
-        revision += 1
-        let currentRevision = revision
+        let snapshot = SettingsSnapshot(settings)
+        if let kind = snapshot.selection.kind { _ = try snapshot.configuration(for: kind) }
+        applyRevision += 1
+        let currentApply = applyRevision
         operationTask?.cancel()
-        monitorTask?.cancel()
-        gpuTask?.cancel()
         let previous = operationTask
         isApplying = true
         let operation = Task { @MainActor in
             if let previous { _ = await previous.result }
-            try self.checkSession(currentRevision)
+            try self.checkApply(currentApply)
+            if self.canKeepCollector(using: snapshot) {
+                self.appliedSettings = snapshot
+                self.publishSelectionNotice(
+                    self.store.detectedBackends, selection: snapshot.selection)
+                return
+            }
+            let detections = await self.detectBackends(using: snapshot)
+            try self.checkApply(currentApply)
+            let selection = try self.selectConfiguration(from: detections, using: snapshot)
+            self.publishSelection(selection, detections: detections, using: snapshot)
+
+            if let configuration = selection.configuration,
+                let active = self.selectedConfiguration,
+                self.hasStableCollector, Self.equivalent(configuration, active)
+            {
+                // Keep request identity, rates, history, and ordinary failure retries intact.
+                self.appliedSettings = snapshot
+                return
+            }
+            if selection.configuration == nil, self.canKeepAutomaticTarget(using: snapshot) {
+                // Changes to other backends cannot turn a failed rescan into a session boundary.
+                self.appliedSettings = snapshot
+                return
+            }
+
+            self.revision += 1
+            let currentRevision = self.revision
             await self.endCollector()
-            try self.checkSession(currentRevision)
+            try self.checkApply(currentApply)
             await self.client.reset()
+            try self.checkApply(currentApply)
             await self.gpuMonitor.reset()
-            try self.checkSession(currentRevision)
+            try self.checkApply(currentApply)
+            self.appliedSettings = snapshot
             self.selectedConfiguration = nil
-            self.epoch = UUID()
-            self.store.beginBackendSession(
-                kind: self.settings.backendSelection.kind, epoch: self.epoch)
-            self.store.updateConnection(.detecting, message: nil)
-            let detections = await self.detectBackends()
-            try self.checkSession(currentRevision)
-            let configuration = try self.selectConfiguration(from: detections)
-            if let configuration {
+            if let configuration = selection.configuration {
                 await self.activate(configuration)
+                try self.checkApply(currentApply)
                 _ = await self.poll(configuration, revision: currentRevision, epoch: self.epoch)
             } else {
+                self.epoch = UUID()
+                self.store.beginBackendSession(kind: snapshot.selection.kind, epoch: self.epoch)
+                self.store.updateConnection(.needsConfiguration, message: selection.message)
                 self.startGPUMonitoring(nil)
             }
-            try self.checkSession(currentRevision)
+            try self.checkApply(currentApply)
             self.monitorTask = Task { @MainActor [weak self] in
                 guard let self else { return }
                 await self.monitor(revision: currentRevision)
@@ -109,7 +163,7 @@ public final class MonitoringCoordinator {
         }
         operationTask = operation
         defer {
-            if revision == currentRevision {
+            if applyRevision == currentApply {
                 isApplying = false
                 operationTask = nil
             }
@@ -125,15 +179,20 @@ public final class MonitoringCoordinator {
     public func rescan() async {
         guard running else { return }
         let currentRevision = revision
-        let detections = await detectBackends()
-        guard running, currentRevision == revision, !Task.isCancelled else { return }
+        let currentApply = applyRevision
+        let snapshot = appliedSettings ?? SettingsSnapshot(settings)
+        let detections = await detectBackends(using: snapshot)
+        guard running, currentRevision == revision, currentApply == applyRevision,
+            !Task.isCancelled
+        else { return }
         store.setDetections(detections)
-        publishSelectionNotice(detections)
+        publishSelectionNotice(detections, selection: snapshot.selection)
     }
 
     public func stop() async {
         running = false
         revision += 1
+        applyRevision += 1
         operationTask?.cancel()
         monitorTask?.cancel()
         gpuTask?.cancel()
@@ -141,6 +200,7 @@ public final class MonitoringCoordinator {
         self.operationTask = nil
         await endCollector()
         selectedConfiguration = nil
+        appliedSettings = nil
         isApplying = false
         epoch = UUID()
         store.beginBackendSession(kind: nil, epoch: epoch)
@@ -149,6 +209,11 @@ public final class MonitoringCoordinator {
     private func checkSession(_ expected: Int) throws {
         try Task.checkCancellation()
         guard running, revision == expected else { throw CancellationError() }
+    }
+
+    private func checkApply(_ expected: Int) throws {
+        try Task.checkCancellation()
+        guard running, applyRevision == expected else { throw CancellationError() }
     }
 
     private func endCollector() async {
@@ -216,11 +281,16 @@ public final class MonitoringCoordinator {
             do { try await Task.sleep(for: delay) } catch { return }
             guard running, revision == expected, !Task.isCancelled else { return }
             if selectedConfiguration == nil {
-                let detections = await detectBackends()
+                guard let snapshot = appliedSettings else { return }
+                let detections = await detectBackends(using: snapshot)
                 guard running, revision == expected, !Task.isCancelled else { return }
                 do {
-                    if let configuration = try selectConfiguration(from: detections) {
+                    let selection = try selectConfiguration(from: detections, using: snapshot)
+                    publishSelection(selection, detections: detections, using: snapshot)
+                    if let configuration = selection.configuration {
                         await activate(configuration)
+                    } else {
+                        store.updateConnection(.needsConfiguration, message: selection.message)
                     }
                 } catch {
                     store.updateConnection(.needsConfiguration, message: error.localizedDescription)
@@ -250,7 +320,9 @@ public final class MonitoringCoordinator {
         } catch is CancellationError {
             return false
         } catch {
-            guard running, revision == expected, self.epoch == epoch else { return false }
+            guard running, revision == expected, self.epoch == epoch, !Task.isCancelled else {
+                return false
+            }
             store.updateConnection(Self.failureState(error), message: error.localizedDescription)
             return false
         }
@@ -268,50 +340,54 @@ public final class MonitoringCoordinator {
         }
     }
 
-    private func selectConfiguration(from detections: [DetectedBackend]) throws
-        -> BackendConfiguration?
-    {
-        store.setDetections(detections)
-        publishSelectionNotice(detections)
-        if let kind = settings.backendSelection.kind {
-            let configuration = try settings.configuration(for: kind)
+    private func selectConfiguration(
+        from detections: [DetectedBackend], using snapshot: SettingsSnapshot
+    ) throws -> Selection {
+        if let kind = snapshot.selection.kind {
+            let configuration = try snapshot.configuration(for: kind)
             if let different = detections.first(where: {
                 Self.endpointKey($0.baseURL) == Self.endpointKey(configuration.baseURL)
                     && $0.kind != kind
             }) {
-                store.updateConnection(
-                    .needsConfiguration,
+                return Selection(
+                    configuration: nil,
                     message:
                         "This endpoint is \(different.kind.title), but \(kind.title) is selected. Open Settings to choose the matching system."
                 )
-                return nil
             }
-            return configuration
+            return Selection(configuration: configuration)
         }
         let chosen: DetectedBackend?
         if detections.count == 1 {
             chosen = detections.first
         } else {
-            chosen = detections.first { $0.id == settings.lastAutomaticBackendID }
+            chosen = detections.first { $0.id == snapshot.lastAutomaticBackendID }
         }
         guard let chosen else {
-            store.updateConnection(
-                .needsConfiguration,
+            return Selection(
+                configuration: nil,
                 message: detections.isEmpty
                     ? "No supported LLM backend was found. Open Settings to configure one."
                     : "Several LLM backends were found. Choose one in Settings.")
-            return nil
         }
-        settings.lastAutomaticBackendID = chosen.id
-        let template = try settings.configuration(for: chosen.kind)
-        return BackendConfiguration(
-            kind: chosen.kind, baseURL: chosen.baseURL,
-            model: template.model, proxyPort: template.proxyPort,
-            studioMonitorToken: template.studioMonitorToken, workerAPIKey: template.workerAPIKey)
+        let template = try snapshot.configuration(for: chosen.kind)
+        return Selection(
+            configuration: configuration(template, at: chosen.baseURL),
+            automaticBackendID: chosen.id)
     }
 
-    private func publishSelectionNotice(_ detections: [DetectedBackend]) {
-        guard let kind = settings.backendSelection.kind else {
+    private func publishSelection(
+        _ selection: Selection, detections: [DetectedBackend], using snapshot: SettingsSnapshot
+    ) {
+        store.setDetections(detections)
+        publishSelectionNotice(detections, selection: snapshot.selection)
+        if let id = selection.automaticBackendID { settings.lastAutomaticBackendID = id }
+    }
+
+    private func publishSelectionNotice(
+        _ detections: [DetectedBackend], selection: BackendSelection
+    ) {
+        guard let kind = selection.kind else {
             store.setSelectionNotice(nil)
             return
         }
@@ -323,11 +399,23 @@ public final class MonitoringCoordinator {
         )
     }
 
-    private func detectBackends() async -> [DetectedBackend] {
-        let urls = detectionURLs()
-        let configurations =
-            (selectedConfiguration.map { [$0] } ?? [])
-            + BackendKind.allCases.compactMap { try? settings.configuration(for: $0) }
+    private func detectBackends(using snapshot: SettingsSnapshot) async -> [DetectedBackend] {
+        let urls = detectionURLs(using: snapshot)
+        var candidates = BackendKind.allCases.compactMap {
+            try? snapshot.configuration(for: $0)
+        }
+        if let active = selectedConfiguration,
+            let template = try? snapshot.configuration(for: active.kind)
+        {
+            // Automatic discovery may use an address different from its saved template.
+            // Probe that address with the new credentials, never the old session's key.
+            candidates.removeAll {
+                $0.kind == active.kind
+                    && Self.endpointKey($0.baseURL) == Self.endpointKey(active.baseURL)
+            }
+            candidates.insert(configuration(template, at: active.baseURL), at: 0)
+        }
+        let configurations = candidates
         let client = client
         async let local = client.discoverLocalBackends(configurations: configurations)
         let probed = await withTaskGroup(of: DetectedBackend?.self) { group in
@@ -353,21 +441,102 @@ public final class MonitoringCoordinator {
 
     /// Saved endpoints and known loopback defaults. Never scan a network.
     func detectionURLs() -> [URL] {
+        detectionURLs(using: SettingsSnapshot(settings))
+    }
+
+    private func detectionURLs(using snapshot: SettingsSnapshot) -> [URL] {
         let configured = BackendKind.allCases.compactMap {
-            try? settings.configuration(for: $0).baseURL
+            try? snapshot.configuration(for: $0).baseURL
         }
         let defaults = BackendKind.allCases.compactMap { URL(string: $0.defaultEndpoint) }
         var seen = Set<String>()
         return (configured + defaults).filter { seen.insert(Self.endpointKey($0)).inserted }
     }
 
+    private func configuration(_ template: BackendConfiguration, at url: URL)
+        -> BackendConfiguration
+    {
+        BackendConfiguration(
+            kind: template.kind, baseURL: url, model: template.model, proxyPort: template.proxyPort,
+            studioMonitorToken: template.studioMonitorToken, workerAPIKey: template.workerAPIKey)
+    }
+
+    private var hasStableCollector: Bool {
+        monitorTask.map { !$0.isCancelled } == true && epoch == store.monitoringEpoch
+    }
+
+    private func canKeepCollector(using snapshot: SettingsSnapshot) -> Bool {
+        guard hasStableCollector, let active = selectedConfiguration else { return false }
+        if let kind = snapshot.selection.kind,
+            let requested = try? snapshot.configuration(for: kind)
+        {
+            return Self.equivalent(requested, active)
+        }
+        guard let appliedSettings, appliedSettings.selection == .automatic,
+            snapshot.lastAutomaticBackendID
+                == DetectedBackend(
+                    kind: active.kind, baseURL: active.baseURL
+                ).id
+        else { return false }
+        // Unchanged automatic preferences do not require successful rediscovery.
+        // In particular, a transient failure must keep the current retry loop and history.
+        return BackendKind.allCases.allSatisfy { kind in
+            switch (snapshot.configurations[kind]!, appliedSettings.configurations[kind]!) {
+            case (.success(let requested), .success(let applied)):
+                return Self.equivalent(requested, applied)
+            case (.failure(let requested), .failure(let applied)):
+                return requested.localizedDescription == applied.localizedDescription
+            default:
+                return false
+            }
+        }
+    }
+
+    private func canKeepAutomaticTarget(using snapshot: SettingsSnapshot) -> Bool {
+        guard hasStableCollector, snapshot.selection == .automatic,
+            let active = selectedConfiguration,
+            let appliedSettings, appliedSettings.selection == .automatic,
+            snapshot.lastAutomaticBackendID
+                == DetectedBackend(
+                    kind: active.kind, baseURL: active.baseURL
+                ).id,
+            let requested = try? snapshot.configuration(for: active.kind),
+            let applied = try? appliedSettings.configuration(for: active.kind)
+        else { return false }
+        return Self.equivalent(requested, applied)
+            && Self.equivalent(configuration(requested, at: active.baseURL), active)
+    }
+
+    private static func equivalent(_ lhs: BackendConfiguration, _ rhs: BackendConfiguration) -> Bool
+    {
+        guard lhs.kind == rhs.kind, endpointKey(lhs.baseURL) == endpointKey(rhs.baseURL) else {
+            return false
+        }
+        switch lhs.kind {
+        case .ollama: return lhs.proxyPort == rhs.proxyPort
+        case .llamaCpp: return lhs.model == rhs.model
+        case .unsloth:
+            return lhs.studioMonitorToken == rhs.studioMonitorToken
+                && lhs.workerAPIKey == rhs.workerAPIKey
+        case .vllm, .rapidMLX: return true
+        }
+    }
+
     private static func endpointKey(_ url: URL) -> String {
         guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             return url.absoluteString
         }
-        if ["localhost", "localhost."].contains(components.host?.lowercased() ?? "") {
+        components.scheme = components.scheme?.lowercased()
+        components.host = components.host?.lowercased()
+        if ["localhost", "localhost."].contains(components.host ?? "") {
             components.host = "127.0.0.1"
         }
+        if (components.scheme == "http" && components.port == 80)
+            || (components.scheme == "https" && components.port == 443)
+        {
+            components.port = nil
+        }
+        while components.path.hasSuffix("/") { components.path.removeLast() }
         return components.string ?? url.absoluteString
     }
 }
