@@ -134,7 +134,8 @@ struct DashboardView: View {
         return layout {
             HistoryControls(
                 navigation: navigationBinding, now: store.chartPresentation.timestamp,
-                historyAge: store.chartHistoryAge, narrow: narrow)
+                historyAge: store.chartHistoryAge, narrow: narrow,
+                automaticDuration: store.chartPresentation.automaticHistoryDuration)
         }
         .anchorPreference(key: DashboardFrameAnchors.self, value: .bounds) {
             ["history-controls": $0]
@@ -201,7 +202,8 @@ struct DashboardView: View {
         if value.preset != store.historyRange {
             value.selectPreset(
                 store.historyRange, now: store.chartPresentation.timestamp,
-                historyAge: store.chartHistoryAge)
+                historyAge: store.chartHistoryAge,
+                automaticDuration: store.chartPresentation.automaticHistoryDuration)
         }
         return value
     }
@@ -232,7 +234,9 @@ struct DashboardView: View {
         let now = store.chartPresentation.timestamp
         return isCompact
             ? DateInterval(start: now.addingTimeInterval(-60), end: now)
-            : currentNavigation.interval(now: now, historyAge: store.chartHistoryAge)
+            : currentNavigation.interval(
+                now: now, historyAge: store.chartHistoryAge,
+                automaticDuration: store.chartPresentation.automaticHistoryDuration)
     }
     private var chartDuration: TimeInterval { chartInterval.duration }
 

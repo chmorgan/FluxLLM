@@ -112,10 +112,17 @@ requests. Choose **Since launch**, **Selected period**, or **Today**; totals are
 kept separately from the chart. `~` marks estimated output and `+` marks a known
 input subtotal when some requests have not reported input usage.
 
-Use the **History** menu for ranges through **24h**, or enter custom dates.
+**Auto** follows the latest burst of request activity, starting at **30s** and
+expanding through **1m**, **2m**, **5m**, and **10m** as activity continues.
+Brief pauses keep the current scale; activity after a minute of confirmed idle
+starts a new 30-second window. The label shows the current width, such as
+**Auto · 5m**. The chart keeps following live time while idle.
+
+Use the **History** menu for fixed ranges through **24h**, or enter custom dates.
 Drag across the chart to zoom, use the arrow buttons to move through history,
 and select **Live** to follow new activity again. Double-click a request rail
-or use its **Fit request** context menu to frame that request.
+or use its **Fit request** context menu to frame that request. Select **Auto**
+again after browsing to resume automatic sizing.
 
 History stays in memory for the current launch and resets when FluxLLM exits.
 A long-running session retains up to 24 hours of chart history and 30 days of

@@ -195,7 +195,7 @@ final class GPUMonitoringTests: XCTestCase {
         XCTAssertFalse(store.gpuHistory[1].isAvailable)
         XCTAssertEqual(store.gpuHistory[1].timestamp, origin.addingTimeInterval(0.5))
         XCTAssertEqual(store.gpuHistory.last?.value, 75)
-        XCTAssertEqual(store.visibleHistoryDuration, 300)
+        XCTAssertEqual(store.visibleHistoryDuration, 30, "GPU activity alone does not expand Auto")
 
         store.applyGPUSample(gpuSample(80, at: later), epoch: epoch)
         store.sample(at: later)

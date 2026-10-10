@@ -373,6 +373,7 @@ final class MetricsStoreTests: XCTestCase {
 
     func testSampleRingsWrapPreservePublishedSnapshotsAndReplaceLatestTimestamp() {
         let store = MetricsStore(clock: { self.origin })
+        store.historyRange = .hour
         store.proxyState = .listening
         store.setChartPresentationDemand(false, consumer: .dashboard)
         for index in 0..<100 {

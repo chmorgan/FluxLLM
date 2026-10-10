@@ -40,21 +40,21 @@ final class ChartPresentationViewportTests: XCTestCase {
         }
     }
 
-    func testFirstShowUsesSelectedPresetAndAutomaticGrowthRebuildsEnoughHistory() {
+    func testFirstShowUsesActivityRangeAndGrowthRebuildsEnoughHistory() {
         let store = MetricsStore(clock: { self.origin })
         let epoch = UUID()
         store.beginBackendSession(kind: .vllm, epoch: epoch)
         store.setChartPresentationDemand(false, consumer: .dashboard)
-        for offset in stride(from: 0.5, through: 59.5, by: 0.5) {
+        for offset in stride(from: 0.5, through: 23.5, by: 0.5) {
             collect(store, epoch: epoch, offset: offset)
         }
         store.setChartPresentationDemand(true, consumer: .dashboard)
-        XCTAssertEqual(store.chartHistoryDuration, 60)
+        XCTAssertEqual(store.chartHistoryDuration, 30)
         XCTAssertEqual(store.chartPresentation.throughput, store.tpsHistory)
-        for offset in stride(from: 60.0, through: 61.5, by: 0.5) {
+        for offset in stride(from: 24.0, through: 25.5, by: 0.5) {
             collect(store, epoch: epoch, offset: offset)
         }
-        XCTAssertEqual(store.chartHistoryDuration, 300)
+        XCTAssertEqual(store.chartHistoryDuration, 60)
         XCTAssertEqual(store.chartPresentation.throughput, store.tpsHistory)
 
         let populated = makePopulatedStore(archived: true)
@@ -125,10 +125,10 @@ final class ChartPresentationViewportTests: XCTestCase {
             interval: DateInterval(start: date(-60), end: origin))
     }
 
-    func testNavigationDemandRetainsPinnedAndGoLiveWidthThenResumesAutomaticGrowth() {
+    func testNavigationDemandRetainsPinnedAndGoLiveWidthThenResumesAdaptiveAuto() {
         var navigation = HistoryNavigation()
         XCTAssertEqual(navigation.presentationViewport, .historyRange)
-        navigation.pan(by: -1, now: date(60), historyAge: 60)
+        navigation.pan(by: -1, now: date(60), historyAge: 60, automaticDuration: 60)
         let pinned = navigation.interval(now: date(61), historyAge: 61)
         XCTAssertEqual(navigation.presentationViewport, .fixed(pinned))
         navigation.goLive()
@@ -141,8 +141,8 @@ final class ChartPresentationViewportTests: XCTestCase {
         XCTAssertEqual(navigation.presentationViewport, .historyRange)
         XCTAssertEqual(
             navigation.presentationViewport.interval(
-                at: date(301), range: .automatic, historyAge: 301
-            ).duration, 900)
+                at: date(301), range: .automatic, historyAge: 301, automaticDuration: 600
+            ).duration, 600)
         navigation.select(DateInterval(start: date(200), end: date(245)), now: date(300))
         navigation.goLive()
         XCTAssertEqual(navigation.presentationViewport, .live(duration: 45))
@@ -197,7 +197,9 @@ final class ChartPresentationViewportTests: XCTestCase {
 
     private func collect(_ store: MetricsStore, epoch: UUID, offset: Double) {
         store.applyBackendSample(
-            BackendSample(kind: .vllm, timestamp: date(offset), currentTPS: offset), epoch: epoch)
+            BackendSample(
+                kind: .vllm, timestamp: date(offset), currentTPS: offset, runningRequests: 1),
+            epoch: epoch)
         store.applyGPUSample(
             GPUActivitySample(timestamp: date(offset), activityPercent: 30, scope: .system),
             epoch: epoch)

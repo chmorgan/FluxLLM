@@ -1,18 +1,23 @@
 import Foundation
 
 /// The display demand is independent of collection and of native visibility.
-/// The standard dashboard range follows automatic growth; a pinned viewport
+/// The standard dashboard range follows recent request activity; a pinned viewport
 /// preserves its absolute interval, and a custom live view preserves its width.
 public enum ChartPresentationViewport: Equatable, Sendable {
     case historyRange
     case live(duration: TimeInterval)
     case fixed(DateInterval)
 
-    func interval(at now: Date, range: HistoryRange, historyAge: TimeInterval) -> DateInterval {
+    func interval(
+        at now: Date, range: HistoryRange, historyAge: TimeInterval,
+        automaticDuration: TimeInterval = 30
+    ) -> DateInterval {
         switch self {
         case .historyRange:
             return DateInterval(
-                start: now.addingTimeInterval(-range.duration(historyAge: historyAge)), end: now)
+                start: now.addingTimeInterval(
+                    -range.duration(historyAge: historyAge, automaticDuration: automaticDuration)),
+                end: now)
         case .live(let duration):
             let duration = duration.isFinite ? min(max(duration, 1), 86_400) : 60
             return DateInterval(start: now.addingTimeInterval(-duration), end: now)

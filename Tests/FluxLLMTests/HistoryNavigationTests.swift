@@ -10,22 +10,77 @@ final class HistoryNavigationTests: XCTestCase {
         now.addingTimeInterval(offset)
     }
 
-    func testAutomaticRangeExpandsAtEachHistoryBoundary() {
+    func testAutomaticRangeUsesResolvedActivityWidthRegardlessOfHistoryAge() {
         let navigation = HistoryNavigation()
-        let examples: [(TimeInterval, TimeInterval)] = [
-            (0, 60), (60, 60), (61, 300), (300, 300),
-            (301, 900), (900, 900), (901, 1800), (1800, 1800),
-            (1801, 3600), (3600, 3600), (3601, 21_600),
-            (21_600, 21_600), (21_601, 86_400), (100_000, 86_400),
-        ]
-
         XCTAssertTrue(navigation.isLive)
         XCTAssertEqual(navigation.preset, .automatic)
-        for (age, duration) in examples {
-            let interval = navigation.interval(now: now, historyAge: age)
-            XCTAssertEqual(interval.duration, duration, "History age: \(age)")
-            XCTAssertEqual(interval.end, now)
+        for age in [0.0, 60, 300, 3_600, 86_400, 100_000] {
+            for duration in [30.0, 60, 120, 300, 600] {
+                let interval = navigation.interval(
+                    now: now, historyAge: age, automaticDuration: duration)
+                XCTAssertEqual(interval.duration, duration, "History age: \(age)")
+                XCTAssertEqual(interval.end, now)
+                XCTAssertEqual(
+                    navigation.presentationViewport.interval(
+                        at: now, range: .automatic, historyAge: age, automaticDuration: duration),
+                    interval)
+            }
         }
+        XCTAssertEqual(navigation.interval(now: now, historyAge: 100_000).duration, 30)
+    }
+
+    func testAutomaticRangeRejectsInvalidWidthsAndClampsToRecentTenMinutes() {
+        let navigation = HistoryNavigation()
+        let examples: [(TimeInterval, TimeInterval)] = [
+            (-1, 30), (0, 30), (29, 30), (601, 600), (86_400, 600),
+            (.nan, 30), (.infinity, 30), (-.infinity, 30),
+        ]
+        for (supplied, expected) in examples {
+            let interval = navigation.interval(
+                now: now, historyAge: 100_000, automaticDuration: supplied)
+            XCTAssertEqual(interval.duration, expected)
+            XCTAssertEqual(interval.end, now)
+            XCTAssertEqual(
+                navigation.presentationViewport.interval(
+                    at: now, range: .automatic, historyAge: 100_000,
+                    automaticDuration: supplied), interval)
+        }
+    }
+
+    func testAutomaticTitleShowsResolvedWidthAndBrowsingCapturesThatWidth() {
+        var navigation = HistoryNavigation()
+        for (duration, title) in [
+            (30.0, "Auto · 30s"), (60, "Auto · 1m"), (120, "Auto · 2m"),
+            (300, "Auto · 5m"), (600, "Auto · 10m"),
+        ] {
+            XCTAssertEqual(
+                navigation.title(now: now, historyAge: 100_000, automaticDuration: duration), title)
+        }
+
+        navigation.pan(by: -1, now: now, historyAge: 100_000, automaticDuration: 120)
+        let pinned = DateInterval(start: date(-240), duration: 120)
+        XCTAssertEqual(
+            navigation.interval(now: date(30), historyAge: 100_030, automaticDuration: 600), pinned)
+        XCTAssertEqual(navigation.presentationViewport, .fixed(pinned))
+        XCTAssertEqual(
+            navigation.title(now: now, historyAge: 100_000, automaticDuration: 600), "2m")
+
+        navigation.goLive()
+        XCTAssertEqual(navigation.presentationViewport, .live(duration: 120))
+        XCTAssertEqual(
+            navigation.interval(now: date(30), historyAge: 100_030, automaticDuration: 30),
+            DateInterval(start: date(-90), duration: 120))
+        XCTAssertEqual(
+            navigation.title(now: date(30), historyAge: 100_030, automaticDuration: 30), "2m")
+
+        navigation.selectPreset(.automatic, now: date(30), historyAge: 100_030)
+        XCTAssertEqual(navigation.presentationViewport, .historyRange)
+        XCTAssertEqual(
+            navigation.interval(now: date(30), historyAge: 100_030, automaticDuration: 30).duration,
+            30)
+        XCTAssertEqual(
+            navigation.title(now: date(30), historyAge: 100_030, automaticDuration: 30),
+            "Auto · 30s")
     }
 
     func testRelativePresetsResumeLiveAndKeepTheirDurations() {
@@ -42,7 +97,8 @@ final class HistoryNavigationTests: XCTestCase {
             XCTAssertEqual(navigation.preset, preset)
             XCTAssertTrue(navigation.isLive)
             XCTAssertNil(navigation.pinnedInterval)
-            let interval = navigation.interval(now: date(30), historyAge: 40)
+            let interval = navigation.interval(
+                now: date(30), historyAge: 40, automaticDuration: 600)
             XCTAssertEqual(interval.duration, duration)
             XCTAssertEqual(interval.end, date(30))
         }
@@ -136,6 +192,18 @@ final class HistoryNavigationTests: XCTestCase {
             DateInterval(start: date(-300), duration: 300))
     }
 
+    func testCustomPresetPinsResolvedAutomaticViewport() {
+        var navigation = HistoryNavigation()
+        navigation.selectPreset(
+            .custom, now: now, historyAge: 100_000, automaticDuration: 300)
+
+        XCTAssertEqual(navigation.preset, .custom)
+        XCTAssertFalse(navigation.isLive)
+        XCTAssertEqual(
+            navigation.interval(now: date(10), historyAge: 100_010, automaticDuration: 30),
+            DateInterval(start: date(-300), duration: 300))
+    }
+
     func testPanFreezesAndPreservesPresetWithLiveReturningToLatestData() {
         var navigation = HistoryNavigation(preset: .fiveMinutes)
         navigation.pan(by: -1, now: now, historyAge: 3600)
@@ -174,7 +242,9 @@ final class HistoryNavigationTests: XCTestCase {
 
         navigation.selectPreset(.automatic, now: date(10), historyAge: 21_601)
         XCTAssertTrue(navigation.isLive)
-        XCTAssertEqual(navigation.interval(now: date(10), historyAge: 21_601).duration, 86_400)
+        XCTAssertEqual(
+            navigation.interval(now: date(10), historyAge: 21_601, automaticDuration: 120).duration,
+            120)
     }
 
     func testFittingEndedRequestIncludesPadding() {

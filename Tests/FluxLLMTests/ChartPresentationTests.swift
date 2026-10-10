@@ -202,15 +202,17 @@ final class ChartPresentationTests: XCTestCase {
         XCTAssertEqual(store.chartPresentation.systemGPU.map(\.isAvailable), [true, false, false])
     }
 
-    func testRangeChangesAreImmediateButAutomaticGrowthUsesPresentedTime() {
+    func testRangeChangesAreImmediateButAutomaticActivitySizingUsesPresentedTime() {
         let (store, epoch) = makeStore()
-        collect(store, epoch: epoch, offset: 0, rate: 20, gpu: 30)
-        collect(store, epoch: epoch, offset: 60, rate: 20, gpu: 30)
-        XCTAssertEqual(store.chartHistoryDuration, 60)
+        store.sample(at: origin)
+        for offset in stride(from: 0.5, through: 24, by: 0.5) {
+            collect(store, epoch: epoch, offset: offset, rate: 20, gpu: 30)
+        }
+        XCTAssertEqual(store.chartHistoryDuration, 30)
         let held = store.chartPresentation
-        collect(store, epoch: epoch, offset: 60.5, rate: 20, gpu: 30)
-        XCTAssertEqual(store.visibleHistoryDuration, 300)
-        XCTAssertEqual(store.chartHistoryDuration, 60)
+        collect(store, epoch: epoch, offset: 24.5, rate: 20, gpu: 30)
+        XCTAssertEqual(store.visibleHistoryDuration, 60)
+        XCTAssertEqual(store.chartHistoryDuration, 30)
         XCTAssertEqual(store.chartPresentation, held)
 
         store.historyRange = .hour
@@ -218,10 +220,10 @@ final class ChartPresentationTests: XCTestCase {
         store.historyRange = .fiveMinutes
         XCTAssertEqual(store.chartHistoryDuration, 300)
         store.historyRange = .automatic
-        XCTAssertEqual(store.chartHistoryDuration, 60)
+        XCTAssertEqual(store.chartHistoryDuration, 30)
         XCTAssertEqual(store.chartPresentation, held)
-        collect(store, epoch: epoch, offset: 61, rate: 20, gpu: 30)
-        XCTAssertEqual(store.chartHistoryDuration, 300)
+        collect(store, epoch: epoch, offset: 25, rate: 20, gpu: 30)
+        XCTAssertEqual(store.chartHistoryDuration, 60)
     }
 
     func testChartUsesRawThroughputEvenWhileNumericEstimateIsSettling() {

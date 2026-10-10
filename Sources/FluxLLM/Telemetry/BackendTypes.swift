@@ -242,7 +242,11 @@ public enum HistoryRange: String, CaseIterable, Identifiable, Sendable {
         case .custom: "Custom"
         }
     }
-    public func duration(historyAge: TimeInterval) -> TimeInterval {
+    /// The activity policy supplies Auto's width. The history-age argument is
+    /// retained for source compatibility with existing range callers.
+    public func duration(
+        historyAge: TimeInterval, automaticDuration: TimeInterval = 30
+    ) -> TimeInterval {
         switch self {
         case .minute: 60
         case .fiveMinutes: 300
@@ -253,21 +257,7 @@ public enum HistoryRange: String, CaseIterable, Identifiable, Sendable {
         case .day: 86_400
         case .custom: 60
         case .automatic:
-            if historyAge <= 60 {
-                60
-            } else if historyAge <= 300 {
-                300
-            } else if historyAge <= 900 {
-                900
-            } else if historyAge <= 1800 {
-                1800
-            } else if historyAge <= 3600 {
-                3600
-            } else if historyAge <= 21_600 {
-                21_600
-            } else {
-                86_400
-            }
+            automaticDuration.isFinite ? min(max(automaticDuration, 30), 600) : 30
         }
     }
 }

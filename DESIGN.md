@@ -177,8 +177,17 @@ The popover shows the last minute. The resizable dashboard adapts its layout and
 content floor. Its range menu offers Auto, 1m, 5m, 15m, 30m, 1h, 6h, 24h, and Custom. Relative presets follow
 live collection; custom ranges, drag-to-zoom, request fitting, and arrow navigation pin the view while
 collection continues. Live resumes a moving window of the selected duration. Request fitting is available
-through a rail's double-click and context menu. Windows are bounded to the retained last 24 hours. Auto growth
-uses held chart-publication time. Epoch-aligned chart means adapt to the visible duration, shared by drawing,
+through a rail's double-click and context menu. Windows are bounded to the retained last 24 hours.
+Auto follows the latest observed request activity episode using 30s, 1m, 2m, 5m, and 10m windows.
+The range widens when an active episode reaches 80% of the current width, holds through short pauses,
+and restarts at 30s on activity after 60s of continuously observed idle. Unknown telemetry pauses
+growth without proving idle; long observation outages break continuity. Proxy lifecycle boundaries
+and fresh native request counts drive the policy, independently of GPU activity and retained rates.
+The policy advances during collection even when charts are hidden, without querying retained history.
+Its width is held with each chart publication and shared by navigation, query selection, and period
+usage totals. The Auto label shows its resolved width. Panning captures that width; Live keeps it until
+Auto is selected again. Auto's time endpoint keeps following collection while idle.
+Epoch-aligned chart means adapt to the visible duration, shared by drawing,
 scaling, and inspection. Unavailable observations are excluded from
 means. Generated/tool gaps draw through a presentation-only zero baseline; GPU sensor gaps remain gaps.
 

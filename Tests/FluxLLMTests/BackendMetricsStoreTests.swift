@@ -85,15 +85,18 @@ final class BackendMetricsStoreTests: XCTestCase {
         XCTAssertFalse(store.isBackendActive)
     }
 
-    func testSleepIntroducesExplicitGapAndHistoryRangeExpandsWithoutLosingOlderSamples() {
-        let store = MetricsStore()
+    func testSleepIntroducesExplicitGapAndRestartsAutoWithoutLosingOlderSamples() {
+        let store = MetricsStore(clock: { self.origin })
         let request = GenerationRequest(startedAt: origin)
         store.apply(.began(request))
-        store.apply(.updated(requestID: request.id, snapshot: GenerationSnapshot(liveTPS: 40)))
+        store.apply(
+            .updated(
+                requestID: request.id,
+                snapshot: GenerationSnapshot(liveTPS: 40, timestamp: origin)))
         store.sample(at: origin)
-        XCTAssertEqual(store.visibleHistoryDuration, 60)
+        XCTAssertEqual(store.visibleHistoryDuration, 30)
         store.sample(at: origin.addingTimeInterval(61))
-        XCTAssertEqual(store.visibleHistoryDuration, 300)
+        XCTAssertEqual(store.visibleHistoryDuration, 30)
         XCTAssertEqual(store.tpsHistory.count, 3)
         XCTAssertFalse(store.tpsHistory[1].isAvailable)
         XCTAssertEqual(store.tpsHistory.first?.value, 40)

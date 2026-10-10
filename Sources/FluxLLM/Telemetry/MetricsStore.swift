@@ -193,13 +193,16 @@ public final class MetricsStore {
     }
 
     public var visibleHistoryDuration: TimeInterval {
-        historyRange.duration(historyAge: historyAge)
+        historyRange.duration(
+            historyAge: historyAge, automaticDuration: automaticHistoryRange.duration)
     }
 
-    /// Range selection is immediate, but automatic growth follows the same held
-    /// time as the plotted samples rather than the faster collection clock.
+    /// Range selection is immediate, but automatic activity sizing follows the
+    /// same held publication as the plotted samples.
     public var chartHistoryDuration: TimeInterval {
-        historyRange.duration(historyAge: chartHistoryAge)
+        historyRange.duration(
+            historyAge: chartHistoryAge,
+            automaticDuration: chartPresentation.automaticHistoryDuration)
     }
 
     public var chartHistoryAge: TimeInterval {
@@ -303,6 +306,7 @@ public final class MetricsStore {
         didSet { if nativeActivity != oldValue { refreshLiveActivity() } }
     }
     @ObservationIgnored private var nativeActivityObservedAt: Date?
+    @ObservationIgnored private var automaticHistoryRange = AutomaticHistoryRange()
     @ObservationIgnored private var lastRatePublicationAt: Date?
     @ObservationIgnored private var slotDisplayAverage = SlotThroughputDisplayAverage()
     @ObservationIgnored private var slotThroughputIsWarmingUp = false
@@ -362,7 +366,8 @@ public final class MetricsStore {
         } else if !isActive && wasActive {
             // Release snapshots held only for a closed surface; raw history is
             // retained independently and will rebuild immediately on reopening.
-            chartPresentation = ChartPresentationSnapshot(timestamp: sampleDate)
+            chartPresentation = ChartPresentationSnapshot(
+                timestamp: sampleDate, automaticHistoryDuration: automaticHistoryRange.duration)
             usageHistory.releaseQueryCaches()
         }
     }
@@ -410,9 +415,19 @@ public final class MetricsStore {
         guard epoch == nil || epoch == monitoringEpoch,
             backendKind == nil || backendKind == .ollama
         else { return }
+        let isBoundary = requiresBoundaryPublication(event)
+        let activityBefore = isBoundary ? backendActivity : nil
+        let observedAt = isBoundary ? clock() : nil
         applyAuthoritativeEvent(event)
         refreshObservedProxyActivity()
-        if requiresBoundaryPublication(event) { publishDashboardScalarPresentation() }
+        if let activityBefore, let observedAt {
+            // Capture both sides of a lifecycle boundary. A short request may
+            // start and finish between collection ticks, and a finishing sibling
+            // must not mark another open request as idle.
+            automaticHistoryRange.observe(activityBefore, at: observedAt)
+            automaticHistoryRange.observe(backendActivity, at: observedAt)
+        }
+        if isBoundary { publishDashboardScalarPresentation() }
     }
 
     private func requiresBoundaryPublication(_ event: GenerationEvent) -> Bool {
@@ -622,6 +637,7 @@ public final class MetricsStore {
         nativeRequestTracker.reset()
         nativeActivity = .unknown
         nativeActivityObservedAt = nil
+        automaticHistoryRange.reset()
         currentTPS = 0
         resetSlotThroughputDisplay()
         clearDisplayRate()
@@ -718,6 +734,7 @@ public final class MetricsStore {
             if !chartPresentation.systemGPU.isEmpty {
                 let replacement = ChartPresentationSnapshot(
                     timestamp: chartPresentation.timestamp,
+                    automaticHistoryDuration: chartPresentation.automaticHistoryDuration,
                     throughput: chartPresentation.throughput,
                     toolActivity: chartPresentation.toolActivity,
                     requestLanes: chartPresentation.requestLanes,
@@ -767,6 +784,7 @@ public final class MetricsStore {
                 running: sample.runningRequests.flatMap { $0 >= 0 ? $0 : nil },
                 queued: sample.queuedRequests.flatMap { $0 >= 0 ? $0 : nil })
             nativeActivityObservedAt = sample.timestamp
+            automaticHistoryRange.observe(nativeActivity, at: sample.timestamp)
         }
         guard sample.isReady else { return }
         if sample.kind == .ollama {
@@ -934,6 +952,7 @@ public final class MetricsStore {
             rateIsAvailable = false
             clearDisplayRate()
         }
+        automaticHistoryRange.observe(backendActivity, at: date)
         publishDisplayRateIfDue(at: date)
         if historyStartedAt == nil { historyStartedAt = date }
         // Sleep or delayed sampling must not look like a continuous measurement.
@@ -1013,7 +1032,8 @@ public final class MetricsStore {
         // must still use the chart's held endpoint, including a pinned viewport
         // when a simultaneous popover displays a different live interval.
         let interval = presentationViewports[.dashboard, default: .historyRange].interval(
-            at: chartPresentation.timestamp, range: historyRange, historyAge: chartHistoryAge)
+            at: chartPresentation.timestamp, range: historyRange, historyAge: chartHistoryAge,
+            automaticDuration: chartPresentation.automaticHistoryDuration)
         let usage =
             dashboardVisible
             ? usageHistory.summary(
@@ -1204,6 +1224,7 @@ public final class MetricsStore {
         guard lastChartPublicationAt.map({ date.timeIntervalSince($0) >= 1 }) ?? true else {
             return
         }
+        let automaticDuration = automaticHistoryRange.duration
         let firstRaw =
             [
                 throughputSamples.first?.timestamp, gpuSamples.first?.timestamp,
@@ -1217,7 +1238,9 @@ public final class MetricsStore {
                     let viewport =
                         presentationViewports[consumer]
                         ?? (consumer == .popover ? .live(duration: 60) : .historyRange)
-                    return viewport.interval(at: date, range: historyRange, historyAge: age)
+                    return viewport.interval(
+                        at: date, range: historyRange, historyAge: age,
+                        automaticDuration: automaticDuration)
                 })
         } else {
             selection = nil
@@ -1292,6 +1315,7 @@ public final class MetricsStore {
         }
         let snapshot = ChartPresentationSnapshot(
             timestamp: date,
+            automaticHistoryDuration: automaticDuration,
             throughput: sampleIntervals.map { throughputSamples.elements(in: $0) } ?? tpsHistory,
             systemGPU: gpuHistoryScope == .system
                 ? (sampleIntervals.map { gpuSamples.elements(in: $0) } ?? gpuHistory) : [],
@@ -1519,6 +1543,8 @@ public struct ChartPresentationSnapshot: Sendable, Equatable {
     /// Identifies a held publication without comparing entire raw histories.
     package let publicationID = UUID()
     public let timestamp: Date
+    /// Activity-based Auto width captured at the same cadence as the chart data.
+    public let automaticHistoryDuration: TimeInterval
     public let throughput: [TimeSeriesPoint]
     public let systemGPU: [TimeSeriesPoint]
     public let toolActivity: [ToolActivityEvent]
@@ -1534,13 +1560,15 @@ public struct ChartPresentationSnapshot: Sendable, Equatable {
     public let toolActivityRequestIDs: Set<UUID>?
 
     public init(
-        timestamp: Date, throughput: [TimeSeriesPoint] = [], systemGPU: [TimeSeriesPoint] = [],
+        timestamp: Date, automaticHistoryDuration: TimeInterval = 30,
+        throughput: [TimeSeriesPoint] = [], systemGPU: [TimeSeriesPoint] = [],
         toolActivity: [ToolActivityEvent] = [], requestLanes: [RequestLane] = [],
         toolObservation: [TimeSeriesPoint] = [], supportsToolActivity: Bool = false,
         archive: ArchivedChartHistory = .empty, historicalRequestLanes: [RequestLane] = [],
         historicalToolActivity: [ToolActivityEvent] = [], toolActivityRequestIDs: Set<UUID>? = nil
     ) {
         self.timestamp = timestamp
+        self.automaticHistoryDuration = automaticHistoryDuration
         self.throughput = throughput
         self.systemGPU = systemGPU
         self.toolActivity = toolActivity
@@ -1554,7 +1582,9 @@ public struct ChartPresentationSnapshot: Sendable, Equatable {
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.timestamp == rhs.timestamp && lhs.throughput == rhs.throughput
+        lhs.timestamp == rhs.timestamp
+            && lhs.automaticHistoryDuration == rhs.automaticHistoryDuration
+            && lhs.throughput == rhs.throughput
             && lhs.systemGPU == rhs.systemGPU
             && lhs.toolActivity == rhs.toolActivity && lhs.requestLanes == rhs.requestLanes
             && lhs.toolObservation == rhs.toolObservation

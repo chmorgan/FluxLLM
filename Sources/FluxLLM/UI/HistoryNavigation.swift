@@ -23,16 +23,36 @@ struct HistoryNavigation: Equatable, Sendable {
         return .historyRange
     }
 
-    func interval(now: Date, historyAge: TimeInterval) -> DateInterval {
+    func interval(
+        now: Date, historyAge: TimeInterval, automaticDuration: TimeInterval = 30
+    ) -> DateInterval {
         if let pinnedInterval { return Self.bounded(pinnedInterval, now: now) }
-        let duration = selectedDuration ?? preset.duration(historyAge: historyAge)
+        let duration =
+            selectedDuration
+            ?? preset.duration(historyAge: historyAge, automaticDuration: automaticDuration)
         return Self.bounded(DateInterval(end: now, duration: duration), now: now)
     }
 
+    /// A captured Auto width behaves like a fixed preset until Auto is chosen again.
+    func title(now: Date, historyAge: TimeInterval, automaticDuration: TimeInterval = 30) -> String
+    {
+        guard preset == .automatic else { return preset.title }
+        let duration = interval(
+            now: now, historyAge: historyAge, automaticDuration: automaticDuration
+        ).duration
+        let width = duration < 60 ? "\(Int(duration))s" : "\(Int(duration / 60))m"
+        return pinnedInterval == nil && selectedDuration == nil ? "Auto · \(width)" : width
+    }
+
     /// Relative presets resume a moving window. Custom starts from the current view.
-    mutating func selectPreset(_ range: HistoryRange, now: Date, historyAge: TimeInterval) {
+    mutating func selectPreset(
+        _ range: HistoryRange, now: Date, historyAge: TimeInterval,
+        automaticDuration: TimeInterval = 30
+    ) {
         if range == .custom {
-            select(interval(now: now, historyAge: historyAge), now: now)
+            select(
+                interval(now: now, historyAge: historyAge, automaticDuration: automaticDuration),
+                now: now)
             return
         }
         preset = range
@@ -57,9 +77,13 @@ struct HistoryNavigation: Equatable, Sendable {
         return true
     }
 
-    mutating func pan(by fraction: Double, now: Date, historyAge: TimeInterval) {
+    mutating func pan(
+        by fraction: Double, now: Date, historyAge: TimeInterval,
+        automaticDuration: TimeInterval = 30
+    ) {
         guard fraction.isFinite else { return }
-        let current = interval(now: now, historyAge: historyAge)
+        let current = interval(
+            now: now, historyAge: historyAge, automaticDuration: automaticDuration)
         let offset = current.duration * fraction
         guard offset.isFinite else { return }
         let shifted = DateInterval(
@@ -128,12 +152,18 @@ struct HistoryControls: View {
     let now: Date
     let historyAge: TimeInterval
     let narrow: Bool
+    var automaticDuration: TimeInterval = 30
 
     @State private var showingCustomRange = false
     @State private var draftStart = Date()
     @State private var draftEnd = Date()
 
-    private var current: DateInterval { navigation.interval(now: now, historyAge: historyAge) }
+    private var current: DateInterval {
+        navigation.interval(now: now, historyAge: historyAge, automaticDuration: automaticDuration)
+    }
+    private var rangeTitle: String {
+        navigation.title(now: now, historyAge: historyAge, automaticDuration: automaticDuration)
+    }
 
     var body: some View {
         HStack(spacing: narrow ? 5 : 8) {
@@ -144,17 +174,21 @@ struct HistoryControls: View {
                     Button(range.title) { choose(range) }
                 }
             } label: {
-                Text(navigation.preset.title).frame(minWidth: 44, alignment: .leading)
+                Text(rangeTitle).frame(minWidth: 44, alignment: .leading)
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
             .accessibilityLabel("History range")
-            .accessibilityValue(navigation.preset.title)
-            .help("Choose a time range. Auto expands as history accumulates, up to 24 hours.")
+            .accessibilityValue(rangeTitle)
+            .help(
+                "Choose a time range. Auto follows recent request activity from 30 seconds to 10 minutes. Choose Auto again after browsing to resume automatic zoom."
+            )
             .popover(isPresented: $showingCustomRange, arrowEdge: .bottom) { customRangeForm }
 
             Button {
-                navigation.pan(by: -0.5, now: now, historyAge: historyAge)
+                navigation.pan(
+                    by: -0.5, now: now, historyAge: historyAge,
+                    automaticDuration: automaticDuration)
             } label: {
                 Image(systemName: "chevron.left")
             }
@@ -164,7 +198,9 @@ struct HistoryControls: View {
             .help("Move half a window earlier (Option–Left Arrow).")
 
             Button {
-                navigation.pan(by: 0.5, now: now, historyAge: historyAge)
+                navigation.pan(
+                    by: 0.5, now: now, historyAge: historyAge,
+                    automaticDuration: automaticDuration)
             } label: {
                 Image(systemName: "chevron.right")
             }
@@ -226,7 +262,8 @@ struct HistoryControls: View {
             draftEnd = current.end
             showingCustomRange = true
         } else {
-            navigation.selectPreset(range, now: now, historyAge: historyAge)
+            navigation.selectPreset(
+                range, now: now, historyAge: historyAge, automaticDuration: automaticDuration)
         }
     }
 }
