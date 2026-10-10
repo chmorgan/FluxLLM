@@ -305,7 +305,8 @@ public final class MetricsStore {
     private var nativeActivity: BackendActivity = .unknown {
         didSet { if nativeActivity != oldValue { refreshLiveActivity() } }
     }
-    @ObservationIgnored private var nativeActivityObservedAt: Date?
+    @ObservationIgnored private var nativeCountActivity: BackendActivity = .unknown
+    @ObservationIgnored private var nativeCountActivityObservedAt: Date?
     @ObservationIgnored private var automaticHistoryRange = AutomaticHistoryRange()
     @ObservationIgnored private var lastRatePublicationAt: Date?
     @ObservationIgnored private var slotDisplayAverage = SlotThroughputDisplayAverage()
@@ -635,8 +636,9 @@ public final class MetricsStore {
         seenProxyRequestIDs.removeAll(keepingCapacity: true)
         retiredProxyRequestIDs.removeAll(keepingCapacity: true)
         nativeRequestTracker.reset()
+        nativeCountActivity = .unknown
+        nativeCountActivityObservedAt = nil
         nativeActivity = .unknown
-        nativeActivityObservedAt = nil
         automaticHistoryRange.reset()
         currentTPS = 0
         resetSlotThroughputDisplay()
@@ -695,7 +697,7 @@ public final class MetricsStore {
         _ state: BackendConnectionState, message: String? = nil, at date: Date? = nil
     ) {
         let date = date ?? clock()
-        expireNativeActivity(at: date)
+        refreshNativeActivity(at: date)
         healthConnectionState = state
         healthConnectionMessage = message
         if state == .ready { lastSuccessfulHealthAt = date }
@@ -774,16 +776,20 @@ public final class MetricsStore {
             lastBackendSampleAt.map({ sample.timestamp >= $0 }) ?? true
         else { return }
         lastBackendSampleAt = sample.timestamp
-        updateConnection(
-            sample.isReady ? .ready : .connecting, message: sample.detail, at: sample.timestamp)
         if sample.kind != .ollama {
             nativeRequestTracker.apply(sample.nativeRequests, at: sample.timestamp)
             // Counts from the scrape remain direct activity evidence even when
             // that provider's separate readiness endpoint is failing.
-            nativeActivity = .native(
+            nativeCountActivity = .native(
                 running: sample.runningRequests.flatMap { $0 >= 0 ? $0 : nil },
                 queued: sample.queuedRequests.flatMap { $0 >= 0 ? $0 : nil })
-            nativeActivityObservedAt = sample.timestamp
+            nativeCountActivityObservedAt = sample.timestamp
+        }
+        // Reconcile after both evidence sources are updated, so an earlier zero
+        // count cannot publish Idle before a later running observation is applied.
+        updateConnection(
+            sample.isReady ? .ready : .connecting, message: sample.detail, at: sample.timestamp)
+        if sample.kind != .ollama {
             automaticHistoryRange.observe(nativeActivity, at: sample.timestamp)
         }
         guard sample.isReady else { return }
@@ -914,8 +920,8 @@ public final class MetricsStore {
         }
         sampleDate = date
         historyBufferRevision &+= 1
-        expireNativeActivity(at: date)
         nativeRequestTracker.advance(at: date)
+        refreshNativeActivity(at: date)
         // In proxy/ollama mode the displayed rate is the sum of every open
         // request's live rate. Refresh it against this sample time so a stalled
         // request (no chunk in `freshnessInterval`) drops out of the trace. The
@@ -1520,11 +1526,21 @@ public final class MetricsStore {
         }
     }
 
-    private func expireNativeActivity(at date: Date) {
-        guard let nativeActivityObservedAt,
-            date.timeIntervalSince(nativeActivityObservedAt) > Self.freshnessInterval
-        else { return }
-        nativeActivity = .unknown
+    private func refreshNativeActivity(at date: Date) {
+        let countsAreFresh =
+            nativeCountActivityObservedAt.map {
+                let age = date.timeIntervalSince($0)
+                return age.isFinite && age >= 0 && age <= Self.freshnessInterval
+            } ?? false
+        let countActivity: BackendActivity = countsAreFresh ? nativeCountActivity : .unknown
+        let next: BackendActivity
+        if countActivity.isActive {
+            next = countActivity
+        } else {
+            let observedCount = nativeRequestTracker.freshRunningRequestCount(at: date)
+            next = observedCount > 0 ? .observedNativeRequests(count: observedCount) : countActivity
+        }
+        if nativeActivity != next { nativeActivity = next }
     }
 
     private var requestIsAwaitingOutput: Bool {

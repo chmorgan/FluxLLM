@@ -223,6 +223,19 @@ struct NativeRequestTracker {
             }
     }
 
+    /// Only accepted, current records supply activity evidence. Retained terminal
+    /// lanes, rejected replays and aggregate polls cannot refresh this count.
+    func freshRunningRequestCount(at date: Date) -> Int {
+        guard date.timeIntervalSince1970.isFinite else { return 0 }
+        return records.values.reduce(0) { count, record in
+            let age = date.timeIntervalSince(record.lastObservedAt)
+            guard record.endStatus == nil, age >= 0, age <= freshnessInterval else {
+                return count
+            }
+            return count + 1
+        }
+    }
+
     private func makeRecord(_ observation: NativeRequestObservation, at date: Date) -> Record {
         let start =
             observation.startedAt.flatMap {

@@ -80,6 +80,8 @@ final class DashboardLiveScalars {
         case .requests(let running, let queued):
             next = [running.map { "\($0) running" }, queued.map { "\($0) queued" }]
                 .compactMap { $0 }.joined(separator: " · ")
+        case .observedNativeRequests(let count):
+            next = "\(count) observed \(count == 1 ? "request" : "requests") in progress"
         case .observedRequests(let count, _, let hasOutput):
             next =
                 count > 1

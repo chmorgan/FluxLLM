@@ -211,8 +211,10 @@ final class NativeRequestTrackerTests: XCTestCase {
         var tracker = NativeRequestTracker()
         let finished = NativeRequestObservation(id: "one", outputTokens: 50, status: .completed)
         tracker.apply(snapshot([finished, request("one", tokens: 10)]), at: date(1))
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(1)), 0)
         let original = try XCTUnwrap(tracker.lanes(at: date(1)).first)
         tracker.apply(snapshot([request("one", tokens: 100)]), at: date(2))
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(2)), 0)
         tracker.apply(snapshot([finished]), at: date(3))
         let lanes = tracker.lanes(at: date(3))
         XCTAssertEqual(lanes.count, 1)
@@ -283,6 +285,33 @@ final class NativeRequestTrackerTests: XCTestCase {
             snapshot([request("old", tokens: 1000)], epoch: replacementEpoch), at: date(1.5))
         XCTAssertEqual(tracker.lanes(at: date(3)).map(\.id), [replacement.id])
         XCTAssertEqual(tracker.lanes(at: date(3)).first?.outputTokens, 20)
+        tracker.apply(snapshot([], epoch: replacementEpoch), at: date(4))
+        tracker.apply(snapshot([request("old")]), at: date(5))
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(5)), 0)
+        XCTAssertEqual(tracker.lanes(at: date(5)).map(\.id), [replacement.id])
+    }
+
+    func testActivityCountUsesFreshCurrentRecordsInsteadOfRetainedLanes() throws {
+        var tracker = NativeRequestTracker()
+        tracker.apply(snapshot([request("one"), request("two")], complete: false), at: date(0))
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(0)), 2)
+        tracker.apply(
+            snapshot(
+                [NativeRequestObservation(id: "one", status: .completed)], complete: false),
+            at: date(2))
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(2)), 1)
+        tracker.apply(snapshot([], complete: false), at: date(4))
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(5)), 1)
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(5.5)), 0)
+        tracker.advance(at: date(5.5))
+        XCTAssertEqual(tracker.lanes(at: date(5.5)).count, 2)
+        XCTAssertTrue(tracker.lanes(at: date(5.5)).allSatisfy(\.terminal))
+        tracker.apply(
+            snapshot([request("unaccepted")], source: .protocolStream), at: date(6))
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(6)), 0)
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(.nan)), 0)
+        tracker.reset()
+        XCTAssertEqual(tracker.freshRunningRequestCount(at: date(6)), 0)
     }
 
     func testMalformedMetadataCannotInventTimesCountsOrRates() throws {

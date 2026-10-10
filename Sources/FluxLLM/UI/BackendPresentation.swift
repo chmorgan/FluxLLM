@@ -20,6 +20,8 @@ enum BackendPresentation {
         case .requests(let running, let queued):
             return [running.map { "\($0) running" }, queued.map { "\($0) queued" }]
                 .compactMap { $0 }.joined(separator: " · ")
+        case .observedNativeRequests(let count):
+            return "\(count) observed \(count == 1 ? "request" : "requests") in progress"
         case .observedRequests(let count, let startedAt, let hasOutput):
             if count > 1 { return "\(count) requests in flight" }
             let elapsed = max(0, store.sampleDate.timeIntervalSince(startedAt))

@@ -209,7 +209,7 @@ final class BackendActivityTests: XCTestCase {
     }
 
     func testNativePositiveCountsProveActivityWithoutInventingRequestPhase() {
-        for kind in [BackendKind.vllm, .rapidMLX, .llamaCpp] {
+        for kind in [BackendKind.vllm, .rapidMLX, .llamaCpp, .unsloth] {
             let store = MetricsStore(clock: { self.origin })
             let epoch = UUID()
             store.beginBackendSession(kind: kind, epoch: epoch)
@@ -312,6 +312,34 @@ final class BackendActivityTests: XCTestCase {
             epoch: epoch)
         XCTAssertTrue(store.isBackendActive)
         store.beginBackendSession(kind: .llamaCpp, epoch: UUID())
+        XCTAssertEqual(store.backendActivity, .unknown)
+    }
+
+    func testNativeObservationRemainsActiveDuringReadinessFailureAndExpiresOnHealthUpdate() {
+        let store = MetricsStore(clock: { self.origin })
+        let epoch = UUID()
+        store.beginBackendSession(kind: .unsloth, epoch: epoch)
+        store.applyBackendSample(
+            BackendSample(
+                kind: .unsloth, timestamp: origin, isReady: false,
+                nativeRequests: .init(
+                    sourceEpoch: UUID(), source: .studioMonitor,
+                    requests: [NativeRequestObservation(id: "one")], isComplete: false),
+                runningRequests: 0, queuedRequests: 0), epoch: epoch)
+
+        XCTAssertEqual(store.connectionState, .connecting)
+        XCTAssertEqual(store.backendActivity, .observedNativeRequests(count: 1))
+        XCTAssertEqual(BackendPresentation.statusTitle(store: store), "Active")
+        XCTAssertEqual(
+            BackendPresentation.activityDetail(store: store), "1 observed request in progress")
+        XCTAssertNil(store.activityRequestStartedAt)
+        XCTAssertNil(store.displayTPS)
+        XCTAssertFalse(store.rateIsAvailable)
+
+        store.updateConnection(.ready, at: origin.addingTimeInterval(6))
+        XCTAssertEqual(store.backendActivity, .unknown)
+        XCTAssertEqual(store.liveScalars.statusTitle, "Unknown")
+        store.beginBackendSession(kind: .ollama, epoch: UUID())
         XCTAssertEqual(store.backendActivity, .unknown)
     }
 }

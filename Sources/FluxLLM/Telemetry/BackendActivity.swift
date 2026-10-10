@@ -6,11 +6,14 @@ public enum BackendActivity: Sendable, Equatable {
     case unknown
     case idle
     case requests(running: Int?, queued: Int?)
+    /// Accepted native observations prove work without supplying aggregate counts
+    /// or the proxy's request phase and start time. This count can be a subset.
+    case observedNativeRequests(count: Int)
     case observedRequests(count: Int, startedAt: Date, hasOutput: Bool)
 
     public var isActive: Bool {
         switch self {
-        case .requests, .observedRequests: true
+        case .requests, .observedNativeRequests, .observedRequests: true
         case .unknown, .idle: false
         }
     }

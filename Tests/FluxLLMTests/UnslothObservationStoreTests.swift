@@ -48,6 +48,117 @@ final class UnslothObservationStoreTests: XCTestCase {
         XCTAssertTrue(store.toolObservationHistory.isEmpty)
     }
 
+    func testFreshNativeRequestsProveActivityWhenAggregateCountsAreZeroOrMissing() {
+        let cases: [(Int?, Int?)] = [(0, 0), (nil, nil), (0, nil), (nil, 0)]
+        for (running, queued) in cases {
+            let (store, epoch) = session()
+            apply(
+                store, epoch: epoch, at: 0,
+                requests: snapshot(
+                    [
+                        NativeRequestObservation(id: "one", outputTokens: 100, liveTPS: 1000),
+                        NativeRequestObservation(id: "two", outputTokens: 200, liveTPS: 2000),
+                    ], source: .studioMonitor, complete: false), running: running, queued: queued)
+            store.sample(at: date(0))
+
+            XCTAssertEqual(store.backendActivity, .observedNativeRequests(count: 2))
+            XCTAssertEqual(BackendPresentation.statusTitle(store: store), "Active")
+            XCTAssertEqual(
+                BackendPresentation.activityDetail(store: store), "2 observed requests in progress")
+            XCTAssertEqual(store.liveScalars.statusTitle, "Active")
+            XCTAssertEqual(store.runningRequests, running)
+            XCTAssertEqual(store.queuedRequests, queued)
+            XCTAssertEqual(store.currentTPS, 88)
+            XCTAssertEqual(store.displayTPS, 88)
+            XCTAssertEqual(store.backendOutputTokens, 5000)
+            XCTAssertNil(store.activityRequestStartedAt)
+            XCTAssertNil(store.activeGeneration)
+            XCTAssertEqual(
+                store.usageSummary(in: DateInterval(start: origin, duration: 10)).requests, 0)
+            // A complete snapshot clears observational evidence without inventing
+            // missing aggregate counts or ruling out an unknown queue.
+            apply(
+                store, epoch: epoch, at: 1,
+                requests: snapshot([], source: .studioMonitor), running: running, queued: queued)
+            XCTAssertEqual(store.backendActivity, .native(running: running, queued: queued))
+        }
+    }
+
+    func testMissingAndPartialSnapshotsKeepActivityOnlyUntilItsOwnFreshnessExpires() {
+        let cases: [(NativeRequestSnapshot?, Bool)] = [
+            (nil, true),
+            (snapshot([], complete: false), true),
+            (snapshot([]), false),
+        ]
+        for (nextSnapshot, remainsActive) in cases {
+            let (store, epoch) = session()
+            apply(
+                store, epoch: epoch, at: 0,
+                requests: snapshot([NativeRequestObservation(id: "one")]), running: 0)
+            apply(store, epoch: epoch, at: 2, requests: nextSnapshot, running: 0)
+            XCTAssertEqual(store.isBackendActive, remainsActive)
+            for time in [4.0, 5.0] {
+                apply(store, epoch: epoch, at: time, requests: nil, running: 0)
+                store.sample(at: date(time))
+                XCTAssertEqual(store.isBackendActive, remainsActive)
+            }
+            // Fresh zero counts do not extend the request's original observation.
+            store.sample(at: date(5.5))
+            XCTAssertEqual(store.connectionState, .ready)
+            XCTAssertEqual(store.backendActivity, .idle)
+            XCTAssertEqual(store.liveScalars.statusTitle, "Idle")
+            XCTAssertTrue(store.requestLanes.allSatisfy(\.terminal))
+        }
+    }
+
+    func testTerminalMonitorHistoryAndReplayCannotKeepActivityAlive() {
+        for status in [ObservedRequestStatus.completed, .cancelled, .failed] {
+            let (store, epoch) = session()
+            apply(
+                store, epoch: epoch, at: 0,
+                requests: snapshot(
+                    [NativeRequestObservation(id: "one")], source: .studioMonitor,
+                    complete: false), running: 0)
+            apply(
+                store, epoch: epoch, at: 1,
+                requests: snapshot(
+                    [NativeRequestObservation(id: "one", liveTPS: 1000, status: status)],
+                    source: .studioMonitor, complete: false), running: 0)
+            XCTAssertEqual(store.backendActivity, .idle)
+            apply(
+                store, epoch: epoch, at: 2,
+                requests: snapshot(
+                    [NativeRequestObservation(id: "one", outputTokens: 300, liveTPS: 2000)],
+                    source: .studioMonitor, complete: false), running: 0)
+            XCTAssertEqual(store.backendActivity, .idle)
+            XCTAssertEqual(store.requestLanes.first?.endStatus, status)
+            XCTAssertEqual(store.liveScalars.statusTitle, "Idle")
+        }
+    }
+
+    func testRetiredObservationSourceAndPreviousSessionCannotReactivateRequests() {
+        let (store, epoch) = session()
+        apply(
+            store, epoch: epoch, at: 0,
+            requests: snapshot([NativeRequestObservation(id: "one")]), running: 0)
+        XCTAssertEqual(store.backendActivity, .observedNativeRequests(count: 1))
+        let replacementEpoch = UUID()
+        apply(
+            store, epoch: epoch, at: 1, requests: snapshot([], epoch: replacementEpoch), running: 0)
+        apply(
+            store, epoch: epoch, at: 2,
+            requests: snapshot([NativeRequestObservation(id: "late")]), running: 0)
+        XCTAssertEqual(store.backendActivity, .idle)
+        XCTAssertTrue(store.requestLanes.isEmpty)
+
+        store.beginBackendSession(kind: .unsloth, epoch: UUID())
+        apply(
+            store, epoch: epoch, at: 3,
+            requests: snapshot([NativeRequestObservation(id: "late")]), running: 0)
+        XCTAssertEqual(store.backendActivity, .unknown)
+        XCTAssertEqual(store.liveScalars.statusTitle, "Connecting")
+    }
+
     func testIdentityExpiresDespiteHealthyAggregatePollsAndKeepsThroughputAvailable() throws {
         let (store, epoch) = session()
         apply(
@@ -248,20 +359,23 @@ final class UnslothObservationStoreTests: XCTestCase {
 
     private func snapshot(
         _ requests: [NativeRequestObservation], source: RequestObservationSource = .slotPolling,
-        epoch: UUID? = nil
+        epoch: UUID? = nil, complete: Bool = true
     ) -> NativeRequestSnapshot {
-        NativeRequestSnapshot(sourceEpoch: epoch ?? sourceEpoch, source: source, requests: requests)
+        NativeRequestSnapshot(
+            sourceEpoch: epoch ?? sourceEpoch, source: source, requests: requests,
+            isComplete: complete)
     }
 
     private func apply(
         _ store: MetricsStore, epoch: UUID, at offset: TimeInterval,
-        requests: NativeRequestSnapshot?, rate: Double = 88, running: Int = 1
+        requests: NativeRequestSnapshot?, rate: Double = 88, running: Int? = 1, queued: Int? = 0
     ) {
         store.applyBackendSample(
             BackendSample(
                 kind: .unsloth, timestamp: date(offset), model: "engine-model", currentTPS: rate,
                 measurementDuration: 1, nativeRequests: requests,
-                runningRequests: running, queuedRequests: 0, outputTokens: 5000, promptTokens: 3000),
+                runningRequests: running, queuedRequests: queued,
+                outputTokens: 5000, promptTokens: 3000),
             epoch: epoch)
     }
 }

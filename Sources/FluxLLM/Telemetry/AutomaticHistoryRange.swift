@@ -34,7 +34,7 @@ struct AutomaticHistoryRange: Sendable {
         lastObservedAt = date
 
         switch activity {
-        case .requests, .observedRequests:
+        case .requests, .observedNativeRequests, .observedRequests:
             if episodeStartedAt == nil || startsNewEpisode {
                 episodeStartedAt = date
                 duration = Self.widths[0]

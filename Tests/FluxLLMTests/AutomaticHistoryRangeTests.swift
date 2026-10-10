@@ -114,6 +114,7 @@ final class AutomaticHistoryRangeTests: XCTestCase {
         let examples: [BackendActivity] = [
             .requests(running: 0, queued: 1),
             .requests(running: 3, queued: 2),
+            .observedNativeRequests(count: 1),
             .observedRequests(count: 1, startedAt: origin, hasOutput: false),
         ]
         for activity in examples {

@@ -177,6 +177,51 @@ final class DashboardLiveScalarsTests: XCTestCase {
         }
     }
 
+    func testNativeObservationPublishesActivityWithoutProxyPhaseOrTokenInvalidations() throws {
+        try withNormal {
+            let store = MetricsStore(clock: { self.origin })
+            let epoch = UUID()
+            let sourceEpoch = UUID()
+            store.beginBackendSession(kind: .unsloth, epoch: epoch)
+            @MainActor func native(
+                _ tokens: Int, at offset: Double, status: ObservedRequestStatus = .running
+            ) {
+                store.applyBackendSample(
+                    BackendSample(
+                        kind: .unsloth, timestamp: date(offset), currentTPS: 10,
+                        nativeRequests: .init(
+                            sourceEpoch: sourceEpoch, source: .studioMonitor,
+                            requests: [
+                                NativeRequestObservation(
+                                    id: "one", outputTokens: tokens, status: status)
+                            ],
+                            isComplete: false),
+                        runningRequests: 0, queuedRequests: 0), epoch: epoch)
+            }
+            native(10, at: 0)
+            XCTAssertEqual(store.liveScalars.statusTitle, "Active")
+            XCTAssertEqual(store.liveScalars.activityDetail, "1 observed request in progress")
+            XCTAssertEqual(store.liveScalars.requestCountLabel, "0")
+            XCTAssertNil(store.activityRequestStartedAt)
+            try assertLegacyValues(store)
+            let activity = observe { _ = store.liveScalars.activityDetail }
+            let status = observe { _ = store.liveScalars.statusTitle }
+            native(20, at: 0.2)
+            store.sample(at: date(0.5))
+            XCTAssertEqual(activity.value, 0)
+            XCTAssertEqual(status.value, 0)
+            XCTAssertEqual(store.requestLanes.first?.outputTokens, 20)
+            try assertLegacyValues(store)
+
+            native(30, at: 1, status: .completed)
+            XCTAssertEqual(activity.value, 1)
+            XCTAssertEqual(status.value, 1)
+            XCTAssertNil(store.liveScalars.activityDetail)
+            XCTAssertEqual(store.liveScalars.statusTitle, "Idle")
+            try assertLegacyValues(store)
+        }
+    }
+
     func testResponseAndUsageObserveIndependentExistingCoalescedPublications() throws {
         try withNormal {
             let store = MetricsStore(clock: { self.origin })
