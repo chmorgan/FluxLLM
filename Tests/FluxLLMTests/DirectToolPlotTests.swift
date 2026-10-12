@@ -152,15 +152,23 @@ final class DirectToolPlotTests: XCTestCase {
         var sawMultipleSegments = false
         var sawPending = false
         for seed in 0..<12 {
-            var observations = (0...80).map { index in
-                TimeSeriesPoint(
-                    timestamp: date(Double(index) / 2),
-                    value: (index + seed) % 17 == 0 ? .nan : 0,
-                    isAvailable: (index + seed * 3) % 13 != 0)
+            var observations: [TimeSeriesPoint] = (0...80).map { (index: Int) -> TimeSeriesPoint in
+                let offset: Double = Double(index) / 2.0
+                let valueIndex: Int = index + seed
+                let value: Double = valueIndex % 17 == 0 ? Double.nan : 0.0
+                let availabilityIndex: Int = index + seed * 3
+                let available: Bool = availabilityIndex % 13 != 0
+                return TimeSeriesPoint(
+                    timestamp: date(offset), value: value, isAvailable: available)
             }
-            observations += stride(from: 0, through: 80, by: 11).map { index in
-                observation(Double(index) / 2, available: (index + seed) % 2 == 0)
-            }
+            let extraObservations: [TimeSeriesPoint] =
+                stride(from: 0, through: 80, by: 11).map { (index: Int) -> TimeSeriesPoint in
+                    let offset: Double = Double(index) / 2.0
+                    let availabilityIndex: Int = index + seed
+                    let available: Bool = availabilityIndex % 2 == 0
+                    return observation(offset, available: available)
+                }
+            observations += extraObservations
             if seed.isMultiple(of: 2) { observations.reverse() }
             var events = (0..<18).map { index in
                 ToolActivityEvent(
