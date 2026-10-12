@@ -535,10 +535,17 @@ final class FileIOTracer {
             // The trace lasts at most 300 seconds. Adjacent UTC dates handle
             // midnight without assuming kernel events arrive in timestamp order.
             // Receipt time only bounds possible dates; it is not the event time.
-            let candidates = [-1.0, 0, 1].map { dayOffset in
-                monotonicSeconds + originUTCDay + dayOffset * 86_400 + timeOfDay - wallSeconds
-            }.filter {
-                $0 >= monotonicSeconds - uncertainty && $0 <= observedAt + uncertainty
+            let dayOffsets: [Double] = [-1.0, 0.0, 1.0]
+            let convertedCandidates: [Double] = dayOffsets.map { dayOffset -> Double in
+                let originSum: Double = monotonicSeconds + originUTCDay
+                let dayAdjustment: Double = dayOffset * 86_400.0
+                let adjustedOrigin: Double = originSum + dayAdjustment
+                let withTimeOfDay: Double = adjustedOrigin + timeOfDay
+                return withTimeOfDay - wallSeconds
+            }
+            let candidates = convertedCandidates.filter { candidate in
+                candidate >= monotonicSeconds - uncertainty
+                    && candidate <= observedAt + uncertainty
             }
             guard candidates.count == 1, let candidate = candidates.first else { return nil }
             return EventTiming(monotonicSeconds: candidate, uncertaintySeconds: uncertainty)
