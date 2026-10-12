@@ -32,6 +32,8 @@ public final class MonitoringCoordinator {
     private var applyRevision = 0
     private var epoch = UUID()
     private var monitorTask: Task<Void, Never>?
+    private var monitorDelayTask: Task<Void, Error>?
+    private var pollRequested = false
     private var gpuTask: Task<Void, Never>?
     private var operationTask: Task<Void, Error>?
     private var appliedSettings: SettingsSnapshot?
@@ -114,6 +116,7 @@ public final class MonitoringCoordinator {
                 self.appliedSettings = snapshot
                 self.publishSelectionNotice(
                     self.store.detectedBackends, selection: snapshot.selection)
+                self.requestPollIfUnhealthy()
                 return
             }
             let detections = await self.detectBackends(using: snapshot)
@@ -127,11 +130,13 @@ public final class MonitoringCoordinator {
             {
                 // Keep request identity, rates, history, and ordinary failure retries intact.
                 self.appliedSettings = snapshot
+                self.requestPollIfUnhealthy()
                 return
             }
             if selection.configuration == nil, self.canKeepAutomaticTarget(using: snapshot) {
                 // Changes to other backends cannot turn a failed rescan into a session boundary.
                 self.appliedSettings = snapshot
+                self.requestPollIfUnhealthy()
                 return
             }
 
@@ -195,6 +200,7 @@ public final class MonitoringCoordinator {
         applyRevision += 1
         operationTask?.cancel()
         monitorTask?.cancel()
+        monitorDelayTask?.cancel()
         gpuTask?.cancel()
         if let operationTask { _ = await operationTask.result }
         self.operationTask = nil
@@ -220,6 +226,10 @@ public final class MonitoringCoordinator {
         let oldMonitor = monitorTask
         monitorTask = nil
         oldMonitor?.cancel()
+        let oldDelay = monitorDelayTask
+        monitorDelayTask = nil
+        oldDelay?.cancel()
+        pollRequested = false
         let oldGPU = gpuTask
         gpuTask = nil
         oldGPU?.cancel()
@@ -278,8 +288,17 @@ public final class MonitoringCoordinator {
                 selectedConfiguration == nil
                 ? discoveryInterval
                 : failures == 0 ? pollInterval : .seconds(min(30, 1 << min(failures, 5)))
-            do { try await Task.sleep(for: delay) } catch { return }
+            if !pollRequested {
+                let sleep = Task { try await Task.sleep(for: delay) }
+                monitorDelayTask = sleep
+                do { try await sleep.value } catch {
+                    if Task.isCancelled { return }
+                }
+                monitorDelayTask = nil
+            }
             guard running, revision == expected, !Task.isCancelled else { return }
+            // Every Apply received during the same sleep is satisfied by this one poll.
+            pollRequested = false
             if selectedConfiguration == nil {
                 guard let snapshot = appliedSettings else { return }
                 let detections = await detectBackends(using: snapshot)
@@ -299,8 +318,15 @@ public final class MonitoringCoordinator {
             if let configuration = selectedConfiguration {
                 let success = await poll(configuration, revision: expected, epoch: epoch)
                 failures = success ? 0 : min(failures + 1, 5)
+                if success, store.connectionState == .ready { pollRequested = false }
             }
         }
+    }
+
+    private func requestPollIfUnhealthy() {
+        guard store.connectionState != .ready else { return }
+        pollRequested = true
+        monitorDelayTask?.cancel()
     }
 
     private func poll(_ configuration: BackendConfiguration, revision expected: Int, epoch: UUID)
@@ -421,7 +447,8 @@ public final class MonitoringCoordinator {
         let probed = await withTaskGroup(of: DetectedBackend?.self) { group in
             for url in urls {
                 let configuration = configurations.first {
-                    $0.kind == .unsloth && Self.endpointKey($0.baseURL) == Self.endpointKey(url)
+                    $0.kind == .unsloth
+                        && Self.endpointKey($0.baseURL) == Self.endpointKey(url)
                 }
                 group.addTask {
                     if let configuration { return try? await client.detect(configuration) }

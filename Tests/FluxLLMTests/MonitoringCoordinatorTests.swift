@@ -88,6 +88,169 @@ final class MonitoringCoordinatorTests: XCTestCase {
         XCTAssertEqual(proxy.stops, 0)
         let resets = await context.client.resetCount
         XCTAssertEqual(resets, 1)
+        let polls = await context.client.sampleCount
+        XCTAssertEqual(polls, 1, "A healthy unchanged Apply must not add a poll")
+        await context.close()
+    }
+
+    func testUnhealthyUnchangedApplyWakesLongSleepWithoutClearingFaultOrHistory() async throws {
+        let context = try makeContext(detections: [.vllm], pollInterval: .seconds(3600))
+        context.settings.backendSelection = .vllm
+        let fault = "Enable backend monitoring metrics."
+        await context.client.failNextSample(.configurationRequired(fault))
+        await context.coordinator.start()
+        context.store.sample()
+        let epoch = context.store.monitoringEpoch
+        let history = context.store.tpsHistory
+        XCTAssertFalse(history.isEmpty)
+        await context.client.holdNextSample()
+
+        try await context.coordinator.applySettings()
+        try await eventually(timeout: .seconds(1)) { await context.client.isSampleHeld }
+
+        XCTAssertEqual(context.store.connectionState, .needsConfiguration)
+        XCTAssertEqual(context.store.connectionMessage, fault)
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertEqual(context.store.tpsHistory, history)
+        let resetsBefore = await context.client.resetCount
+        XCTAssertEqual(resetsBefore, 1)
+        await context.client.releaseSample()
+        try await eventually { context.store.connectionState == .ready }
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertEqual(context.store.tpsHistory, history)
+        let polls = await context.client.sampleCount
+        XCTAssertEqual(polls, 2)
+        await context.close()
+    }
+
+    func testUnhealthyApplyInterruptsFailureBackoffAndPreservesMeasuredHistory() async throws {
+        let context = try makeContext(detections: [.vllm], pollInterval: .milliseconds(10))
+        context.settings.backendSelection = .vllm
+        await context.coordinator.start()
+        context.store.sample()
+        let epoch = context.store.monitoringEpoch
+        let history = context.store.tpsHistory
+        XCTAssertTrue(history.contains { $0.isAvailable && $0.value == 42 })
+        await context.client.failNextSample(.configurationRequired("Worker credentials changed."))
+        try await eventually { context.store.connectionState == .needsConfiguration }
+        await context.client.holdNextSample()
+
+        try await context.coordinator.applySettings()
+        try await eventually(timeout: .seconds(1)) { await context.client.isSampleHeld }
+
+        XCTAssertEqual(context.store.connectionState, .needsConfiguration)
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertEqual(context.store.tpsHistory, history)
+        await context.client.releaseSample()
+        try await eventually { context.store.connectionState == .ready }
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 1)
+        let maximum = await context.client.maximumSamplesInFlight
+        XCTAssertEqual(maximum, 1)
+        await context.close()
+    }
+
+    func testApplyWakesDuringInflightFailureCoalesceIntoOneSerializedRetry() async throws {
+        let context = try makeContext(detections: [.vllm], pollInterval: .seconds(3600))
+        context.settings.backendSelection = .vllm
+        await context.client.failNextSample(.configurationRequired("Initial monitoring fault."))
+        await context.coordinator.start()
+        let epoch = context.store.monitoringEpoch
+        await context.client.holdNextSample()
+        await context.client.failNextSample(
+            .configurationRequired("Monitoring is still unavailable."))
+        try await context.coordinator.applySettings()
+        try await eventually { await context.client.isSampleHeld }
+
+        for _ in 0..<3 { try await context.coordinator.applySettings() }
+        let pollsBefore = await context.client.sampleCount
+        XCTAssertEqual(pollsBefore, 2)
+        let inFlight = await context.client.samplesInFlight
+        XCTAssertEqual(inFlight, 1)
+        XCTAssertEqual(context.store.connectionState, .needsConfiguration)
+        await context.client.releaseSample()
+        try await eventually(timeout: .seconds(1)) {
+            context.store.connectionState == .ready
+        }
+
+        let pollsAfter = await context.client.sampleCount
+        XCTAssertEqual(pollsAfter, 3)
+        let maximum = await context.client.maximumSamplesInFlight
+        XCTAssertEqual(maximum, 1)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 1)
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        await context.close()
+    }
+
+    func testSuccessfulInflightRetrySatisfiesCoalescedApplyWakes() async throws {
+        let context = try makeContext(detections: [.vllm], pollInterval: .seconds(3600))
+        context.settings.backendSelection = .vllm
+        await context.client.failNextSample(.configurationRequired("Initial monitoring fault."))
+        await context.coordinator.start()
+        await context.client.holdNextSample()
+        try await context.coordinator.applySettings()
+        try await eventually { await context.client.isSampleHeld }
+        for _ in 0..<3 { try await context.coordinator.applySettings() }
+        await context.client.releaseSample()
+        try await eventually { context.store.connectionState == .ready }
+
+        let polls = await context.client.sampleCount
+        XCTAssertEqual(
+            polls, 2, "The accepted in-flight sample satisfies pending unchanged Applies")
+        let maximum = await context.client.maximumSamplesInFlight
+        XCTAssertEqual(maximum, 1)
+        await context.close()
+    }
+
+    func testShutdownDuringInflightApplyRetryRejectsLateFault() async throws {
+        let context = try makeContext(detections: [.vllm], pollInterval: .seconds(3600))
+        context.settings.backendSelection = .vllm
+        await context.client.failNextSample(.configurationRequired("Initial monitoring fault."))
+        await context.coordinator.start()
+        await context.client.holdNextSample()
+        await context.client.failNextSample(
+            .configurationRequired("Late retired monitoring fault."))
+        try await context.coordinator.applySettings()
+        try await eventually { await context.client.isSampleHeld }
+        let stopping = Task { await context.coordinator.stop() }
+        try await eventually { await context.client.sampleCancellations == 1 }
+        await context.client.releaseSample()
+        await stopping.value
+
+        XCTAssertNil(context.coordinator.selectedConfiguration)
+        XCTAssertEqual(context.store.connectionState, .detecting)
+        XCTAssertNil(context.store.connectionMessage)
+        let polls = await context.client.sampleCount
+        XCTAssertEqual(polls, 2)
+        context.removeDefaults()
+    }
+
+    func testReconfigurationDuringInflightRetryAwaitsOldSampleAndRejectsItsFault() async throws {
+        let context = try makeContext(detections: [.vllm], pollInterval: .seconds(3600))
+        context.settings.backendSelection = .vllm
+        await context.client.failNextSample(.configurationRequired("Initial monitoring fault."))
+        await context.coordinator.start()
+        let epoch = context.store.monitoringEpoch
+        await context.client.holdNextSample()
+        await context.client.failNextSample(
+            .configurationRequired("Late retired monitoring fault."))
+        try await context.coordinator.applySettings()
+        try await eventually { await context.client.isSampleHeld }
+        context.settings.backendEndpoints[.vllm] = "http://127.0.0.1:9001"
+        let applying = Task { try await context.coordinator.applySettings() }
+        try await eventually { await context.client.sampleCancellations == 1 }
+        await context.client.releaseSample()
+        try await applying.value
+
+        XCTAssertNotEqual(context.store.monitoringEpoch, epoch)
+        XCTAssertEqual(context.coordinator.selectedConfiguration?.baseURL.port, 9001)
+        XCTAssertEqual(context.store.connectionState, .ready)
+        XCTAssertNil(context.store.connectionMessage)
+        let maximum = await context.client.maximumSamplesInFlight
+        XCTAssertEqual(maximum, 1)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 2)
         await context.close()
     }
 
@@ -371,8 +534,10 @@ final class MonitoringCoordinatorTests: XCTestCase {
             coordinator: coordinator, client: client, defaults: defaults, suite: suite)
     }
 
-    private func eventually(_ condition: @MainActor () async -> Bool) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+    private func eventually(
+        timeout: Duration = .seconds(2), _ condition: @MainActor () async -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
         while !(await condition()) {
             guard ContinuousClock.now < deadline else {
                 XCTFail("Coordinator did not reach the expected lifecycle point")
@@ -386,6 +551,14 @@ final class MonitoringCoordinatorTests: XCTestCase {
 private actor FixtureBackendClient: BackendClientProtocol {
     private var detections: [DetectedBackend]
     private(set) var resetCount = 0
+    private(set) var sampleCount = 0
+    private(set) var samplesInFlight = 0
+    private(set) var maximumSamplesInFlight = 0
+    private(set) var sampleCancellations = 0
+    private var sampleFailure: BackendClientError?
+    private var holdSample = false
+    private var sampleContinuation: CheckedContinuation<Void, Never>?
+    var isSampleHeld: Bool { sampleContinuation != nil }
     private var holdDiscovery = false
     private var discoveryContinuation: CheckedContinuation<Void, Never>?
     var isDiscoveryHeld: Bool { discoveryContinuation != nil }
@@ -422,9 +595,33 @@ private actor FixtureBackendClient: BackendClientProtocol {
     }
 
     func sample(_ configuration: BackendConfiguration) async throws -> BackendSample {
-        BackendSample(
+        sampleCount += 1
+        samplesInFlight += 1
+        maximumSamplesInFlight = max(maximumSamplesInFlight, samplesInFlight)
+        defer { samplesInFlight -= 1 }
+        let failure = sampleFailure
+        sampleFailure = nil
+        if holdSample {
+            holdSample = false
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { sampleContinuation = $0 }
+            } onCancel: {
+                Task { await self.recordSampleCancellation() }
+            }
+        }
+        if let failure { throw failure }
+        return BackendSample(
             kind: configuration.kind, model: "fixture", currentTPS: 42,
             runningRequests: configuration.kind == .ollama ? nil : 1)
+    }
+
+    func failNextSample(_ error: BackendClientError) { sampleFailure = error }
+    func holdNextSample() { holdSample = true }
+    private func recordSampleCancellation() { sampleCancellations += 1 }
+
+    func releaseSample() {
+        sampleContinuation?.resume()
+        sampleContinuation = nil
     }
 
     func reset() { resetCount += 1 }
