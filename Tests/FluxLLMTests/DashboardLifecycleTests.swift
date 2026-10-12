@@ -27,7 +27,6 @@ final class DashboardLifecycleTests: XCTestCase {
                 window.setActivationPolicy = { _ in }
                 if let remembered { XCTAssertEqual(window.frame, remembered) }
                 window.setContentSize(NSSize(width: 800 + cycle * 20, height: 800 + cycle * 20))
-                remembered = window.frame
                 window.present()
                 XCTAssertTrue(controller.prepareDashboardWindow() === window)
                 window.windowDidMiniaturize(
@@ -35,6 +34,7 @@ final class DashboardLifecycleTests: XCTestCase {
                 XCTAssertTrue(
                     controller.prepareDashboardWindow() === window,
                     "Minimization preserves the native window")
+                remembered = window.frame
                 window.close()
             }
             drainNativeUpdates()
