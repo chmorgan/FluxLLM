@@ -681,12 +681,43 @@ final class UnslothBackendClientTests: XCTestCase {
         XCTAssertEqual(resets, 1)
     }
 
-    func testWorkerReplacementDuringARequestRejectsStaleModelAndMetrics() async throws {
+    func testWorkerReplacementDuringARequestReconnectsWithoutPublishingStaleModelOrMetrics()
+        async throws
+    {
+        let metrics = "llamacpp:predicted_tokens_seconds 0\nllamacpp:requests_processing 1"
+        let transport = UnslothTransportStub([
+            "/metrics": Array(repeating: .ok(metrics), count: 6),
+            "/props": [
+                .ok(#"{"model_alias":"first","endpoint_slots":true}"#),
+                .ok(#"{"model_alias":"second","endpoint_slots":true}"#),
+            ],
+            "/slots": [100, 156, 10000, 10056].map { count in
+                .ok(
+                    "[{\"id\":3,\"id_task\":5893,\"is_processing\":true,"
+                        + "\"next_token\":[{\"n_decoded\":\(count)}]}]")
+            },
+        ])
         let gate = UnslothSampleGate()
-        let backend = UnslothUnderlyingStub(
-            detection: .init(kind: .llamaCpp, baseURL: worker), gate: gate)
+        let clock = UnslothSlotTestClock()
         let discovery = UnslothDiscoveryStub([server()])
-        let client = UnslothBackendClient(normal: backend, discovery: discovery)
+        let client = UnslothBackendClient(
+            normal: HTTPBackendClient(
+                transport: { request in
+                    let response = try await transport.respond(request)
+                    if request.url?.path == "/slots" {
+                        let requests = await transport.requests
+                        if requests.filter({ $0.url?.path == "/slots" }).count == 2 {
+                            await gate.hold()
+                        }
+                    }
+                    return response
+                }, monotonicTime: { clock.now() }, wallClock: { clock.date() }),
+            discovery: discovery)
+        let baseline = try await client.sample(configuration())
+        let firstEpoch = try XCTUnwrap(baseline.nativeRequests?.sourceEpoch)
+        XCTAssertEqual(baseline.model, "first")
+        XCTAssertEqual(baseline.throughputState, .warmingUp)
+        clock.advance(1)
         let task = Task { try await client.sample(configuration()) }
         await gate.waitUntilStarted()
         await discovery.replace([server(workerBirth: 999)])
@@ -695,11 +726,27 @@ final class UnslothBackendClientTests: XCTestCase {
             _ = try await task.value
             XCTFail("A replaced worker must not publish its old sample")
         } catch {
-            guard case .configurationRequired(let message) = error as? BackendClientError else {
-                return XCTFail("Expected process-change guidance, got \(error)")
+            guard case .reconnecting(let message) = error as? BackendClientError else {
+                return XCTFail("Expected automatic reconnection, got \(error)")
             }
             XCTAssertTrue(message.contains("changed"))
+            XCTAssertEqual(error.localizedDescription, message)
         }
+        clock.advance(1)
+        let recovered = try await client.sample(configuration())
+        let replacementEpoch = try XCTUnwrap(recovered.nativeRequests?.sourceEpoch)
+        XCTAssertEqual(recovered.kind, .unsloth)
+        XCTAssertEqual(recovered.model, "second")
+        XCTAssertEqual(recovered.runningRequests, 1)
+        XCTAssertNotEqual(replacementEpoch, firstEpoch)
+        XCTAssertNil(recovered.currentTPS, "Replacement counters must warm up independently")
+        XCTAssertEqual(recovered.throughputState, .warmingUp)
+        clock.advance(1)
+        let measured = try await client.sample(configuration())
+        XCTAssertEqual(measured.currentTPS, 56)
+        XCTAssertEqual(measured.nativeRequests?.sourceEpoch, replacementEpoch)
+        let requests = await transport.requests
+        XCTAssertEqual(requests.filter { $0.url?.path == "/props" }.count, 2)
     }
 
     func testResetAndCancellationRejectInflightResults() async throws {

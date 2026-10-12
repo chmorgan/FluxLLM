@@ -16,6 +16,8 @@ public enum BackendClientError: Error, LocalizedError, Sendable, Equatable {
     case invalidEndpoint, invalidResponse, responseTooLarge, unsupportedMetrics
     case httpStatus(Int)
     case configurationRequired(String)
+    /// A verified backend changed during a read and can be retried with the current settings.
+    case reconnecting(String)
 
     public var errorDescription: String? {
         switch self {
@@ -25,6 +27,7 @@ public enum BackendClientError: Error, LocalizedError, Sendable, Equatable {
         case .responseTooLarge: "The backend response exceeded the monitoring size limit."
         case .unsupportedMetrics: "This backend did not expose the expected monitoring metrics."
         case .configurationRequired(let message): message
+        case .reconnecting(let message): message
         case .httpStatus(let code):
             code == 401 || code == 403
                 ? "The backend requires authentication. Authenticated monitoring is not configured."

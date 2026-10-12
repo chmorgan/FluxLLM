@@ -156,7 +156,11 @@ public final class MonitoringCoordinator {
                 _ = await self.poll(configuration, revision: currentRevision, epoch: self.epoch)
             } else {
                 self.epoch = UUID()
-                self.store.beginBackendSession(kind: snapshot.selection.kind, epoch: self.epoch)
+                let endpoint = snapshot.selection.kind.flatMap {
+                    try? snapshot.configuration(for: $0).baseURL
+                }
+                self.store.beginBackendSession(
+                    kind: snapshot.selection.kind, epoch: self.epoch, endpoint: endpoint)
                 self.store.updateConnection(.needsConfiguration, message: selection.message)
                 self.startGPUMonitoring(nil)
             }
@@ -257,7 +261,8 @@ public final class MonitoringCoordinator {
         sourceURL?.fragment = nil
         let sourceID =
             "\(configuration.kind.rawValue)|\(sourceURL?.string ?? configuration.kind.rawValue)|\(configuration.model ?? "")"
-        store.beginBackendSession(kind: configuration.kind, epoch: epoch, sourceID: sourceID)
+        store.beginBackendSession(
+            kind: configuration.kind, epoch: epoch, sourceID: sourceID, endpoint: sourceURL?.url)
         store.updateConnection(.connecting, message: nil)
         if configuration.kind == .ollama {
             proxy = proxyFactory(configuration, epoch)
@@ -357,6 +362,8 @@ public final class MonitoringCoordinator {
     private static func failureState(_ error: Error) -> BackendConnectionState {
         guard let error = error as? BackendClientError else { return .unavailable }
         switch error {
+        case .reconnecting:
+            return .connecting
         case .invalidEndpoint, .unsupportedMetrics, .configurationRequired:
             return .needsConfiguration
         case .httpStatus(let status) where [400, 401, 403, 404, 501].contains(status):
@@ -372,7 +379,7 @@ public final class MonitoringCoordinator {
         if let kind = snapshot.selection.kind {
             let configuration = try snapshot.configuration(for: kind)
             if let different = detections.first(where: {
-                Self.endpointKey($0.baseURL) == Self.endpointKey(configuration.baseURL)
+                BackendEndpoint.key($0.baseURL) == BackendEndpoint.key(configuration.baseURL)
                     && $0.kind != kind
             }) {
                 return Selection(
@@ -437,7 +444,7 @@ public final class MonitoringCoordinator {
             // Probe that address with the new credentials, never the old session's key.
             candidates.removeAll {
                 $0.kind == active.kind
-                    && Self.endpointKey($0.baseURL) == Self.endpointKey(active.baseURL)
+                    && BackendEndpoint.key($0.baseURL) == BackendEndpoint.key(active.baseURL)
             }
             candidates.insert(configuration(template, at: active.baseURL), at: 0)
         }
@@ -448,7 +455,7 @@ public final class MonitoringCoordinator {
             for url in urls {
                 let configuration = configurations.first {
                     $0.kind == .unsloth
-                        && Self.endpointKey($0.baseURL) == Self.endpointKey(url)
+                        && BackendEndpoint.key($0.baseURL) == BackendEndpoint.key(url)
                 }
                 group.addTask {
                     if let configuration { return try? await client.detect(configuration) }
@@ -477,7 +484,7 @@ public final class MonitoringCoordinator {
         }
         let defaults = BackendKind.allCases.compactMap { URL(string: $0.defaultEndpoint) }
         var seen = Set<String>()
-        return (configured + defaults).filter { seen.insert(Self.endpointKey($0)).inserted }
+        return (configured + defaults).filter { seen.insert(BackendEndpoint.key($0)).inserted }
     }
 
     private func configuration(_ template: BackendConfiguration, at url: URL)
@@ -536,7 +543,9 @@ public final class MonitoringCoordinator {
 
     private static func equivalent(_ lhs: BackendConfiguration, _ rhs: BackendConfiguration) -> Bool
     {
-        guard lhs.kind == rhs.kind, endpointKey(lhs.baseURL) == endpointKey(rhs.baseURL) else {
+        guard lhs.kind == rhs.kind,
+            BackendEndpoint.key(lhs.baseURL) == BackendEndpoint.key(rhs.baseURL)
+        else {
             return false
         }
         switch lhs.kind {
@@ -547,23 +556,5 @@ public final class MonitoringCoordinator {
                 && lhs.workerAPIKey == rhs.workerAPIKey
         case .vllm, .rapidMLX: return true
         }
-    }
-
-    private static func endpointKey(_ url: URL) -> String {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return url.absoluteString
-        }
-        components.scheme = components.scheme?.lowercased()
-        components.host = components.host?.lowercased()
-        if ["localhost", "localhost."].contains(components.host ?? "") {
-            components.host = "127.0.0.1"
-        }
-        if (components.scheme == "http" && components.port == 80)
-            || (components.scheme == "https" && components.port == 443)
-        {
-            components.port = nil
-        }
-        while components.path.hasSuffix("/") { components.path.removeLast() }
-        return components.string ?? url.absoluteString
     }
 }

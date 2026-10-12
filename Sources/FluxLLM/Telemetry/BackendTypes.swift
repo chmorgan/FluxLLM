@@ -53,6 +53,27 @@ public struct BackendConfiguration: Equatable, Sendable {
     }
 }
 
+/// Discovery and applied-session status use the same canonical endpoint identity.
+enum BackendEndpoint {
+    static func key(_ url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url.absoluteString
+        }
+        components.scheme = components.scheme?.lowercased()
+        components.host = components.host?.lowercased()
+        if ["localhost", "localhost."].contains(components.host ?? "") {
+            components.host = "127.0.0.1"
+        }
+        if (components.scheme == "http" && components.port == 80)
+            || (components.scheme == "https" && components.port == 443)
+        {
+            components.port = nil
+        }
+        while components.path.hasSuffix("/") { components.path.removeLast() }
+        return components.string ?? url.absoluteString
+    }
+}
+
 public struct DetectedBackend: Identifiable, Equatable, Sendable {
     public var id: String { "\(kind.rawValue)|\(baseURL.absoluteString)" }
     public let kind: BackendKind

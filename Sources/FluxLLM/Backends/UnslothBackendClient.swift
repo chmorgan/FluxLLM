@@ -234,7 +234,7 @@ public actor UnslothBackendClient: BackendClientProtocol {
             }
             try check(operation)
             guard current.count == 1, current.first == server else {
-                throw BackendClientError.configurationRequired(
+                throw BackendClientError.reconnecting(
                     "Unsloth's inference processes changed during monitoring. The next poll will reconnect to the current worker."
                 )
             }
@@ -278,7 +278,7 @@ public actor UnslothBackendClient: BackendClientProtocol {
             }
             try check(operation)
             guard current.count == 1, current.first == studio else {
-                throw BackendClientError.configurationRequired(
+                throw BackendClientError.reconnecting(
                     "Unsloth's inference processes changed during discovery. Monitoring will retry."
                 )
             }

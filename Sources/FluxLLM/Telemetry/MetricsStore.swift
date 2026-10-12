@@ -45,6 +45,8 @@ public final class MetricsStore {
             refreshLiveActivity()
         }
     }
+    /// The applied endpoint is independent of unapplied Settings drafts and discoveries.
+    public private(set) var backendEndpoint: URL?
     public private(set) var monitoringEpoch = UUID()
     public private(set) var connectionState: BackendConnectionState = .detecting {
         didSet { if connectionState != oldValue { refreshLiveActivity() } }
@@ -612,7 +614,9 @@ public final class MetricsStore {
     }
 
     /// Changing sources never joins unrelated rates into one continuous trace.
-    public func beginBackendSession(kind: BackendKind?, epoch: UUID, sourceID: String? = nil) {
+    public func beginBackendSession(
+        kind: BackendKind?, epoch: UUID, sourceID: String? = nil, endpoint: URL? = nil
+    ) {
         defer {
             refreshLiveGPU()
             publishDashboardScalarPresentation()
@@ -624,6 +628,14 @@ public final class MetricsStore {
         historySource = sourceID ?? kind?.rawValue ?? "unconfigured"
         monitoringEpoch = epoch
         presentationViewports.removeAll(keepingCapacity: true)
+        var endpointComponents = endpoint.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)
+        }
+        endpointComponents?.user = nil
+        endpointComponents?.password = nil
+        endpointComponents?.query = nil
+        endpointComponents?.fragment = nil
+        backendEndpoint = kind == nil ? nil : endpointComponents?.url
         backendKind = kind
         connectionState = kind == nil ? .detecting : .connecting
         healthConnectionState = connectionState

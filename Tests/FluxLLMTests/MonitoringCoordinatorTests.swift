@@ -9,6 +9,7 @@ final class MonitoringCoordinatorTests: XCTestCase {
         let context = try makeContext(detections: [.vllm])
         await context.coordinator.start()
         XCTAssertEqual(context.store.backendKind, .vllm)
+        XCTAssertEqual(context.store.backendEndpoint?.absoluteString, "http://127.0.0.1:8000")
         XCTAssertEqual(context.store.connectionState, .ready)
         XCTAssertEqual(context.store.currentTPS, 42)
         XCTAssertTrue(context.proxies.instances.isEmpty)
@@ -22,6 +23,7 @@ final class MonitoringCoordinatorTests: XCTestCase {
         let context = try makeContext(detections: [.ollama, .vllm])
         await context.coordinator.start()
         XCTAssertNil(context.store.backendKind)
+        XCTAssertNil(context.store.backendEndpoint)
         XCTAssertEqual(context.store.connectionState, .needsConfiguration)
         XCTAssertTrue(context.proxies.instances.isEmpty)
         context.settings.lastAutomaticBackendID = "vllm|http://127.0.0.1:8000"
@@ -62,6 +64,7 @@ final class MonitoringCoordinatorTests: XCTestCase {
         await context.coordinator.start()
         XCTAssertEqual(context.store.connectionState, .needsConfiguration)
         XCTAssertTrue(context.store.connectionMessage?.contains("vLLM") == true)
+        XCTAssertEqual(context.store.backendEndpoint?.port, 8000)
         XCTAssertTrue(context.proxies.instances.isEmpty)
         await context.close()
     }
@@ -219,6 +222,7 @@ final class MonitoringCoordinatorTests: XCTestCase {
         await stopping.value
 
         XCTAssertNil(context.coordinator.selectedConfiguration)
+        XCTAssertNil(context.store.backendEndpoint)
         XCTAssertEqual(context.store.connectionState, .detecting)
         XCTAssertNil(context.store.connectionMessage)
         let polls = await context.client.sampleCount
@@ -245,12 +249,30 @@ final class MonitoringCoordinatorTests: XCTestCase {
 
         XCTAssertNotEqual(context.store.monitoringEpoch, epoch)
         XCTAssertEqual(context.coordinator.selectedConfiguration?.baseURL.port, 9001)
+        XCTAssertEqual(context.store.backendEndpoint?.port, 9001)
         XCTAssertEqual(context.store.connectionState, .ready)
         XCTAssertNil(context.store.connectionMessage)
         let maximum = await context.client.maximumSamplesInFlight
         XCTAssertEqual(maximum, 1)
         let resets = await context.client.resetCount
         XCTAssertEqual(resets, 2)
+        await context.close()
+    }
+
+    func testReconnectingFailureKeepsSessionConnectingUntilRetrySucceeds() async throws {
+        let context = try makeContext(detections: [.vllm], pollInterval: .seconds(3600))
+        context.settings.backendSelection = .vllm
+        await context.client.failNextSample(
+            .reconnecting("The worker restarted; monitoring will retry."))
+        await context.coordinator.start()
+        let epoch = context.store.monitoringEpoch
+        XCTAssertEqual(context.store.connectionState, .connecting)
+        XCTAssertEqual(context.store.liveScalars.statusTitle, "Connecting")
+        try await context.coordinator.applySettings()
+        try await eventually { context.store.connectionState == .ready }
+        XCTAssertEqual(context.store.monitoringEpoch, epoch)
+        let resets = await context.client.resetCount
+        XCTAssertEqual(resets, 1)
         await context.close()
     }
 

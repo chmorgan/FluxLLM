@@ -1,8 +1,74 @@
 import Foundation
 
-/// Human-facing connection labels never expose collector or proxy diagnostics.
+/// Dashboard labels summarize health; Settings also explains the applied connection.
 @MainActor
 enum BackendPresentation {
+    struct SettingsConnection: Identifiable, Equatable {
+        enum Tone: Equatable { case ready, pending, warning }
+
+        let kind: BackendKind
+        let endpoint: URL
+        let isApplied: Bool
+        let status: String
+        let detail: String?
+        let tone: Tone
+
+        var id: String { "\(kind.rawValue)|\(BackendEndpoint.key(endpoint))" }
+
+        var symbol: String {
+            switch tone {
+            case .ready: "checkmark.circle"
+            case .pending: "arrow.triangle.2.circlepath"
+            case .warning: "exclamationmark.circle"
+            }
+        }
+    }
+
+    /// Discovery is a snapshot. Only the applied kind and endpoint receive live
+    /// health, regardless of the selected draft or a different server's scan result.
+    static func settingsConnections(store: MetricsStore) -> [SettingsConnection] {
+        var rows: [SettingsConnection] = []
+        if let kind = store.backendKind, let endpoint = store.backendEndpoint {
+            let status: String
+            let tone: SettingsConnection.Tone
+            switch store.connectionState {
+            case .detecting, .connecting:
+                status = "Connecting"
+                tone = .pending
+            case .needsConfiguration:
+                status = "Configure"
+                tone = .warning
+            case .unavailable:
+                status = "Unavailable"
+                tone = .warning
+            case .ready:
+                status = statusTitle(store: store)
+                tone = .ready
+            }
+            rows.append(
+                SettingsConnection(
+                    kind: kind, endpoint: endpoint, isApplied: true, status: status,
+                    detail: nonempty(store.connectionMessage) ?? configurationPrompt(store: store),
+                    tone: tone))
+        }
+        var seen = Set(rows.map(\.id))
+        for backend in store.detectedBackends {
+            let row = SettingsConnection(
+                kind: backend.kind, endpoint: backend.baseURL, isApplied: false,
+                status: backend.isReady ? "Ready" : "Not ready",
+                detail: nonempty(backend.detail), tone: backend.isReady ? .ready : .warning)
+            if seen.insert(row.id).inserted { rows.append(row) }
+        }
+        return rows
+    }
+
+    private static func nonempty(_ text: String?) -> String? {
+        guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !trimmed.isEmpty
+        else { return nil }
+        return trimmed
+    }
+
     static func statusTitle(store: MetricsStore) -> String {
         if store.isBackendActive { return "Active" }
         switch store.connectionState {

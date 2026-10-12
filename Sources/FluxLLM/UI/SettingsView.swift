@@ -164,6 +164,8 @@ public struct SettingsView: View {
                         Text(choice.title).tag(choice)
                     }
                 }
+                Text("Connection edits take effect when you click Apply.")
+                    .font(.caption).foregroundStyle(.secondary)
                 if selection == .automatic {
                     Text(
                         "FluxLLM selects a detected system and remembers it while it remains available. Choose a system when several are detected."
@@ -257,12 +259,20 @@ public struct SettingsView: View {
     }
 
     private var unslothDetected: Bool { firstDetectedUnsloth != nil }
-    private var showsUnslothCredentialsAtTop: Bool { unslothDetected || selection == .unsloth }
+    private var connectionRows: [BackendPresentation.SettingsConnection] {
+        store.map { BackendPresentation.settingsConnections(store: $0) } ?? []
+    }
+    private var firstUnslothConnection: BackendPresentation.SettingsConnection? {
+        connectionRows.first { $0.kind == .unsloth }
+    }
+    private var showsUnslothCredentialsAtTop: Bool {
+        firstUnslothConnection != nil || selection == .unsloth
+    }
 
     private var connectionDiscoverySection: some View {
         VStack(alignment: .leading, spacing: 12) {
             detectionSection
-            if selection == .unsloth && !unslothDetected {
+            if selection == .unsloth && firstUnslothConnection == nil {
                 unslothCredentialsSection
             }
         }
@@ -272,7 +282,7 @@ public struct SettingsView: View {
     private var detectionSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Detected systems").font(.headline)
+                Text("Connections").font(.headline)
                 Spacer()
                 if isScanning { ProgressView().controlSize(.small) }
                 Button("Scan Again") {
@@ -284,26 +294,31 @@ public struct SettingsView: View {
                 }
                 .disabled(isScanning || isApplying || store == nil)
             }
-            if let detected = store?.detectedBackends, !detected.isEmpty {
-                ForEach(detected) { backend in
+            if !connectionRows.isEmpty {
+                ForEach(connectionRows) { connection in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(
-                                systemName: backend.isReady
-                                    ? "checkmark.circle" : "exclamationmark.circle"
-                            )
-                            .foregroundStyle(backend.isReady ? Color.green : Color.orange)
-                            Text(backend.kind.title).fontWeight(.medium)
-                            Text(backend.baseURL.absoluteString)
+                            Image(systemName: connection.symbol)
+                                .foregroundStyle(connectionColor(connection.tone))
+                            Text(connection.kind.title).fontWeight(.medium)
+                            Text(connection.endpoint.absoluteString)
                                 .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                         }
-                        if !backend.isReady, let detail = backend.detail, !detail.isEmpty {
+                        Text(
+                            connection.isApplied
+                                ? "Monitoring · \(connection.status)"
+                                : "Last scan · \(connection.status)"
+                        )
+                        .foregroundStyle(.secondary)
+                        if let detail = connection.detail {
                             Text(detail).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                     .font(.caption).textSelection(.enabled)
-                    if backend.kind == .unsloth, backend.id == firstDetectedUnsloth?.id {
+                    if connection.kind == .unsloth,
+                        connection.id == firstUnslothConnection?.id
+                    {
                         unslothCredentialsSection.padding(.top, 6)
                     }
                 }
@@ -315,6 +330,14 @@ public struct SettingsView: View {
                 )
                 .font(.caption).foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private func connectionColor(_ tone: BackendPresentation.SettingsConnection.Tone) -> Color {
+        switch tone {
+        case .ready: .green
+        case .pending: .secondary
+        case .warning: .orange
         }
     }
 
